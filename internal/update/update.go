@@ -1,6 +1,7 @@
 // Package update — самообновление исполняемого файла агента: загрузка,
 // проверка sha256 и подписи Ed25519, замена с копией .prev, откат версии,
-// не дошедшей до связи с сервером за несколько запусков (boot guard).
+// не дошедшей до связи с сервером за несколько запусков (boot guard); сборки
+// воркеров из выпуска — файлом или архивом .tar.gz.
 package update
 
 import (
@@ -15,6 +16,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
+	"strings"
 	"syscall"
 )
 
@@ -47,16 +50,37 @@ func NewPaths(binary string) Paths {
 	return Paths{Binary: binary, Marker: binary + ".update.json"}
 }
 
-// Sign — подпись релиза: Ed25519 над hex sha256 файла.
-func Sign(priv ed25519.PrivateKey, sha256hex string) string {
-	return base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(sha256hex)))
+// AgentName — имя сборки агента в подписи.
+const AgentName = "agent"
+
+// Build — что подписывается: сборка Name (agent или имя воркера) версии
+// Version под OS/Arch с содержимым SHA256 (hex).
+type Build struct {
+	Name, Version, OS, Arch, SHA256 string
 }
 
-// Verify — подпись релиза ключом выпуска.
-func Verify(pub ed25519.PublicKey, sha256hex, signature string) error {
+// Local — сборка name версии version под эту машину.
+func Local(name, version, sha256hex string) Build {
+	return Build{Name: name, Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH, SHA256: sha256hex}
+}
+
+// Payload — подписываемая строка (§7): agent-release/1, имя, версия, os,
+// arch, sha256 строчными — через \n.
+func (b Build) Payload() string {
+	return strings.Join([]string{"agent-release/1", b.Name, b.Version, b.OS, b.Arch, strings.ToLower(b.SHA256)}, "\n")
+}
+
+// Sign — подпись сборки: Ed25519 над Payload, base64.
+func Sign(priv ed25519.PrivateKey, b Build) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(b.Payload())))
+}
+
+// Verify — подпись сборки ключом выпуска: подпись другой сборки (версии,
+// платформы, имени) не подходит.
+func Verify(pub ed25519.PublicKey, b Build, signature string) error {
 	sig, err := base64.StdEncoding.DecodeString(signature)
-	if err != nil || !ed25519.Verify(pub, []byte(sha256hex), sig) {
-		return errors.New("update: подпись релиза не сходится")
+	if err != nil || !ed25519.Verify(pub, []byte(b.Payload()), sig) {
+		return fmt.Errorf("update: подпись сборки %s %s (%s/%s) не сходится", b.Name, b.Version, b.OS, b.Arch)
 	}
 	return nil
 }
@@ -89,7 +113,7 @@ func Install(ctx context.Context, client *http.Client, auth string, p Paths, pub
 	if pub == nil {
 		return ErrNotVerified
 	}
-	if err := Verify(pub, rel.SHA256, rel.Signature); err != nil {
+	if err := Verify(pub, Local(AgentName, rel.Version, rel.SHA256), rel.Signature); err != nil {
 		return err
 	}
 	if current, err := FileHash(p.Binary); err == nil && current == rel.SHA256 {
@@ -114,16 +138,27 @@ func Install(ctx context.Context, client *http.Client, auth string, p Paths, pub
 // нельзя проверить, ставить её агент не будет.
 var ErrNotVerified = errors.New("update: не задан ключ проверки релизов (update.publicKey)")
 
-// Fetch — проверить подпись sha256 ключом выпуска и скачать файл в dst
+// Fetch — проверить подпись сборки b ключом выпуска и скачать файл в dst
 // (0755) со сверкой sha256. Ключа нет — ErrNotVerified.
-func Fetch(ctx context.Context, client *http.Client, auth string, pub ed25519.PublicKey, url, sha256hex, signature, dst string) error {
+func Fetch(ctx context.Context, client *http.Client, auth string, pub ed25519.PublicKey, b Build, url, signature, dst string) error {
 	if pub == nil {
 		return ErrNotVerified
 	}
-	if err := Verify(pub, sha256hex, signature); err != nil {
+	if err := Verify(pub, b, signature); err != nil {
 		return err
 	}
-	return Download(ctx, client, auth, url, dst, sha256hex)
+	return Download(ctx, client, auth, url, dst, b.SHA256)
+}
+
+// FetchArchive — как Fetch, но сборка — архив .tar.gz: после проверки он
+// распаковывается в новый каталог dst (Extract), сам архив удаляется.
+func FetchArchive(ctx context.Context, client *http.Client, auth string, pub ed25519.PublicKey, b Build, url, signature, dst string) error {
+	archive := dst + ".tar.gz"
+	if err := Fetch(ctx, client, auth, pub, b, url, signature, archive); err != nil {
+		return err
+	}
+	defer os.Remove(archive)
+	return Extract(archive, dst)
 }
 
 // Download — скачать url в dst (0755) и сверить sha256; при ошибке dst удаляется.

@@ -27,19 +27,22 @@ sdk/
 
 ## Установка
 
-Всё ставится с GitHub, без npm и PyPI. Версия SDK совпадает с версией агента:
+Всё ставится с GitHub, без npm и PyPI. Версия SDK совпадает с версией агента; `<версия>` — номер
+выпуска без `v`, например `1.1.0`; список выпусков — <https://github.com/epifanovmd/agent/releases>.
 
 ```bash
-# Go — прямо из репозитория (или @v<версия>)
-go get github.com/epifanovmd/agent/sdk/go/server@latest   # и sdk/go/worker
+# Go ≥ 1.25 — пакеты из репозитория: server, worker, message, sealed
+go get github.com/epifanovmd/agent/sdk/go/...@v<версия>
 # Node ≥ 24 — готовый архив из GitHub Release (TypeScript уже собран)
 npm install https://github.com/epifanovmd/agent/releases/download/v<версия>/agent-sdk-<версия>.tgz
 # Python ≥ 3.10 — готовый пакет из GitHub Release (зависимостей нет)
 pip install https://github.com/epifanovmd/agent/releases/download/v<версия>/agent_sdk-<версия>-py3-none-any.whl
+# или Python — прямо из репозитория
+pip install "git+https://github.com/epifanovmd/agent@v<версия>#subdirectory=sdk/python"
 ```
 
-`<версия>` — номер выпуска без `v`, например `1.1.0`; список выпусков —
-<https://github.com/epifanovmd/agent/releases>. Особенности языков — [node/README.md](node/README.md),
+Для Node есть только архив из Release: из подкаталога git-репозитория npm пакет не ставит, а
+собранного кода в репозитории нет. Особенности языков — [node/README.md](node/README.md),
 [python/README.md](python/README.md).
 
 **Без SDK тоже можно.** Агент, воркер и сервер обмениваются строками JSON. Формат — в
@@ -120,29 +123,29 @@ report`; Python — обычные функции, работают в пото�
 
 ### Job
 
-| Что                               | Go (`*worker.Job`)                                               | Node (`Job`)                                     | Python (`Job`)                                    |
-| --------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------- |
-| что пришло                        | `ID`, `Queue`, `Data json.RawMessage`, `Attempt`, `LeaseSeconds` | `id`, `queue`, `data`, `attempt`, `leaseSeconds` | `id`, `queue`, `data`, `attempt`, `lease_seconds` |
-| прогресс 0..1 и текст             | `Progress(value float64, text ...string)`                        | `progress(value, text?)`                         | `progress(value, text=None)`                      |
-| строка журнала                    | `Log(line string)`                                               | `log(line)`                                      | `log(line)`                                       |
-| событие задачи                    | `Event(typ string, data any) error`                              | `event(type, data?)`                             | `event(type, data=None)`                          |
-| отменили                          | `ctx.Done()`                                                     | `signal` (`AbortSignal`), `cancelled`            | `cancelled`, `check_cancelled()` → `Cancelled`    |
-| просят закончить пораньше         | `StopRequested() <-chan struct{}`                                | `stopRequested`                                  | `stop_requested`                                  |
-| имена файлов                      | `Inputs() []string`, `Outputs() []string`                        | `inputs`, `outputs`                              | `inputs`, `outputs`                               |
-| входной файл во временный каталог | `InputPath(ctx, name) (string, error)`                           | `await inputPath(name)`                          | `input_path(name) -> Path`                        |
-| скачать в своё место              | `Download(ctx, name, path string) error`                         | `await download(name, target)`                   | `download(name, target) -> Path`                  |
-| загрузить результат               | `Upload(ctx, name, data []byte)`, `UploadFile(ctx, name, path)`  | `await upload(name, Uint8Array \| путь)`         | `upload(name, bytes \| путь)`                     |
-| свежие ссылки                     | `RefreshURLs(ctx, inputs, outputs []string) error`               | `await refreshUrls(inputs?, outputs?)`           | `refresh_urls(inputs=None, outputs=None)`         |
+| Что                               | Go (`*worker.Job`)                                               | Node (`Job`)                                     | Python (`Job`)                                                                                            |
+| --------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| что пришло                        | `ID`, `Queue`, `Data json.RawMessage`, `Attempt`, `LeaseSeconds` | `id`, `queue`, `data`, `attempt`, `leaseSeconds` | `id`, `queue`, `data`, `attempt`, `lease_seconds`                                                         |
+| прогресс 0..1 и текст             | `Progress(value float64, text ...string)`                        | `progress(value, text?)`                         | `progress(value, text=None)`                                                                              |
+| строка журнала                    | `Log(line string)`                                               | `log(line)`                                      | `log(line)`                                                                                               |
+| событие задачи                    | `Event(typ string, data any) error`                              | `event(type, data?)`                             | `event(type, data=None)`                                                                                  |
+| отменили                          | `ctx.Done()`                                                     | `signal` (`AbortSignal`), `cancelled`            | `cancelled`, `check_cancelled()` → `Cancelled`; ждать с отменой — `wait(timeout) -> bool`, `cancel_event` |
+| просят закончить пораньше         | `StopRequested() <-chan struct{}`                                | `stopRequested`                                  | `stop_requested`                                                                                          |
+| имена файлов                      | `Inputs() []string`, `Outputs() []string`                        | `inputs`, `outputs`                              | `inputs`, `outputs`                                                                                       |
+| входной файл во временный каталог | `InputPath(ctx, name) (string, error)`                           | `await inputPath(name)`                          | `input_path(name) -> Path`                                                                                |
+| скачать в своё место              | `Download(ctx, name, path string) error`                         | `await download(name, target)`                   | `download(name, target) -> Path`                                                                          |
+| загрузить результат               | `Upload(ctx, name, data []byte)`, `UploadFile(ctx, name, path)`  | `await upload(name, Uint8Array \| путь)`         | `upload(name, bytes \| путь)`                                                                             |
+| свежие ссылки                     | `RefreshURLs(ctx, inputs, outputs []string) error`               | `await refreshUrls(inputs?, outputs?)`           | `refresh_urls(inputs=None, outputs=None)`                                                                 |
 
 Подробно — [docs/jobs.md](docs/jobs.md).
 
 ### Command
 
-| Что        | Go (`*worker.Command`)                             | Node (`Command`)                   | Python (`Command`)                             |
-| ---------- | -------------------------------------------------- | ---------------------------------- | ---------------------------------------------- |
-| что пришло | `ID`, `Name`, `Args json.RawMessage`, `TimeoutSec` | `id`, `name`, `args`, `timeoutSec` | `id`, `name`, `args`, `timeout_sec`            |
-| вывод      | `Write(p []byte)` — это `io.Writer`                | `write(text)`                      | `write(text)`                                  |
-| срок истёк | `ctx.Done()`                                       | `signal`, `cancelled`              | `cancelled`, `check_cancelled()` → `Cancelled` |
+| Что        | Go (`*worker.Command`)                             | Node (`Command`)                   | Python (`Command`)                                                                      |
+| ---------- | -------------------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------- |
+| что пришло | `ID`, `Name`, `Args json.RawMessage`, `TimeoutSec` | `id`, `name`, `args`, `timeoutSec` | `id`, `name`, `args`, `timeout_sec`                                                     |
+| вывод      | `Write(p []byte)` — это `io.Writer`                | `write(text)`                      | `write(text)`                                                                           |
+| срок истёк | `ctx.Done()`                                       | `signal`, `cancelled`              | `cancelled`, `check_cancelled()` → `Cancelled`; `wait(timeout) -> bool`, `cancel_event` |
 
 Подробно — [docs/commands.md](docs/commands.md).
 
@@ -155,10 +158,25 @@ report`; Python — обычные функции, работают в пото�
 | состояние: не применилось с отчётом | `worker.StateFailed(msg string, report any) error`    | `new StateError(msg, report?)`            | `StateFailed(message, report=None)`        |
 | агент отклонил запрос               | `*message.Error`                                      | `AgentError(code, message, retryable)`    | `AgentError(code, message, retryable)`     |
 
-Код — `^[A-Z0-9_]{1,64}$`. Любая другая ошибка, исключение или паника: задача — `WORKER_ERROR`
-(сервер повторит), команда — `COMMAND_FAILED`, состояние — «не применилось» с текстом (агент
-повторит). Воркер при этом не падает. Константы Go: `worker.CodeWorkerError`,
-`worker.CodeWorkerStopping`, `worker.CodeCommandFailed`, `worker.CodeCommandUnknown`.
+Код — `^[A-Z0-9_]{1,64}$`; код не по этому правилу SDK заменяет на `WORKER_ERROR` (задача) или
+`COMMAND_FAILED` (команда), а исходный код дописывает в начало текста. Любая другая ошибка,
+исключение или паника: задача — `WORKER_ERROR` (сервер повторит), команда — `COMMAND_FAILED`,
+состояние — «не применилось» с текстом (агент повторит). Воркер при этом не падает.
+
+Итог, который нельзя отправить, тоже не роняет воркер — агент получает ответ с ошибкой:
+
+- результат не превращается в JSON (Node: `BigInt`, цикл; Python: объект, `NaN`): задача —
+  `WORKER_ERROR`, команда — `COMMAND_FAILED`, состояние и уборка — `ok: false` с текстом;
+- строка сообщения длиннее 16 МБ (предел канала): задача — `RESULT_TOO_LARGE` без повторов
+  (крупные данные — выходным файлом), команда — `RESULT_TOO_LARGE`, состояние и уборка —
+  `ok: false` с текстом `RESULT_TOO_LARGE: …`;
+- событие или показатели больше 16 МБ не отправляются — запись в лог воркера, связь с агентом
+  остаётся. Данные события или показателей не в JSON — ошибка сразу у вызова (Go — `error`,
+  Node — `TypeError`, Python — `TypeError`/`ValueError`).
+
+Константы Go: `worker.CodeWorkerError`, `worker.CodeWorkerStopping`, `worker.CodeCommandFailed`,
+`worker.CodeCommandUnknown`, `worker.CodeResultTooLarge`; Node — `RESULT_TOO_LARGE`; Python —
+`agent_sdk.worker.errors.RESULT_TOO_LARGE`.
 
 ### Контекст
 
@@ -178,9 +196,28 @@ report`; Python — обычные функции, работают в пото�
   куски до 64 КБ, ссылки на файлы обновляет сам, загрузку повторяет до 4 раз.
 - Задача, пришедшая во время остановки, возвращается с `WORKER_STOPPING` — сервер отдаст её
   другим.
+- Отмена задачи (`job.cancel`): итог обработчика не уходит; когда обработчик вернулся, SDK сам
+  сообщает агенту `job.fail` с кодом `CANCELLED` — так агент освобождает место. Обработчику
+  достаточно вернуться.
+- Повторный `job.assign` той же задачи с той же попыткой ничего не меняет; с большей попыткой —
+  прежняя попытка отменяется так же, новая выполняется. Задача, отменённая, пока ждала места в
+  очереди, обработчик не вызывает; при обрыве связи ждущие задачи убираются.
+- `setHealth`, `pause`, `resume`, `requestRestart`, `report`, `event` (и их варианты в Go и
+  Python) можно вызывать и до запуска: сообщения копятся и уходят сразу после того, как агент
+  принял воркер (`worker.ready`), по порядку. Копится не больше 1000 — лишние вытесняют самые
+  старые (запись в лог).
+- Сообщает агенту, что отвечает на проверку (`ping: true` в `worker.register`), и отвечает на
+  `worker.ping` сообщением `worker.pong` — по ним агент замечает зависший воркер.
+- Имя входного файла во временном каталоге задачи — только последняя часть имени: каталоги и
+  `..` отбрасываются. Каталог создаётся при первом входном файле и удаляется после задачи.
+- Node учитывает заторы канала: пока поток не принимает, сообщения ждут в очереди по порядку; при
+  долгом заторе прогресс задач и показатели отбрасываются (запись в лог), остальное ждёт.
 - Остановка (SIGTERM или `worker.drain`): новых задач не берёт, текущие задачи и команды
   дорабатывает, выходит. Пропала связь с агентом — всё отменяет и выходит.
 - Показатели начинает собирать после того, как агент принял воркер; ошибка сбора — в лог.
+  Каналы, которые агент отклонил (`worker.ready.rejected`), не опрашиваются; источник вернул
+  `nil` / `undefined` / `null` / `None` — точка не отправляется.
+- Сообщение `error` от агента пишет в лог с кодом и текстом.
 - Свой лог пишет в stderr — агент добавляет его в свой журнал с именем воркера.
 
 ---
@@ -193,25 +230,26 @@ HTTP-серверу. Всю работу со связью он делает с�
 
 ### Настройки `Agents`
 
-| Настройка (Node)                                          | Go (`server.Options`)                  | Python (`Agents(…)`)                          | По умолчанию                             | Что                                                                    |
-| --------------------------------------------------------- | -------------------------------------- | --------------------------------------------- | ---------------------------------------- | ---------------------------------------------------------------------- |
-| `enrollToken`                                             | `EnrollToken string`                   | `enroll_token`                                | —                                        | общий токен регистрации                                                |
-| `enroll(token, {name, labels, host}) → {labels?} \| null` | `Enroll func(token) (labels, ok bool)` | `enroll(token) → {labels?} \| None`           | —                                        | своя проверка токена; `labels` — выданные метки                        |
-| `store`                                                   | `Store`                                | `store`                                       | `MemoryStore`                            | хранилище ([docs/store.md](docs/store.md))                             |
-| `files`                                                   | `Files`                                | `files`                                       | `MemoryFiles`                            | где лежат файлы задач                                                  |
-| `statusIntervalMs`                                        | `StatusInterval time.Duration`         | `status_interval_ms`                          | 5000                                     | как часто агент присылает статус                                       |
-| `metricsIntervalMs`                                       | `MetricsInterval`                      | `metrics_interval_ms`                         | 15000                                    | как часто агент присылает метрики                                      |
-| `offlineGraceMs`                                          | `OfflineGrace`                         | `offline_grace_ms`                            | 20000                                    | сколько агент считается на связи после обрыва                          |
-| `offlineAfterMs`                                          | `OfflineAfter`                         | `offline_after_ms`                            | max(3 × статус, 30 с) + `offlineGraceMs` | без вестей дольше — без связи, даже если его процесс бэкенда упал      |
-| `metricsStoreIntervalMs`                                  | `MetricsStoreInterval`                 | `metrics_store_interval_ms`                   | 15000                                    | не чаще скольких мс сохранять точку метрик в `Store`                   |
-| `metricsRetentionMs`                                      | `MetricsRetention`                     | `metrics_retention_ms`                        | 7 суток                                  | сколько хранить историю метрик                                         |
-| `enrollFailureLimit`                                      | `EnrollFailureLimit int`               | `enroll_failure_limit`                        | 10                                       | неудачных регистраций с одного адреса за окно                          |
-| `enrollFailureWindowMs`                                   | `EnrollFailureWindow`                  | `enroll_failure_window_ms`                    | 60000                                    | окно подсчёта неудачных регистраций                                    |
-| `releasesDir`                                             | `ReleasesDir`                          | `releases_dir`                                | —                                        | каталог выпуска ([docs/releases.md](docs/releases.md))                 |
-| `publicKey`                                               | `PublicKey`                            | `public_key`                                  | —                                        | открытый ключ подписи (base64), вписывается в `install.sh`             |
-| `baseUrl`                                                 | `PublicURL` (или `SetPublicURL(url)`)  | `base_url`                                    | из запроса                               | публичный адрес: ссылки на файлы задач, `install.sh`, `installCommand` |
-| `trustProxy`                                              | `TrustProxy bool`                      | `trust_proxy`                                 | `false`                                  | адрес агента — первый из `X-Forwarded-For`                             |
-| `log: (msg, extra) => …`                                  | `Log *slog.Logger`                     | `log` — `logging.Logger` или `fn(msg, extra)` | —                                        | лог                                                                    |
+| Настройка (Node)                                          | Go (`server.Options`)                                          | Python (`Agents(…)`)                                      | По умолчанию                             | Что                                                                                                                                 |
+| --------------------------------------------------------- | -------------------------------------------------------------- | --------------------------------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `enrollToken`                                             | `EnrollToken string`                                           | `enroll_token`                                            | —                                        | общий токен регистрации                                                                                                             |
+| `enroll(token, {name, labels, host}) → {labels?} \| null` | `Enroll func(token string, info EnrollInfo) (labels, ok bool)` | `enroll(token, {name, labels, host}) → {labels?} \| None` | —                                        | своя проверка токена; `labels` — выданные метки                                                                                     |
+| `store`                                                   | `Store`                                                        | `store`                                                   | `MemoryStore`                            | хранилище ([docs/store.md](docs/store.md))                                                                                          |
+| `files`                                                   | `Files`                                                        | `files`                                                   | `MemoryFiles`                            | где лежат файлы задач                                                                                                               |
+| `statusIntervalMs`                                        | `StatusInterval time.Duration`                                 | `status_interval_ms`                                      | 5000                                     | как часто агент присылает статус                                                                                                    |
+| `metricsIntervalMs`                                       | `MetricsInterval`                                              | `metrics_interval_ms`                                     | 15000                                    | как часто агент присылает метрики                                                                                                   |
+| `offlineGraceMs`                                          | `OfflineGrace`                                                 | `offline_grace_ms`                                        | 20000                                    | сколько агент считается на связи после обрыва                                                                                       |
+| `offlineAfterMs`                                          | `OfflineAfter`                                                 | `offline_after_ms`                                        | max(3 × статус, 30 с) + `offlineGraceMs` | без вестей дольше — без связи, даже если его процесс бэкенда упал                                                                   |
+| `metricsStoreIntervalMs`                                  | `MetricsStoreInterval`                                         | `metrics_store_interval_ms`                               | 15000                                    | не чаще скольких мс сохранять точку метрик в `Store`                                                                                |
+| `metricsRetentionMs`                                      | `MetricsRetention`                                             | `metrics_retention_ms`                                    | 7 суток                                  | сколько хранить историю метрик                                                                                                      |
+| `enrollFailureLimit`                                      | `EnrollFailureLimit int`                                       | `enroll_failure_limit`                                    | 10                                       | неудачных регистраций с одного адреса за окно                                                                                       |
+| `enrollFailureWindowMs`                                   | `EnrollFailureWindow`                                          | `enroll_failure_window_ms`                                | 60000                                    | окно подсчёта неудачных регистраций                                                                                                 |
+| `releasesDir`                                             | `ReleasesDir`                                                  | `releases_dir`                                            | —                                        | каталог выпуска ([docs/releases.md](docs/releases.md))                                                                              |
+| `publicKey`                                               | `PublicKey`                                                    | `public_key`                                              | —                                        | открытый ключ подписи (base64), вписывается в `install.sh`                                                                          |
+| `baseUrl`                                                 | `PublicURL` (или `SetPublicURL(url)`)                          | `base_url`                                                | из запроса                               | публичный адрес: ссылки на файлы задач, `install.sh`, `installCommand`                                                              |
+| `trustProxy`                                              | `TrustProxy bool`                                              | `trust_proxy`                                             | `false`                                  | бэкенд за доверенным прокси: адрес клиента — первый из `X-Forwarded-For`, адрес сервера — из `X-Forwarded-Host`/`X-Forwarded-Proto` |
+| `log: (msg, extra) => …`                                  | `Log *slog.Logger`                                             | `log` — `logging.Logger` или `fn(msg, extra)`             | —                                        | лог                                                                                                                                 |
+| —                                                         | —                                                              | `max_body`                                                | 32 МБ                                    | предел тела запроса для адаптеров (`body_limit(path)`; регистрация — 64 КБ)                                                         |
 
 `0` в `metricsStoreIntervalMs`, `metricsRetentionMs`, `enrollFailureLimit` — в Node и Python
 «каждую точку», «хранить всегда», «без ограничения»; в Go для этого — отрицательное значение
@@ -219,47 +257,57 @@ HTTP-серверу. Всю работу со связью он делает с�
 Python сразу бросают ошибку при создании `Agents`. События в Go — функции в `Options`
 ([ниже](#события)).
 
+Регистрация (`POST …/enroll`): тело — не больше 64 КБ (больше — `413`), `token` и `name` —
+непустые строки, `name` — до 128 символов, `labels` — до 64 меток, ключ — непустая строка до 256
+символов, значение — строка до 256 символов (иначе — `400 MESSAGE_INVALID`). Неудачи считаются по адресу клиента — так же, как
+`Agent.address` (с `trustProxy` — первый из `X-Forwarded-For`).
+
 ### Подключение к HTTP-серверу
 
-| Go                                                      | Node                                                                                | Python                                                                                                                                                                                                                                                                               |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `agents := server.New(opts)`                            | `const agents = new Agents(opts)`                                                   | `agents = Agents(…)`                                                                                                                                                                                                                                                                 |
-| `agents.Handler() http.Handler` или `agents.Mount(mux)` | `await agents.handle(req, res)` → обработан ли; `agents.attach(server)` — WebSocket | `handle_enroll(body, remote=None)`, `handle_sync(auth, body, is_disconnected=None, *, base_url, remote, forwarded_for)`, `authenticate(auth)`, `serve_websocket(auth, conn, *, base_url, remote, forwarded_for)`, `handle_file(method, key, body)`, `handle_release(path, base_url)` |
-| `agents.Close()`                                        | `agents.close()`                                                                    | `await agents.close()`                                                                                                                                                                                                                                                               |
+| Go                                                      | Node                                                                                | Python                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `agents := server.New(opts)`                            | `const agents = new Agents(opts)`                                                   | `agents = Agents(…)`                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `agents.Handler() http.Handler` или `agents.Mount(mux)` | `await agents.handle(req, res)` → обработан ли; `agents.attach(server)` — WebSocket | `AgentsApp(agents, fallback=None)` (`agent_sdk.server.asgi`) — ASGI-приложение маршрутов агентов; или по методу на маршрут: `handle_enroll(body, remote=None, forwarded_for=None)`, `handle_sync(auth, body, is_disconnected=None, *, base_url, remote, forwarded_for)`, `authenticate(auth)`, `serve_websocket(auth, conn, *, base_url, remote, forwarded_for)`, `handle_file(method, key, body)`, `handle_release(path, base_url)` |
+| `agents.Close()`                                        | `agents.close()`                                                                    | `await agents.close()`                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 Маршруты: `POST /api/v1/agent-link/enroll`, `GET /api/v1/agent-link` (WebSocket), `POST
 /api/v1/agent-link/sync`, `GET /api/v1/agent-link/releases/<file>`, `GET
 /api/v1/agent-link/install.sh`, `GET`/`PUT /files/<jobId>/(in|out)/<имя>` (для `MemoryFiles`).
-`close` закрывает сессии кодом `1012` — агенты переподключатся сразу.
+`close` закрывает сессии кодом `1012` — агенты переподключатся сразу. Подключение к Express,
+Fastify, NestJS, FastAPI — [docs/connection.md](docs/connection.md#связь-websocket-и-http).
 
 ### Методы
 
 Go — методы `*server.Agents` (ошибки — `error`, чаще `*message.Error` с `Code`); Node и Python —
-асинхронные, кроме `on`, `off`, `by`, `alerts`, `installCommand` / `install_command`.
+асинхронные, кроме `on`, `off`, `by`, `installCommand` / `install_command`.
 
 **Задачи** — [docs/jobs.md](docs/jobs.md)
 
-| Что                | Go                                                | Node                                                           | Python                                                                                                            |
-| ------------------ | ------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| поставить          | `Enqueue(req JobRequest) (*Job, error)`           | `enqueue(req: JobRequest): Promise<Job>`                       | `enqueue(queue, data=None, *, max_attempts=1, lease_seconds=60, inputs=None, outputs=None, agent_id=None) -> Job` |
-| отменить           | `CancelJob(id string) error`                      | `cancelJob(id): Promise<Job>`                                  | `cancel_job(job_id) -> Job`                                                                                       |
-| закончить пораньше | `StopJob(id string) error`                        | `stopJob(id): Promise<Job>`                                    | `stop_job(job_id) -> Job`                                                                                         |
-| прочитать          | `Job(id) (*Job, error)`, `Jobs() ([]*Job, error)` | `getJob(id)`, `listJobs(filter?: {status?, queue?, agentId?})` | `get_job(job_id)`, `list_jobs(*, status=None, queue=None, agent_id=None)`                                         |
+| Что                | Go                                                           | Node                                                                                   | Python                                                                                                            |
+| ------------------ | ------------------------------------------------------------ | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| поставить          | `Enqueue(req JobRequest) (*Job, error)`                      | `enqueue(req: JobRequest): Promise<Job>`                                               | `enqueue(queue, data=None, *, max_attempts=1, lease_seconds=60, inputs=None, outputs=None, agent_id=None) -> Job` |
+| отменить           | `CancelJob(id string) error`                                 | `cancelJob(id): Promise<Job>`                                                          | `cancel_job(job_id) -> Job`                                                                                       |
+| закончить пораньше | `StopJob(id string) error`                                   | `stopJob(id): Promise<Job>`                                                            | `stop_job(job_id) -> Job`                                                                                         |
+| прочитать          | `Job(id) (*Job, error)`, `Jobs(f JobFilter) ([]*Job, error)` | `getJob(id)`, `listJobs(filter?: {status?, queue?, agentId?, limit?, after?})`         | `get_job(job_id)`, `list_jobs(*, status=None, queue=None, agent_id=None, limit=0, after=None)`                    |
+| убрать старые      | `Prune(PruneOptions) (int, error)`                           | `prune({jobsOlderThanMs?, commandsOlderThanMs?, eventsOlderThanMs?}): Promise<number>` | `prune(*, jobs_older_than_ms=None, commands_older_than_ms=None, events_older_than_ms=None) -> int`                |
 
-Списки задач — новые первыми.
+Списки задач — новые первыми; `limit` и `after` (id последней записи прошлой страницы) — чтение
+страницами; записи `after` нет — страница пустая ([docs/store.md](docs/store.md#методы-по-языкам)). `prune` удаляет завершённые задачи,
+команды и события старше заданных сроков ([docs/store.md](docs/store.md#уборка)).
 
 `JobRequest`: `queue`, `data`, `maxAttempts` (1), `leaseSeconds` (60, не меньше 5), `inputs` (имя →
 содержимое или ссылка), `outputs` (имена файлов-результатов), `agentId` (закрепить).
 
 **Команды** — [docs/commands.md](docs/commands.md)
 
-| Что                    | Go                                                | Node                                                           | Python                                                                    |
-| ---------------------- | ------------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| отправить              | `Command(req CommandRequest) (*Command, error)`   | `command(req: CommandRequest): Promise<Command>`               | `command(name, args=None, *, timeout_sec=60, agent_id=None) -> Command`   |
-| отправить и ждать итог | `Call(ctx, req CommandRequest) (*Command, error)` | `call(req): Promise<Command>`                                  | `call(name, args=None, *, timeout_sec=60, agent_id=None) -> Command`      |
-| прочитать              | `CommandByID(id) (*Command, error)`, `Commands()` | `getCommand(id)`, `listCommands(filter?: {status?, agentId?})` | `get_command(command_id)`, `list_commands(*, status=None, agent_id=None)` |
+| Что                    | Go                                                               | Node                                                                           | Python                                                                                         |
+| ---------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| отправить              | `Command(req CommandRequest) (*Command, error)`                  | `command(req: CommandRequest): Promise<Command>`                               | `command(name, args=None, *, timeout_sec=60, agent_id=None) -> Command`                        |
+| отправить и ждать итог | `Call(ctx, req CommandRequest) (*Command, error)`                | `call(req): Promise<Command>`                                                  | `call(name, args=None, *, timeout_sec=60, agent_id=None) -> Command`                           |
+| отменить               | `CancelCommand(id string) (*Command, error)`                     | `cancelCommand(id): Promise<Command>`                                          | `cancel_command(command_id) -> Command`                                                        |
+| прочитать              | `CommandByID(id) (*Command, error)`, `Commands(f CommandFilter)` | `getCommand(id)`, `listCommands(filter?: {status?, agentId?, limit?, after?})` | `get_command(command_id)`, `list_commands(*, status=None, agent_id=None, limit=0, after=None)` |
 
-Списки команд — новые первыми.
+Списки команд — новые первыми, страницами — как задачи.
 
 `CommandRequest`: `name`, `args`, `timeoutSec` (60), `agentId` (без него — агент на связи,
 объявивший команду).
@@ -277,14 +325,15 @@ Go — методы `*server.Agents` (ошибки — `error`, чаще `*messa
 
 **Агенты и связь** — [docs/connection.md](docs/connection.md)
 
-| Что                                  | Go                                                                                         | Node                                        | Python                                 |
-| ------------------------------------ | ------------------------------------------------------------------------------------------ | ------------------------------------------- | -------------------------------------- |
-| все агенты                           | `List() ([]*Agent, error)`                                                                 | `listAgents(): Promise<Agent[]>`            | `list_agents() -> List[Agent]`         |
-| агент                                | `Agent(id) (*Agent, error)`                                                                | `getAgent(id): Promise<Agent \| undefined>` | `get_agent(agent_id) -> Agent \| None` |
-| отозвать                             | `Revoke(agentID string) error`                                                             | `revoke(agentId): Promise<Agent>`           | `revoke(agent_id) -> Agent`            |
-| сменить ключ                         | `RotateKey(agentID string) (*Command, error)`                                              | `rotateKey(agentId): Promise<Command>`      | `rotate_key(agent_id) -> Command`      |
-| доставить изменения других процессов | `Refresh(agentID string)` — `""` — все                                                     | `refresh(agentId?): Promise<void>`          | `refresh(agent_id=None)`               |
-| регистрация вручную                  | `Enroll(token, name string, labels map[string]string) (agentID, secret string, err error)` | —                                           | —                                      |
+| Что                                  | Go                                                                          | Node                                        | Python                                 |
+| ------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------- | -------------------------------------- |
+| все агенты                           | `List() ([]*Agent, error)`                                                  | `listAgents(): Promise<Agent[]>`            | `list_agents() -> List[Agent]`         |
+| агент                                | `Agent(id) (*Agent, error)`                                                 | `getAgent(id): Promise<Agent \| undefined>` | `get_agent(agent_id) -> Agent \| None` |
+| отозвать                             | `Revoke(agentID string) error`                                              | `revoke(agentId): Promise<Agent>`           | `revoke(agent_id) -> Agent`            |
+| удалить отозванного                  | `DeleteAgent(agentID string) error`                                         | `deleteAgent(agentId): Promise<void>`       | `delete_agent(agent_id) -> None`       |
+| сменить ключ                         | `RotateKey(agentID string) (*Command, error)`                               | `rotateKey(agentId): Promise<Command>`      | `rotate_key(agent_id) -> Command`      |
+| доставить изменения других процессов | `Refresh(agentID string)` — `""` — все                                      | `refresh(agentId?): Promise<void>`          | `refresh(agent_id=None)`               |
+| регистрация вручную                  | `Enroll(token string, info EnrollInfo) (agentID, secret string, err error)` | —                                           | —                                      |
 
 **Воркеры** — [docs/workers.md](docs/workers.md)
 
@@ -301,7 +350,7 @@ Go — методы `*server.Agents` (ошибки — `error`, чаще `*messa
 | снять подписку    | `Unsubscribe(agentID, id string) error`                                 | `unsubscribe(agentId, id): Promise<void>`                              | `unsubscribe(agent_id, id)`                                                                                             |
 | история метрик    | `Metrics(agentID string, since int64) ([]MetricsPoint, error)`          | `listMetrics(agentId, { since? }): Promise<MetricsPoint[]>`            | `list_metrics(agent_id, since=None) -> List[MetricsPoint]`                                                              |
 | события воркеров  | `Events(n int) ([]AgentEvent, error)` — новые первыми                   | `listEvents(limit = 100)` — новые первыми                              | `list_events(limit=100)` — новые первыми                                                                                |
-| активные проблемы | `Alerts() []Alert`                                                      | `alerts(): Alert[]`                                                    | `alerts() -> List[Alert]`                                                                                               |
+| активные проблемы | `Alerts() ([]Alert, error)`                                             | `alerts(): Promise<Alert[]>`                                           | `alerts() -> List[Alert]`                                                                                               |
 
 Подписка: `id?`, `ttlMs` (30000; Go — `TTL time.Duration`), `status: {intervalMs}`, `metrics:
 {intervalMs?, groups?}`, `logs: {level}`, `channels: {канал: {intervalMs}}`; Go —
@@ -321,8 +370,9 @@ Channels map[string]IntervalSpec}`. Интервалы — не меньше 200
 
 **От имени пользователя** — `by(actor)` ([docs/events.md](docs/events.md#журнал-аудита)): Go
 `agents.By(actor) *server.Actor`, Node `agents.by(actor): Actor`, Python `agents.by(actor) ->
-Actor` — те же изменяющие методы (задачи, команды, состояние, `revoke`, `rotateKey`,
-`updateAgent`, `updateWorker`, `pauseWorker`, `resumeWorker`) с отметкой `actor`.
+Actor` — те же изменяющие методы (задачи, команды и `cancelCommand`, состояние, `revoke`,
+`deleteAgent`, `rotateKey`, `updateAgent`, `updateWorker`, `pauseWorker`, `resumeWorker`) с
+отметкой `actor`.
 
 ### Команда установки
 
@@ -381,7 +431,7 @@ Go вызывает обработчики синхронно, вне блоки
 at}]`), `result`, `error` (`{code, message}`), `stopRequested`, `inputs`, `outputs`,
   `createdAt`, `finishedAt`, `actor`.
 - **Command**: `id`, `agentId`, `name`, `args`, `timeoutSec`, `status` (`pending` | `running` |
-  `succeeded` | `failed`), `output` (последние 256 КБ), `result`, `error`, `exitCode` (код выхода
+  `succeeded` | `failed` | `cancelled`), `output` (последние 256 КБ), `result`, `error`, `exitCode` (код выхода
   из `cmd.done`), `createdAt`, `finishedAt`, `actor`.
 - **DesiredState**: `domain`, `agentId` (пусто — общий), `version`, `spec`, `updatedAt`, `actor`.
 - **AgentEvent**: `agentId`, `agentName`, `source`, `type`, `data`, `at`.
@@ -396,8 +446,8 @@ at}]`), `result`, `error` (`{code, message}`), `stopRequested`, `inputs`, `outpu
 ### Хранилище
 
 `Store` — интерфейс хранения агентов, задач, команд, состояния с историей, событий и метрик;
-`MemoryStore` — в памяти, для разработки. Методы по языкам, правила (растущие версии, запись
-агента в транзакции, история, чистка метрик) и пример на SQL — [docs/store.md](docs/store.md).
+`MemoryStore` — в памяти, для разработки. Методы по языкам, служебные поля, правила (условная
+запись по `rev`, растущие версии, история, уборка) и пример на SQL — [docs/store.md](docs/store.md).
 
 ### Файлы задач
 
@@ -414,18 +464,22 @@ Node — `AgentsError` (`code`, `status` — HTTP-статус для ответ
 `AgentsError(code, message, status)`, Go — `*message.Error` (`Code`, `Message`) или
 `server.ErrNotFound` при чтении.
 
-| Код                               | Когда                                                                        |
-| --------------------------------- | ---------------------------------------------------------------------------- |
-| `MESSAGE_INVALID`                 | неверные аргументы: имя не по правилу, интервал меньше 200 мс, нет токена    |
-| `AGENT_NOT_FOUND`                 | агента нет                                                                   |
-| `AGENT_REVOKED`                   | агент отозван (`subscribe`, `rotateKey`, `pauseWorker`, …)                   |
-| `JOB_NOT_FOUND`, `JOB_NOT_ACTIVE` | `cancelJob` / `stopJob`: задачи нет или она уже завершена                    |
-| `COMMAND_NOT_SUPPORTED`           | ни один агент (или этот агент) не объявил команду                            |
-| `STATE_VERSION_NOT_FOUND`         | `rollbackState`: версии нет в истории                                        |
-| `SEAL_NOT_AVAILABLE`              | `seal`: агент не сообщил ключ шифрования (в Python — ещё нет `cryptography`) |
-| `UPDATE_NOT_AVAILABLE`            | `updateAgent` / `updateWorker`: нет выпуска, сборки или агент не умеет       |
-| `ENROLL_RATE_LIMITED`             | регистрация: слишком много неудачных попыток (`429`)                         |
-| `AGENT_ENROLLMENT_TOKEN_INVALID`  | регистрация: неверный токен (`401`)                                          |
+| Код                                       | Когда                                                                        |
+| ----------------------------------------- | ---------------------------------------------------------------------------- |
+| `MESSAGE_INVALID`                         | неверные аргументы: имя не по правилу, интервал меньше 200 мс, нет токена    |
+| `AGENT_NOT_FOUND`                         | агента нет                                                                   |
+| `AGENT_REVOKED`                           | агент отозван (`subscribe`, `rotateKey`, `pauseWorker`, …)                   |
+| `AGENT_NOT_REVOKED`                       | `deleteAgent`: агент не отозван (`409`)                                      |
+| `JOB_NOT_FOUND`, `JOB_NOT_ACTIVE`         | `cancelJob` / `stopJob`: задачи нет или она уже завершена                    |
+| `COMMAND_NOT_SUPPORTED`                   | ни один агент (или этот агент) не объявил команду                            |
+| `COMMAND_NOT_FOUND`, `COMMAND_NOT_ACTIVE` | `cancelCommand`: команды нет (`404`) или она уже завершена (`409`)           |
+| `STORE_CONFLICT`                          | запись всё время меняют другие процессы, 8 попыток не записались (`409`)     |
+| `STATE_VERSION_NOT_FOUND`                 | `rollbackState`: версии нет в истории                                        |
+| `SEAL_NOT_AVAILABLE`                      | `seal`: агент не сообщил ключ шифрования (в Python — ещё нет `cryptography`) |
+| `UPDATE_NOT_AVAILABLE`                    | `updateAgent` / `updateWorker`: нет выпуска, сборки или агент не умеет       |
+| `ENROLL_RATE_LIMITED`                     | регистрация: слишком много неудачных попыток (`429`)                         |
+| `MESSAGE_INVALID` (`413`)                 | регистрация: тело больше 64 КБ                                               |
+| `AGENT_ENROLLMENT_TOKEN_INVALID`          | регистрация: неверный токен (`401`)                                          |
 
 ---
 

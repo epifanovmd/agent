@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,27 @@ type conn interface {
 type DialError struct {
 	Status int
 	Err    error
+	// RetryAfter — из заголовка Retry-After (0 — нет).
+	RetryAfter time.Duration
+}
+
+// parseRetryAfter — секунды (Retry-After или reason кода 4429) или дата HTTP;
+// 0 — не разобрать.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.ParseFloat(v, 64); err == nil {
+		if n <= 0 {
+			return 0
+		}
+		return time.Duration(n * float64(time.Second))
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return max(time.Until(t), 0)
+	}
+	return 0
 }
 
 func (e *DialError) Error() string {
@@ -65,7 +87,7 @@ func dialWS(ctx context.Context, client *http.Client, serverURL, auth string) (c
 	})
 	if err != nil {
 		if resp != nil {
-			return nil, &DialError{Status: resp.StatusCode, Err: err}
+			return nil, &DialError{Status: resp.StatusCode, Err: err, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 		}
 		return nil, err
 	}

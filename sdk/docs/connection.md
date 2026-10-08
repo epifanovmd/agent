@@ -38,23 +38,29 @@ const agents = new Agents({
 
 ```go
 agents := server.New(server.Options{
-	Enroll: func(token string) (map[string]string, bool) {
-		nodeID, ok := lookupToken(token)
+	Enroll: func(token string, info server.EnrollInfo) (map[string]string, bool) {
+		nodeID, ok := lookupToken(token) // info.Name, info.Labels, info.Host — из запроса
 		return map[string]string{"nodeId": nodeID}, ok
 	},
 })
 ```
 
 ```python
-async def check(token: str):          # функция или корутина
-    node_id = await lookup_token(token)
+async def check(token: str, info: dict):   # функция или корутина
+    node_id = await lookup_token(token)      # info["name"], info["labels"], info["host"]
     return {"labels": {"nodeId": node_id}} if node_id else None
 
 agents = Agents(enroll=check)
 ```
 
-В Node `enroll` получает ещё имя, метки и сведения об узле из запроса; в Go и Python — только
-токен.
+`enroll` получает токен и то, что агент прислал о себе: имя, метки и сведения об узле
+(`host`).
+
+Запрос проверяется **до** токена: тело — не больше 64 КБ (больше — `413`, тело дальше не
+читается), `token` и `name` — непустые строки, `name` — до 128 символов, `labels` — объект до 64
+меток, ключ — непустая строка до 256 символов, значение — строка до 256 символов; иначе — `400
+MESSAGE_INVALID`. Такие отказы считаются неудачными
+попытками ([ниже](#ограничение-попыток-регистрации)).
 
 **Что уходит по сети.** `POST /api/v1/agent-link/enroll` `{token, name, labels, host}` → `201
 {agentId, secret}`; неверный токен — `401 AGENT_ENROLLMENT_TOKEN_INVALID`
@@ -97,8 +103,13 @@ Agents(enroll_token=token, enroll_failure_limit=10, enroll_failure_window_ms=600
 ```
 
 По умолчанию — 10 неудач за минуту. Выключить: в Node и Python — `0`, в Go — отрицательное
-значение (ноль в Go — значение по умолчанию). В Python адрес клиента передаёт бэкенд:
-`handle_enroll(body, remote=client_ip)`; без него все клиенты считаются одним.
+значение (ноль в Go — значение по умолчанию).
+
+Адрес клиента — тот же, что попадает в `agent.address`: адрес сокета, а с `trustProxy` —
+первый адрес `X-Forwarded-For`. Без `trustProxy` за прокси все агенты приходят с адреса
+прокси и делят один лимит. В Python адрес передаёт адаптер (`AgentsApp` — сам) или бэкенд:
+`handle_enroll(body, remote=client_ip, forwarded_for=xff)`; без него все клиенты считаются
+одним.
 
 **Что уходит по сети.** После лимита — `429 ENROLL_RATE_LIMITED` с заголовком `Retry-After`
 (секунды до конца окна).
@@ -148,12 +159,55 @@ mux.HandleFunc("/api/", yourAPI)
 ```
 
 ```python
-# по методу на маршрут — пример для FastAPI в sdk/python/README.md
-reply = await agents.handle_enroll(body, remote=ip)                      # POST …/enroll
-status, data = await agents.handle_sync(auth, body, request.is_disconnected,
-                                        remote=ip, forwarded_for=xff)     # POST …/sync
-await agents.serve_websocket(auth, ws, remote=ip, forwarded_for=xff)     # WS …/agent-link
+# ASGI-приложение маршрутов агентов (без зависимостей); остальное — в fallback (FastAPI и т. п.)
+from agent_sdk.server.asgi import AgentsApp
+app = AgentsApp(agents, fallback=api)  # или api.mount("/", AgentsApp(agents)) последним маршрутом
 ```
+
+Подключение к фреймворкам:
+
+- **Express** — маршруты агентов **до** `express.json()` и других разборщиков тела: `Agents`
+  читает тело сам, с пределом.
+
+  ```ts
+  const app = express();
+  app.use(async (req, res, next) => ((await agents.handle(req, res)) ? undefined : next()));
+  app.use(express.json());
+  const server = app.listen(8080);
+  agents.attach(server); // WebSocket
+  ```
+
+- **Fastify** — отдать ответ `Agents` через `reply.hijack()`, тело не разбирать:
+
+  ```ts
+  fastify.addHook("onRequest", async (req, reply) => {
+    if (!req.url.startsWith("/api/v1/agent-link") && !req.url.startsWith("/files/")) return;
+    reply.hijack();
+    if (!(await agents.handle(req.raw, reply.raw))) reply.raw.writeHead(404).end();
+  });
+  await fastify.listen({ port: 8080 });
+  agents.attach(fastify.server);
+  ```
+
+- **NestJS** (Express внутри) — без глобального разбора тела, `Agents` — первым:
+
+  ```ts
+  const app = await NestFactory.create(AppModule, { bodyParser: false });
+  app.use(async (req, res, next) => ((await agents.handle(req, res)) ? undefined : next()));
+  app.use(express.json());
+  await app.listen(8080);
+  agents.attach(app.getHttpServer());
+  ```
+
+- **Python** без ASGI — по методу на маршрут; тело читайте не больше `agents.body_limit(path)`
+  (регистрация — 64 КБ, остальное — `max_body`, 32 МБ):
+
+  ```python
+  reply = await agents.handle_enroll(body, remote=ip, forwarded_for=xff)  # POST …/enroll
+  status, data = await agents.handle_sync(auth, body, request.is_disconnected,
+                                          remote=ip, forwarded_for=xff)   # POST …/sync
+  await agents.serve_websocket(auth, ws, remote=ip, forwarded_for=xff)   # WS …/agent-link
+  ```
 
 Интервалы, которые сервер задаёт агентам: `statusIntervalMs` (5000) и `metricsIntervalMs`
 (15000); в Go — `StatusInterval`, `MetricsInterval`.
@@ -214,8 +268,9 @@ agents.on("alert", notify)
 - `offlineAfterMs` — для нескольких процессов бэкенда: агент «на связи» по записи, но без
   сессии в этом процессе и без вестей дольше этого срока (процесс с его сессией упал) — агент
   без связи. По умолчанию `max(3 × statusIntervalMs, 30 с) + offlineGraceMs`;
-- `trustProxy` — бэкенд за доверенным прокси: адрес агента — первый из `X-Forwarded-For`
-  (иначе адрес сокета; заголовок подделывается клиентом).
+- `trustProxy` — бэкенд за доверенным прокси: адрес агента — первый из `X-Forwarded-For`, адрес
+  сервера для ссылок — из `X-Forwarded-Host` и `X-Forwarded-Proto` (иначе адрес сокета, `Host` и
+  TLS соединения; заголовки подделывает любой клиент).
 
 **Что уходит по сети.** `status` при каждом изменении и не реже `statusIntervalMs` — это и
 «я жив».
@@ -333,10 +388,23 @@ agent = await agents.revoke(agent_id)
 **Результат.** `agent.revoked: true`, `online: false`; аудит `agent.revoke`. Повторная
 регистрация — **новый** агент с новым id.
 
+Отозванного агента можно удалить совсем — `deleteAgent(agentId)` (Go `DeleteAgent`, Python
+`delete_agent`): из `Store` уходят запись агента и его история метрик, задачи, команды, события
+и снимки состояния остаются. Не отозванного удалить нельзя — `AGENT_NOT_REVOKED`; аудит
+`agent.delete`.
+
 ## Несколько процессов бэкенда
 
 Агент подключён к одному процессу, и только этот процесс может ему что-то отправить. Все
-процессы работают с одним `Store` ([store.md](store.md)).
+процессы работают с одним `Store` ([store.md](store.md)): записи меняются условно (по `rev`),
+поэтому задача не выдаётся двум агентам, а запись одного процесса не затирает отзыв, подписки
+или ключ, записанные другим.
+
+**Балансировщик.** WebSocket — одно долгое соединение, с ним ничего настраивать не нужно.
+HTTP-канал (`POST …/sync`) — это сессия из многих запросов: они должны приходить в **тот же**
+процесс («липкие» сессии по заголовку `Authorization` или по адресу клиента). Без этого каждый
+запрос к другому процессу открывает новую сессию, и агент получает сообщения с задержкой и
+повторами.
 
 **Бэкенд.** Процесс, изменивший данные (задача, команда, состояние, подписка, отзыв), сообщает
 остальным своим способом, и каждый вызывает `refresh`: отправит тот, к кому подключён агент,
@@ -363,9 +431,15 @@ await agents.refresh()          # или refresh(agent_id)
 - раздаёт задачи из очереди;
 - применяет подписки из записи агента (сводная — агенту, если изменилась);
 - закрывает сессию отозванного в другом процессе агента (`4401`);
-- будит ждущие `call`: итог команды мог сохранить другой процесс.
+- будит ждущие `call`: итог команды мог сохранить другой процесс;
+- отправляет `cmd.cancel` агентам этого процесса по командам, отменённым в другом процессе, —
+  отправленным агенту в этой сессии или выполнявшимся, когда агент подключился (один раз,
+  [commands.md](commands.md#отменить-команду)).
 
-Сроки задач и команд каждый процесс проверяет по БД сам, раз в секунду.
+Сроки задач и команд каждый процесс проверяет по БД сам, раз в секунду. Номер последнего
+принятого сообщения агента (`lastSeq`) и активные уведомления о проблемах тоже лежат в записи
+агента: повтор после переподключения к другому процессу не обрабатывается второй раз, а
+`alerts()` в любом процессе отдаёт одно и то же.
 
 **Что уходит по сети** — то, что накопилось: `cmd.run`, `state.put`, `job.assign`, `config`.
 

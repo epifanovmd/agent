@@ -49,7 +49,10 @@ class EnrollTest(AgentsCase):
         self.assertEqual(status, 401)
 
     async def test_enroll_callback(self) -> None:
-        async def check(token: str) -> Any:
+        seen: List[Dict[str, Any]] = []
+
+        async def check(token: str, info: Dict[str, Any]) -> Any:
+            seen.append(info)
             return {"labels": {"zone": "eu"}} if token == "fleet" else None
 
         agents = Agents(enroll=check)
@@ -60,11 +63,12 @@ class EnrollTest(AgentsCase):
         agent = await agents.get_agent(body["agentId"])
         assert agent is not None
         self.assertEqual(agent.labels, {"disk": "ssd", "zone": "eu"})
+        self.assertEqual(seen[-1], {"name": "x", "labels": {"disk": "ssd"}, "host": None})
         await agents.close()
 
     async def test_hello_labels(self) -> None:
         """Метки следуют за hello; выданные при регистрации переписать нельзя."""
-        agents = Agents(enroll=lambda token: {"labels": {"nodeId": "n1"}})
+        agents = Agents(enroll=lambda token, info: {"labels": {"nodeId": "n1"}})
         changes: List[Change] = []
         agents.on("change", changes.append)
         status, body = await agents.handle_enroll({"token": "t", "name": "x", "labels": {"zone": "eu"}})

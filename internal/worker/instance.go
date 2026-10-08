@@ -20,15 +20,31 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
+	"github.com/epifanovmd/agent/internal/cgroup"
 	"github.com/epifanovmd/agent/internal/commands"
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/jobs"
 	"github.com/epifanovmd/agent/sdk/go/message"
 )
 
-// registerTimeout — воркер должен объявить очереди за это время (импорт тяжёлых библиотек).
-const registerTimeout = 120 * time.Second
+// defaultRegisterTimeout — воркер должен объявить очереди за это время
+// (импорт тяжёлых библиотек), если в настройках не задано registerTimeout.
+const defaultRegisterTimeout = 120 * time.Second
+
+// Проверка «жив ли воркер» (§10, «Проверка»): worker.ping раз в pingEvery,
+// ответ — за pingWait, pingMisses запросов подряд без ответа — копия зависла.
+// Переменные — для тестов.
+var (
+	pingEvery  = 30 * time.Second
+	pingWait   = 10 * time.Second
+	pingMisses = 3
+)
+
+// lineMax — строка вывода воркера длиннее обрезается: строка без перевода
+// строки не копится в памяти без предела.
+const lineMax = 16 << 10
 
 // ipcFD — номер унаследованного дескриптора канала (первый из ExtraFiles).
 const ipcFD = 3
@@ -49,6 +65,12 @@ type instance struct {
 	cmd     *exec.Cmd
 	ipc     net.Conn
 	writeMu sync.Mutex
+	// group — подгруппа cgroup этой копии (nil — без ограничений).
+	group *cgroup.Group
+	// hung — копия не отвечала на worker.ping и завершена принудительно.
+	hung atomic.Bool
+	// pingEvery, pingWait — сроки проверки на момент запуска.
+	pingEvery, pingWait time.Duration
 
 	mu       sync.Mutex
 	queues   map[string]int
@@ -82,17 +104,51 @@ type call struct {
 func startInstance(sup *Supervisor, w *worker, id string) (*instance, error) {
 	sup.mu.Lock()
 	spec, build := w.spec, w.build
+	extra := slices.Clone(sup.env)
 	sup.mu.Unlock()
 	reporter, log, agentVersion := jobs.Reporter(sup.jobs), sup.log, sup.agentVer
 	argv := spec.Argv()
+	dir := spec.Dir
 	var releaseVersion string
 	if spec.Release {
-		if _, err := os.Stat(argv[0]); err != nil {
+		info, err := os.Stat(spec.Current())
+		if err != nil {
 			return nil, fmt.Errorf("worker %s: нет сборки (%s): поставьте её install.sh --worker %s или обновите воркер командой worker.update",
-				spec.Name, argv[0], spec.Name)
+				spec.Name, spec.Current(), spec.Name)
+		}
+		switch {
+		case info.IsDir() && len(spec.Command) == 0:
+			// Архив без command в настройках — его файл run.
+			argv = append([]string{"./" + config.ReleaseRun}, spec.Args...)
+			dir = spec.Current()
+		case info.IsDir():
+			dir = spec.Current() // command выполняется в каталоге сборки
+		case len(spec.Command) > 0:
+			dir = spec.ReleaseDir // ./current — сама сборка
 		}
 		releaseVersion = readVersion(filepath.Join(spec.ReleaseDir, config.ReleaseVersion))
 	}
+	set := map[string]string{
+		"AGENT_IPC_FD":     fmt.Sprint(ipcFD),
+		"AGENT_WORKER":     spec.Name,
+		"AGENT_VERSION":    agentVersion,
+		"PYTHONUNBUFFERED": "1",
+	}
+	if spec.Release {
+		// Версия установленной сборки (файл version) — воркер может сообщить
+		// её в worker.register.
+		set["AGENT_WORKER_RELEASE_VERSION"] = releaseVersion
+	}
+	var cred *syscall.Credential
+	var userEnv map[string]string
+	if spec.User != "" {
+		var err error
+		if cred, userEnv, err = lookupUser(spec.User); err != nil {
+			return nil, fmt.Errorf("worker %s: user: %w", spec.Name, err)
+		}
+	}
+	env := workerEnv(os.Environ(), spec, extra, set, userEnv)
+
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, fmt.Errorf("worker %s: socketpair: %w", spec.Name, err)
@@ -105,36 +161,8 @@ func startInstance(sup *Supervisor, w *worker, id string) (*instance, error) {
 		child.Close()
 		return nil, fmt.Errorf("worker %s: ipc: %w", spec.Name, err)
 	}
+	defer child.Close()
 
-	// Подгруппа cgroup — до запуска: сразу после него процесс переносится туда.
-	group := sup.workerGroup(spec)
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Dir = spec.Dir
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("AGENT_IPC_FD=%d", ipcFD),
-		"AGENT_WORKER="+spec.Name,
-		"AGENT_VERSION="+agentVersion,
-		"PYTHONUNBUFFERED=1",
-	)
-	if spec.Release {
-		// Версия установленной сборки (файл version) — воркер может сообщить
-		// её в worker.register.
-		cmd.Env = append(cmd.Env, "AGENT_WORKER_RELEASE_VERSION="+releaseVersion)
-	}
-	if spec.User != "" {
-		if err := runAs(cmd, spec.User); err != nil {
-			child.Close()
-			ipc.Close()
-			return nil, fmt.Errorf("worker %s: user: %w", spec.Name, err)
-		}
-	}
-	sup.mu.Lock()
-	cmd.Env = append(cmd.Env, sup.env...)
-	sup.mu.Unlock()
-	for k, v := range spec.Env {
-		cmd.Env = append(cmd.Env, k+"="+os.ExpandEnv(v))
-	}
-	cmd.ExtraFiles = []*os.File{child}
 	inst := &instance{
 		id:       id,
 		spec:     spec,
@@ -144,26 +172,58 @@ func startInstance(sup *Supervisor, w *worker, id string) (*instance, error) {
 		log:      log.With("worker", spec.Name, "instance", id),
 		agentVer: agentVersion,
 		build:    build,
-		cmd:      cmd,
 		ipc:      ipc,
 		ready:    make(chan struct{}),
 		exited:   make(chan struct{}),
 		jobs:     map[string]message.JobRef{},
 		calls:    map[string]*call{},
 		ctxWake:  make(chan struct{}, 1),
+
+		pingEvery: pingEvery,
+		pingWait:  pingWait,
 	}
-	out := &lineLog{log: inst.log}
-	cmd.Stdout, cmd.Stderr = out, out
-	if err := cmd.Start(); err != nil {
-		child.Close()
+	// Подгруппа cgroup копии — до запуска: процесс попадает туда сразу.
+	if group := sup.workerGroup(spec); group != nil {
+		if inst.group, err = group.Instance(id); err != nil {
+			inst.log.Warn("ограничения воркера не применены: подгруппа копии не создана", "err", err)
+		}
+	}
+	stdout := &lineLog{log: inst.log, level: slog.LevelInfo}
+	stderr := &lineLog{log: inst.log, level: slog.LevelWarn}
+	newCmd := func() *exec.Cmd {
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Dir = dir
+		cmd.Env = env
+		cmd.ExtraFiles = []*os.File{child}
+		cmd.Stdout, cmd.Stderr = stdout, stderr
+		// Своя группа процессов: сигнал остановки получают и потомки воркера.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: cred}
+		return cmd
+	}
+	cmd := newCmd()
+	inCgroup := false
+	if inst.group != nil {
+		if release, ok := useCgroupFD(cmd, inst.group.Dir()); ok {
+			defer release()
+			inCgroup = true
+		}
+	}
+	err = cmd.Start()
+	if err != nil && inCgroup {
+		// Ядро не умеет запуск сразу в группе — обычный запуск и перенос.
+		cmd, inCgroup = newCmd(), false
+		err = cmd.Start()
+	}
+	if err != nil {
 		ipc.Close()
+		inst.removeGroup()
 		return nil, fmt.Errorf("worker %s: запуск: %w", spec.Name, err)
 	}
-	child.Close()
+	inst.cmd = cmd
 	inst.started = time.Now()
 	inst.log.Info("воркер запущен", "pid", cmd.Process.Pid)
-	if group != nil {
-		if err := group.Add(cmd.Process.Pid); err != nil {
+	if inst.group != nil && !inCgroup {
+		if err := inst.group.Add(cmd.Process.Pid); err != nil {
 			inst.log.Warn("ограничения воркера не применены: процесс не перенесён в cgroup", "err", err)
 		}
 	}
@@ -171,23 +231,52 @@ func startInstance(sup *Supervisor, w *worker, id string) (*instance, error) {
 	go inst.readLoop()
 	go func() {
 		err := cmd.Wait()
+		// Потомки, пережившие воркер, завершаются вместе с ним.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if inst.group != nil {
+			_ = inst.group.Kill()
+		}
 		inst.mu.Lock()
 		inst.exitErr = err
 		inst.mu.Unlock()
 		ipc.Close()
-		out.Flush()
+		stdout.Flush()
+		stderr.Flush()
+		inst.removeGroup()
 		close(inst.exited)
 	}()
+	wait := spec.RegisterTimeout.Std()
+	if wait <= 0 {
+		wait = defaultRegisterTimeout
+	}
 	go func() {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
 		select {
 		case <-inst.ready:
 		case <-inst.exited:
-		case <-time.After(registerTimeout):
-			inst.log.Error("воркер не зарегистрировался вовремя — перезапуск")
-			_ = cmd.Process.Kill()
+		case <-timer.C:
+			inst.log.Error("воркер не зарегистрировался вовремя — перезапуск", "registerTimeout", wait)
+			inst.kill()
 		}
 	}()
 	return inst, nil
+}
+
+// removeGroup — убрать подгруппу копии (процессов в ней уже нет; ядру нужно
+// немного времени, чтобы их забыть).
+func (i *instance) removeGroup() {
+	if i.group == nil {
+		return
+	}
+	var err error
+	for range 20 {
+		if err = i.group.Remove(); err == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	i.log.Debug("подгруппа копии воркера не удалена", "err", err)
 }
 
 // ─── jobs.Runner ───────────────────────────────────────────────────────
@@ -216,8 +305,14 @@ func (i *instance) Run(a message.JobAssign) error {
 }
 
 func (i *instance) Cancel(ref message.JobRef) {
-	i.forget(ref.JobID)
+	i.forgetRef(ref)
 	_ = i.send(message.MustNew(message.TypeJobCancel, ref))
+}
+
+// ReplaceStuck — jobs.StuckReplacer: отменённая задача не завершилась за
+// срок — копия заменяется новой.
+func (i *instance) ReplaceStuck(ref message.JobRef) {
+	go i.sup.replaceStuck(i, fmt.Sprintf("отменённая задача %s (попытка %d) не завершилась", ref.JobID, ref.Attempt))
 }
 
 func (i *instance) Stop(ref message.JobRef) {
@@ -234,23 +329,42 @@ func (i *instance) retire() {
 	_ = i.send(message.MustNew(message.TypeWorkerDrain, struct{}{}))
 }
 
-// terminate — SIGTERM, через timeout — SIGKILL.
+// terminate — SIGTERM всей группе процессов воркера, по отмене ctx — SIGKILL.
 func (i *instance) terminate(ctx context.Context) {
 	i.stopping.Store(true)
-	if i.cmd.Process == nil {
+	if i.cmd == nil || i.cmd.Process == nil {
 		return
 	}
-	_ = i.cmd.Process.Signal(syscall.SIGTERM)
+	i.signal(syscall.SIGTERM)
 	select {
 	case <-i.exited:
 	case <-ctx.Done():
 		i.log.Warn("воркер не завершился вовремя — SIGKILL")
-		_ = i.cmd.Process.Kill()
+		i.kill()
 		<-i.exited
 	}
 }
 
+// signal — сигнал группе процессов воркера (он и его потомки).
+func (i *instance) signal(sig syscall.Signal) {
+	if err := syscall.Kill(-i.cmd.Process.Pid, sig); err != nil {
+		_ = i.cmd.Process.Signal(sig)
+	}
+}
+
+// kill — завершить копию принудительно: SIGKILL группе процессов и
+// cgroup.kill её подгруппы (потомки, сменившие группу процессов).
+func (i *instance) kill() {
+	i.signal(syscall.SIGKILL)
+	if i.group != nil {
+		_ = i.group.Kill()
+	}
+}
+
 func (i *instance) exitReason() string {
+	if i.hung.Load() {
+		return "воркер завис: нет ответа на worker.ping"
+	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.exitErr == nil {
@@ -265,9 +379,13 @@ func (i *instance) runningJobs() int {
 	return len(i.jobs)
 }
 
-func (i *instance) forget(jobID string) {
+// forgetRef — задача ref завершена или отменена (другая попытка того же
+// jobId остаётся).
+func (i *instance) forgetRef(ref message.JobRef) {
 	i.mu.Lock()
-	delete(i.jobs, jobID)
+	if i.jobs[ref.JobID] == ref {
+		delete(i.jobs, ref.JobID)
+	}
 	i.mu.Unlock()
 }
 
@@ -307,6 +425,10 @@ func (i *instance) handle(env message.Envelope) error {
 		}
 		rejected := i.register(reg)
 		err := i.send(message.MustNew(message.TypeWorkerReady, message.WorkerReady{AgentVersion: i.agentVer, Rejected: rejected}))
+		if !i.sup.cleaning {
+			// Имена, которые воркер больше не объявляет, снимаются.
+			i.sup.prune(i.w, i)
+		}
 		if i.registered() {
 			return err // повторная регистрация: контекст уже идёт
 		}
@@ -315,7 +437,12 @@ func (i *instance) handle(env message.Envelope) error {
 		i.pushContext()
 		close(i.ready)
 		go i.contextLoop()
+		if reg.Ping {
+			go i.pingLoop()
+		}
 		return err
+	case message.TypeWorkerPong:
+		i.resolve("pong:"+env.Re, env)
 	case message.TypeWorkerHealth, message.TypeWorkerPause, message.TypeWorkerResume, message.TypeWorkerRestart:
 		return i.control(env)
 	case message.TypeJobProgress:
@@ -335,14 +462,14 @@ func (i *instance) handle(env message.Envelope) error {
 		if err := env.Decode(&c); err != nil {
 			return err
 		}
-		i.forget(c.JobID)
+		i.forgetRef(c.JobRef)
 		i.reporter.Complete(c)
 	case message.TypeJobFail:
 		var f message.JobFail
 		if err := env.Decode(&f); err != nil {
 			return err
 		}
-		i.forget(f.JobID)
+		i.forgetRef(f.JobRef)
 		i.reporter.Fail(f)
 	case message.TypeJobURLs:
 		var req message.JobURLsRequest
@@ -591,8 +718,48 @@ func (i *instance) applyState(ctx context.Context, put message.StatePut) (any, e
 	return applied.Report, nil
 }
 
+// pingLoop — проверка, что копия жива (§10, «Проверка»): pingMisses запросов
+// подряд без ответа — предупреждение и принудительное завершение; цикл места
+// перезапустит копию как упавшую.
+func (i *instance) pingLoop() {
+	misses := 0
+	for {
+		timer := time.NewTimer(i.pingEvery)
+		select {
+		case <-i.exited:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		env := message.MustNew(message.TypeWorkerPing, struct{}{})
+		env.ID = message.NewID()
+		ctx, cancel := context.WithTimeout(context.Background(), i.pingWait)
+		_, err := i.await(ctx, "pong:"+env.ID, env, nil)
+		cancel()
+		if i.hasExited() {
+			return
+		}
+		if err == nil {
+			misses = 0
+			continue
+		}
+		misses++
+		i.log.Warn("воркер не ответил на worker.ping", "misses", misses, "err", err)
+		if misses >= pingMisses {
+			i.log.Warn("воркер завис: нет ответа на worker.ping — перезапуск", "misses", misses)
+			i.hung.Store(true)
+			i.kill()
+			return
+		}
+	}
+}
+
+// urlsWait — сколько воркер ждёт ответа на job.urls: агент за это время
+// повторяет запрос серверу (jobs.Manager.URLs).
+var urlsWait = 2 * time.Minute
+
 func (i *instance) answerURLs(id string, req message.JobURLsRequest) {
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), urlsWait)
 	defer cancel()
 	urls, err := i.reporter.URLs(ctx, req)
 	var reply message.Envelope
@@ -612,41 +779,80 @@ func (i *instance) answerURLs(id string, req message.JobURLsRequest) {
 	}
 }
 
-// lineLog — вывод воркера построчно в лог агента.
+// lineLog — вывод воркера построчно в лог агента с уровнем level (stdout —
+// info, stderr — warn). Строка длиннее lineMax обрезается с пометкой,
+// остаток до перевода строки отбрасывается.
 type lineLog struct {
-	log *slog.Logger
-	mu  sync.Mutex
-	buf strings.Builder
+	log   *slog.Logger
+	level slog.Level
+	mu    sync.Mutex
+	buf   []byte
+	// skip — отбрасывать до конца строки (её начало уже записано).
+	skip bool
 }
+
+// truncatedMark — пометка обрезанной строки.
+const truncatedMark = " …[строка обрезана]"
 
 func (l *lineLog) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.buf.Write(p)
-	text := l.buf.String()
-	for {
-		idx := strings.IndexByte(text, '\n')
+	n := len(p)
+	for len(p) > 0 {
+		idx := slices.Index(p, '\n')
+		part := p
+		if idx >= 0 {
+			part = p[:idx]
+		}
+		if !l.skip {
+			room := lineMax - len(l.buf)
+			if len(part) > room {
+				l.buf = append(l.buf, part[:room]...)
+				l.emit(string(trimRune(l.buf)) + truncatedMark)
+				l.skip = true
+			} else {
+				l.buf = append(l.buf, part...)
+			}
+		}
 		if idx < 0 {
 			break
 		}
-		if line := strings.TrimRight(text[:idx], "\r"); line != "" {
-			l.log.Info(line)
+		if !l.skip {
+			l.emit(string(l.buf))
 		}
-		text = text[idx+1:]
+		l.buf, l.skip = l.buf[:0], false
+		p = p[idx+1:]
 	}
-	l.buf.Reset()
-	l.buf.WriteString(text)
-	return len(p), nil
+	return n, nil
+}
+
+func (l *lineLog) emit(line string) {
+	if line = strings.TrimRight(line, "\r"); line != "" {
+		l.log.Log(context.Background(), l.level, line)
+	}
+}
+
+// trimRune — без неполного символа UTF-8 в конце.
+func trimRune(b []byte) []byte {
+	for k := 0; k < utf8.UTFMax && len(b) > 0; k++ {
+		if utf8.Valid(b) {
+			return b
+		}
+		b = b[:len(b)-1]
+	}
+	return b
 }
 
 // Flush — недописанная последняя строка.
 func (l *lineLog) Flush() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if rest := strings.TrimSpace(l.buf.String()); rest != "" {
-		l.log.Info(rest)
+	if !l.skip {
+		if rest := strings.TrimSpace(string(l.buf)); rest != "" {
+			l.log.Log(context.Background(), l.level, rest)
+		}
 	}
-	l.buf.Reset()
+	l.buf, l.skip = l.buf[:0], false
 }
 
 var _ io.Writer = (*lineLog)(nil)

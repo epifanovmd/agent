@@ -6,7 +6,6 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -64,8 +63,12 @@ func TestWorkerLimitsCgroup(t *testing.T) {
 	sup.mu.Unlock()
 
 	dir := filepath.Join(service, "worker-echo")
+	// Копия — в своей подгруппе внутри группы воркера.
+	if raw, _ := os.ReadFile(filepath.Join(dir, "i-echo_1", "cgroup.procs")); strings.TrimSpace(string(raw)) != strconv.Itoa(pid) {
+		t.Errorf("cgroup.procs копии = %q, want %d", raw, pid)
+	}
 	for file, want := range map[string]string{
-		"memory.max": "536870912", "cpu.max": "50000 100000", "pids.max": "256", "cgroup.procs": strconv.Itoa(pid),
+		"memory.max": "536870912", "cpu.max": "50000 100000", "pids.max": "256",
 	} {
 		raw, _ := os.ReadFile(filepath.Join(dir, file))
 		if got := strings.TrimSpace(string(raw)); got != want {
@@ -94,23 +97,39 @@ func TestWorkerLimitsUnavailable(t *testing.T) {
 }
 
 // user — uid/gid пользователя и его HOME; неизвестный — ошибка запуска.
-func TestRunAs(t *testing.T) {
+func TestLookupUser(t *testing.T) {
 	me, err := user.Current()
 	if err != nil {
 		t.Skip(err)
 	}
-	cmd := exec.Command("/bin/true")
-	if err := runAs(cmd, me.Username); err != nil {
+	cred, env, err := lookupUser(me.Username)
+	if err != nil {
 		t.Fatal(err)
 	}
-	cred := cmd.SysProcAttr.Credential
 	if strconv.Itoa(int(cred.Uid)) != me.Uid || strconv.Itoa(int(cred.Gid)) != me.Gid {
 		t.Fatalf("credential %+v, пользователь %+v", cred, me)
 	}
-	if !strings.Contains(strings.Join(cmd.Env, "\n"), "HOME="+me.HomeDir) {
-		t.Fatalf("env %v", cmd.Env)
+	if env["HOME"] != me.HomeDir || env["USER"] != me.Username {
+		t.Fatalf("env %v", env)
 	}
-	if err := runAs(exec.Command("/bin/true"), "no-such-user-agent-test"); err == nil {
+	if _, _, err := lookupUser("no-such-user-agent-test"); err == nil {
 		t.Fatal("неизвестный пользователь: ожидалась ошибка")
+	}
+}
+
+// Окружение воркера: только обычные переменные агента и inheritEnv, без
+// AGENT_*; затем переменные агента, пользователя и env воркера (важнее всех).
+func TestWorkerEnv(t *testing.T) {
+	agent := []string{
+		"PATH=/bin", "HOME=/root", "LC_ALL=C", "SECRET=x", "AGENT_ENROLL_TOKEN=t", "AGENT_LOG_LEVEL=debug",
+		"EXAMPLE_A=1", "EXAMPLE_B=2", "OTHER=3", "https_proxy=http://proxy.example",
+	}
+	spec := config.Worker{InheritEnv: []string{"EXAMPLE_*", "OTHER"}, Env: map[string]string{"PATH": "/opt/bin", "X": "y"}}
+	env := workerEnv(agent, spec, []string{"AGENT_SERVER_CA_FILE=/ca.pem"},
+		map[string]string{"AGENT_WORKER": "report"}, map[string]string{"HOME": "/home/report"})
+	got := strings.Join(env, " ")
+	want := "AGENT_SERVER_CA_FILE=/ca.pem AGENT_WORKER=report EXAMPLE_A=1 EXAMPLE_B=2 HOME=/home/report LC_ALL=C OTHER=3 PATH=/opt/bin X=y https_proxy=http://proxy.example"
+	if got != want {
+		t.Fatalf("окружение:\n%s\nнужно:\n%s", got, want)
 	}
 }

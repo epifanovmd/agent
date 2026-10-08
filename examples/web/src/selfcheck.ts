@@ -66,7 +66,7 @@ const ctx: Ctx = {
       `команда ${id.slice(0, 8)}`,
       (s) => {
         const cmd = s.commands.find((c) => c.id === id);
-        return cmd && (cmd.status === "succeeded" || cmd.status === "failed") ? cmd : undefined;
+        return cmd && cmd.status !== "pending" && cmd.status !== "running" ? cmd : undefined;
       },
       timeoutMs,
     );

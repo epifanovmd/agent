@@ -322,7 +322,8 @@ func TestCompare(t *testing.T) {
 }
 
 // release: true — команда по умолчанию <dataDir>/workers/<name>/current + args;
-// command вместе с release — ошибка; имя воркера из выпуска — по правилу имён.
+// с command (сборка-архив) — command + args; имя воркера из выпуска — по
+// правилу имён.
 func TestWorkerRelease(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "agent.yaml")
@@ -337,6 +338,9 @@ workers:
   - name: plain
     command: ["/bin/echo", "a"]
     args: ["b"]
+  - name: packed
+    release: true
+    command: ["python3", "./main.py"]
 `), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
@@ -353,13 +357,19 @@ workers:
 	if got := plain.Argv(); !slices.Equal(got, []string{"/bin/echo", "a", "b"}) {
 		t.Fatalf("argv: %v", got)
 	}
+	if packed := cfg.Workers[2]; !slices.Equal(packed.Argv(), []string{"python3", "./main.py"}) ||
+		packed.Current() != filepath.Join(dir, "workers", "packed", "current") {
+		t.Fatalf("архив: %v %s", packed.Argv(), packed.Current())
+	}
 	// Повторная проверка не ломает уже проверенные настройки.
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
 
 	for name, w := range map[string]Worker{
-		"command и release": {Name: "x", Release: true, Command: []string{"/bin/x"}},
+		"inheritEnv AGENT_": {Name: "x", Command: []string{"/bin/x"}, InheritEnv: []string{"AGENT_ENROLL_TOKEN"}},
+		"backoff max < min": {Name: "x", Command: []string{"/bin/x"}, Backoff: Backoff{Min: Duration(time.Minute), Max: Duration(time.Second)}},
+		"maxRestarts < 0":   {Name: "x", Command: []string{"/bin/x"}, MaxRestarts: -1},
 		"имя с путём":       {Name: "../x", Release: true},
 		"без command":       {Name: "x"},
 	} {
@@ -479,5 +489,30 @@ func TestBuiltinWorkerPause(t *testing.T) {
 		if err := c.Validate(); err != nil && strings.Contains(err.Error(), name) {
 			t.Fatalf("%s можно выключить: %v", name, err)
 		}
+	}
+}
+
+// Умолчания пределов и сроков: state.applyTimeout, commands.maxConcurrent,
+// jobs.cancelTimeout, outbox.maxMessages, backoff и registerTimeout воркера.
+func TestTuningDefaults(t *testing.T) {
+	c := Defaults()
+	c.Server.URL = "https://api.example.com"
+	c.State.ApplyTimeout, c.Commands.MaxConcurrent, c.Jobs.CancelTimeout, c.Outbox.MaxMessages = 0, 0, 0, 0
+	c.Workers = []Worker{{Name: "w", Command: []string{"/bin/w"}}}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c.State.ApplyTimeout.Std() != 5*time.Minute || c.Commands.MaxConcurrent != 8 ||
+		c.Jobs.CancelTimeout.Std() != 30*time.Second || c.Outbox.MaxMessages != 10000 {
+		t.Fatalf("умолчания: %+v %+v %+v %+v", c.State, c.Commands, c.Jobs, c.Outbox)
+	}
+	w := c.Workers[0]
+	if w.Backoff.Min.Std() != time.Second || w.Backoff.Max.Std() != 30*time.Second || w.RegisterTimeout.Std() != 2*time.Minute {
+		t.Fatalf("воркер: %+v", w)
+	}
+	next := c
+	next.Commands.MaxConcurrent = 2
+	if d := Compare(c, next); !d.Tuning || !d.Changed() || len(d.Restart) > 0 {
+		t.Fatalf("diff: %+v", d)
 	}
 }

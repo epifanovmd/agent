@@ -19,7 +19,19 @@ import {
 } from "../index";
 import { Channel } from "./channel";
 import { Command } from "./command";
-import { CommandError, JobError, StateError } from "./errors";
+import {
+  CANCELLED,
+  COMMAND_FAILED,
+  COMMAND_UNKNOWN,
+  CommandError,
+  JobError,
+  MessageTooLargeError,
+  RESULT_TOO_LARGE,
+  StateError,
+  WORKER_ERROR,
+  WORKER_STOPPING,
+  normalizeCode,
+} from "./errors";
 import { Job } from "./job";
 
 export type JobHandler = (job: Job) => unknown | Promise<unknown>;
@@ -38,6 +50,12 @@ export type ContextHandler = (ctx: WorkerContext) => void;
  */
 export const AUTO_INTERVAL = "auto";
 const DEFAULT_INTERVAL_MS = 15_000;
+/** Сколько сообщений копится до worker.ready; лишние вытесняют самые старые. */
+export const EARLY_LIMIT = 1000;
+
+/** Итог отправки: ушло, канал закрыт или данные не отправить (не JSON, больше 16 МБ). */
+type SendResult =
+  { ok: true } | { ok: false; closed: true } | { ok: false; closed: false; tooLarge: boolean; message: string };
 
 export interface TelemetryOptions {
   /** Интервал опроса, мс, или "auto" (AUTO_INTERVAL) — по подписке и частоте метрик агента (по умолчанию 15000). */
@@ -102,6 +120,10 @@ interface Queue {
  * Остановка — SIGTERM или `worker.drain`: новые задачи не берутся, текущие
  * задачи и команды дорабатываются, run() завершается. Канал закрыт (агента
  * нет) — всё отменяется.
+ *
+ * setHealth, pause, resume, requestRestart, report и event можно звать и до run():
+ * до worker.ready сообщения копятся (не больше EARLY_LIMIT, лишние вытесняют самые
+ * старые) и уходят сразу после него по порядку.
  */
 export class Worker {
   readonly name: string;
@@ -123,7 +145,10 @@ export class Worker {
   private started = false;
   private ctx: WorkerContext = defaultContext();
   private readonly contextHandlers: ContextHandler[] = [];
-  private readonly early: [string, unknown][] = [];
+  /** Сообщения воркера до worker.ready — уйдут сразу после него. */
+  private early: [string, unknown][] = [];
+  private earlyDropped = false;
+  private isReady = false;
   private busy = 0;
   private draining = false;
   private chan?: Channel;
@@ -222,33 +247,39 @@ export class Worker {
   setHealth(ok: boolean, message?: string): void {
     const data: { ok: boolean; message?: string } = { ok: !!ok };
     if (message) data.message = String(message).slice(0, 2000);
-    this.send("worker.health", data);
+    this.control("worker.health", data);
   }
 
   /** Не брать новые задачи очередей queues (без списка — всех своих); выданные доделываются. */
   pause(queues?: string[]): void {
-    this.send("worker.pause", this.queueList(queues));
+    this.control("worker.pause", this.queueList(queues));
   }
 
   /** Снова брать задачи очередей queues (без списка — всех своих); пауза от сервера остаётся. */
   resume(queues?: string[]): void {
-    this.send("worker.resume", this.queueList(queues));
+    this.control("worker.resume", this.queueList(queues));
   }
 
   /** Попросить агента заменить воркер штатно (его способом rolling/stop-first), без статуса сбоя. */
   requestRestart(reason?: string): void {
-    this.send("worker.restart", reason ? { reason: String(reason).slice(0, 2000) } : {});
+    this.control("worker.restart", reason ? { reason: String(reason).slice(0, 2000) } : {});
   }
 
-  /** Последние данные канала: уйдут в ближайший metrics агента. */
+  /**
+   * Последние данные канала: уйдут в ближайший metrics агента. Данные не
+   * превращаются в JSON — TypeError; больше 16 МБ — не отправляются, запись в лог.
+   */
   report(channel: string, data: unknown): void {
     if (!this.channels.includes(channel)) throw new Error(`канал ${channel} не объявлен: worker.channel("${channel}")`);
-    this.send("telemetry", { channel, data });
+    this.control("telemetry", { channel, data });
   }
 
-  /** Событие воркера серверу; доставка надёжная (агент хранит до подтверждения). */
+  /**
+   * Событие воркера серверу; доставка надёжная (агент хранит до подтверждения).
+   * Данные не превращаются в JSON — TypeError; больше 16 МБ — не отправляется, запись в лог.
+   */
   event(type: string, data?: unknown): void {
-    this.send("event", { type: String(type).slice(0, 50), data });
+    this.control("event", { type: String(type).slice(0, 50), data });
   }
 
   // ── работа ──
@@ -259,7 +290,8 @@ export class Worker {
     if (!this.queues.size && !this.commands.size && !this.domains.size && !this.channels.length && !this.cleanupFn) {
       throw new Error("нечего объявить: нужны очередь, команда, домен, канал телеметрии или уборка");
     }
-    const chan = this.transport ? new Channel(this.transport) : Channel.fromEnv();
+    const log = (level: LogLevel, msg: string) => this.log(level, msg);
+    const chan = this.transport ? new Channel(this.transport, { log }) : Channel.fromEnv({ log });
     this.chan = chan;
     const register: WorkerRegister = {
       name: this.name,
@@ -270,8 +302,8 @@ export class Worker {
     if (this.commands.size) register.commands = [...this.commands.keys()];
     if (this.domains.size) register.domains = [...this.domains.keys()];
     if (this.channels.length) register.channels = [...this.channels];
+    register.ping = true;
     chan.send("worker.register", register);
-    for (const [type, data] of this.early.splice(0)) chan.send(type, data);
 
     const onSignal = () => this.drain();
     if (opts.signals ?? true) {
@@ -290,7 +322,14 @@ export class Worker {
       };
       chan.onMessage((env) => this.dispatch(env));
       chan.onClose(() => {
-        // Агента нет: итоги некому отдать — всё прервать.
+        // Агента нет: итоги некому отдать — всё прервать, ждущие задачи убрать.
+        for (const q of this.queues.values()) {
+          for (const job of q.waiting.splice(0)) {
+            job.cancel("канал с агентом закрыт");
+            if (this.jobs.get(job.id) === job) this.jobs.delete(job.id);
+            void job.close();
+          }
+        }
         for (const job of this.jobs.values()) job.cancel("канал с агентом закрыт");
         for (const cmd of this.running.values()) cmd.cancel("канал с агентом закрыт");
         this.draining = true;
@@ -325,12 +364,54 @@ export class Worker {
     }
   }
 
-  private send(type: string, data: unknown, opts?: { re?: string }): void {
-    if (!this.chan) {
+  /** Сообщение от имени воркера: до worker.ready — в очередь, после — сразу. */
+  private control(type: string, data: unknown): void {
+    if (!this.isReady) {
+      JSON.stringify(data); // не JSON — ошибка сразу, а не при отправке
+      if (this.early.length >= EARLY_LIMIT) {
+        this.early.shift();
+        if (!this.earlyDropped) {
+          this.earlyDropped = true;
+          this.log("warn", `до worker.ready накоплено больше ${EARLY_LIMIT} сообщений: старые отброшены`);
+        }
+      }
       this.early.push([type, data]);
       return;
     }
-    if (!this.chan.send(type, data, opts)) this.log("warn", `${type} не отправлено: канал с агентом закрыт`);
+    const res = this.trySend(type, data);
+    // Данные не JSON — ошибка вызывающему; больше 16 МБ — уже в логе.
+    if (!res.ok && !res.closed && !res.tooLarge) throw new TypeError(`${type}: ${res.message}`);
+  }
+
+  /** Отправка без исключений: итог и запись в лог при сбое. */
+  private trySend(type: string, data: unknown, opts?: { re?: string }): SendResult {
+    if (!this.chan) return { ok: false, closed: true };
+    try {
+      if (this.chan.send(type, data, opts)) return { ok: true };
+      this.log("warn", `${type} не отправлено: канал с агентом закрыт`);
+      return { ok: false, closed: true };
+    } catch (err) {
+      const tooLarge = err instanceof MessageTooLargeError;
+      const message = tooLarge ? "больше 16 МБ" : `не превращается в JSON: ${(err as Error)?.message ?? err}`;
+      this.log("warn", `${type} не отправлено: ${message}`);
+      return { ok: false, closed: false, tooLarge, message };
+    }
+  }
+
+  /**
+   * Итог агенту. Данные не превращаются в JSON или больше 16 МБ — вместо них
+   * fallback(код, текст) (код RESULT_TOO_LARGE или undefined): тип и данные.
+   */
+  private deliver(
+    type: string,
+    data: unknown,
+    opts: { re?: string } = {},
+    fallback?: (code: string | undefined, text: string) => [string, unknown],
+  ): void {
+    const res = this.trySend(type, data, opts);
+    if (res.ok || res.closed || !fallback) return;
+    const [ftype, fdata] = fallback(res.tooLarge ? RESULT_TOO_LARGE : undefined, res.message);
+    this.trySend(ftype, fdata, opts);
   }
 
   private dispatch(env: Envelope): void {
@@ -350,19 +431,23 @@ export class Worker {
         const job = this.jobs.get(ref.jobId);
         if (!job || job.attempt !== ref.attempt) return;
         if (env.type === "job.cancel") {
-          job.cancel();
+          job.cancel("задача отменена", true);
           this.dequeue(job);
         } else job.requestStop();
         return;
       }
+      case "worker.ping":
+        return void this.trySend("worker.pong", {}, { re: env.id });
       case "cmd.run":
-        return void this.track(this.runCommand(d as CommandRun));
+        return this.track(this.runCommand(d as CommandRun));
       case "cmd.cancel":
         return this.running.get(d.commandId)?.cancel();
       case "state.put":
-        return void this.track(this.applyState(d as StatePut, env.id));
+        return this.track(this.applyState(d as StatePut, env.id));
       case "worker.cleanup":
-        return void this.track(this.runCleanup(env.id));
+        return this.track(this.runCleanup(env.id));
+      case "error":
+        return this.log("warn", `ошибка от агента: ${d.code ?? "?"} ${d.message ?? ""}`);
       default:
         this.log("warn", `неизвестное сообщение агента: ${env.type}`);
     }
@@ -373,9 +458,16 @@ export class Worker {
     if (this.rejected.length)
       this.log("warn", `агент отклонил имена (зарезервированы или заняты): ${this.rejected.join(", ")}`);
     this.log("info", `воркер ${this.name} зарегистрирован у агента ${d.agentVersion ?? "?"}`);
+    if (!this.isReady) {
+      this.isReady = true;
+      for (const [type, data] of this.early.splice(0)) this.trySend(type, data);
+    }
     if (this.draining || this.started) return;
     this.started = true;
-    for (const name of this.sources.keys()) this.schedule(name, true);
+    for (const name of this.sources.keys()) {
+      if (this.rejected.includes(name)) this.log("warn", `канал телеметрии ${name} отклонён агентом — не опрашивается`);
+      else this.schedule(name, true);
+    }
   }
 
   /** Таймер источника по его интервалу (now — сразу опросить); интервал тот же — не трогать. */
@@ -390,7 +482,8 @@ export class Worker {
     if (cur) clearInterval(cur.timer);
     const poll = async () => {
       try {
-        this.report(name, await src.fn());
+        const data = await src.fn();
+        if (data !== undefined && data !== null) this.report(name, data); // нет данных — точку не отправлять
       } catch (err) {
         this.log("error", `телеметрия ${name} не собрана: ${(err as Error).message}`);
       }
@@ -428,7 +521,8 @@ export class Worker {
     if (channels) this.ctx.channels = channels;
     else delete this.ctx.channels;
     if (this.started && !this.draining) {
-      for (const [name, src] of this.sources) if (src.intervalMs === AUTO_INTERVAL) this.schedule(name);
+      for (const [name, src] of this.sources)
+        if (src.intervalMs === AUTO_INTERVAL && !this.rejected.includes(name)) this.schedule(name);
     }
     for (const fn of this.contextHandlers) {
       try {
@@ -447,22 +541,33 @@ export class Worker {
   }
 
   private assign(d: JobAssign): void {
-    if (this.jobs.has(d.jobId)) return; // повторная доставка
+    if (typeof d.jobId !== "string" || !d.jobId) return this.log("warn", "job.assign без jobId пропущен");
     const q = this.queues.get(d.queue);
     if (this.draining || !q) {
-      this.send("job.fail", {
+      this.trySend("job.fail", {
         jobId: d.jobId,
-        attempt: d.attempt,
-        code: "WORKER_STOPPING",
+        attempt: d.attempt ?? 0,
+        code: WORKER_STOPPING,
         retryable: true,
         message: `Воркер ${this.name} не берёт задачу очереди ${d.queue}`,
       });
       return;
     }
+    const prev = this.jobs.get(d.jobId);
+    if (prev && prev.attempt >= (d.attempt ?? 0)) return; // повторная доставка той же (или прежней) попытки
     const job = new Job(this.chan!, d, (level, msg) => this.log(level, msg));
     this.jobs.set(job.id, job);
-    if (q.running < q.concurrency) void this.execute(q, job);
+    if (prev) {
+      // Новая попытка той же задачи: прежняя уже не нужна.
+      prev.cancel("пришла новая попытка", true);
+      this.dequeue(prev);
+    }
+    if (q.running < q.concurrency) this.start(q, job);
     else q.waiting.push(job);
+  }
+
+  private start(q: Queue, job: Job): void {
+    this.execute(q, job).catch((err) => this.log("error", `задача ${job.id}: ${(err as Error)?.stack ?? err}`));
   }
 
   /** Отменённая задача из ожидания — сразу прочь. */
@@ -471,39 +576,56 @@ export class Worker {
     const i = q?.waiting.indexOf(job) ?? -1;
     if (q && i >= 0) {
       q.waiting.splice(i, 1);
-      this.jobs.delete(job.id);
+      if (this.jobs.get(job.id) === job) this.jobs.delete(job.id);
+      this.confirmCancel(job);
       void job.close();
       this.checkIdle();
     }
+  }
+
+  /**
+   * Обработчик отменённой задачи завершился (или не вызывался): `job.fail` с
+   * кодом CANCELLED подтверждает агенту, что место свободно. Ровно один раз;
+   * агент серверу его не передаёт. Канал закрыт — не отправляется.
+   */
+  private confirmCancel(job: Job): void {
+    if (!job.cancelledByAgent || job.cancelConfirmed) return;
+    job.cancelConfirmed = true;
+    this.trySend("job.fail", { ...job.ref, code: CANCELLED, message: "задача отменена", retryable: false });
   }
 
   private async execute(q: Queue, job: Job): Promise<void> {
     q.running++;
     try {
       const result = await q.fn(job);
-      if (job.cancelled) return;
+      if (job.cancelled) return; // итог обработчика не нужен; подтверждение — в finally
       job.flush();
-      this.send("job.complete", { ...job.ref, result });
+      this.deliver("job.complete", { ...job.ref, result }, {}, (code, text) => [
+        "job.fail",
+        failData(job, code ?? WORKER_ERROR, `результат задачи ${text}`, code === undefined),
+      ]);
     } catch (err) {
       if (job.cancelled) return;
       job.flush();
       if (err instanceof JobError) {
-        this.send("job.fail", {
-          ...job.ref,
-          code: err.code,
-          message: err.message.slice(0, 2000),
-          retryable: err.retryable,
-        });
+        this.trySend("job.fail", failData(job, err.code, err.message, err.retryable));
       } else {
         this.log("error", `задача ${job.id} упала: ${(err as Error)?.stack ?? err}`);
-        this.send("job.fail", { ...job.ref, code: "WORKER_ERROR", message: describe(err), retryable: true });
+        this.trySend("job.fail", failData(job, WORKER_ERROR, describe(err), true));
       }
     } finally {
       q.running--;
-      this.jobs.delete(job.id);
+      if (this.jobs.get(job.id) === job) this.jobs.delete(job.id);
+      this.confirmCancel(job);
       await job.close();
-      const next = q.waiting.shift();
-      if (next) void this.execute(q, next);
+      // Следующая ждущая; отменённые до запуска обработчик не получают.
+      let next = q.waiting.shift();
+      while (next?.cancelled) {
+        if (this.jobs.get(next.id) === next) this.jobs.delete(next.id);
+        this.confirmCancel(next);
+        next = q.waiting.shift();
+      }
+      if (next) this.start(q, next);
       this.checkIdle();
     }
   }
@@ -515,23 +637,33 @@ export class Worker {
     this.running.set(cmd.id, cmd);
     try {
       if (!handler) {
-        done.error = { code: "COMMAND_UNKNOWN", message: `Команда ${cmd.name} не поддерживается` };
+        done.error = { code: COMMAND_UNKNOWN, message: `Команда ${cmd.name} не поддерживается` };
       } else {
         const result = await handler(cmd);
         done.ok = true;
         if (result !== undefined) done.result = result;
       }
     } catch (err) {
-      if (err instanceof CommandError) done.error = { code: err.code, message: err.message.slice(0, 2000) };
-      else {
+      if (err instanceof CommandError) {
+        const [code, message] = normalizeCode(err.code, err.message, COMMAND_FAILED);
+        done.error = { code, message: message.slice(0, 2000) };
+      } else {
         if (!cmd.cancelled) this.log("error", `команда ${cmd.name} упала: ${(err as Error)?.stack ?? err}`);
-        done.error = { code: "COMMAND_FAILED", message: describe(err) };
+        done.error = { code: COMMAND_FAILED, message: describe(err) };
       }
     } finally {
       this.running.delete(cmd.id);
     }
     // Срок истёк: итог уже не нужен (агент ответил серверу TIMEOUT).
-    if (!cmd.cancelled) this.send("cmd.done", done);
+    if (cmd.cancelled) return;
+    this.deliver("cmd.done", done, {}, (code, text) => [
+      "cmd.done",
+      {
+        commandId: cmd.id,
+        ok: false,
+        error: { code: code ?? COMMAND_FAILED, message: `итог команды ${text}`.slice(0, 2000) },
+      },
+    ]);
   }
 
   private async applyState(d: StatePut, re: string | undefined): Promise<void> {
@@ -551,7 +683,15 @@ export class Worker {
         if (err.report !== undefined) applied.report = err.report;
       } else applied.error = describe(err);
     }
-    this.send("state.applied", applied, { re });
+    this.deliver("state.applied", applied, { re }, (code, text) => [
+      "state.applied",
+      {
+        domain: d.domain,
+        version: d.version,
+        ok: false,
+        error: (code ? `${code}: отчёт состояния ${text}` : `отчёт состояния ${text}`).slice(0, 2000),
+      },
+    ]);
   }
 
   private async runCleanup(re: string | undefined): Promise<void> {
@@ -563,23 +703,30 @@ export class Worker {
       this.log("error", `уборка воркера ${this.name} не удалась: ${(err as Error)?.message ?? err}`);
       cleaned.error = (err instanceof Error ? err.message : String(err)).slice(0, 2000);
     }
-    this.send("worker.cleaned", cleaned, { re });
+    this.deliver("worker.cleaned", cleaned, { re }, (code, text) => [
+      "worker.cleaned",
+      { ok: false, error: (code ? `${code}: итог уборки ${text}` : `итог уборки ${text}`).slice(0, 2000) },
+    ]);
   }
 
   /** Команды и применения состояния в работе — их дожидается drain. */
-  private async track(p: Promise<void>): Promise<void> {
+  private track(p: Promise<void>): void {
     this.busy++;
-    try {
-      await p;
-    } finally {
+    p.catch((err) => this.log("error", `обработка сообщения агента: ${(err as Error)?.stack ?? err}`)).finally(() => {
       this.busy--;
       this.checkIdle();
-    }
+    });
   }
 
   private checkIdle(): void {
     if (this.draining && this.jobs.size === 0 && this.busy === 0) this.finish?.();
   }
+}
+
+/** job.fail: код по схеме (иначе WORKER_ERROR), текст до 2000 символов. */
+function failData(job: Job, code: unknown, message: string, retryable: boolean): Record<string, unknown> {
+  const [c, m] = normalizeCode(code, message, WORKER_ERROR);
+  return { ...job.ref, code: c, message: m.slice(0, 2000), retryable };
 }
 
 function describe(err: unknown): string {

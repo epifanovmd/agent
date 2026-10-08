@@ -125,7 +125,12 @@ await agents.resumeWorker(agent.id, "report");
   `alert`, `log` есть события по видам с готовым объектом — `agent`, `job`, `command`, `state`,
   `stateApplied`, `event`;
 - ошибки API — `AgentsError` с полями `code`, `status` (HTTP-статус) и `retryAfterSec` (у `429`);
+- `alerts(): Promise<Alert[]>` читает активные проблемы из `Store`; `cancelCommand(id)`,
+  `deleteAgent(agentId): Promise<void>` (только отозванного), `prune({jobsOlderThanMs?,
+commandsOlderThanMs?, eventsOlderThanMs?}): Promise<number>`, `listJobs` / `listCommands` с
+  `limit` и `after` — постранично;
 - `MemoryFiles` — `EventEmitter` с событием `upload` (`{ jobId, name }`), содержимое —
   `files.get(jobId, "out", name)`;
-- помощники для своего API: `readJSON(req)`, `readBody(req)`, `sendJSON(res, status, body)`,
-  `baseUrl(req)`, `clientAddress(req)`.
+- помощники для своего API: `readJSON(req)`, `readBody(req, limit?)` (больше предела —
+  `AgentsError` со статусом 413), `sendJSON(res, status, body)`, `baseUrl(req, trustProxy?)`,
+  `clientAddress(req, trustProxy?)` — заголовки `X-Forwarded-*` только с `trustProxy`.

@@ -11,11 +11,13 @@ import threading
 import uuid
 from typing import Any, Dict, Iterator, Optional, Tuple
 
-from ..message import ENV_IPC_FD, encode, envelope
-from .errors import AgentError
+from ..message import ENV_IPC_FD, envelope
+from .errors import AgentError, MessageTooLarge
 
 #: Ответ агента на запрос — не дольше (агент сам ждёт сервер до 30 с).
 REQUEST_TIMEOUT = 45.0
+#: Предел строки канала (§10), байт: длиннее агент не примет.
+MAX_LINE = 16 << 20
 
 
 class Channel:
@@ -42,20 +44,34 @@ class Channel:
 
     def send(self, type: str, data: Any = None, *, id: Optional[str] = None,
              re: Optional[str] = None) -> None:
-        line = encode(envelope(type, data, id=id, re=re)).encode() + b"\n"
+        """Отправить сообщение. Данные не превращаются в JSON — ``TypeError`` или ``ValueError``;
+        строка длиннее ``MAX_LINE`` — ``MessageTooLarge`` (канал цел); канал закрыт — ``OSError``."""
+        line = json.dumps(envelope(type, data, id=id, re=re), ensure_ascii=False, separators=(",", ":"),
+                          allow_nan=False).encode() + b"\n"
+        if len(line) > MAX_LINE:
+            raise MessageTooLarge(f"{type}: сообщение больше 16 МБ")
         with self._write_lock:
             self._sock.sendall(line)
 
     def request(self, type: str, data: Any, timeout: float = REQUEST_TIMEOUT) -> Any:
-        """Запрос с ответом (``job.urls``); ошибка агента — ``AgentError``."""
+        """Запрос с ответом (``job.urls``); ошибка агента — ``AgentError`` (канал закрыт —
+        код ``CHANNEL_CLOSED``, нет ответа — ``TIMEOUT``)."""
         request_id = uuid.uuid4().hex
         done = threading.Event()
         slot: list = []
         with self._pending_lock:
+            if self.closed:
+                raise AgentError("CHANNEL_CLOSED", "канал с агентом закрыт")
             self._pending[request_id] = (done, slot)
         try:
-            self.send(type, data, id=request_id)
-            if not done.wait(timeout) or not slot:
+            try:
+                self.send(type, data, id=request_id)
+            except OSError:
+                raise AgentError("CHANNEL_CLOSED", "канал с агентом закрыт") from None
+            answered = done.wait(timeout)
+            if not slot:
+                if answered or self.closed:
+                    raise AgentError("CHANNEL_CLOSED", "канал с агентом закрыт")
                 raise AgentError("TIMEOUT", f"нет ответа агента на {type}")
             reply = slot[0]
         finally:
@@ -82,12 +98,16 @@ class Channel:
         except (OSError, ValueError):
             pass
         finally:
-            self._closed.set()
             with self._pending_lock:
+                self._closed.set()
                 for done, _ in self._pending.values():
                     done.set()
 
     def close(self) -> None:
+        with self._pending_lock:
+            self._closed.set()
+            for done, _ in self._pending.values():
+                done.set()
         try:
             self._sock.shutdown(socket.SHUT_RDWR)
         except OSError:

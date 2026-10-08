@@ -2,13 +2,15 @@
 # Выпуск агента (scripts/release.sh): сборки linux/darwin × amd64/arm64, manifest.json и install.sh в
 # /dist/<версия>/ — каталог выпуска, который раздаёт сервер (releases, install.sh; COPY --from в его образе).
 # Подпись — секрет BuildKit `agent_signing_key` (agent keygen); без него
-# manifest без подписей и агенты на такие сборки не обновляются.
+# manifest без подписей и агенты на такие сборки не обновляются. Открытый ключ
+# (AGENT_UPDATE_PUBLIC_KEY, аргумент сборки) вшивается в сборки агента.
 #
 #   docker build -f deploy/Dockerfile.dist --secret id=agent_signing_key,env=AGENT_SIGNING_KEY \
-#     -t ghcr.io/epifanovmd/agent-dist:<версия> .
+#     --build-arg AGENT_UPDATE_PUBLIC_KEY -t ghcr.io/epifanovmd/agent-dist:<версия> .
 ARG GO_VERSION=1.26
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS build
+ARG AGENT_UPDATE_PUBLIC_KEY=""
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -17,6 +19,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     --mount=type=secret,id=agent_signing_key,required=false \
     v=$(cat VERSION) && \
     AGENT_SIGNING_KEY="$(cat /run/secrets/agent_signing_key 2>/dev/null || true)" \
+    AGENT_UPDATE_PUBLIC_KEY="$AGENT_UPDATE_PUBLIC_KEY" \
       scripts/release.sh "/dist/$v" "$v"
 
 FROM scratch

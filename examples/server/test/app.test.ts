@@ -557,6 +557,38 @@ test("уведомления: alert в потоке, активные — в sna
   a.ws.close();
 });
 
+test("отмена команды: POST /api/commands/:id/cancel → cancelled и cmd.cancel агенту; ошибки по кодам", async () => {
+  const a = await agent("app-cancel", { commands: { names: ["example.cmd"] } });
+  const cmd = await call("POST", "/api/commands", { name: "example.cmd", agentId: a.agentId });
+  assert.equal((await a.wait("cmd.run")).data.commandId, cmd.body.id);
+  const res = await call("POST", `/api/commands/${cmd.body.id}/cancel`, undefined, { "X-Actor": "ivan" });
+  assert.equal(res.status, 200);
+  assert.deepEqual([res.body.status, res.body.error?.code], ["cancelled", "CANCELLED"]);
+  assert.equal((await a.wait("cmd.cancel")).data.commandId, cmd.body.id);
+  const again = await call("POST", `/api/commands/${cmd.body.id}/cancel`);
+  assert.deepEqual([again.status, again.body.code], [409, "COMMAND_NOT_ACTIVE"]);
+  const none = await call("POST", "/api/commands/nope/cancel");
+  assert.deepEqual([none.status, none.body.code], [404, "COMMAND_NOT_FOUND"]);
+  a.ws.close();
+});
+
+test("удаление агента: DELETE /api/agents/:id — только отозванного", async () => {
+  const a = await agent("app-delete", {});
+  const early = await call("DELETE", `/api/agents/${a.agentId}`);
+  assert.deepEqual([early.status, early.body.code], [409, "AGENT_NOT_REVOKED"]);
+  assert.equal((await call("POST", `/api/agents/${a.agentId}/revoke`)).status, 200);
+  const res = await call("DELETE", `/api/agents/${a.agentId}`);
+  assert.deepEqual([res.status, res.body], [200, {}]);
+  const snap = (await call("GET", "/api/snapshot")).body;
+  assert.equal(
+    snap.agents.some((x: { id: string }) => x.id === a.agentId),
+    false,
+  );
+  const none = await call("DELETE", `/api/agents/${a.agentId}`);
+  assert.deepEqual([none.status, none.body.code], [404, "AGENT_NOT_FOUND"]);
+  a.ws.close();
+});
+
 test("пауза воркера: POST /api/agents/:id/workers/:name/pause|resume → worker.pause/resume, actor", async () => {
   const a = await agent("app-pause", { commands: { names: ["worker.pause", "worker.resume"] } });
   const p = await call("POST", `/api/agents/${a.agentId}/workers/report/pause`, undefined, { "X-Actor": "ivan" });

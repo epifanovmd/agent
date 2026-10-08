@@ -42,8 +42,9 @@ func (s *Supervisor) AnyReleased() bool {
 }
 
 // Update — worker.update: fetch кладёт проверенную сборку в dst (рядом с
-// current); текущая откладывается как previous, новая становится current
-// (атомарно), воркер заменяется своим способом (rolling | stop-first) и
+// current) — файл или каталог распакованного архива; текущая откладывается
+// как previous, новая становится current (файл — атомарно, каталог —
+// переименованием), воркер заменяется своим способом (rolling | stop-first) и
 // должен зарегистрироваться с версией version не позже max(stopTimeout,
 // updateWait). Иначе previous возвращается на место, воркер перезапускается
 // с ней, итог — ошибка WORKER_UPDATE_FAILED. Ошибка fetch типа
@@ -81,9 +82,10 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, fetch fun
 	}
 	current := filepath.Join(dir, config.ReleaseCurrent)
 	next := current + ".new"
+	_ = os.RemoveAll(next) // остаток прерванного обновления
 	fmt.Fprintf(out, "загрузка %s %s…\n", name, version)
 	if err := fetch(next); err != nil {
-		_ = os.Remove(next)
+		_ = os.RemoveAll(next)
 		var ce *commands.Error
 		if errors.As(err, &ce) {
 			return res, err
@@ -94,18 +96,32 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, fetch fun
 	res.Previous = readVersion(filepath.Join(dir, config.ReleaseVersion))
 	_, statErr := os.Stat(current)
 	hadCurrent := statErr == nil
+	previous := filepath.Join(dir, config.ReleasePrevious)
+	dirs := isDir(current) || isDir(next)
 	if hadCurrent {
-		if err := keepAside(current, filepath.Join(dir, config.ReleasePrevious)); err != nil {
-			_ = os.Remove(next)
+		var err error
+		if dirs {
+			// Каталог: текущая сборка переезжает в previous целиком.
+			if err = os.RemoveAll(previous); err == nil {
+				err = os.Rename(current, previous)
+			}
+		} else {
+			err = keepAside(current, previous)
+		}
+		if err != nil {
+			_ = os.RemoveAll(next)
 			return res, failed("копия текущей сборки: %v", err)
 		}
 		if err := writeFileAtomic(filepath.Join(dir, config.ReleasePreviousVersion), res.Previous); err != nil {
-			_ = os.Remove(next)
+			_ = os.RemoveAll(next)
 			return res, failed("%v", err)
 		}
 	}
 	if err := os.Rename(next, current); err != nil {
-		_ = os.Remove(next)
+		_ = os.RemoveAll(next)
+		if dirs && hadCurrent {
+			_ = os.Rename(previous, current)
+		}
 		return res, failed("замена сборки: %v", err)
 	}
 	if err := writeFileAtomic(filepath.Join(dir, config.ReleaseVersion), version); err != nil {
@@ -178,14 +194,23 @@ func (s *Supervisor) rollback(w *worker, spec config.Worker, hadCurrent bool, pr
 	current := filepath.Join(dir, config.ReleaseCurrent)
 	var errs []string
 	if hadCurrent {
-		if err := keepAside(filepath.Join(dir, config.ReleasePrevious), current); err != nil {
+		prevBuild := filepath.Join(dir, config.ReleasePrevious)
+		var err error
+		if isDir(prevBuild) || isDir(current) {
+			if err = os.RemoveAll(current); err == nil {
+				err = os.Rename(prevBuild, current)
+			}
+		} else {
+			err = keepAside(prevBuild, current)
+		}
+		if err != nil {
 			errs = append(errs, "возврат сборки: "+err.Error())
 		}
 		if err := writeFileAtomic(filepath.Join(dir, config.ReleaseVersion), previous); err != nil {
 			errs = append(errs, err.Error())
 		}
 	} else {
-		_ = os.Remove(current)
+		_ = os.RemoveAll(current)
 		_ = os.Remove(filepath.Join(dir, config.ReleaseVersion))
 	}
 	s.mu.Lock()
@@ -255,6 +280,12 @@ func (s *Supervisor) restore(w *worker, spec config.Worker, slots []*slot, faile
 	if err := s.replace(ctx, w, replace); err != nil {
 		s.log.Error("воркер: прежняя сборка не запустилась", "worker", spec.Name, "err", err)
 	}
+}
+
+// isDir — путь есть и это каталог.
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // keepAside — dst становится копией src атомарно: жёсткая ссылка (или копия)

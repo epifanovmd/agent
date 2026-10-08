@@ -338,3 +338,39 @@ func TestUnseal(t *testing.T) {
 		t.Fatalf("исполнитель вызван с нераскрытым: %s", r.got())
 	}
 }
+
+// hangReconciler — первый раз не отвечает (ждёт отмены ctx), потом применяет.
+type hangReconciler struct{ calls atomic.Int32 }
+
+func (h *hangReconciler) Domain() string { return "example.app" }
+func (h *hangReconciler) Apply(ctx context.Context, _ int64, _ json.RawMessage) (any, error) {
+	if h.calls.Add(1) == 1 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return nil, nil
+}
+
+// Исполнитель не ответил за state.applyTimeout — раздел не применён
+// (STATE_TIMEOUT), повтор по обычному правилу.
+func TestApplyTimeout(t *testing.T) {
+	h := &hangReconciler{}
+	s := &sink{}
+	m := New(t.TempDir(), s, logx.Discard())
+	m.SetApplyTimeout(50 * time.Millisecond)
+	m.retry = 50 * time.Millisecond
+	_ = m.Register(h)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Start(ctx)
+	_ = m.Handle(ctx, put(1))
+	wait(t, func() bool { return s.count() == 2 })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if first := s.got[0]; first.OK || !strings.HasPrefix(first.Error, ErrTimeout) {
+		t.Fatalf("срок: %+v", first)
+	}
+	if !s.got[1].OK {
+		t.Fatalf("повтор: %+v", s.got[1])
+	}
+}

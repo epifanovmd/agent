@@ -120,7 +120,9 @@ func (f *Funcs) Run(a message.JobAssign) error {
 		}()
 		result, err := safeCall(ctx, h.fn, job)
 		if ctx.Err() != nil {
-			return // отменена: итог не нужен
+			// Отменена: итог не нужен, только подтверждение, что место свободно.
+			f.reporter.Fail(message.JobFail{JobRef: a.Ref(), Code: message.ErrCancelled, Message: "отменена"})
+			return
 		}
 		if err != nil {
 			var je *Error

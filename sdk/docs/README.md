@@ -64,13 +64,15 @@ http.ListenAndServe(":8080", agents.Handler()) // или agents.Mount(mux) ря�
 
 ```python
 from agent_sdk.server import Agents
+from agent_sdk.server.asgi import AgentsApp
 
 agents = Agents(enroll_token="demo-token")
-# Маршруты агентов отдаются методам agents.handle_enroll, handle_sync, serve_websocket,
-# handle_file, handle_release — из любого веб-фреймворка на asyncio.
+app = AgentsApp(agents, fallback=api)  # маршруты агентов, остальное — api (FastAPI и т. п.)
+# запуск — любой ASGI-сервер: uvicorn module:app
 ```
 
-В Python у `Agents` нет одного `handle`: на каждый маршрут — свой метод. Подключение к
+В Python маршруты агентов отдаёт ASGI-приложение `AgentsApp(agents)` или, без ASGI, методы
+`handle_enroll`, `handle_sync`, `serve_websocket`, `handle_file`, `handle_release`. Подключение к
 FastAPI/Starlette — в [sdk/python/README.md](../python/README.md#сервер-agent_sdkserver), сервер на
 стандартной библиотеке — [examples/server-python](../../examples/server-python/README.md).
 
@@ -158,7 +160,17 @@ await worker.run();
 
 ## Шаг 3. Агент
 
-Собрать агента под свою машину — `make build` (Go ставить не нужно, сборка идёт в контейнере):
+Готовая сборка агента лежит в GitHub Release — файл `agent-<os>-<arch>` под свою машину
+(`<os>` — `linux` или `darwin`, `<arch>` — `amd64` или `arm64`, `<версия>` — номер без `v`,
+например `1.1.0`):
+
+```bash
+curl -fLO https://github.com/epifanovmd/agent/releases/download/v<версия>/agent-<os>-<arch>
+chmod +x agent-<os>-<arch>
+xattr -d com.apple.quarantine agent-<os>-<arch>   # только macOS: иначе система не даст запустить
+```
+
+Собрать самому из репозитория — `make build` (Go ставить не нужно, сборка идёт в контейнере):
 программа появится в `dist/<версия>/agent-<os>-<arch>`. Настройки:
 
 ```yaml
@@ -177,7 +189,7 @@ workers:
 ```
 
 ```bash
-dist/<версия>/agent-<os>-<arch> run -config agent.yaml
+./agent-<os>-<arch> run -config agent.yaml
 ```
 
 Агент зарегистрируется по токену, запустит воркер и подключится к бэкенду. В бэкенде появится
@@ -185,9 +197,19 @@ dist/<версия>/agent-<os>-<arch> run -config agent.yaml
 `agent.capabilities` — очередь `example.render`, команда `example.report.reload`, раздел
 `example.report`, канал `example.report`.
 
-На сервере без Docker агент ставится одной командой, которую собирает сам бэкенд
-(`agents.installCommand(…)`), — см. [releases.md](releases.md#установка-одной-командой).
-Все настройки агента — в [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#настройки).
+На настоящем узле агент работает службой systemd (Debian/Ubuntu, RHEL/Fedora, SUSE и т. п.) и
+ставится одной командой, которую собирает сам бэкенд (`agents.installCommand(…)`), — см.
+[releases.md](releases.md#установка-одной-командой). Без раздачи с бэкенда — из GitHub Release:
+
+```bash
+curl -fLO https://github.com/epifanovmd/agent/releases/download/v<версия>/agent-linux-amd64
+curl -fLO https://github.com/epifanovmd/agent/releases/download/v<версия>/install.sh
+sudo sh install.sh --binary ./agent-linux-amd64 --server https://api.example.com --token <токен>
+```
+
+На узлах без systemd (Alpine и другие) агент работает в контейнере. Установка, флаги, удаление и
+резервная копия — в [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#установка), все настройки
+агента — [там же](../../docs/ARCHITECTURE.md#настройки).
 
 ## Шаг 4. Бэкенд управляет узлом
 
@@ -225,8 +247,11 @@ await agents.set_state("example.report", {"header": "ACME"})
 
 `MemoryStore` хранит всё в памяти — для разработки. В работе бэкенду нужен свой `Store` поверх
 БД (агенты, задачи, команды, состояние, события, метрики): что в нём и какие правила — в
-[store.md](store.md). Если процессов бэкенда несколько, изменения доставляет тот, к кому
-подключён агент, — по `refresh` ([connection.md](connection.md#несколько-процессов-бэкенда)).
+[store.md](store.md); записи он меняет условно (по номеру версии `rev`), поэтому процессы не
+затирают изменения друг друга. Если процессов бэкенда несколько, у них общий `Store`, а
+изменения доставляет тот, к кому подключён агент, — по `refresh`; HTTP-канал агента за
+балансировщиком требует «липких» сессий
+([connection.md](connection.md#несколько-процессов-бэкенда)).
 
 ## Все разделы
 

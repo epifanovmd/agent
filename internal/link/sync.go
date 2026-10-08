@@ -230,6 +230,7 @@ func (c *syncConn) exchange(ctx context.Context, body syncRequest) (syncResponse
 		// Сессия истекла (сервер её забыл) — сразу новая с hello.
 		return syncResponse{}, &CloseError{Code: message.CloseRestart, Reason: e.Code}
 	default:
-		return syncResponse{}, &DialError{Status: resp.StatusCode, Err: errors.New(strings.TrimSpace(string(data)))}
+		return syncResponse{}, &DialError{Status: resp.StatusCode, Err: errors.New(strings.TrimSpace(string(data))),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
 	}
 }

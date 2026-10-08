@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from . import files
-from .errors import AgentError, Cancelled
+from .errors import AgentError, Cancelled, MessageTooLarge
 
 if TYPE_CHECKING:
     from .channel import Channel
@@ -35,8 +35,11 @@ class Job:
 
     Прогресс, лог и события уходят агенту; связь с сервером, повторы и
     досылка после обрыва — его забота. Отмена: ``job.cancelled`` становится
-    ``True``, ``check_cancelled()`` бросает ``Cancelled``. Остановка
-    (``stop_requested``) — довести шаг и вернуть результат как обычно.
+    ``True``, ``check_cancelled()`` бросает ``Cancelled``; ждать с отменой —
+    ``job.wait(секунд)`` (``True`` — отменена) или ``job.cancel_event``. Итог
+    отменённой задачи не отправляется: когда обработчик вернулся (или бросил
+    исключение), SDK сам шлёт агенту ``job.fail`` с кодом ``CANCELLED``.
+    Остановка (``stop_requested``) — довести шаг и вернуть результат как обычно.
     """
 
     def __init__(self, channel: "Channel", assign: Dict[str, Any]) -> None:
@@ -57,9 +60,14 @@ class Job:
         self._last_sent = 0.0
         self._timer: Optional[threading.Timer] = None
         self._event_seq = 0
+        self._event_lock = threading.Lock()
         self._cancelled = threading.Event()
+        #: Отменена агентом (job.cancel или новая попытка): нужно подтверждение CANCELLED.
+        self._cancel_confirm = False
+        self._cancel_confirmed = False
         self._stop_requested = threading.Event()
-        self._tmp = Path(tempfile.mkdtemp(prefix=f"job-{self.id[:8]}-"))
+        #: Временный каталог задачи — создаётся при первом ``input_path``.
+        self._tmp: Optional[Path] = None
 
     @property
     def ref(self) -> Dict[str, Any]:
@@ -70,6 +78,15 @@ class Job:
     @property
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        """Устанавливается при отмене задачи (``job.cancel``) и закрытии канала."""
+        return self._cancelled
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        """Подождать ``timeout`` секунд (``None`` — до отмены); ``True`` — задачу отменили."""
+        return self._cancelled.wait(timeout)
 
     @property
     def stop_requested(self) -> bool:
@@ -104,12 +121,18 @@ class Job:
 
         Доставка надёжная и по порядку: агент хранит событие до подтверждения
         сервером, повтор сервер отбрасывает по номеру ``seq``.
+        Данные не превращаются в JSON — ``TypeError``/``ValueError``; событие больше 16 МБ
+        отбрасывается с записью в лог.
         """
-        with self._lock:
-            self._event_seq += 1
-            seq = self._event_seq
         self.flush()
-        self._channel.send("job.event", {**self.ref, "seq": seq, "type": type[:50], "data": data})
+        with self._event_lock:
+            seq = self._event_seq + 1
+            try:
+                self._channel.send("job.event", {**self.ref, "seq": seq, "type": str(type)[:50], "data": data})
+            except MessageTooLarge:
+                log.warning("событие %s задачи %s больше 16 МБ — не отправлено", type, self.id)
+                return
+            self._event_seq = seq
 
     @property
     def inputs(self) -> List[str]:
@@ -120,8 +143,15 @@ class Job:
         return list(self._outputs)
 
     def input_path(self, name: str) -> Path:
-        """Скачать входной файл во временный каталог задачи (один раз)."""
-        target = self._tmp / "inputs" / name
+        """Скачать входной файл во временный каталог задачи (один раз). Имя файла в каталоге —
+        только последняя часть ``name``: каталоги и ``..`` отбрасываются."""
+        base = _base_name(name)
+        if name not in self._inputs:
+            raise KeyError(f"нет входного файла {name!r}")
+        with self._lock:
+            if self._tmp is None:
+                self._tmp = Path(tempfile.mkdtemp(prefix=f"job-{_safe_prefix(self.id)}-"))
+            target = self._tmp / "inputs" / base
         if not target.exists():
             self.download(name, target)
         return target
@@ -143,7 +173,8 @@ class Job:
         """Загрузить выходной файл по подписанной ссылке (PUT).
 
         Неудача (сеть, истёкшая ссылка) — повтор со свежей ссылкой от
-        сервера; после ``UPLOAD_ATTEMPTS`` попыток — исключение.
+        сервера; после ``UPLOAD_ATTEMPTS`` попыток — исключение. Отмена задачи прерывает
+        паузу между попытками (``Cancelled``).
         """
         if name not in self._outputs:
             raise KeyError(f"нет выходного файла {name!r}")
@@ -155,10 +186,14 @@ class Job:
                 files.upload(target["url"], source, target.get("contentType"))
                 return
             except OSError as err:
-                if attempt == UPLOAD_ATTEMPTS:
+                if attempt == UPLOAD_ATTEMPTS or self.cancelled:
                     raise
+                close = getattr(err, "close", None)  # HTTPError держит ответ сервера
+                if callable(close):
+                    close()
                 log.warning("загрузка %s задачи %s: %s — повтор", name, self.id, err)
-                time.sleep(UPLOAD_RETRY_SECONDS * attempt)
+                if self._cancelled.wait(UPLOAD_RETRY_SECONDS * attempt):
+                    raise Cancelled(self.id) from None
                 try:
                     self.refresh_urls(outputs=[name])
                 except AgentError as refresh_err:
@@ -199,10 +234,12 @@ class Job:
             self._last_sent = time.monotonic()
         try:
             self._channel.send("job.progress", update)
-        except OSError:
-            pass
+        except (OSError, ValueError) as err:
+            log.warning("прогресс задачи %s не отправлен: %s", self.id, err)
 
-    def cancel(self) -> None:
+    def cancel(self, by_agent: bool = False) -> None:
+        if by_agent:
+            self._cancel_confirm = True
         if not self._cancelled.is_set():
             log.info("задача %s отменена", self.id)
         self._cancelled.set()
@@ -217,7 +254,9 @@ class Job:
             if self._timer:
                 self._timer.cancel()
                 self._timer = None
-        shutil.rmtree(self._tmp, ignore_errors=True)
+            tmp, self._tmp = self._tmp, None
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def _schedule(self) -> None:
         with self._lock:
@@ -234,3 +273,16 @@ class Job:
         return bool(self._urls_expire_at) and (
             self._urls_expire_at - time.time() * 1000 < URL_REFRESH_MARGIN_MS
         )
+
+
+def _base_name(name: str) -> str:
+    """Последняя часть имени файла (разделители ``/`` и ``\\``); пусто, ``.`` и ``..`` — ``ValueError``."""
+    base = str(name).replace("\\", "/").rsplit("/", 1)[-1]
+    if base in ("", ".", ".."):
+        raise ValueError(f"неверное имя входного файла {name!r}")
+    return base
+
+
+def _safe_prefix(job_id: str) -> str:
+    """Начало id задачи для имени каталога: без разделителей и точек."""
+    return "".join("_" if c in "/\\." else c for c in str(job_id)[:8])

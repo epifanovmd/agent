@@ -282,7 +282,7 @@ class AlertsTest(Case):
         await a.wait("ack", 2)
         self.assertEqual(self.of("degraded"), [(True, None, "воркеры перезапускаются")])
         self.assertEqual(self.of("workerDown"), [(True, "echo", "Воркер echo: backoff")])
-        self.assertEqual({x.type for x in self.agents.alerts()}, {"degraded", "workerDown"})
+        self.assertEqual({x.type for x in await self.agents.alerts()}, {"degraded", "workerDown"})
         self.assertEqual(self.alerts[0].agent_name, "a1")
 
         a.push(status("idle", [{"name": "echo", "state": "starting", "instances": 0}]))
@@ -292,7 +292,7 @@ class AlertsTest(Case):
                                                (False, None, "воркеры перезапускаются")])
         self.assertEqual(self.of("workerDown"), [(True, "echo", "Воркер echo: backoff"),
                                                  (False, "echo", "Воркер echo: backoff")])
-        self.assertEqual(self.agents.alerts(), [])
+        self.assertEqual(await self.agents.alerts(), [])
 
         # degraded без status.message — текст по умолчанию.
         a.push(status("degraded", []))
@@ -318,10 +318,10 @@ class AlertsTest(Case):
         a.conn.inbox.put_nowait(None)  # обрыв: offline_grace_ms=0 — сразу offline
         await a.task
         self.assertEqual(self.of("offline"), [(True, None, "Агент без связи")])
-        self.assertEqual(self.agents.alerts()[0].type, "offline")
+        self.assertEqual((await self.agents.alerts())[0].type, "offline")
         await a.connect(name="a1")
         self.assertEqual(self.of("offline"), [(True, None, "Агент без связи"), (False, None, "Агент без связи")])
-        self.assertEqual(self.agents.alerts(), [])
+        self.assertEqual(await self.agents.alerts(), [])
         self.assertEqual(set(self.alerts[0].to_dict()) >= {"type", "agentId", "agentName", "active", "at"}, True)
 
 

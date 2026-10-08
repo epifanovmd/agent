@@ -18,7 +18,9 @@ import secrets
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from ..message import INSTALL_PATH, RELEASES_PATH, Close, MessageError, decode, encode, new_id, now_ms
+from ..message import (
+    ENROLL_PATH, INSTALL_PATH, RELEASES_PATH, Close, MessageError, decode, encode, new_id, now_ms,
+)
 from .model import Agent
 from .session import HttpReply, Reply, Session
 
@@ -34,6 +36,14 @@ _SAFE_SERVER = re.compile(r"https?://[A-Za-z0-9.\-:\[\]]+(/.*)?")
 _SHELL_UNSAFE = re.compile(r'["$`\\\n\r]')
 #: Ключ проверки релизов — только алфавит base64, иначе не подставляется.
 _SAFE_KEY = re.compile(r"[A-Za-z0-9+/=]*")
+#: Предел тела запроса регистрации, байт.
+ENROLL_MAX_BODY = 64 << 10
+#: Имя агента при регистрации — не длиннее, символов.
+ENROLL_MAX_NAME = 128
+#: Меток при регистрации — не больше.
+ENROLL_MAX_LABELS = 64
+#: Ключ и значение метки — не длиннее, символов.
+ENROLL_MAX_LABEL = 256
 
 
 class Transport:
@@ -41,35 +51,59 @@ class Transport:
 
     # ── регистрация и учётные данные (§5) ───────────────────────────────
 
-    async def handle_enroll(self, body: Any, remote: Optional[str] = None) -> HttpReply:
+    def body_limit(self, path: str) -> int:
+        """Предел тела запроса для пути, байт: регистрация — 64 КБ, остальное — ``max_body``.
+        Транспорт читает тело не больше предела; ``Content-Length`` больше — сразу 413."""
+        if path.split("?", 1)[0] == ENROLL_PATH:
+            return min(ENROLL_MAX_BODY, self.max_body)
+        return self.max_body
+
+    def request_base(self, host: Optional[str], *, secure: bool = False, forwarded_host: Optional[str] = None,
+                     forwarded_proto: Optional[str] = None) -> str:
+        """Адрес сервера, по которому до него дошёл клиент (ссылки на файлы, ``install.sh``):
+        ``host`` — заголовок ``Host``, ``secure`` — соединение по TLS. ``X-Forwarded-Host`` и
+        ``X-Forwarded-Proto`` учитываются только с ``trust_proxy``. Нет адреса — пусто."""
+        scheme = "https" if secure else "http"
+        if self.trust_proxy:
+            proto = (forwarded_proto or "").split(",", 1)[0].strip().lower()
+            if proto in ("http", "https"):
+                scheme = proto
+            forwarded = (forwarded_host or "").split(",", 1)[0].strip()
+            if forwarded:
+                host = forwarded
+        return f"{scheme}://{host}" if host else ""
+
+    async def handle_enroll(self, body: Any, remote: Optional[str] = None, *,
+                            forwarded_for: Optional[str] = None) -> HttpReply:
         """``POST /api/v1/agent-link/enroll``: токен → ``201 {agentId, secret}``.
 
-        ``remote`` — адрес клиента (если транспорт его знает; иначе все клиенты — один ``"*"``):
-        неудачные попытки (неверный токен или запрос) считаются по нему. Больше ``enroll_failure_limit`` за
-        ``enroll_failure_window_ms`` — ``429 ENROLL_RATE_LIMITED`` (даже с верным токеном) до
-        конца окна. Ответ — ``HttpReply``: пара ``(статус, тело)`` и ``reply.headers``; у 429 там
-        ``Retry-After`` (секунды) — бэкенд передаёт его заголовком ответа.
+        ``remote`` — адрес клиента, ``forwarded_for`` — заголовок ``X-Forwarded-For`` (берётся
+        только с ``trust_proxy``); адрес — как ``Agent.address``, транспорт не знает его — все
+        клиенты один ``"*"``. Неудачные попытки (неверный токен или запрос) считаются по нему.
+        Больше ``enroll_failure_limit`` за ``enroll_failure_window_ms`` — ``429 ENROLL_RATE_LIMITED``
+        (даже с верным токеном) до конца окна. Ответ — ``HttpReply``: пара ``(статус, тело)`` и
+        ``reply.headers``; у 429 там ``Retry-After`` (секунды) — бэкенд передаёт его заголовком ответа.
+
+        Тело — не больше 64 КБ (иначе ``413 MESSAGE_INVALID``); ``token`` и ``name`` — непустые
+        строки, ``name`` — до 128 символов, ``labels`` — объект до 64 меток (ключ — непустая строка
+        до 256 символов, значение — строка до 256), иначе ``400 MESSAGE_INVALID``. Хук ``enroll``
+        получает ``(token, {"name", "labels", "host"})``.
         """
-        client = remote or "*"
+        client = self._client_address(remote, forwarded_for) or "*"
         now = now_ms()
-        retry_ms = self._enroll_blocked(client, now)
-        if retry_ms > 0:
-            secs = max(1, -(-retry_ms // 1000))
-            return HttpReply(429, {"code": "ENROLL_RATE_LIMITED",
-                                   "message": f"Слишком много неудачных регистраций: повторите через {secs} с"},
-                             {"Retry-After": str(secs)})
+        retry = self._enroll_rate_limited(client, now)
+        if retry is not None:
+            return retry
+        if isinstance(body, (bytes, bytearray, str)) and len(body) > self.body_limit(ENROLL_PATH):
+            return self._enroll_too_large(client, now)
         try:
             req = _parse_body(body)
+            token, name, labels = _enroll_request(req)
         except ValueError as err:
             return self._enroll_invalid(client, now, str(err))
-        token, name = str(req.get("token") or ""), str(req.get("name") or "")
-        if not token or not name:
-            return self._enroll_invalid(client, now, "Нужны token и name")
-        labels = {str(k): str(v) for k, v in (req.get("labels") or {}).items()} \
-            if isinstance(req.get("labels"), dict) else {}
         given: Dict[str, str] = {}
         if self._enroll is not None:
-            granted = self._enroll(token)
+            granted = self._enroll(token, {"name": name, "labels": dict(labels), "host": req.get("host")})
             if inspect.isawaitable(granted):
                 granted = await granted
             if not granted and granted != {}:
@@ -86,6 +120,27 @@ class Transport:
             self._changed("agent", agent.id)
         self._log("агент зарегистрирован", agent=name, id=agent.id)
         return HttpReply(201, {"agentId": agent.id, "secret": secret})
+
+    def enroll_too_large(self, remote: Optional[str] = None, *, forwarded_for: Optional[str] = None) -> HttpReply:
+        """Ответ на запрос регистрации с телом больше ``body_limit`` (транспорт его не дочитал):
+        ``413 MESSAGE_INVALID``, в счёт неудач клиента (или ``429``, если их уже слишком много)."""
+        client = self._client_address(remote, forwarded_for) or "*"
+        now = now_ms()
+        retry = self._enroll_rate_limited(client, now)
+        return retry if retry is not None else self._enroll_too_large(client, now)
+
+    def _enroll_too_large(self, client: str, now: int) -> HttpReply:
+        self._count_enroll_failure(client, now)
+        return HttpReply(413, {"code": "MESSAGE_INVALID", "message": "Слишком большой запрос регистрации"})
+
+    def _enroll_rate_limited(self, client: str, now: int) -> Optional[HttpReply]:
+        retry_ms = self._enroll_blocked(client, now)
+        if retry_ms <= 0:
+            return None
+        secs = max(1, -(-retry_ms // 1000))
+        return HttpReply(429, {"code": "ENROLL_RATE_LIMITED",
+                               "message": f"Слишком много неудачных регистраций: повторите через {secs} с"},
+                         {"Retry-After": str(secs)})
 
     def _enroll_blocked(self, client: str, now: int) -> int:
         """Сколько мс клиенту ещё ждать (0 — можно); заодно забыть устаревшие попытки."""
@@ -135,14 +190,19 @@ class Transport:
         if not agent.pending_secret_hash or not hmac.compare_digest(hashed, agent.pending_secret_hash):
             return None
         async with self._op():
+            def promote(rec: Agent) -> bool:
+                if rec.revoked or not rec.pending_secret_hash \
+                        or not hmac.compare_digest(hashed, rec.pending_secret_hash):
+                    return False
+                rec.secret_hash, rec.pending_secret_hash = rec.pending_secret_hash, ""
+                return True
+
+            promoted = await self._mutate_agent(agent_id, promote)
+            if promoted is not None:
+                self._log("агент вошёл с новым ключом", agent=promoted.name)
+                return promoted
             agent = await self.store.get_agent(agent_id)
-            if agent is None or agent.revoked:
-                return None
-            if agent.pending_secret_hash and hmac.compare_digest(hashed, agent.pending_secret_hash):
-                agent.secret_hash, agent.pending_secret_hash = agent.pending_secret_hash, ""
-                await self.store.update_agent(agent)
-                self._log("агент вошёл с новым ключом", agent=agent.name)
-            elif not hmac.compare_digest(hashed, agent.secret_hash):
+            if agent is None or agent.revoked or not hmac.compare_digest(hashed, agent.secret_hash):
                 return None
             return agent
 
@@ -415,6 +475,27 @@ def _parse_body(body: Any) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("тело — не объект JSON")
     return parsed
+
+
+def _enroll_request(req: Dict[str, Any]) -> Tuple[str, str, Dict[str, str]]:
+    """Проверенные ``token``, ``name`` и ``labels`` запроса регистрации; неверно — ``ValueError``."""
+    token, name, labels = req.get("token"), req.get("name"), req.get("labels")
+    if not isinstance(token, str) or not token or not isinstance(name, str) or not name:
+        raise ValueError("Нужны token и name (непустые строки)")
+    if len(name) > ENROLL_MAX_NAME:
+        raise ValueError(f"name длиннее {ENROLL_MAX_NAME} символов")
+    if labels is None:
+        return token, name, {}
+    if not isinstance(labels, dict):
+        raise ValueError("labels — объект")
+    if len(labels) > ENROLL_MAX_LABELS:
+        raise ValueError(f"Меток больше {ENROLL_MAX_LABELS}")
+    for key, value in labels.items():
+        if not isinstance(key, str) or not key or len(key) > ENROLL_MAX_LABEL:
+            raise ValueError(f"Ключ метки — непустая строка до {ENROLL_MAX_LABEL} символов")
+        if not isinstance(value, str) or len(value) > ENROLL_MAX_LABEL:
+            raise ValueError(f"Значение метки {key!r} — строка до {ENROLL_MAX_LABEL} символов")
+    return token, name, dict(labels)
 
 
 def _check(env: Dict[str, Any]) -> Dict[str, Any]:

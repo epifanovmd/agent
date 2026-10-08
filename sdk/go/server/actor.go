@@ -58,8 +58,14 @@ func (x *Actor) RollbackState(domain string, version int64, agentID string) (*De
 	return x.agents.rollbackState(x.name, domain, version, agentID)
 }
 
+// CancelCommand — Agents.CancelCommand от имени actor.
+func (x *Actor) CancelCommand(id string) (*Command, error) { return x.agents.cancelCommand(x.name, id) }
+
 // Revoke — Agents.Revoke от имени actor.
 func (x *Actor) Revoke(agentID string) error { return x.agents.revoke(x.name, agentID) }
+
+// DeleteAgent — Agents.DeleteAgent от имени actor.
+func (x *Actor) DeleteAgent(agentID string) error { return x.agents.deleteAgent(x.name, agentID) }
 
 // UpdateAgent — Agents.UpdateAgent от имени actor.
 func (x *Actor) UpdateAgent(agentID string) (*Command, error) {
@@ -122,12 +128,15 @@ func (a *Agents) rotated(agentID string, result json.RawMessage) bool {
 		a.log.Warn("agent.rotateKey: нет корректного secretHash в итоге", "agent", agentID)
 		return false
 	}
-	agent, err := a.store.GetAgent(agentID)
-	if err != nil || agent.Revoked {
-		return false
-	}
-	agent.PendingSecretHash = strings.ToLower(r.SecretHash)
-	if !a.storeAgent(agent) {
+	hash := strings.ToLower(r.SecretHash)
+	agent, written, _ := a.mutateAgent(agentID, func(ag *Agent) bool {
+		if ag.Revoked {
+			return false
+		}
+		ag.PendingSecretHash = hash
+		return true
+	})
+	if !written {
 		return false
 	}
 	a.log.Info("агенту выдан новый секрет — ждём подключения с ним", "agent", agent.Name)

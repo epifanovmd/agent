@@ -39,6 +39,10 @@ type WorkerArtifact struct {
 	Signature   string `json:"signature,omitempty"`
 	Restart     string `json:"restart,omitempty"`
 	StopTimeout string `json:"stopTimeout,omitempty"`
+	// Command — для сборки-архива: что в нём запускать (путь внутри архива,
+	// например bin/report); установщик вписывает его в command воркера.
+	// Нет — агент запускает файл run архива.
+	Command string `json:"command,omitempty"`
 }
 
 // Worker — сборка воркера name под os/arch (nil — нет). Записей одного

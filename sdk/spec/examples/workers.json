@@ -17,7 +17,8 @@
         ],
         "commands": ["example.app.reload"],
         "domains": ["example.app"],
-        "channels": ["example.app"]
+        "channels": ["example.app"],
+        "ping": true
       }
     }
   },
@@ -155,6 +156,24 @@
     "message": {
       "type": "worker.drain",
       "ts": 1791380000100,
+      "data": {}
+    }
+  },
+  "worker.ping": {
+    "from": "agent",
+    "to": "worker",
+    "message": {
+      "type": "worker.ping",
+      "id": "01JAPING00000000000000001",
+      "data": {}
+    }
+  },
+  "worker.pong": {
+    "from": "worker",
+    "to": "agent",
+    "message": {
+      "type": "worker.pong",
+      "re": "01JAPING00000000000000001",
       "data": {}
     }
   },

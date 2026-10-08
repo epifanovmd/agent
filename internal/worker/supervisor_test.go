@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -57,9 +58,16 @@ func fakeWorker() {
 	if version == "" {
 		version = os.Getenv("AGENT_WORKER_RELEASE_VERSION") // воркер из выпуска
 	}
+	// WORKER_PING: answer — отвечает на worker.ping, silent — нет.
+	ping := os.Getenv("WORKER_PING")
+	var cmds []string
+	if c := os.Getenv("WORKER_COMMANDS"); c != "" {
+		cmds = strings.Split(c, ",")
+	}
 	send(message.MustNew(message.TypeWorkerRegister, message.WorkerRegister{
-		Name: "echo", Version: version, SDK: "test",
-		Queues: []message.QueueCapacity{{Name: "echo", Concurrency: 2}, {Name: "hidden", Concurrency: 1}},
+		Name: "echo", Version: version, SDK: "test", Ping: ping != "",
+		Queues:   []message.QueueCapacity{{Name: "echo", Concurrency: 2}, {Name: "hidden", Concurrency: 1}},
+		Commands: cmds,
 	}))
 	// IPC_LOG — записывать каждое сообщение агента строкой «тип данные».
 	var ipcLog *os.File
@@ -77,6 +85,22 @@ func fakeWorker() {
 		switch env.Type {
 		case message.TypeWorkerDrain:
 			os.Exit(0)
+		case message.TypeWorkerPing:
+			if ping == "answer" {
+				pong := message.MustNew(message.TypeWorkerPong, struct{}{})
+				pong.Re = env.ID
+				send(pong)
+			}
+		case message.TypeStatePut:
+			// WORKER_STATE: ok (по умолчанию) | silent (не отвечает).
+			if os.Getenv("WORKER_STATE") == "silent" {
+				continue
+			}
+			var put message.StatePut
+			_ = env.Decode(&put)
+			reply := message.MustNew(message.TypeStateApplied, message.StateApplied{Domain: put.Domain, Version: put.Version, OK: true})
+			reply.Re = env.ID
+			send(reply)
 		case message.TypeWorkerCleanup:
 			// WORKER_CLEANUP: ok (по умолчанию) | fail | silent (не отвечает).
 			reply := message.WorkerCleaned{OK: true}
@@ -95,6 +119,9 @@ func fakeWorker() {
 		case message.TypeJobAssign:
 			if os.Getenv("WORKER_CRASH") == "1" {
 				os.Exit(1)
+			}
+			if os.Getenv("WORKER_HANG") == "1" {
+				continue // задача «зависла»: ни итога, ни реакции на отмену
 			}
 			var a message.JobAssign
 			_ = env.Decode(&a)

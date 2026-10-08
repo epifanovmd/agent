@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"maps"
 	"reflect"
 	"regexp"
@@ -162,20 +163,26 @@ func (a *Agents) Subscribe(agentID string, req SubscribeRequest) (Subscription, 
 	}
 	a.mu.Lock()
 	defer a.unlock()
-	agent, err := a.store.GetAgent(agentID)
-	if err != nil {
+	var revoked bool
+	agent, _, err := a.mutateAgent(agentID, func(ag *Agent) bool {
+		if revoked = ag.Revoked; revoked {
+			return false
+		}
+		ts := now()
+		sub.Until = ts + ttl.Milliseconds()
+		subs := activeSubscriptions(ag.Subscriptions, ts)
+		subs = slices.DeleteFunc(subs, func(s Subscription) bool { return s.ID == sub.ID })
+		ag.Subscriptions = append(subs, sub)
+		return true
+	})
+	if errors.Is(err, ErrNotFound) {
 		return Subscription{}, protoErr("AGENT_NOT_FOUND", "Агент не найден")
 	}
-	if agent.Revoked {
-		return Subscription{}, protoErr("AGENT_REVOKED", "Агент отозван")
-	}
-	ts := now()
-	sub.Until = ts + ttl.Milliseconds()
-	subs := activeSubscriptions(agent.Subscriptions, ts)
-	subs = slices.DeleteFunc(subs, func(s Subscription) bool { return s.ID == sub.ID })
-	agent.Subscriptions = append(subs, sub)
-	if err := a.store.UpdateAgent(agent); err != nil {
+	if err != nil {
 		return Subscription{}, err
+	}
+	if revoked {
+		return Subscription{}, protoErr("AGENT_REVOKED", "Агент отозван")
 	}
 	if ss := a.sessions[agentID]; ss != nil {
 		a.applySubscription(ss, agent)
@@ -188,19 +195,21 @@ func (a *Agents) Subscribe(agentID string, req SubscribeRequest) (Subscription, 
 func (a *Agents) Unsubscribe(agentID, id string) error {
 	a.mu.Lock()
 	defer a.unlock()
-	agent, err := a.store.GetAgent(agentID)
-	if err != nil {
+	agent, written, err := a.mutateAgent(agentID, func(ag *Agent) bool {
+		n := len(ag.Subscriptions)
+		ag.Subscriptions = slices.DeleteFunc(ag.Subscriptions, func(s Subscription) bool { return s.ID == id })
+		if len(ag.Subscriptions) == n {
+			return false
+		}
+		if len(ag.Subscriptions) == 0 {
+			ag.Subscriptions = nil
+		}
+		return true
+	})
+	if errors.Is(err, ErrNotFound) {
 		return protoErr("AGENT_NOT_FOUND", "Агент не найден")
 	}
-	n := len(agent.Subscriptions)
-	agent.Subscriptions = slices.DeleteFunc(agent.Subscriptions, func(s Subscription) bool { return s.ID == id })
-	if len(agent.Subscriptions) == n {
-		return nil
-	}
-	if len(agent.Subscriptions) == 0 {
-		agent.Subscriptions = nil
-	}
-	if err := a.store.UpdateAgent(agent); err != nil {
+	if err != nil || !written {
 		return err
 	}
 	if ss := a.sessions[agentID]; ss != nil {
@@ -290,21 +299,26 @@ func (a *Agents) expireSubscriptions(ss *session, ts int64) {
 	if ss.closed || !ss.greeted || ss.subUntil == 0 || ts < ss.subUntil {
 		return
 	}
-	agent, err := a.store.GetAgent(ss.agentID)
-	if err != nil {
-		return
+	if agent := a.pruneSubscriptions(ss.agentID, ts, nil); agent != nil {
+		a.applySubscription(ss, agent)
 	}
-	a.pruneSubscriptions(agent, ts)
-	a.applySubscription(ss, agent)
 }
 
-// pruneSubscriptions — удалить из записи агента истёкшие подписки. Под a.mu.
-func (a *Agents) pruneSubscriptions(agent *Agent, ts int64) {
-	if !hasExpired(agent.Subscriptions, ts) {
-		return
+// pruneSubscriptions — удалить из записи агента истёкшие подписки, если
+// cond (nil — всегда) верно для свежей записи; ответ — свежая запись (nil —
+// не прочитана). Под a.mu.
+func (a *Agents) pruneSubscriptions(agentID string, ts int64, cond func(*Agent) bool) *Agent {
+	agent, _, err := a.mutateAgent(agentID, func(ag *Agent) bool {
+		if !hasExpired(ag.Subscriptions, ts) || (cond != nil && !cond(ag)) {
+			return false
+		}
+		ag.Subscriptions = activeSubscriptions(ag.Subscriptions, ts)
+		return true
+	})
+	if err != nil {
+		return nil
 	}
-	agent.Subscriptions = activeSubscriptions(agent.Subscriptions, ts)
-	a.storeAgent(agent)
+	return agent
 }
 
 // sweepOfflineSubscriptions — сверка: у агента без связи (сессии нет нигде)
@@ -314,10 +328,7 @@ func (a *Agents) sweepOfflineSubscriptions(list []*Agent, ts int64) {
 		if agent.Online || a.sessions[agent.ID] != nil || !hasExpired(agent.Subscriptions, ts) {
 			continue
 		}
-		cur, err := a.store.GetAgent(agent.ID) // другой процесс мог обновить запись
-		if err != nil || cur.Online {
-			continue
-		}
-		a.pruneSubscriptions(cur, ts)
+		// Другой процесс мог обновить запись: условие — по свежей.
+		a.pruneSubscriptions(agent.ID, ts, func(ag *Agent) bool { return !ag.Online })
 	}
 }

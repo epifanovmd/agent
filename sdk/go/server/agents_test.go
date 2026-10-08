@@ -38,9 +38,17 @@ func exampleEnv(t *testing.T, name string) message.Envelope {
 	return env
 }
 
+// resetSeq — забыть принятые seq потока агента (следующее сообщение — не повтор).
+func resetSeq(t *testing.T, agents *Agents, id string) {
+	t.Helper()
+	if _, _, err := agents.mutateAgent(id, func(ag *Agent) bool { ag.LastSeq = 0; return true }); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func enroll(t *testing.T, agents *Agents, name string) (id, secret string) {
 	t.Helper()
-	id, secret, err := agents.Enroll("t", name, nil)
+	id, secret, err := agents.Enroll("t", EnrollInfo{Name: name})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,9 +137,7 @@ func TestExamplesAccepted(t *testing.T) {
 			continue
 		}
 		n++
-		agents.mu.Lock()
-		agents.streams[id].lastSeq = 0 // каждый образец — в обработку, не как повтор
-		agents.unlock()
+		resetSeq(t, agents, id) // каждый образец — в обработку, не как повтор
 		for _, out := range handle(agents, ss, exampleEnv(t, ex.Name)) {
 			if out.Type != message.TypeError {
 				continue
@@ -229,10 +235,10 @@ func TestLeaseExpiredAndCommandTimeout(t *testing.T) {
 	agents.mu.Lock()
 	j, _ := agents.store.GetJob(job.ID)
 	j.LeaseUntil = now() - 1
-	_ = agents.store.UpdateJob(j)
+	_, _ = agents.store.UpdateJob(j)
 	c, _ := agents.store.GetCommand(cmd.ID)
 	c.CreatedAt -= 20_000
-	_ = agents.store.UpdateCommand(c)
+	_, _ = agents.store.UpdateCommand(c)
 	agents.sweep()
 	agents.unlock()
 
@@ -448,13 +454,13 @@ func TestDeleteState(t *testing.T) {
 }
 
 func TestEnrollOptions(t *testing.T) {
-	agents := newTestAgents(t, Options{Enroll: func(token string) (map[string]string, bool) {
+	agents := newTestAgents(t, Options{Enroll: func(token string, _ EnrollInfo) (map[string]string, bool) {
 		return map[string]string{"pool": token}, token == "ok"
 	}})
-	if _, _, err := agents.Enroll("bad", "a", nil); err == nil {
+	if _, _, err := agents.Enroll("bad", EnrollInfo{Name: "a"}); err == nil {
 		t.Fatal("неверный токен принят")
 	}
-	id, secret, err := agents.Enroll("ok", "a", map[string]string{"zone": "eu"})
+	id, secret, err := agents.Enroll("ok", EnrollInfo{Name: "a", Labels: map[string]string{"zone": "eu"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -643,14 +649,14 @@ func TestHelloLabels(t *testing.T) {
 	var mu sync.Mutex
 	var changes []Change
 	agents := newTestAgents(t, Options{
-		Enroll: func(string) (map[string]string, bool) { return map[string]string{"nodeId": "n1"}, true },
+		Enroll: func(string, EnrollInfo) (map[string]string, bool) { return map[string]string{"nodeId": "n1"}, true },
 		OnChange: func(c Change) {
 			mu.Lock()
 			changes = append(changes, c)
 			mu.Unlock()
 		},
 	})
-	id, _, err := agents.Enroll("t", "a", map[string]string{"zone": "eu", "nodeId": "x"})
+	id, _, err := agents.Enroll("t", EnrollInfo{Name: "a", Labels: map[string]string{"zone": "eu", "nodeId": "x"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,8 +715,8 @@ func TestListOrderNewestFirst(t *testing.T) {
 		cmdIDs = append(cmdIDs, c.ID)
 	}
 	newest := func(ids []string) []string { r := slices.Clone(ids); slices.Reverse(r); return r }
-	jobs, _ := agents.Jobs()
-	cmds, _ := agents.Commands()
+	jobs, _ := agents.Jobs(JobFilter{})
+	cmds, _ := agents.Commands(CommandFilter{})
 	stJobs, _ := agents.store.ListJobs(JobFilter{})
 	stCmds, _ := agents.store.ListCommands(CommandFilter{})
 	for name, got := range map[string][]string{

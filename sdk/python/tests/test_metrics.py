@@ -275,7 +275,7 @@ class MetricsStoreIntervalTest(Case):
         self.assertEqual(got, ats, "событие metrics — каждая точка")
         info = await self.agents.get_agent(agent.id)
         assert info is not None
-        self.assertEqual(info.metrics["host"], {"n": base + 19_999}, "agent.metrics — каждая точка")
+        self.assertEqual(info.metrics["host"], {"n": base + 20_000}, "agent.metrics — последняя по времени точка")
 
 
 class MetricsBackfillThinningTest(Case):

@@ -55,7 +55,7 @@ class AdminTest(unittest.IsolatedAsyncioTestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.app = App(self.agents, Path(tmp.name))
-        self.server = await serve(self.app, "127.0.0.1", 0)
+        self.server = await serve(self.app, "127.0.0.1", 0, body_limit=self.agents.body_limit)
         self.port = self.server.sockets[0].getsockname()[1]
 
     async def asyncTearDown(self) -> None:

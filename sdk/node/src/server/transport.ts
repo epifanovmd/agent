@@ -16,9 +16,9 @@ import {
   SYNC_PATH,
   type Envelope,
 } from "../index";
-import { baseUrl, clientAddress, readJSON, sendJSON } from "./http";
+import { baseUrl, clientAddress, readBody, readJSON, sendJSON } from "./http";
 import type { Agents } from "./agents";
-import { AgentsError } from "./model";
+import { AgentsError, ENROLL_MAX_BODY } from "./model";
 import { Session } from "./session";
 
 /** Тайминги транспорта (тесты уменьшают). */
@@ -99,7 +99,7 @@ export class Transport {
       return notFound(res);
     }
     // Значения попадают в строку sh в двойных кавычках — только безопасные символы.
-    const server = this.agents.publicUrl(baseUrl(req));
+    const server = this.agents.publicUrl(baseUrl(req, this.agents.trustProxy));
     if (!safeServer(server)) {
       sendJSON(res, 400, { code: "MESSAGE_INVALID", message: "Некорректный адрес сервера" });
       return true;
@@ -126,10 +126,17 @@ export class Transport {
     this.wss?.close();
   }
 
-  /** POST enroll — токен регистрации → учётные данные; клиент для ограничения попыток — адрес сокета. */
+  /**
+   * POST enroll — токен регистрации → учётные данные. Тело — не больше ENROLL_MAX_BODY (читается
+   * до проверки токена, больше — 413); клиент для ограничения попыток — адрес как у Agent.address.
+   */
   private async enroll(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = async () => {
+      const raw = await readBody(req, ENROLL_MAX_BODY);
+      return raw.length ? JSON.parse(raw.toString("utf8")) : {};
+    };
     try {
-      sendJSON(res, 201, await this.agents.enrollAgent(await readJSON(req), req.socket.remoteAddress || "*"));
+      sendJSON(res, 201, await this.agents.enrollAgent(body, clientAddress(req, this.agents.trustProxy) || "*"));
     } catch (err) {
       const e = err instanceof AgentsError ? err : new AgentsError("MESSAGE_INVALID", (err as Error).message);
       if (e.retryAfterSec !== undefined) res.setHeader("Retry-After", String(e.retryAfterSec));
@@ -162,7 +169,15 @@ export class Transport {
         (agent) => {
           if (!agent) return reject(socket, 401, "Unauthorized");
           wss.handleUpgrade(req, socket, head, (ws) =>
-            this.serve(ws, new Session(agent.id, "ws", baseUrl(req), clientAddress(req, this.agents.trustProxy))),
+            this.serve(
+              ws,
+              new Session(
+                agent.id,
+                "ws",
+                baseUrl(req, this.agents.trustProxy),
+                clientAddress(req, this.agents.trustProxy),
+              ),
+            ),
           );
         },
         () => reject(socket, 500, "Internal Server Error"),
@@ -244,7 +259,12 @@ export class Transport {
       if (messages[0]?.type !== "hello") {
         return sendJSON(res, 400, { code: "AGENT_HELLO_REQUIRED", message: "Первое сообщение — hello" });
       }
-      ss = new Session(agent.id, "http", baseUrl(req), clientAddress(req, this.agents.trustProxy));
+      ss = new Session(
+        agent.id,
+        "http",
+        baseUrl(req, this.agents.trustProxy),
+        clientAddress(req, this.agents.trustProxy),
+      );
       const hello = messages[0];
       await ss.serial(() => this.agents.open(ss, hello));
       if (ss.closed) {

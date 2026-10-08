@@ -34,6 +34,7 @@ test("register — первым сообщением, пустые списки 
     version: "1.0.0",
     sdk: reg.data.sdk,
     queues: [{ name: "q", concurrency: 2 }],
+    ping: true,
   });
   assert.match(reg.data.sdk, /^node\//);
   a.close();
@@ -87,7 +88,7 @@ test("задача: JobError — код и retryable, другая ошибка 
   await done;
 });
 
-test("задача: job.cancel прерывает signal, итог не отправляется; job.stop — stopRequested", async () => {
+test("задача: job.cancel прерывает signal, итог — job.fail CANCELLED; job.stop — stopRequested", async () => {
   const a = fakeAgent();
   let aborted = false;
   a.worker.job("q", { concurrency: 2 }, async (job) => {
@@ -113,12 +114,74 @@ test("задача: job.cancel прерывает signal, итог не отпр
   assert.equal(stopped.data.result.stopped, true);
   await sleep(30);
   assert.ok(aborted);
-  assert.equal(
-    a.inbox.got.some((e) => e.data?.jobId === "c" && (e.type === "job.complete" || e.type === "job.fail")),
-    false,
+  assert.deepEqual(
+    a.inbox.got
+      .filter((e) => e.data?.jobId === "c" && (e.type === "job.complete" || e.type === "job.fail"))
+      .map((e) => e.data),
+    [{ jobId: "c", attempt: 0, code: "CANCELLED", message: "задача отменена", retryable: false }],
   );
   a.close();
   await done;
+});
+
+test("отмена: CANCELLED ровно один раз — и когда обработчик вернул результат, и для ждущей задачи", async () => {
+  const a = fakeAgent();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let runs = 0;
+  a.worker.job("q", async () => {
+    runs++;
+    await gate; // отмену обработчик не замечает и возвращает результат
+    return "ok";
+  });
+  const done = a.worker.run({ signals: false });
+  a.send("job.assign", assign("run"));
+  a.send("job.assign", assign("wait"));
+  await sleep(20);
+  a.send("job.cancel", { jobId: "wait", attempt: 0 });
+  const waiting = await a.inbox.wait("job.fail", (e) => e.data.jobId === "wait");
+  assert.equal(waiting.data.code, "CANCELLED");
+  a.send("job.cancel", { jobId: "run", attempt: 0 });
+  a.send("job.cancel", { jobId: "run", attempt: 0 });
+  await sleep(20);
+  assert.equal(
+    a.inbox.all("job.fail").filter((e) => e.data.jobId === "run").length,
+    0,
+    "до возврата обработчика подтверждения нет",
+  );
+  release();
+  await a.inbox.wait("job.fail", (e) => e.data.jobId === "run");
+  await sleep(30);
+  const results = a.inbox.got.filter((e) => e.type === "job.complete" || e.type === "job.fail");
+  assert.deepEqual(
+    results.map((e) => [e.data.jobId, e.data.code]),
+    [
+      ["wait", "CANCELLED"],
+      ["run", "CANCELLED"],
+    ],
+  );
+  assert.equal(runs, 1);
+  a.close();
+  await done;
+});
+
+test("отмена: канал закрыт до возврата обработчика — подтверждение не отправляется", async () => {
+  const a = fakeAgent();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  a.worker.job("q", async () => {
+    await gate;
+    return "ok";
+  });
+  const done = a.worker.run({ signals: false });
+  a.send("job.assign", assign("j"));
+  await sleep(20);
+  a.send("job.cancel", { jobId: "j", attempt: 0 });
+  await sleep(20);
+  a.close();
+  release();
+  await done;
+  assert.equal(a.inbox.all("job.fail").length, 0);
 });
 
 test("задачи очереди — не больше concurrency одновременно", async () => {
@@ -529,11 +592,15 @@ test('телеметрия intervalMs: "auto" — с частотой подпи
   await done;
 });
 
-test("самоуправление: setHealth, pause, resume, requestRestart — сообщения агенту; до run — после register", async () => {
+test("самоуправление: setHealth, pause, resume, requestRestart — сообщения агенту; до run — после worker.ready", async () => {
   const a = fakeAgent();
   a.worker.job("q1", async () => null).job("q2", async () => null);
   a.worker.setHealth(false, "нет связи с базой");
   const done = a.worker.run({ signals: false });
+  await a.inbox.wait("worker.register");
+  await sleep(30);
+  assert.equal(a.inbox.all("worker.health").length, 0, "до worker.ready — копится");
+  a.send("worker.ready", { agentVersion: "1.1.0" });
   await a.inbox.wait("worker.health");
   assert.equal(a.inbox.got[0].type, "worker.register");
   a.worker.setHealth(true);

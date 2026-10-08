@@ -10,15 +10,9 @@ type agentLog struct {
 	entries []message.LogEntry
 }
 
-// receiveLog — сообщение log (поток): записи — в OnLog (SDK их не хранит). Под a.mu.
-func (a *Agents) receiveLog(agent *Agent, env message.Envelope) *message.Error {
-	var l message.LogBatch
-	if err := env.Decode(&l); err != nil {
-		return invalid(env.Type, err)
+// receiveLog — записи сообщения log (поток) — в OnLog (SDK их не хранит). Под a.mu.
+func (a *Agents) receiveLog(agentID string, entries []message.LogEntry) {
+	if a.opts.OnLog != nil && len(entries) > 0 {
+		a.logs = append(a.logs, agentLog{agentID: agentID, entries: entries})
 	}
-	a.storeAgent(agent) // lastSeenAt
-	if a.opts.OnLog != nil && len(l.Entries) > 0 {
-		a.logs = append(a.logs, agentLog{agentID: agent.ID, entries: l.Entries})
-	}
-	return nil
 }

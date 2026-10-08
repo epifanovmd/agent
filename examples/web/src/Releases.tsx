@@ -109,7 +109,17 @@ export function ReleasePanel({ snapshot }: { snapshot: Snapshot }) {
                   </td>
                   <td className="actions">
                     {cmd && (
-                      <Badge tone={cmd.status === "failed" ? "bad" : cmd.status === "succeeded" ? "ok" : "info"}>
+                      <Badge
+                        tone={
+                          cmd.status === "failed"
+                            ? "bad"
+                            : cmd.status === "succeeded"
+                              ? "ok"
+                              : cmd.status === "cancelled"
+                                ? "muted"
+                                : "info"
+                        }
+                      >
                         {cmd.status}
                         {cmd.error ? `: ${cmd.error.code}` : ""}
                       </Badge>
@@ -167,7 +177,17 @@ export function ReleasePanel({ snapshot }: { snapshot: Snapshot }) {
                     </td>
                     <td className="actions">
                       {cmd && (
-                        <Badge tone={cmd.status === "failed" ? "bad" : cmd.status === "succeeded" ? "ok" : "info"}>
+                        <Badge
+                          tone={
+                            cmd.status === "failed"
+                              ? "bad"
+                              : cmd.status === "succeeded"
+                                ? "ok"
+                                : cmd.status === "cancelled"
+                                  ? "muted"
+                                  : "info"
+                          }
+                        >
                           {cmd.status}
                           {cmd.error ? `: ${cmd.error.code}` : ""}
                         </Badge>

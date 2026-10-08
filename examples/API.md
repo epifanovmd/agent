@@ -15,6 +15,7 @@
 | POST   | `/api/jobs/:id/cancel`, `/api/jobs/:id/stop` | отменить / закончить пораньше → Job                                                                           |
 | POST   | `/api/commands`                              | команда `{name, args, timeoutSec, agentId}` → Command                                                         |
 | GET    | `/api/commands/:id`                          | Command                                                                                                       |
+| POST   | `/api/commands/:id/cancel`                   | отменить ждущую или выполняющуюся команду → Command (`cancelled`)                                             |
 | PUT    | `/api/state/:domain?agentId=`                | задать состояние (тело — снимок); без `agentId` — всем → DesiredState                                         |
 | DELETE | `/api/state/:domain?agentId=`                | с `agentId` — вернуть агента на общее состояние; без — удалить общий снимок → `{state: DesiredState \| null}` |
 | GET    | `/api/state/:domain/history?agentId=&limit=` | история версий раздела, от новых к старым → DesiredState[]                                                    |
@@ -23,6 +24,7 @@
 | POST   | `/api/agents/:id/subscriptions`              | подписка на агента (тело — как у `agents.subscribe`, ниже) → `{id, until}`                                    |
 | DELETE | `/api/agents/:id/subscriptions/:subId`       | снять подписку → `{}`                                                                                         |
 | POST   | `/api/agents/:id/revoke`                     | отозвать агента → Agent                                                                                       |
+| DELETE | `/api/agents/:id`                            | удалить отозванного агента (запись и историю метрик) → `{}`                                                   |
 | POST   | `/api/agents/:id/update`                     | обновить агента → Command (`agent.update`)                                                                    |
 | POST   | `/api/agents/:id/rotate-key`                 | сменить ключ агента → Command (`agent.rotateKey`)                                                             |
 | POST   | `/api/agents/:id/workers/:name/update`       | обновить воркер из выпуска → Command (`worker.update`)                                                        |
@@ -50,7 +52,9 @@
 Все части необязательные. Интервал меньше 200 мс, неверное имя группы или канала, неизвестный
 уровень — ошибка `MESSAGE_INVALID`. Подписки агента видны в его записи (`subscriptions`).
 
-Ошибки — `{code, message}` с HTTP-статусом: `404 *_NOT_FOUND`, `409 UPDATE_NOT_AVAILABLE` и т. д.
+Ошибки — `{code, message}` с HTTP-статусом: `404 *_NOT_FOUND`, `409 UPDATE_NOT_AVAILABLE`,
+`409 COMMAND_NOT_ACTIVE` (команда уже завершена), `409 AGENT_NOT_REVOKED` (удалить можно только
+отозванного), `409 STORE_CONFLICT` и т. д.
 
 ## Изменения вживую — WebSocket `/api/ws`
 

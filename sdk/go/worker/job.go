@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,6 +89,7 @@ type Job struct {
 	log          []string
 	lastSent     time.Time
 	timer        *time.Timer
+	eventMu      sync.Mutex // порядок событий и их seq
 	eventSeq     int64
 	tmpDir       string
 	closed       bool
@@ -139,7 +141,8 @@ func (j *Job) Log(line string) {
 }
 
 // Event — доменное событие задачи (итог этапа и т. п.): надёжно и по
-// порядку, seq нумерует SDK с 1 в пределах попытки.
+// порядку, seq нумерует SDK с 1 в пределах попытки. Событие больше 16 МБ не
+// отправляется (ошибка и запись в лог).
 func (j *Job) Event(typ string, data any) error {
 	var raw json.RawMessage
 	if data != nil {
@@ -149,11 +152,14 @@ func (j *Job) Event(typ string, data any) error {
 		}
 	}
 	j.flush()
-	j.mu.Lock()
-	j.eventSeq++
-	seq := j.eventSeq
-	j.mu.Unlock()
-	return j.w.send(message.TypeJobEvent, message.JobEvent{JobRef: j.ref(), Seq: seq, Type: truncate(typ, 50), Data: raw}, "")
+	j.eventMu.Lock()
+	defer j.eventMu.Unlock()
+	seq := j.eventSeq + 1
+	err := j.w.send(message.TypeJobEvent, message.JobEvent{JobRef: j.ref(), Seq: seq, Type: truncate(typ, 50), Data: raw}, "")
+	if err == nil {
+		j.eventSeq = seq // не отправленное (больше 16 МБ) номер не занимает
+	}
+	return err
 }
 
 // Inputs — имена входных файлов.
@@ -171,8 +177,16 @@ func (j *Job) Outputs() []string {
 }
 
 // InputPath — входной файл во временном каталоге задачи (скачивается один
-// раз; каталог удаляется по завершении задачи).
+// раз; каталог удаляется по завершении задачи). Имя файла в каталоге — только
+// последняя часть name: каталоги и «..» отбрасываются.
 func (j *Job) InputPath(ctx context.Context, name string) (string, error) {
+	base, err := baseName(name)
+	if err != nil {
+		return "", err
+	}
+	if _, ok := j.inputURL(name); !ok {
+		return "", fmt.Errorf("worker: нет входного файла %q", name)
+	}
 	j.mu.Lock()
 	if j.tmpDir == "" {
 		dir, err := os.MkdirTemp("", "job-"+safePrefix(j.ID)+"-")
@@ -182,7 +196,7 @@ func (j *Job) InputPath(ctx context.Context, name string) (string, error) {
 		}
 		j.tmpDir = dir
 	}
-	target := filepath.Join(j.tmpDir, "inputs", filepath.Base(name))
+	target := filepath.Join(j.tmpDir, "inputs", base)
 	j.mu.Unlock()
 	if _, err := os.Stat(target); err == nil {
 		return target, nil
@@ -311,7 +325,8 @@ func (j *Job) expiring() bool {
 
 // ─── жизненный цикл (Worker) ───────────────────────────────────────────
 
-// abort — job.cancel: прервать, итог не отправлять.
+// abort — job.cancel (или новая попытка): прервать; итог обработчика не
+// отправляется, когда обработчик завершится — job.fail CANCELLED (confirmCancel).
 func (j *Job) abort() {
 	if !j.cancelled.Swap(true) {
 		j.w.log.Info("задача отменена", "job", j.ID)
@@ -383,6 +398,19 @@ func (j *Job) close() {
 		_ = os.RemoveAll(dir)
 	}
 	j.cancel()
+}
+
+// baseName — последняя часть имени файла (разделители «/» и «\»); пусто,
+// «.» и «..» — ошибка.
+func baseName(name string) (string, error) {
+	base := name
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	if base == "" || base == "." || base == ".." {
+		return "", fmt.Errorf("worker: неверное имя входного файла %q", name)
+	}
+	return base, nil
 }
 
 func safePrefix(id string) string {

@@ -46,33 +46,30 @@ func (w *Worker) OnContext(fn func(Context)) {
 
 // SetHealth — воркер сам сообщает агенту, в порядке ли он (worker.health):
 // ok == false — status.workers[].health = degraded с причиной message, на
-// сервере — alert workerDegraded; ok == true — снова в порядке.
+// сервере — alert workerDegraded; ok == true — снова в порядке (message —
+// пояснение, необязательно). До worker.ready сообщение копится (см. control).
 func (w *Worker) SetHealth(ok bool, msg string) error {
-	h := message.WorkerHealth{OK: ok}
-	if !ok {
-		h.Message = truncate(msg, 2000)
-	}
-	return w.send(message.TypeWorkerHealth, h, "")
+	return w.control(message.TypeWorkerHealth, message.WorkerHealth{OK: ok, Message: truncate(msg, 2000)})
 }
 
 // Pause — не брать новые задачи очередей queues (без queues — всех своих):
 // агент перестаёт их выдавать, выданные доделываются. Пауза воркера
 // независима от паузы с сервера (команда worker.pause).
 func (w *Worker) Pause(queues ...string) error {
-	return w.send(message.TypeWorkerPause, message.WorkerPause{Queues: slices.Clone(queues)}, "")
+	return w.control(message.TypeWorkerPause, message.WorkerPause{Queues: slices.Clone(queues)})
 }
 
 // Resume — снова брать задачи очередей queues (без queues — всех), снятых
 // Pause; паузу с сервера не снимает.
 func (w *Worker) Resume(queues ...string) error {
-	return w.send(message.TypeWorkerResume, message.WorkerResume{Queues: slices.Clone(queues)}, "")
+	return w.control(message.TypeWorkerResume, message.WorkerResume{Queues: slices.Clone(queues)})
 }
 
 // RequestRestart — попросить агента заменить воркер штатно (как команда
 // worker.restart: его способом, без статуса сбоя и без alert); reason — в
 // журнал агента.
 func (w *Worker) RequestRestart(reason string) error {
-	return w.send(message.TypeWorkerRestart, message.WorkerRestartRequest{Reason: truncate(reason, 2000)}, "")
+	return w.control(message.TypeWorkerRestart, message.WorkerRestartRequest{Reason: truncate(reason, 2000)})
 }
 
 // setContext — worker.context от агента: запомнить, разбудить опрос

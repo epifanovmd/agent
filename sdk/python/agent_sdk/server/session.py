@@ -54,7 +54,7 @@ class Session:
         self.code = 0
         #: Выданные, ещё не принятые задачи: jobId → очередь (занимают слот).
         self.pending: Dict[str, str] = {}
-        #: Команды, отправленные в этой сессии.
+        #: Команды, отправленные в этой сессии (``cmd.run``) и ещё не завершённые.
         self.sent: Set[str] = set()
         #: Домен → версия, известная агенту.
         self.known: Dict[str, int] = {}
@@ -69,6 +69,9 @@ class Session:
         self.address = ""
         #: Закрыть сессию кодом 1012 после ответа на текущее сообщение (ключ сменён).
         self.restart = False
+        #: Изменения уведомлений о проблемах по текущему сообщению: ``fn(запись агента) -> [Alert]``
+        #: (применяются к свежей записи при её записи).
+        self.alert_ops: List[Any] = []
         self._waiters: Set[asyncio.Future] = set()
 
     def send(self, type: str, data: Any, re: Optional[str] = None) -> None:

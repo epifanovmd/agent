@@ -19,11 +19,11 @@ from .. import __version__
 from .channel import Channel
 from .command import Command
 from .context import ContextAgent, WorkerContext
-from .errors import AgentError, Cancelled, CommandFailed, JobFailed, StateFailed
+from .errors import AgentError, Cancelled, CommandFailed, JobFailed, MessageTooLarge, StateFailed
 from .job import Job
 from .worker import AUTO_INTERVAL, Worker
 
 __all__ = [
     "AUTO_INTERVAL", "AgentError", "Cancelled", "Channel", "Command", "CommandFailed", "ContextAgent", "Job",
-    "JobFailed", "StateFailed", "Worker", "WorkerContext", "__version__",
+    "JobFailed", "MessageTooLarge", "StateFailed", "Worker", "WorkerContext", "__version__",
 ]

@@ -35,8 +35,14 @@ import { MemoryFiles, type Files } from "./files";
 import { installCommand, type InstallOptions } from "./install";
 import {
   AgentsError,
+  commandFinished,
+  ENROLL_MAX_LABEL,
+  ENROLL_MAX_LABELS,
+  ENROLL_MAX_NAME,
+  jobFinished,
   publicAgent,
   helloLabels,
+  publicCommand,
   publicJob,
   type Agent,
   type Alert,
@@ -50,6 +56,7 @@ import {
   type ChangeKind,
   type Command,
   type CommandFilter,
+  type CommandRecord,
   type CommandRequest,
   type DesiredState,
   type Job,
@@ -57,6 +64,7 @@ import {
   type JobRecord,
   type JobRequest,
   type MetricsPoint,
+  type PruneOptions,
   type ReleaseManifest,
   type UpdateCandidate,
   type WorkerArtifact,
@@ -70,7 +78,10 @@ import { Transport } from "./transport";
 export interface AgentsOptions {
   /** Токен регистрации агентов (или своя проверка — enroll). */
   enrollToken?: string;
-  /** Своя проверка токена регистрации: метки агента или null — отказ. */
+  /**
+   * Своя проверка токена регистрации: метки агента или null — отказ. Получает токен и
+   * name, labels, host из запроса (уже проверенные на пределы).
+   */
   enroll?: (
     token: string,
     req: { name: string; labels: Record<string, string>; host?: unknown },
@@ -112,8 +123,10 @@ export interface AgentsOptions {
   /** Окно подсчёта неудачных регистраций, мс (по умолчанию 60000). */
   enrollFailureWindowMs?: number;
   /**
-   * Сервер за доверенным прокси: адрес агента (Agent.address) — первый из X-Forwarded-For.
-   * По умолчанию false — адрес сокета (заголовок подделывается клиентом).
+   * Сервер за доверенным прокси: адрес агента (Agent.address) и адрес для ограничения неудачных
+   * регистраций — первый из X-Forwarded-For, адрес сервера для ссылок — из X-Forwarded-Host и
+   * X-Forwarded-Proto. По умолчанию false — адрес сокета и заголовок Host (заголовки X-Forwarded-*
+   * подделываются клиентом).
    */
   trustProxy?: boolean;
   log?: (msg: string, extra?: Record<string, unknown>) => void;
@@ -217,12 +230,16 @@ const ROTATE_TIMEOUT_SEC = 60;
 const WORKER_CONTROL_TIMEOUT_SEC = 30;
 /** Сколько версий истории просматривает rollbackState. */
 const ROLLBACK_LOOKUP = 1000;
+/** Попыток условной записи при конфликте rev (запись одновременно меняют другие процессы). */
+const MUTATE_ATTEMPTS = 8;
+/** Поля записи агента, которые меняют сообщения потока (кроме lastSeenAt, lastSeq, stateApplied, alerts). */
+const MESSAGE_FIELDS = ["status", "metrics", "metricsAt", "inventory", "capabilities", "pendingSecretHash"] as const;
 
 /**
  * Движок связи с агентами. Бэкенд подключает транспорты (`attach`, `handle`) и
  * пользуется API приложения: задачи, команды, состояние, чтение, события.
- * Изменения выполняются по одному (Store асинхронный): гонок между сессиями
- * и API нет.
+ * В процессе изменения выполняются по одному; записи в Store — условные (по rev) с
+ * повтором, поэтому несколько процессов с общим Store не затирают изменения друг друга.
  */
 export class Agents extends EventEmitter<AgentsEvents> {
   readonly store: Store;
@@ -249,8 +266,6 @@ export class Agents extends EventEmitter<AgentsEvents> {
   private readonly callWaiters = new Set<() => void>();
   /** Адрес клиента → моменты неудачных регистраций в окне. */
   private readonly enrollFailures = new Map<string, number[]>();
-  /** Активные проблемы этого процесса: ключ (type, agentId, domain|worker). */
-  private readonly activeAlerts = new Map<string, Alert>();
   /** Сессии, которые закрыть кодом 1012 после ответа на cmd.done agent.rotateKey. */
   private readonly restartAfterReply = new WeakSet<Session>();
   private readonly transport: Transport;
@@ -297,9 +312,9 @@ export class Agents extends EventEmitter<AgentsEvents> {
       agentsDefaults.sweepIntervalMs,
     );
     this.timer.unref();
-    this.pruneTimer = setInterval(() => void this.prune(), agentsDefaults.pruneIntervalMs);
+    this.pruneTimer = setInterval(() => void this.pruneMetricsHistory(), agentsDefaults.pruneIntervalMs);
     this.pruneTimer.unref();
-    void this.prune();
+    void this.pruneMetricsHistory();
   }
 
   // ── транспорт ──
@@ -378,6 +393,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
         createdAt: Date.now(),
         leaseUntil: 0,
         eventSeq: 0,
+        rev: 0,
       };
       if (req.agentId) job.pinnedAgentId = req.agentId;
       if (actor) job.actor = actor;
@@ -396,7 +412,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return j && publicJob(j);
   }
 
-  /** Задачи, новые первыми. */
+  /** Задачи, новые первыми; limit и after — постраничное чтение. */
   async listJobs(filter?: JobFilter): Promise<Job[]> {
     return (await this.store.listJobs(filter)).map(publicJob);
   }
@@ -408,9 +424,45 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return this.commandAs("", req);
   }
 
-  /** Команда и её итог (succeeded или failed; срок — timeoutSec + 15 с). */
+  /** Команда и её итог (succeeded, failed или cancelled; срок — timeoutSec + 15 с). */
   call(req: CommandRequest): Promise<Command> {
     return this.callAs("", req);
+  }
+
+  /**
+   * Отменить команду: ждущая или выполняющаяся становится cancelled (error CANCELLED). Уже
+   * отправленной агенту или выполняющейся — агенту cmd.cancel; ждущая и не отправленная —
+   * без сообщения. Итог агента после отмены не учитывается. Сессия агента в другом процессе —
+   * cmd.cancel шлёт тот процесс при refresh. Нет — COMMAND_NOT_FOUND; завершена — COMMAND_NOT_ACTIVE.
+   */
+  cancelCommand(id: string): Promise<Command> {
+    return this.cancelCommandAs("", id);
+  }
+
+  private async cancelCommandAs(actor: string, id: string): Promise<Command> {
+    const res = await this.exclusive(async () => {
+      let wasRunning = false;
+      const cmd = await this.mutateCommand(id, (c) => {
+        if (commandFinished(c)) throw new AgentsError("COMMAND_NOT_ACTIVE", "Команда уже завершена", 409);
+        wasRunning = c.status === "running";
+        Object.assign(c, {
+          status: "cancelled",
+          error: { code: "CANCELLED", message: "Команду отменили" },
+          finishedAt: Date.now(),
+        });
+        return true;
+      });
+      if (!cmd) throw new AgentsError("COMMAND_NOT_FOUND", "Команда не найдена", 404);
+      const ss = this.sessions.get(cmd.agentId);
+      if (ss && (wasRunning || ss.sent.has(cmd.id))) {
+        ss.sent.delete(cmd.id);
+        ss.send("cmd.cancel", { commandId: cmd.id });
+      }
+      this.commandChanged(cmd);
+      return publicCommand(cmd);
+    });
+    this.audit(actor, "command.cancel", id, res.agentId);
+    return res;
   }
 
   private async commandAs(actor: string, req: CommandRequest): Promise<Command> {
@@ -433,11 +485,11 @@ export class Agents extends EventEmitter<AgentsEvents> {
         const capable = (await this.store.listAgents()).filter(
           (a) => !a.revoked && a.capabilities?.commands?.names?.includes(req.name),
         );
-        agentId = (capable.find((a) => this.sessions.has(a.id)) ?? capable[0])?.id;
+        agentId = (capable.find((a) => a.online) ?? capable[0])?.id;
         if (!agentId)
           throw new AgentsError("COMMAND_NOT_SUPPORTED", `Ни один агент не объявил команду ${req.name}`, 404);
       }
-      const cmd: Command = {
+      const cmd: CommandRecord = {
         id: newId(),
         agentId,
         name: req.name,
@@ -446,6 +498,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
         status: "pending",
         output: "",
         createdAt: Date.now(),
+        rev: 0,
       };
       if (actor) cmd.actor = actor;
       await this.store.createCommand(cmd);
@@ -453,7 +506,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
       const agent = ss && (await this.store.getAgent(agentId));
       if (ss && agent) await this.deliver(ss, agent);
       this.commandChanged(cmd);
-      return cmd;
+      return publicCommand(cmd);
     });
   }
 
@@ -465,7 +518,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
    */
   private async callAs(actor: string, req: CommandRequest): Promise<Command> {
     const cmd = await this.commandAs(actor, req);
-    const finished = (c: Command) => c.status === "succeeded" || c.status === "failed";
+    const finished = commandFinished;
     return new Promise<Command>((resolve) => {
       let settled = false;
       const finish = (c: Command) => {
@@ -481,26 +534,27 @@ export class Agents extends EventEmitter<AgentsEvents> {
         if (c.id === cmd.id && finished(c)) finish(c);
       };
       const recheck = () => {
-        void this.store.getCommand(cmd.id).then((c) => c && finished(c) && finish(c));
+        void this.store.getCommand(cmd.id).then((c) => c && finished(c) && finish(publicCommand(c)));
       };
       this.on("command", onCommand);
       this.callWaiters.add(recheck);
       const poll = setInterval(recheck, agentsDefaults.callPollIntervalMs);
       const deadline = setTimeout(
-        () => void this.store.getCommand(cmd.id).then((c) => finish(c ?? cmd)),
+        () => void this.store.getCommand(cmd.id).then((c) => finish(c ? publicCommand(c) : cmd)),
         cmd.timeoutSec * 1000 + agentsDefaults.commandGraceMs + agentsDefaults.callSlackMs,
       );
       recheck(); // итог мог прийти до подписки
     });
   }
 
-  getCommand(id: string): Promise<Command | undefined> {
-    return this.store.getCommand(id);
+  async getCommand(id: string): Promise<Command | undefined> {
+    const c = await this.store.getCommand(id);
+    return c && publicCommand(c);
   }
 
-  /** Команды, новые первыми. */
-  listCommands(filter?: CommandFilter): Promise<Command[]> {
-    return this.store.listCommands(filter);
+  /** Команды, новые первыми; limit и after — постраничное чтение. */
+  async listCommands(filter?: CommandFilter): Promise<Command[]> {
+    return (await this.store.listCommands(filter)).map(publicCommand);
   }
 
   // ── желаемое состояние ──
@@ -654,22 +708,66 @@ export class Agents extends EventEmitter<AgentsEvents> {
 
   private async revokeAs(actor: string, agentId: string): Promise<Agent> {
     const res = await this.exclusive(async () => {
-      const agent = await this.store.getAgent(agentId);
+      let ended: Alert[] = [];
+      const agent = await this.mutateAgent(agentId, (a) => {
+        a.revoked = true;
+        a.online = false;
+        delete a.subscriptions;
+        delete a.pendingSecretHash;
+        // Отозванный — не «проблема»: его уведомления закончились.
+        ended = applyAlerts(a, [{ settle: () => true }], Date.now()).ended;
+        return true;
+      });
       if (!agent) throw new AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404);
-      agent.revoked = true;
-      agent.online = false;
-      delete agent.subscriptions;
-      delete agent.pendingSecretHash;
       this.dropSession(agentId);
-      await this.store.updateAgent(agent);
       this.opts.log("агент отозван", { agent: agent.name, id: agent.id });
       this.agentChanged(agent);
-      // Отозванный — не «проблема»: его уведомления закончились.
-      for (const a of [...this.activeAlerts.values()]) if (a.agentId === agentId) this.settle(a);
+      this.emitAlerts(ended);
       return publicAgent(agent);
     });
     this.audit(actor, "agent.revoke", agentId, agentId);
     return res;
+  }
+
+  /**
+   * Удалить отозванного агента (сначала revoke): его запись и история метрик. Задачи, команды,
+   * события и снимки состояния остаются. Нет — AGENT_NOT_FOUND; не отозван — AGENT_NOT_REVOKED.
+   */
+  deleteAgent(agentId: string): Promise<void> {
+    return this.deleteAgentAs("", agentId);
+  }
+
+  private async deleteAgentAs(actor: string, agentId: string): Promise<void> {
+    await this.exclusive(async () => {
+      const agent = await this.store.getAgent(agentId);
+      if (!agent) throw new AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404);
+      if (!agent.revoked) throw new AgentsError("AGENT_NOT_REVOKED", "Удалить можно только отозванного агента", 409);
+      if (!(await this.store.deleteAgent(agentId))) throw new AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404);
+      this.dropSession(agentId);
+      this.eventIds.delete(agentId);
+      this.lastStored.delete(agentId);
+      this.lastStored.delete(`${agentId}\0backfill`);
+      this.opts.log("агент удалён", { agent: agent.name, id: agentId });
+      this.notify("agent", agentId);
+    });
+    this.audit(actor, "agent.delete", agentId, agentId);
+  }
+
+  /**
+   * Уборка Store: завершённые задачи и команды, завершённые раньше, чем столько мс назад, и
+   * события старше. Нет или 0 — этот вид записей не трогать. Результат — сколько записей
+   * удалено. Сами Agents уборку не запускают: её вызывает бэкенд (например, раз в час).
+   */
+  async prune(opts: PruneOptions = {}): Promise<number> {
+    const now = Date.now();
+    const before = (ms: number | undefined) => (ms && ms > 0 ? now - ms : undefined);
+    const removed = await this.store.prune({
+      jobsBefore: before(opts.jobsOlderThanMs),
+      commandsBefore: before(opts.commandsOlderThanMs),
+      eventsBefore: before(opts.eventsOlderThanMs),
+    });
+    if (removed > 0) this.opts.log("старые записи удалены", { records: removed });
+    return removed;
   }
 
   /**
@@ -692,9 +790,14 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return cmd;
   }
 
-  /** Активные проблемы этого процесса (для снимка интерфейса). */
-  alerts(): Alert[] {
-    return [...this.activeAlerts.values()].map((a) => ({ ...a }));
+  /**
+   * Активные проблемы всех агентов (из записей агентов в Store — видны любому процессу),
+   * по времени начала.
+   */
+  async alerts(): Promise<Alert[]> {
+    const out: Alert[] = [];
+    for (const a of await this.store.listAgents()) if (!a.revoked) for (const x of a.alerts ?? []) out.push({ ...x });
+    return out.sort((x, y) => x.at - y.at);
   }
 
   // ── метрики ──
@@ -718,17 +821,18 @@ export class Agents extends EventEmitter<AgentsEvents> {
     const sub = subscriptionFrom(opts);
     const ttlMs = Math.max(1, Math.floor(opts.ttlMs ?? 30_000));
     return this.exclusive(async () => {
-      const agent = await this.store.getAgent(agentId);
-      if (!agent) throw new AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404);
-      if (agent.revoked) throw new AgentsError("AGENT_REVOKED", "Агент отозван", 409);
       const now = Date.now();
       sub.until = now + ttlMs;
-      const subs = (agent.subscriptions ?? []).filter((s) => s.until > now);
-      const at = subs.findIndex((s) => s.id === sub.id);
-      if (at >= 0) subs[at] = sub;
-      else subs.push(sub);
-      agent.subscriptions = subs;
-      await this.store.updateAgent(agent);
+      const agent = await this.mutateAgent(agentId, (a) => {
+        if (a.revoked) throw new AgentsError("AGENT_REVOKED", "Агент отозван", 409);
+        const subs = (a.subscriptions ?? []).filter((s) => s.until > now);
+        const at = subs.findIndex((s) => s.id === sub.id);
+        if (at >= 0) subs[at] = sub;
+        else subs.push(sub);
+        a.subscriptions = subs;
+        return true;
+      });
+      if (!agent) throw new AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404);
       this.applySubscription(agent, now);
       return { id: sub.id, until: sub.until };
     });
@@ -737,16 +841,19 @@ export class Agents extends EventEmitter<AgentsEvents> {
   /** Снять подписку id; её нет — не ошибка. Агента нет — AGENT_NOT_FOUND. */
   async unsubscribe(agentId: string, id: string): Promise<void> {
     return this.exclusive(async () => {
-      const agent = await this.store.getAgent(agentId);
-      if (!agent) throw new AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404);
       const now = Date.now();
-      const subs = agent.subscriptions ?? [];
-      const left = subs.filter((s) => s.id !== id && s.until > now);
-      if (left.length === subs.length) return;
-      if (left.length) agent.subscriptions = left;
-      else delete agent.subscriptions;
-      await this.store.updateAgent(agent);
-      this.applySubscription(agent, now);
+      let found = false;
+      const agent = await this.mutateAgent(agentId, (a) => {
+        found = true;
+        const subs = a.subscriptions ?? [];
+        const left = subs.filter((s) => s.id !== id && s.until > now);
+        if (left.length === subs.length) return false;
+        if (left.length) a.subscriptions = left;
+        else delete a.subscriptions;
+        return true;
+      });
+      if (!found) throw new AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404);
+      if (agent) this.applySubscription(agent, now);
     });
   }
 
@@ -973,13 +1080,11 @@ export class Agents extends EventEmitter<AgentsEvents> {
   // ── для транспортов (внутреннее) ──
 
   /**
-   * @internal POST enroll: токен регистрации → учётные данные. remote — адрес клиента
+   * @internal POST enroll: токен регистрации → учётные данные. body — тело запроса или функция,
+   * читающая его (ошибка чтения, например 413, идёт в счёт неудач). remote — адрес клиента
    * (ограничение неудачных попыток); неизвестен — "*".
    */
-  async enrollAgent(
-    body: { token?: unknown; name?: unknown; labels?: Record<string, string>; host?: unknown } | null | undefined,
-    remote = "*",
-  ): Promise<{ agentId: string; secret: string }> {
+  async enrollAgent(body: unknown, remote = "*"): Promise<{ agentId: string; secret: string }> {
     const client = remote || "*";
     const limit = this.opts.enrollFailureLimit;
     const window = this.opts.enrollFailureWindowMs;
@@ -999,7 +1104,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
       }
     }
     try {
-      return await this.enrollChecked(body);
+      return await this.enrollChecked(typeof body === "function" ? await (body as () => Promise<unknown>)() : body);
     } catch (e) {
       if (limit > 0) this.enrollFailed(client, window);
       throw e;
@@ -1017,15 +1122,17 @@ export class Agents extends EventEmitter<AgentsEvents> {
     }
   }
 
-  private async enrollChecked(
-    body: { token?: unknown; name?: unknown; labels?: Record<string, string>; host?: unknown } | null | undefined,
-  ): Promise<{ agentId: string; secret: string }> {
-    const token = String(body?.token ?? "");
-    const name = String(body?.name ?? "");
-    if (!name || !token) throw new AgentsError("MESSAGE_INVALID", "Нужны token и name");
-    const labels: Record<string, string> = { ...(body?.labels ?? {}) };
+  private async enrollChecked(body: unknown): Promise<{ agentId: string; secret: string }> {
+    if (body instanceof SyntaxError) throw new AgentsError("MESSAGE_INVALID", body.message);
+    const b = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+    const { token, name } = b;
+    if (typeof token !== "string" || !token || typeof name !== "string" || !name)
+      throw new AgentsError("MESSAGE_INVALID", "Нужны token и name — непустые строки");
+    if ([...name].length > ENROLL_MAX_NAME)
+      throw new AgentsError("MESSAGE_INVALID", `name длиннее ${ENROLL_MAX_NAME} символов`);
+    const labels = enrollLabels(b.labels);
     const verdict = this.opts.enroll
-      ? await this.opts.enroll(token, { name, labels, host: body?.host })
+      ? await this.opts.enroll(token, { name, labels: { ...labels }, host: b.host })
       : safeEqual(token, this.opts.enrollToken!)
         ? {}
         : null;
@@ -1042,6 +1149,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
       stateApplied: {},
       secretHash: sha256(secret),
       lastSeq: 0,
+      rev: 0,
     };
     await this.store.createAgent(agent);
     this.opts.log("агент зарегистрирован", { agent: name, id: agent.id });
@@ -1062,15 +1170,19 @@ export class Agents extends EventEmitter<AgentsEvents> {
     if (!agent.pendingSecretHash || !safeEqual(hash, agent.pendingSecretHash)) return undefined;
     // Вход с новым секретом после agent.rotateKey: он — основной, старый больше не принимается.
     return this.exclusive(async () => {
-      const cur = await this.store.getAgent(id);
-      if (!cur || cur.revoked) return undefined;
-      if (safeEqual(hash, cur.secretHash)) return cur;
-      if (!cur.pendingSecretHash || !safeEqual(hash, cur.pendingSecretHash)) return undefined;
-      cur.secretHash = cur.pendingSecretHash;
-      delete cur.pendingSecretHash;
-      await this.store.updateAgent(cur);
-      this.opts.log("ключ агента сменён", { agent: cur.name, id: cur.id });
-      return cur;
+      let current = false;
+      const cur = await this.mutateAgent(id, (a) => {
+        current = !a.revoked && safeEqual(hash, a.secretHash);
+        if (a.revoked || current || !a.pendingSecretHash || !safeEqual(hash, a.pendingSecretHash)) return false;
+        a.secretHash = a.pendingSecretHash;
+        delete a.pendingSecretHash;
+        return true;
+      });
+      if (cur) {
+        this.opts.log("ключ агента сменён", { agent: cur.name, id: cur.id });
+        return cur;
+      }
+      return current ? this.store.getAgent(id) : undefined;
     });
   }
 
@@ -1137,7 +1249,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
   }
 
   /** История метрик старше metricsRetentionMs — прочь (раз в pruneIntervalMs и при старте). */
-  private async prune(): Promise<void> {
+  private async pruneMetricsHistory(): Promise<void> {
     if (this.opts.metricsRetentionMs <= 0 || this.stopped) return;
     try {
       const n = await this.store.pruneMetrics(Date.now() - this.opts.metricsRetentionMs);
@@ -1153,27 +1265,36 @@ export class Agents extends EventEmitter<AgentsEvents> {
       const hello = env.data as Hello | undefined;
       if (env.type !== "hello" || !hello?.agent || !Array.isArray(hello.versions)) return ss.close(Close.Invalid);
       if (!hello.versions.includes(MESSAGE_VERSION)) return ss.close(Close.Unsupported);
-      const agent = await this.store.getAgent(ss.agentId);
-      if (!agent || agent.revoked || this.stopped)
-        return ss.close(agent && !agent.revoked ? Close.Restart : Close.Unauthorized);
+      if (this.stopped) {
+        const a = await this.store.getAgent(ss.agentId);
+        return ss.close(a && !a.revoked ? Close.Restart : Close.Unauthorized);
+      }
+      const now = Date.now();
+      let ended: Alert[] = [];
+      const agent = await this.mutateAgent(ss.agentId, (a) => {
+        if (a.revoked) return false;
+        if (a.bootId !== hello.agent.bootId) {
+          a.bootId = hello.agent.bootId;
+          a.lastSeq = 0;
+        }
+        Object.assign(a, {
+          hello,
+          online: true,
+          transport: ss.mode,
+          lastSeenAt: now,
+          capabilities: hello.capabilities ?? {},
+          labels: helloLabels(a, hello.labels),
+        });
+        if (ss.address) a.address = ss.address;
+        ended = applyAlerts(a, [settleKey("offline", "")], now).ended;
+        return true;
+      });
+      if (!agent) return ss.close(Close.Unauthorized);
       clearTimeout(this.grace.get(agent.id));
       this.grace.delete(agent.id);
       const prev = this.sessions.get(agent.id);
       if (prev && prev !== ss) prev.close(Close.Replaced);
       this.sessions.set(agent.id, ss);
-      if (agent.bootId !== hello.agent.bootId) {
-        agent.bootId = hello.agent.bootId;
-        agent.lastSeq = 0;
-      }
-      Object.assign(agent, {
-        hello,
-        online: true,
-        transport: ss.mode,
-        lastSeenAt: Date.now(),
-        capabilities: hello.capabilities ?? {},
-        labels: helloLabels(agent, hello.labels),
-      });
-      if (ss.address) agent.address = ss.address;
       learnDomains(ss, hello.capabilities);
       const config = this.config(agent);
       this.sentSubscription.set(ss, JSON.stringify(config.subscription ?? {}));
@@ -1185,10 +1306,12 @@ export class Agents extends EventEmitter<AgentsEvents> {
         config,
       });
       this.opts.log("агент на связи", { agent: agent.name, transport: ss.mode });
-      this.settleKey("offline", agent.id, "");
+      this.emitAlerts(ended);
       await this.reconcile(ss, hello.jobs ?? []);
+      // Выполняющиеся команды (приняты в прошлой сессии, может быть, другим процессом) —
+      // как отправленные в этой: их отмену в другом процессе refresh доставит агенту.
+      for (const c of await this.store.listCommands({ status: "running", agentId: agent.id })) ss.sent.add(c.id);
       await this.deliver(ss, agent);
-      await this.store.updateAgent(agent);
       this.agentChanged(agent);
     });
   }
@@ -1217,79 +1340,134 @@ export class Agents extends EventEmitter<AgentsEvents> {
 
   private async goOffline(agentId: string): Promise<void> {
     if (this.sessions.has(agentId)) return;
-    const agent = await this.store.getAgent(agentId);
-    if (!agent || !agent.online) return;
-    agent.online = false;
-    await this.store.updateAgent(agent);
-    this.opts.log("агент без связи", { agent: agent.name });
-    this.agentChanged(agent);
-    this.raise(agent, "offline", "", "Агент без связи");
+    const agent = await this.markOffline(agentId, (a) => a.online);
+    if (agent) this.opts.log("агент без связи", { agent: agent.name });
   }
 
-  /** @internal Сообщение открытой сессии; ack или error по классу доставки (§4). */
+  /** Агент online → offline и начало проблемы offline (условие when — по свежей записи). */
+  private async markOffline(agentId: string, when: (a: AgentRecord) => boolean): Promise<AgentRecord | undefined> {
+    const now = Date.now();
+    let started: Alert[] = [];
+    const agent = await this.mutateAgent(agentId, (a) => {
+      if (!a.online || a.revoked || !when(a)) return false;
+      a.online = false;
+      started = applyAlerts(a, [{ raise: newAlert(a, "offline", "Агент без связи", now) }], now).started;
+      return true;
+    });
+    if (!agent) return undefined;
+    this.agentChanged(agent);
+    this.emitAlerts(started);
+    return agent;
+  }
+
+  /**
+   * @internal Сообщение открытой сессии; ack или error по классу доставки (§4). Изменения записи
+   * агента — одной условной записью на сообщение: поля, изменённые сообщением, поверх свежей записи.
+   */
   process(ss: Session, env: Envelope): Promise<void> {
     return this.exclusive(async () => {
       if (ss.closed || this.sessions.get(ss.agentId) !== ss) return;
       const agent = await this.store.getAgent(ss.agentId);
       if (!agent || agent.revoked) return ss.close(Close.Unauthorized);
-      agent.lastSeenAt = Date.now();
       if (typeof env?.type !== "string") {
         ss.send("error", { code: "MESSAGE_INVALID", message: "Нет type", retryable: false });
         return;
       }
-      if (STREAM.has(env.type) && env.seq) {
-        if (env.seq <= agent.lastSeq) {
-          ss.send("ack", { seq: agent.lastSeq });
-          return;
-        }
-        agent.lastSeq = env.seq;
+      // Учёт seq — в записи агента: повтор после переподключения к другому процессу не обрабатывается дважды.
+      const seq = STREAM.has(env.type) && env.seq ? env.seq : 0;
+      if (seq && seq <= (agent.lastSeq ?? 0)) {
+        ss.send("ack", { seq: agent.lastSeq });
+        return;
       }
+      const before = Object.fromEntries(MESSAGE_FIELDS.map((k) => [k, JSON.stringify(agent[k] ?? null)]));
+      const appliedBefore = JSON.stringify(agent.stateApplied ?? {});
+      const alerts: AlertOp[] = [];
       let err: MessageError | undefined;
-      const statusBefore = env.type === "status" ? JSON.stringify(agent.status ?? null) : undefined;
       try {
-        err = await this.dispatch(ss, agent, env);
+        err = await this.dispatch(ss, agent, env, alerts);
       } catch (e) {
-        err = {
-          code: "MESSAGE_INVALID",
-          message: `Некорректное ${env.type}: ${(e as Error).message}`,
-          retryable: false,
-        };
+        // Запись всё время меняют другие процессы — агент повторит сообщение.
+        err =
+          e instanceof AgentsError && e.code === "STORE_CONFLICT"
+            ? { code: e.code, message: e.message, retryable: true }
+            : {
+                code: "MESSAGE_INVALID",
+                message: `Некорректное ${env.type}: ${(e as Error).message}`,
+                retryable: false,
+              };
       }
-      await this.store.updateAgent(agent);
+      const changed = MESSAGE_FIELDS.filter((k) => JSON.stringify(agent[k] ?? null) !== before[k]);
+      const metricsChanged = changed.includes("metrics") || changed.includes("metricsAt");
+      const prevApplied = JSON.parse(appliedBefore) as Record<string, unknown>;
+      const applied = Object.entries(agent.stateApplied ?? {}).filter(
+        ([d, v]) => JSON.stringify(v) !== JSON.stringify(prevApplied[d]),
+      );
+      const now = Date.now();
+      let started: Alert[] = [];
+      let ended: Alert[] = [];
+      const written = await this.mutateAgent(agent.id, (a) => {
+        if (a.revoked) return false;
+        a.lastSeenAt = now;
+        if (seq) a.lastSeq = Math.max(a.lastSeq ?? 0, seq);
+        for (const k of changed) {
+          if (k === "metrics" || k === "metricsAt") continue;
+          setField(a, k, agent[k]);
+        }
+        // Текущие метрики — последняя по времени точка (другой процесс мог записать точку новее).
+        if (metricsChanged && (a.metrics === undefined || (agent.metricsAt ?? 0) >= (a.metricsAt ?? 0))) {
+          setField(a, "metrics", agent.metrics);
+          setField(a, "metricsAt", agent.metricsAt);
+        }
+        if (applied.length) a.stateApplied = { ...a.stateApplied, ...Object.fromEntries(applied) };
+        ({ started, ended } = applyAlerts(a, alerts, now));
+        return true;
+      });
+      if (!written) return ss.close(Close.Unauthorized);
+      this.emitAlerts(started);
+      this.emitAlerts(ended);
       if (err) ss.send("error", err, env.id);
       else if (RELIABLE.has(env.type) && env.id) ss.send("ack", { ids: [env.id] });
-      else if (STREAM.has(env.type) && env.seq) ss.send("ack", { seq: env.seq });
+      else if (seq) ss.send("ack", { seq });
       // Ожидающий ключ записан, ответ на cmd.done отправлен — переподключение с новым ключом.
       if (this.restartAfterReply.has(ss)) {
         this.restartAfterReply.delete(ss);
         ss.close(Close.Restart);
       }
-      // «Агент изменился» — только если есть что обновить: тот же status (пульс) и
-      // досланная точка метрик текущее состояние агента не меняют.
+      // «Агент изменился» — только если есть что обновить: тот же status (пульс), досланная
+      // или устаревшая точка метрик текущее состояние агента не меняют.
       const quiet =
-        (env.type === "status" && JSON.stringify(agent.status ?? null) === statusBefore) ||
-        (env.type === "metrics" && (env.data as { backfill?: boolean } | undefined)?.backfill === true);
+        (env.type === "status" && !changed.includes("status")) || (env.type === "metrics" && !metricsChanged);
       if (!quiet && ["status", "metrics", "inventory", "capabilities", "state.applied"].includes(env.type))
-        this.agentChanged(agent);
+        this.agentChanged(written);
     });
   }
 
   // ── механика ──
 
-  private async dispatch(ss: Session, agent: AgentRecord, env: Envelope): Promise<MessageError | undefined> {
+  /**
+   * Сообщение агента: agent — рабочая копия записи (process запишет изменённые поля), alerts —
+   * начала и концы проблем (process применит их к свежей записи).
+   */
+  private async dispatch(
+    ss: Session,
+    agent: AgentRecord,
+    env: Envelope,
+    alerts: AlertOp[],
+  ): Promise<MessageError | undefined> {
     const d = env.data ?? {};
     switch (env.type) {
       case "status": {
         agent.status = d as Status;
         ss.statusSeen = true;
-        this.checkStatus(agent);
+        alerts.push(...statusAlerts(agent, agent.status, Date.now()));
         for (const r of agent.status.jobs ?? []) {
+          if (typeof r?.jobId !== "string") continue;
           ss.pending.delete(r.jobId); // учтена в slots
-          const job = await this.held(agent.id, r);
-          if (job) {
-            job.leaseUntil = Date.now() + job.leaseSeconds * 1000;
-            await this.store.updateJob(job);
-          }
+          await this.mutateJob(r.jobId, (j) => {
+            if (!isHeld(j, agent.id, r)) return false;
+            j.leaseUntil = Date.now() + j.leaseSeconds * 1000;
+            return true;
+          });
         }
         await this.fill(ss, agent);
         return;
@@ -1308,7 +1486,11 @@ export class Agents extends EventEmitter<AgentsEvents> {
           this.lastStored.set(key, point.at);
         }
         this.emit("metrics", agent.id, point);
-        if (!point.backfill) agent.metrics = m;
+        // Текущие метрики — последняя по времени точка без backfill.
+        if (!point.backfill && (agent.metrics === undefined || point.at >= (agent.metricsAt ?? 0))) {
+          agent.metrics = m;
+          agent.metricsAt = point.at;
+        }
         return;
       }
       case "inventory":
@@ -1344,36 +1526,40 @@ export class Agents extends EventEmitter<AgentsEvents> {
         return;
       }
       case "job.accept": {
-        const job = await this.held(agent.id, d);
-        if (job && !job.accepted) {
-          job.accepted = true;
-          await this.store.updateJob(job);
-          this.jobChanged(job);
-        }
+        const job = await this.mutateJob(jobIdOf(d), (j) => {
+          if (!isHeld(j, agent.id, d) || j.accepted) return false;
+          j.accepted = true;
+          return true;
+        });
+        if (job) this.jobChanged(job);
         return;
       }
       case "job.progress": {
-        const job = await this.held(agent.id, d);
-        if (!job) return;
-        if (typeof d.progress === "number") job.progress = d.progress;
-        if (typeof d.text === "string") job.text = d.text;
-        if (Array.isArray(d.log)) job.log = [...job.log, ...d.log.map(String)].slice(-KEEP_LOG);
-        await this.store.updateJob(job);
-        this.jobChanged(job);
+        const job = await this.mutateJob(jobIdOf(d), (j) => {
+          if (!isHeld(j, agent.id, d)) return false;
+          if (typeof d.progress === "number") j.progress = d.progress;
+          if (typeof d.text === "string") j.text = d.text;
+          if (Array.isArray(d.log)) j.log = [...j.log, ...d.log.map(String)].slice(-KEEP_LOG);
+          return true;
+        });
+        if (job) this.jobChanged(job);
         return;
       }
       case "job.event": {
-        const job = await this.held(agent.id, d);
-        if (!job) return leaseLost();
+        if (!(await this.held(agent.id, d))) return leaseLost();
         if (typeof d.type !== "string" || !(d.seq >= 1)) return invalid(env.type);
-        if (d.seq > job.eventSeq) {
-          job.eventSeq = d.seq;
-          job.events = [...job.events, { seq: d.seq, type: d.type, data: d.data, at: env.ts ?? Date.now() }].slice(
+        let lost = true;
+        const job = await this.mutateJob(jobIdOf(d), (j) => {
+          lost = !isHeld(j, agent.id, d);
+          if (lost || d.seq <= j.eventSeq) return false;
+          j.eventSeq = d.seq;
+          j.events = [...j.events, { seq: d.seq, type: d.type, data: d.data, at: env.ts ?? Date.now() }].slice(
             -KEEP_JOB_EVENTS,
           );
-          await this.store.updateJob(job);
-          this.jobChanged(job);
-        }
+          return true;
+        });
+        if (lost) return leaseLost();
+        if (job) this.jobChanged(job);
         return;
       }
       case "job.urls": {
@@ -1387,79 +1573,83 @@ export class Agents extends EventEmitter<AgentsEvents> {
         return;
       }
       case "job.complete": {
-        const job = await this.held(agent.id, d);
+        const job = await this.mutateJob(jobIdOf(d), (j) => {
+          if (!isHeld(j, agent.id, d)) return false;
+          Object.assign(j, { status: "completed", result: d.result, progress: 1, finishedAt: Date.now() });
+          delete j.error;
+          return true;
+        });
         if (!job) return (await this.finishedHere(agent.id, d, "completed")) ? undefined : leaseLost();
         ss.pending.delete(job.id);
-        Object.assign(job, {
-          status: "completed",
-          result: d.result,
-          progress: 1,
-          error: undefined,
-          finishedAt: Date.now(),
-        });
-        await this.store.updateJob(job);
         this.opts.log("задача выполнена", { job: job.id, queue: job.queue });
         this.jobChanged(job);
         await this.fill(ss, agent);
         return;
       }
       case "job.fail": {
-        const job = await this.held(agent.id, d);
+        const job = await this.failAttempt(
+          jobIdOf(d),
+          agent.id,
+          d.attempt,
+          String(d.code ?? "WORKER_ERROR"),
+          String(d.message ?? ""),
+          d.retryable === true,
+        );
         if (!job) return (await this.finishedHere(agent.id, d)) ? undefined : leaseLost();
-        await this.failAttempt(job, String(d.code ?? "WORKER_ERROR"), String(d.message ?? ""), d.retryable === true);
         return;
       }
       case "job.reject": {
         ss.pending.delete(d.jobId);
-        const job = await this.held(agent.id, d);
+        const job = await this.mutateJob(jobIdOf(d), (j) => {
+          if (!isHeld(j, agent.id, d)) return false;
+          Object.assign(j, { status: "queued", accepted: false, leaseUntil: 0 });
+          delete j.agentId;
+          return true;
+        });
         if (job) {
-          Object.assign(job, { status: "queued", agentId: undefined, accepted: false, leaseUntil: 0 });
-          await this.store.updateJob(job);
           this.jobChanged(job);
           await this.fillAll(ss.agentId);
         }
         return;
       }
       case "cmd.accept": {
-        const cmd = await this.store.getCommand(d.commandId);
-        if (cmd?.agentId === agent.id && cmd.status === "pending") {
-          cmd.status = "running";
-          await this.store.updateCommand(cmd);
-          this.commandChanged(cmd);
-        }
+        const cmd = await this.mutateCommand(commandIdOf(d), (c) => {
+          if (c.agentId !== agent.id || c.status !== "pending") return false;
+          c.status = "running";
+          return true;
+        });
+        if (cmd) this.commandChanged(cmd);
         return;
       }
       case "cmd.output": {
-        const cmd = await this.store.getCommand(d.commandId);
-        if (cmd?.agentId === agent.id && typeof d.chunk === "string") {
-          cmd.output = (cmd.output + d.chunk).slice(-KEEP_OUTPUT);
-          await this.store.updateCommand(cmd);
-          this.commandChanged(cmd);
-        }
+        if (typeof d.chunk !== "string") return;
+        const cmd = await this.mutateCommand(commandIdOf(d), (c) => {
+          if (c.agentId !== agent.id || commandFinished(c)) return false;
+          c.output = (c.output + d.chunk).slice(-KEEP_OUTPUT);
+          return true;
+        });
+        if (cmd) this.commandChanged(cmd);
         return;
       }
       case "cmd.done": {
-        const cmd = await this.store.getCommand(d.commandId);
-        if (cmd?.agentId === agent.id && (cmd.status === "pending" || cmd.status === "running")) {
-          Object.assign(cmd, {
+        const id = commandIdOf(d);
+        ss.sent.delete(id);
+        // Итог — только незавершённой: поздний итог (после отмены или срока) не учитывается.
+        const cmd = await this.mutateCommand(id, (c) => {
+          if (c.agentId !== agent.id || commandFinished(c)) return false;
+          Object.assign(c, {
             status: d.ok ? "succeeded" : "failed",
             result: d.result,
             error: d.error,
             finishedAt: Date.now(),
           });
-          if (Number.isInteger(d.exitCode)) cmd.exitCode = d.exitCode;
-          await this.store.updateCommand(cmd);
-          this.commandChanged(cmd);
-        }
-        // Итог смены ключа (даже после срока команды на сервере): хеш нового секрета — ожидающий.
+          if (Number.isInteger(d.exitCode)) c.exitCode = d.exitCode;
+          return true;
+        });
+        if (cmd) this.commandChanged(cmd);
+        // Принятый итог смены ключа: хеш нового секрета — ожидающий.
         const hash = (d.result as { secretHash?: unknown } | undefined)?.secretHash;
-        if (
-          cmd?.agentId === agent.id &&
-          cmd.name === ROTATE_KEY &&
-          d.ok &&
-          typeof hash === "string" &&
-          SHA256_HEX.test(hash)
-        ) {
+        if (cmd && d.ok && cmd.name === ROTATE_KEY && typeof hash === "string" && SHA256_HEX.test(hash)) {
           agent.pendingSecretHash = hash;
           this.restartAfterReply.add(ss);
         }
@@ -1473,10 +1663,10 @@ export class Agents extends EventEmitter<AgentsEvents> {
           ss.known.set(applied.domain, applied.version);
         this.emit("stateApplied", { ...applied, agentId: agent.id });
         this.emit("change", { kind: "state", id: applied.domain });
-        if (applied.ok) this.settleKey("stateFailed", agent.id, applied.domain);
+        if (applied.ok) alerts.push(settleKey("stateFailed", applied.domain));
         else
-          this.raise(agent, "stateFailed", applied.domain, applied.error ?? "", {
-            domain: applied.domain,
+          alerts.push({
+            raise: newAlert(agent, "stateFailed", applied.error ?? "", Date.now(), { domain: applied.domain }),
           });
         return;
       }
@@ -1489,12 +1679,13 @@ export class Agents extends EventEmitter<AgentsEvents> {
   private async held(agentId: string, ref: JobRef): Promise<JobRecord | undefined> {
     if (typeof ref?.jobId !== "string") return undefined;
     const job = await this.store.getJob(ref.jobId);
-    return job && job.status === "running" && job.agentId === agentId && job.attempt === ref.attempt ? job : undefined;
+    return job && isHeld(job, agentId, ref) ? job : undefined;
   }
 
   /** Повтор итога уже завершённой этим агентом попытки — подтвердить (идемпотентно). */
   private async finishedHere(agentId: string, ref: JobRef, status?: Job["status"]): Promise<boolean> {
-    const job = await this.store.getJob(ref?.jobId);
+    if (typeof ref?.jobId !== "string") return false;
+    const job = await this.store.getJob(ref.jobId);
     return (
       !!job &&
       job.agentId === agentId &&
@@ -1510,12 +1701,26 @@ export class Agents extends EventEmitter<AgentsEvents> {
       if (listed.has(`${job.id}#${job.attempt}`)) {
         if (job.stopRequested) ss.send("job.stop", ref(job));
       } else if (!job.accepted) {
-        job.leaseUntil = Date.now() + job.leaseSeconds * 1000;
-        await this.store.updateJob(job);
-        ss.pending.set(job.id, job.queue);
-        ss.send("job.assign", await this.assignment(ss, job));
+        const again = await this.mutateJob(job.id, (j) => {
+          if (!isHeld(j, ss.agentId, job) || j.accepted) return false;
+          j.leaseUntil = Date.now() + j.leaseSeconds * 1000;
+          return true;
+        });
+        if (!again) continue;
+        ss.pending.set(again.id, again.queue);
+        ss.send("job.assign", await this.assignment(ss, again));
       } else {
-        await this.failAttempt(job, "AGENT_LOST", "Агент перезапустился и потерял задачу", true);
+        await this.failAttempt(
+          job.id,
+          ss.agentId,
+          job.attempt,
+          "AGENT_LOST",
+          "Агент перезапустился и потерял задачу",
+          true,
+          {
+            when: (j) => j.accepted,
+          },
+        );
       }
     }
     for (const r of reported) {
@@ -1523,9 +1728,18 @@ export class Agents extends EventEmitter<AgentsEvents> {
     }
   }
 
-  /** Ожидающие команды и новые версии объявленных доменов. */
+  /**
+   * Ожидающие команды и новые версии объявленных доменов. Команды, отправленные в этой сессии и
+   * отменённые (в том числе другим процессом), — cmd.cancel по одному разу; завершённые — забываются.
+   */
   private async deliver(ss: Session, agent: AgentRecord): Promise<void> {
     if (ss.closed) return;
+    for (const id of [...ss.sent]) {
+      const c = await this.store.getCommand(id);
+      if (c && !commandFinished(c)) continue;
+      ss.sent.delete(id);
+      if (c?.status === "cancelled") ss.send("cmd.cancel", { commandId: id });
+    }
     // Старые первыми.
     const declared = agent.capabilities?.commands?.names ?? [];
     for (const cmd of (await this.store.listCommands({ status: "pending", agentId: agent.id })).reverse()) {
@@ -1543,7 +1757,10 @@ export class Agents extends EventEmitter<AgentsEvents> {
     }
   }
 
-  /** Раздать ждущие задачи по свободным слотам сессии (status.slots). */
+  /**
+   * Раздать ждущие задачи по свободным слотам сессии (status.slots). Задачу берёт условная запись
+   * queued → running: взял другой процесс — пропустить.
+   */
   private async fill(ss: Session, agent: AgentRecord): Promise<void> {
     const st = agent.status;
     if (ss.closed || !ss.statusSeen || !st?.slots || NOT_DISPATCHING.has(st.state)) return;
@@ -1556,18 +1773,23 @@ export class Agents extends EventEmitter<AgentsEvents> {
       let free = st.slots[queue] - [...ss.pending.values()].filter((q) => q === queue).length;
       for (const job of queued) {
         if (free <= 0) break;
-        if (job.queue !== queue || job.status !== "queued") continue;
+        if (job.queue !== queue) continue;
         if (job.pinnedAgentId && job.pinnedAgentId !== agent.id) continue;
-        Object.assign(job, {
-          status: "running",
-          agentId: agent.id,
-          accepted: false,
-          leaseUntil: Date.now() + job.leaseSeconds * 1000,
+        const taken = await this.mutateJob(job.id, (j) => {
+          if (j.status !== "queued" || j.attempt !== job.attempt || j.queue !== queue) return false;
+          if (j.pinnedAgentId && j.pinnedAgentId !== agent.id) return false;
+          Object.assign(j, {
+            status: "running",
+            agentId: agent.id,
+            accepted: false,
+            leaseUntil: Date.now() + j.leaseSeconds * 1000,
+          });
+          return true;
         });
-        await this.store.updateJob(job);
-        ss.pending.set(job.id, queue);
-        ss.send("job.assign", await this.assignment(ss, job));
-        this.jobChanged(job);
+        if (!taken) continue;
+        ss.pending.set(taken.id, queue);
+        ss.send("job.assign", await this.assignment(ss, taken));
+        this.jobChanged(taken);
         free--;
       }
     }
@@ -1599,50 +1821,69 @@ export class Agents extends EventEmitter<AgentsEvents> {
     };
   }
 
-  /** Провал попытки: повтор, если попытки остались. */
-  private async failAttempt(job: JobRecord, code: string, message: string, retryable: boolean): Promise<void> {
-    if (job.agentId) this.sessions.get(job.agentId)?.pending.delete(job.id);
-    job.error = { code, message };
-    if (retryable && job.attempt + 1 < job.maxAttempts) {
-      Object.assign(job, {
-        status: "queued",
-        attempt: job.attempt + 1,
-        agentId: undefined,
-        accepted: false,
-        eventSeq: 0,
-        leaseUntil: 0,
-        progress: 0,
-        stopRequested: false,
-      });
-      await this.store.updateJob(job);
-      this.jobChanged(job);
-      await this.fillAll();
-      return;
-    }
-    Object.assign(job, { status: "failed", finishedAt: Date.now() });
-    await this.store.updateJob(job);
-    this.opts.log("задача провалена", { job: job.id, code });
+  /**
+   * Провал попытки (задача running у agentId в попытке attempt и opts.when по свежей записи):
+   * повтор, если попытки остались. opts.cancel — агенту на связи job.cancel этой попытки.
+   * Результат — записанная задача; условие не выполнено — undefined.
+   */
+  private async failAttempt(
+    jobId: string,
+    agentId: string | undefined,
+    attempt: number,
+    code: string,
+    message: string,
+    retryable: boolean,
+    opts: { when?: (j: JobRecord) => boolean; cancel?: boolean } = {},
+  ): Promise<JobRecord | undefined> {
+    let retry = false;
+    const job = await this.mutateJob(jobId, (j) => {
+      if (j.status !== "running" || j.agentId !== agentId || j.attempt !== attempt) return false;
+      if (opts.when && !opts.when(j)) return false;
+      j.error = { code, message };
+      retry = retryable && j.attempt + 1 < j.maxAttempts;
+      if (retry) {
+        Object.assign(j, {
+          status: "queued",
+          attempt: j.attempt + 1,
+          accepted: false,
+          eventSeq: 0,
+          leaseUntil: 0,
+          progress: 0,
+          stopRequested: false,
+        });
+        delete j.agentId;
+      } else Object.assign(j, { status: "failed", finishedAt: Date.now() });
+      return true;
+    });
+    if (!job) return undefined;
+    const ss = agentId ? this.sessions.get(agentId) : undefined;
+    ss?.pending.delete(jobId);
+    if (opts.cancel) ss?.send("job.cancel", { jobId, attempt });
     this.jobChanged(job);
+    if (retry) await this.fillAll();
+    else this.opts.log("задача провалена", { job: job.id, code });
+    return job;
   }
 
   private async signalJob(actor: string, id: string, kind: "cancel" | "stop"): Promise<Job> {
     const res = await this.exclusive(async () => {
-      const job = await this.store.getJob(id);
+      let wasRunning = false;
+      const job = await this.mutateJob(id, (j) => {
+        if (jobFinished(j)) throw new AgentsError("JOB_NOT_ACTIVE", "Задача уже завершена", 409);
+        wasRunning = j.status === "running";
+        if (kind === "stop" && wasRunning) j.stopRequested = true;
+        else Object.assign(j, { status: "cancelled", finishedAt: Date.now() });
+        return true;
+      });
       if (!job) throw new AgentsError("JOB_NOT_FOUND", "Задача не найдена", 404);
-      if (job.status !== "queued" && job.status !== "running")
-        throw new AgentsError("JOB_NOT_ACTIVE", "Задача уже завершена", 409);
       const ss = job.agentId ? this.sessions.get(job.agentId) : undefined;
-      if (kind === "stop" && job.status === "running") {
-        job.stopRequested = true;
-        ss?.send("job.stop", ref(job));
-      } else {
-        if (ss && job.status === "running") {
+      if (ss && wasRunning) {
+        if (kind === "stop") ss.send("job.stop", ref(job));
+        else {
           ss.pending.delete(job.id);
           ss.send("job.cancel", ref(job));
         }
-        Object.assign(job, { status: "cancelled", finishedAt: Date.now() });
       }
-      await this.store.updateJob(job);
       this.jobChanged(job);
       return publicJob(job);
     });
@@ -1653,35 +1894,41 @@ export class Agents extends EventEmitter<AgentsEvents> {
   /**
    * Раз в секунду: истёкшие аренды задач, сроки команд, истёкшие подписки (агентов на связи
    * с этим процессом; агентов без связи — любым процессом), агенты без вестей (offlineAfterMs).
+   * Условия проверяются по свежей записи: аренду, продлённую другим процессом, не трогаем.
    */
   private sweep(): Promise<void> {
     return this.exclusive(async () => {
       const now = Date.now();
       for (const id of [...this.sessions.keys()]) {
-        const agent = await this.store.getAgent(id);
-        if (!agent) continue;
-        if (!dropExpired(agent, now)) continue;
-        await this.store.updateAgent(agent);
-        this.applySubscription(agent, now);
+        const agent = await this.mutateAgent(id, (a) => dropExpired(a, now));
+        if (agent) this.applySubscription(agent, now);
       }
       await this.sweepOffline(now);
       for (const job of await this.store.listJobs({ status: "running" })) {
-        if (now > job.leaseUntil) {
-          // Агент на связи, но задачу не перечисляет: её заберут — прервать.
-          this.sessions.get(job.agentId ?? "")?.send("job.cancel", { jobId: job.id, attempt: job.attempt });
-          await this.failAttempt(job, "LEASE_EXPIRED", "Агент перестал отвечать: аренда истекла", true);
-        }
+        if (now <= job.leaseUntil) continue;
+        // Агент на связи, но задачу не перечисляет: её заберут — прервать.
+        await this.failAttempt(
+          job.id,
+          job.agentId,
+          job.attempt,
+          "LEASE_EXPIRED",
+          "Агент перестал отвечать: аренда истекла",
+          true,
+          { when: (j) => now > j.leaseUntil, cancel: true },
+        );
       }
-      for (const cmd of await this.store.listCommands({ status: ["pending", "running"] })) {
-        if (now > cmd.createdAt + cmd.timeoutSec * 1000 + agentsDefaults.commandGraceMs) {
-          Object.assign(cmd, {
+      for (const listed of await this.store.listCommands({ status: ["pending", "running"] })) {
+        if (now <= listed.createdAt + listed.timeoutSec * 1000 + agentsDefaults.commandGraceMs) continue;
+        const cmd = await this.mutateCommand(listed.id, (c) => {
+          if (commandFinished(c)) return false;
+          Object.assign(c, {
             status: "failed",
             error: { code: "TIMEOUT", message: "Нет итога от агента" },
             finishedAt: now,
           });
-          await this.store.updateCommand(cmd);
-          this.commandChanged(cmd);
-        }
+          return true;
+        });
+        if (cmd) this.commandChanged(cmd);
       }
     });
   }
@@ -1691,8 +1938,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
    * сессией упал) — offline и alert offline. Сессия здесь или отсрочка offlineGraceMs — не трогаем.
    */
   private async sweepOffline(now: number): Promise<void> {
-    const stale = (a: AgentRecord | undefined): a is AgentRecord =>
-      !!a &&
+    const stale = (a: AgentRecord) =>
       a.online &&
       !a.revoked &&
       !this.sessions.has(a.id) &&
@@ -1700,21 +1946,14 @@ export class Agents extends EventEmitter<AgentsEvents> {
       now - (a.lastSeenAt ?? 0) > this.opts.offlineAfterMs;
     for (const listed of await this.store.listAgents()) {
       if (!stale(listed)) continue;
-      // Перечитать: другой процесс мог обновить запись после listAgents.
-      const agent = await this.store.getAgent(listed.id);
-      if (!stale(agent)) continue;
-      agent.online = false;
-      await this.store.updateAgent(agent);
-      this.opts.log("агент без вестей — без связи", { agent: agent.name, lastSeenAt: agent.lastSeenAt });
-      this.agentChanged(agent);
-      this.raise(agent, "offline", "", "Агент без связи");
+      // Условие — по свежей записи: другой процесс мог обновить её после listAgents.
+      const agent = await this.markOffline(listed.id, stale);
+      if (agent) this.opts.log("агент без вестей — без связи", { agent: agent.name, lastSeenAt: agent.lastSeenAt });
     }
     // Истёкшие подписки агентов без связи: сверять их некому, кроме любого процесса.
     for (const listed of await this.store.listAgents()) {
       if (listed.online || this.sessions.has(listed.id) || !hasExpired(listed, now)) continue;
-      const agent = await this.store.getAgent(listed.id);
-      if (!agent || agent.online || !dropExpired(agent, now)) continue;
-      await this.store.updateAgent(agent);
+      await this.mutateAgent(listed.id, (a) => !a.online && dropExpired(a, now));
     }
   }
 
@@ -1784,63 +2023,62 @@ export class Agents extends EventEmitter<AgentsEvents> {
     }
   }
 
-  /** Проблема началась: событие alert, если её ещё нет среди активных. */
-  private raise(
-    agent: AgentRecord,
-    type: AlertType,
-    sub: string,
-    message: string,
-    extra: { domain?: string; worker?: string } = {},
-  ): void {
-    const key = alertKey(type, agent.id, sub);
-    if (this.activeAlerts.has(key)) return;
-    const a: Alert = {
-      type,
-      agentId: agent.id,
-      agentName: agent.name,
-      active: true,
-      message,
-      at: Date.now(),
-      ...extra,
-    };
-    this.activeAlerts.set(key, a);
-    this.safeEmit("alert", { ...a });
+  /** События alert (начала или концы проблем) — после записи. */
+  private emitAlerts(list: Alert[]): void {
+    for (const a of list) this.safeEmit("alert", { ...a });
   }
 
-  /** Проблема закончилась: событие alert (active: false) с текстом её начала, если она была активной. */
-  private settleKey(type: AlertType, agentId: string, sub: string): void {
-    const a = this.activeAlerts.get(alertKey(type, agentId, sub));
-    if (a) this.settle(a);
-  }
-
-  private settle(a: Alert): void {
-    this.activeAlerts.delete(alertKey(a.type, a.agentId, a.domain ?? a.worker ?? ""));
-    this.safeEmit("alert", { ...a, active: false, at: Date.now() });
-  }
-
-  /** status: degraded, воркеры в сбое и воркеры degraded (worker.health) — начало и конец уведомлений. */
-  private checkStatus(agent: AgentRecord): void {
-    const st = agent.status;
-    if (!st) return;
-    if (st.state === "degraded") this.raise(agent, "degraded", "", st.message || "Агент не в порядке");
-    else this.settleKey("degraded", agent.id, "");
-    const down = new Set<string>();
-    const degraded = new Set<string>();
-    for (const w of Array.isArray(st.workers) ? st.workers : []) {
-      if (typeof w?.name !== "string") continue;
-      if (w.health === "degraded") {
-        degraded.add(w.name);
-        this.raise(agent, "workerDegraded", w.name, w.message || `Воркер ${w.name} не в порядке`, { worker: w.name });
-      }
-      if (!WORKER_DOWN.has(w.state)) continue;
-      down.add(w.name);
-      this.raise(agent, "workerDown", w.name, `Воркер ${w.name}: ${w.state}`, { worker: w.name });
+  /**
+   * Чтение-изменение-запись с повтором: fn меняет свежую запись и говорит, писать ли (false —
+   * условие не выполнено, ничего не делать). Конфликт rev — перечитать и повторить fn, до
+   * MUTATE_ATTEMPTS раз; дальше — ошибка STORE_CONFLICT. Результат — записанная запись; записи
+   * нет или fn вернула false — undefined. fn может выполниться несколько раз: побочные действия —
+   * у вызывающего, после записи, по итогу последнего прогона fn.
+   */
+  private async mutate<T extends { rev: number }>(
+    what: string,
+    id: string,
+    get: (id: string) => Promise<T | undefined>,
+    put: (rec: T) => Promise<boolean>,
+    fn: (rec: T) => boolean,
+  ): Promise<T | undefined> {
+    for (let i = 0; i < MUTATE_ATTEMPTS; i++) {
+      const rec = await get(id);
+      if (!rec || !fn(rec)) return undefined;
+      if (await put(rec)) return rec;
     }
-    for (const a of [...this.activeAlerts.values()]) {
-      if (a.agentId !== agent.id) continue;
-      if (a.type === "workerDown" && !down.has(a.worker ?? "")) this.settle(a);
-      if (a.type === "workerDegraded" && !degraded.has(a.worker ?? "")) this.settle(a);
-    }
+    this.opts.log("запись не сохранена: её одновременно меняют другие процессы", { record: what, id });
+    throw new AgentsError("STORE_CONFLICT", `Запись ${what} ${id} одновременно меняют другие процессы`, 409);
+  }
+
+  private mutateAgent(id: string, fn: (a: AgentRecord) => boolean): Promise<AgentRecord | undefined> {
+    return this.mutate(
+      "агента",
+      id,
+      (x) => this.store.getAgent(x),
+      (r) => this.store.updateAgent(r),
+      fn,
+    );
+  }
+
+  private mutateJob(id: string, fn: (j: JobRecord) => boolean): Promise<JobRecord | undefined> {
+    return this.mutate(
+      "задачи",
+      id,
+      (x) => this.store.getJob(x),
+      (r) => this.store.updateJob(r),
+      fn,
+    );
+  }
+
+  private mutateCommand(id: string, fn: (c: CommandRecord) => boolean): Promise<CommandRecord | undefined> {
+    return this.mutate(
+      "команды",
+      id,
+      (x) => this.store.getCommand(x),
+      (r) => this.store.updateCommand(r),
+      fn,
+    );
   }
 
   private notify(kind: ChangeKind, id: string): void {
@@ -1857,8 +2095,8 @@ export class Agents extends EventEmitter<AgentsEvents> {
     this.notify("job", j.id);
   }
 
-  private commandChanged(c: Command): void {
-    this.emit("command", { ...c });
+  private commandChanged(c: CommandRecord): void {
+    this.emit("command", publicCommand(c));
     this.notify("command", c.id);
   }
 }
@@ -2024,7 +2262,110 @@ function dropExpired(a: AgentRecord, now: number): boolean {
   return true;
 }
 
-const alertKey = (type: AlertType, agentId: string, sub: string) => `${type}\0${agentId}\0${sub}`;
+/** Начало или конец проблем агента: raise — начать, если такой ещё нет; settle — закончить подходящие. */
+type AlertOp = { raise: Alert } | { settle: (a: Alert) => boolean };
+
+const alertKey = (a: Alert) => `${a.type}\0${a.agentId}\0${a.domain ?? a.worker ?? ""}`;
+
+function newAlert(
+  agent: AgentRecord,
+  type: AlertType,
+  message: string,
+  at: number,
+  extra: { domain?: string; worker?: string } = {},
+): Alert {
+  return { type, agentId: agent.id, agentName: agent.name, active: true, message, at, ...extra };
+}
+
+/** Закончить проблему type (sub — раздел или воркер; пусто — проблема агента). */
+function settleKey(type: AlertType, sub: string): AlertOp {
+  return { settle: (a) => a.type === type && (a.domain ?? a.worker ?? "") === sub };
+}
+
+/**
+ * Применить к записи агента начала и концы проблем. Результат — начавшиеся (их не было в записи)
+ * и закончившиеся (были; active: false, текст начала, время — now).
+ */
+function applyAlerts(a: AgentRecord, ops: AlertOp[], now: number): { started: Alert[]; ended: Alert[] } {
+  let list = [...(a.alerts ?? [])];
+  const started: Alert[] = [];
+  const ended: Alert[] = [];
+  for (const op of ops) {
+    if ("raise" in op) {
+      const key = alertKey(op.raise);
+      if (list.some((x) => alertKey(x) === key)) continue;
+      list.push({ ...op.raise });
+      started.push({ ...op.raise });
+    } else {
+      const keep: Alert[] = [];
+      for (const x of list) {
+        if (op.settle(x)) ended.push({ ...x, active: false, at: now });
+        else keep.push(x);
+      }
+      list = keep;
+    }
+  }
+  if (list.length) a.alerts = list;
+  else delete a.alerts;
+  return { started, ended };
+}
+
+/** status: degraded, воркеры в сбое и воркеры degraded (worker.health) — начала и концы проблем. */
+function statusAlerts(agent: AgentRecord, st: Status, now: number): AlertOp[] {
+  const ops: AlertOp[] = [];
+  if (st.state === "degraded")
+    ops.push({ raise: newAlert(agent, "degraded", st.message || "Агент не в порядке", now) });
+  else ops.push(settleKey("degraded", ""));
+  const down = new Set<string>();
+  const degraded = new Set<string>();
+  for (const w of Array.isArray(st.workers) ? st.workers : []) {
+    if (typeof w?.name !== "string") continue;
+    if (w.health === "degraded") {
+      degraded.add(w.name);
+      ops.push({
+        raise: newAlert(agent, "workerDegraded", w.message || `Воркер ${w.name} не в порядке`, now, { worker: w.name }),
+      });
+    }
+    if (!WORKER_DOWN.has(w.state)) continue;
+    down.add(w.name);
+    ops.push({ raise: newAlert(agent, "workerDown", `Воркер ${w.name}: ${w.state}`, now, { worker: w.name }) });
+  }
+  ops.push({
+    settle: (a) =>
+      (a.type === "workerDown" && !down.has(a.worker ?? "")) ||
+      (a.type === "workerDegraded" && !degraded.has(a.worker ?? "")),
+  });
+  return ops;
+}
+
+/** Задача у агента в попытке ref.attempt и выполняется. */
+function isHeld(j: JobRecord, agentId: string, ref: { attempt?: unknown }): boolean {
+  return j.status === "running" && j.agentId === agentId && j.attempt === ref?.attempt;
+}
+
+const jobIdOf = (d: { jobId?: unknown }) => (typeof d?.jobId === "string" ? d.jobId : "");
+const commandIdOf = (d: { commandId?: unknown }) => (typeof d?.commandId === "string" ? d.commandId : "");
+
+/** Поле записи агента: undefined — убрать. */
+function setField<K extends keyof AgentRecord>(a: AgentRecord, k: K, v: AgentRecord[K]): void {
+  if (v === undefined) delete (a as unknown as Record<string, unknown>)[k];
+  else a[k] = v;
+}
+
+/** Метки из запроса регистрации: объект строк в пределах ENROLL_MAX_LABELS и ENROLL_MAX_LABEL. */
+function enrollLabels(v: unknown): Record<string, string> {
+  if (v === undefined || v === null) return {};
+  if (typeof v !== "object" || Array.isArray(v)) throw new AgentsError("MESSAGE_INVALID", "labels — объект строк");
+  const entries = Object.entries(v);
+  if (entries.length > ENROLL_MAX_LABELS) throw new AgentsError("MESSAGE_INVALID", `Меток больше ${ENROLL_MAX_LABELS}`);
+  for (const [k, val] of entries) {
+    if (!k || [...k].length > ENROLL_MAX_LABEL)
+      throw new AgentsError("MESSAGE_INVALID", `Ключ метки — непустая строка до ${ENROLL_MAX_LABEL} символов`);
+    if (typeof val !== "string" || [...val].length > ENROLL_MAX_LABEL)
+      throw new AgentsError("MESSAGE_INVALID", `Значение метки ${k} — строка до ${ENROLL_MAX_LABEL} символов`);
+  }
+  return Object.fromEntries(entries) as Record<string, string>;
+}
 
 function safeEqual(a: string, b: string): boolean {
   const x = Buffer.from(a);
@@ -2082,6 +2423,12 @@ export class Actor {
   }
   revoke(agentId: string): Promise<Agent> {
     return this.agents["revokeAs"](this.actor, agentId);
+  }
+  deleteAgent(agentId: string): Promise<void> {
+    return this.agents["deleteAgentAs"](this.actor, agentId);
+  }
+  cancelCommand(id: string): Promise<Command> {
+    return this.agents["cancelCommandAs"](this.actor, id);
   }
   updateAgent(agentId: string): Promise<Command> {
     return this.agents["updateAgentAs"](this.actor, agentId);

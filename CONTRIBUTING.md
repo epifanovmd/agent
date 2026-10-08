@@ -83,3 +83,5 @@ make check
 Версия одна на агента, все SDK и примеры — файл `VERSION`. Новая версия — `make version V=1.2.0`;
 `make version-check` (и `make check`) проверяет, что она везде одинаковая. Выпуск публикует CI по
 тегу `v<VERSION>` — подробнее в [README.md](README.md#выпуск).
+
+Об уязвимостях — не в открытых issue, а закрыто: [SECURITY.md](SECURITY.md).

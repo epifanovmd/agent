@@ -20,8 +20,14 @@ import (
 // ждёт сервер до 30 с.
 const requestTimeout = 45 * time.Second
 
+// maxLine — предел строки канала (§10): длиннее агент не примет.
+const maxLine = 16 << 20
+
 // errClosed — канал с агентом закрыт.
 var errClosed = errors.New("worker: канал с агентом закрыт")
+
+// errTooLarge — сообщение длиннее maxLine: не отправлено, канал цел.
+var errTooLarge = errors.New("worker: сообщение больше 16 МБ")
 
 // channel — канал IPC: по строке JSON на конверт (§10), отправка из любых
 // горутин, ответы на запросы — по re.
@@ -38,7 +44,7 @@ type channel struct {
 
 func newChannel(conn io.ReadWriteCloser) *channel {
 	sc := bufio.NewScanner(conn)
-	sc.Buffer(make([]byte, 64*1024), 16<<20)
+	sc.Buffer(make([]byte, 64*1024), maxLine)
 	return &channel{conn: conn, scanner: sc, pending: map[string]chan message.Envelope{}}
 }
 
@@ -81,6 +87,9 @@ func (c *channel) send(env message.Envelope) error {
 	raw, err := json.Marshal(env)
 	if err != nil {
 		return err
+	}
+	if len(raw)+1 > maxLine {
+		return errTooLarge
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()

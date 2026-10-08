@@ -87,7 +87,7 @@ class WorkerDegradedTest(Case):
         a.push(status([sick], "degraded"), status([sick], "degraded"))
         await a.wait("ack", 2)
         self.assertEqual(self.of(), [(True, "report", "нет связи с базой")])
-        self.assertIn("workerDegraded", {x.type for x in self.agents.alerts()})
+        self.assertIn("workerDegraded", {x.type for x in await self.agents.alerts()})
 
         a.push(status([{**sick, "health": "ok", "message": None}]))
         await a.wait("ack", 3)
@@ -97,7 +97,7 @@ class WorkerDegradedTest(Case):
         a.push(status([sick], "degraded"), status([]))
         await a.wait("ack", 5)
         self.assertEqual([x[0] for x in self.of()], [True, False, True, False])
-        self.assertEqual(self.agents.alerts(), [])
+        self.assertEqual(await self.agents.alerts(), [])
 
         # Без сообщения воркера — текст по умолчанию, и он же в конце.
         quiet = {**sick, "message": None}
@@ -114,7 +114,7 @@ class WorkerDegradedTest(Case):
         await self.agents.revoke(a.id)
         self.assertEqual([(x.type, x.active, x.message) for x in self.alerts],
                          [("degraded", True, "плохо"), ("degraded", False, "плохо")])
-        self.assertEqual(self.agents.alerts(), [])
+        self.assertEqual(await self.agents.alerts(), [])
 
     async def test_example_status_accepted(self) -> None:
         for name, env in between("agent", "server"):

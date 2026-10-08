@@ -3,12 +3,23 @@
 import { Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import { envelope, newId, type Envelope } from "../index";
-import { AgentError } from "./errors";
+import { AgentError, MessageTooLargeError } from "./errors";
 
 /** Ответ агента на запрос (job.urls) — не дольше (агент сам ждёт сервер до 30 с). */
 export const REQUEST_TIMEOUT_MS = 45_000;
+/** Предел строки канала (§10), байт: длиннее агент не примет. */
+export const MAX_LINE_BYTES = 16 << 20;
+/**
+ * Строк в очереди записи, пока поток не готов (обратное давление), после которых
+ * прогресс задач и телеметрия отбрасываются; остальное ждёт в очереди.
+ */
+export const WRITE_QUEUE_SOFT_LIMIT = 1000;
+
+/** Сообщения, которые можно отбросить при заторе: следующие их заменят. */
+const DROPPABLE = new Set(["job.progress", "telemetry"]);
 
 type Pending = { resolve: (env: Envelope) => void; reject: (err: Error) => void; timer: NodeJS.Timeout };
+type Logger = (level: "info" | "warn" | "error", msg: string) => void;
 
 export class Channel {
   private buf = "";
@@ -17,33 +28,55 @@ export class Channel {
   private closeListeners: (() => void)[] = [];
   private isClosed = false;
   private readonly stream: Duplex;
+  /** Строки, ждущие 'drain' потока. */
+  private queue: string[] = [];
+  private needDrain = false;
+  private dropped = 0;
+  private readonly log: Logger;
 
-  constructor(stream: Duplex) {
+  constructor(stream: Duplex, opts: { log?: Logger } = {}) {
     this.stream = stream;
+    this.log = opts.log ?? (() => {});
     stream.setEncoding("utf8");
     stream.on("data", (chunk: string) => this.read(chunk));
+    stream.on("drain", () => this.drainQueue());
     stream.on("end", () => this.shutdown());
     stream.on("close", () => this.shutdown());
     stream.on("error", () => this.shutdown());
   }
 
   /** Канал, унаследованный от агента; без агента — понятная ошибка. */
-  static fromEnv(): Channel {
+  static fromEnv(opts: { log?: Logger } = {}): Channel {
     const fd = Number(process.env.AGENT_IPC_FD);
     if (!process.env.AGENT_IPC_FD || !Number.isInteger(fd)) {
       throw new Error("воркер запускается агентом (AGENT_IPC_FD не задан): опишите его в workers конфигурации агента");
     }
-    return new Channel(new Socket({ fd, readable: true, writable: true }));
+    return new Channel(new Socket({ fd, readable: true, writable: true }), opts);
   }
 
   get closed(): boolean {
     return this.isClosed;
   }
 
-  /** Отправить конверт; канал закрыт — false (агента нет, слать некому). */
+  /**
+   * Отправить конверт; канал закрыт — false (агента нет, слать некому). Данные не
+   * превращаются в JSON (BigInt, цикл) — TypeError; строка больше 16 МБ —
+   * MessageTooLargeError; в обоих случаях канал цел. Пока поток не готов
+   * принимать (обратное давление), строки ждут в очереди.
+   */
   send(type: string, data?: unknown, opts: { id?: string; re?: string } = {}): boolean {
     if (this.isClosed || this.stream.destroyed || !this.stream.writable) return false;
-    this.stream.write(JSON.stringify(envelope(type, data, opts)) + "\n");
+    const line = JSON.stringify(envelope(type, data, opts)) + "\n";
+    if (Buffer.byteLength(line) > MAX_LINE_BYTES) throw new MessageTooLargeError(type);
+    if (this.needDrain) {
+      if (DROPPABLE.has(type) && this.queue.length >= WRITE_QUEUE_SOFT_LIMIT) {
+        if (this.dropped++ === 0) this.log("warn", "канал с агентом не успевает: прогресс и телеметрия отбрасываются");
+        return true;
+      }
+      this.queue.push(line);
+      return true;
+    }
+    this.write(line);
     return true;
   }
 
@@ -66,7 +99,15 @@ export class Channel {
           } else resolve(env.data as T);
         },
       });
-      if (!this.send(type, data, { id })) {
+      let sent: boolean;
+      try {
+        sent = this.send(type, data, { id });
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        return reject(err);
+      }
+      if (!sent) {
         clearTimeout(timer);
         this.pending.delete(id);
         reject(new AgentError("CHANNEL_CLOSED", "канал с агентом закрыт"));
@@ -85,9 +126,25 @@ export class Channel {
   }
 
   close(): void {
+    // Накопленное при заторе — дописать, если поток ещё принимает.
+    for (const line of this.queue.splice(0)) if (this.stream.writable) this.stream.write(line);
     this.stream.end();
     this.stream.destroy();
     this.shutdown();
+  }
+
+  private write(line: string): void {
+    if (!this.stream.write(line)) this.needDrain = true;
+  }
+
+  /** 'drain': дописать очередь, пока поток принимает. */
+  private drainQueue(): void {
+    this.needDrain = false;
+    while (this.queue.length && !this.needDrain && !this.isClosed) this.write(this.queue.shift()!);
+    if (!this.queue.length && !this.needDrain && this.dropped) {
+      this.log("warn", `канал с агентом снова успевает; отброшено сообщений: ${this.dropped}`);
+      this.dropped = 0;
+    }
   }
 
   private read(chunk: string): void {
@@ -117,6 +174,7 @@ export class Channel {
   private shutdown(): void {
     if (this.isClosed) return;
     this.isClosed = true;
+    this.queue = [];
     for (const [id, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new AgentError("CHANNEL_CLOSED", "канал с агентом закрыт"));

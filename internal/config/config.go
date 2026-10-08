@@ -48,7 +48,25 @@ type Config struct {
 	Update    Update            `yaml:"update"`
 	State     State             `yaml:"state"`
 	Commands  Commands          `yaml:"commands"`
+	Jobs      Jobs              `yaml:"jobs"`
+	Outbox    Outbox            `yaml:"outbox"`
 	Workers   []Worker          `yaml:"workers"`
+}
+
+// Jobs — задачи.
+type Jobs struct {
+	// CancelTimeout — сколько после job.cancel держать место задачи, пока
+	// воркер её не завершил; не завершил — копия воркера заменяется. По
+	// умолчанию 30s.
+	CancelTimeout Duration `yaml:"cancelTimeout"`
+}
+
+// Outbox — очередь важных сообщений на диске.
+type Outbox struct {
+	// MaxMessages — сообщений в очереди не больше (по умолчанию 10000).
+	// Переполнена — отбрасываются самые старые из тех, что можно потерять
+	// (event, job.event, state.applied); таких нет — новое не принимается.
+	MaxMessages int `yaml:"maxMessages"`
 }
 
 type Server struct {
@@ -73,6 +91,9 @@ type Commands struct {
 	// Disabled — встроенные команды (BuiltinCommands), которые агент не
 	// объявляет и не выполняет.
 	Disabled []string `yaml:"disabled"`
+	// MaxConcurrent — команд одновременно (по умолчанию 8); остальные ждут
+	// своей очереди, срок команды при этом идёт.
+	MaxConcurrent int `yaml:"maxConcurrent"`
 }
 
 // BuiltinCommands — встроенные команды агента (их можно выключить в commands.disabled).
@@ -144,6 +165,10 @@ type State struct {
 	// последний снимок каждого раздела (та же версия): воркер исправляет
 	// ручные изменения на узле. 0 — выключено. По умолчанию 10m.
 	ResyncInterval Duration `yaml:"resyncInterval"`
+	// ApplyTimeout — сколько ждать ответа воркера на снимок раздела; не
+	// ответил — раздел не применён (STATE_TIMEOUT), повтор по обычному
+	// правилу. По умолчанию 5m.
+	ApplyTimeout Duration `yaml:"applyTimeout"`
 }
 
 // Стратегии замены экземпляров воркера.
@@ -168,9 +193,11 @@ type Worker struct {
 	// дорабатывает — без простоя) | stop-first (сначала уходит старый — для
 	// воркеров, держащих порт, интерфейс или другой единственный ресурс).
 	Restart string `yaml:"restart"`
-	// Release — воркер из выпуска: исполняемый файл ведёт агент
-	// (<dataDir>/workers/<name>/current), сервер может обновить его командой
-	// worker.update. command не задаётся.
+	// Release — воркер из выпуска: сборку ведёт агент
+	// (<dataDir>/workers/<name>/current), сервер может обновить её командой
+	// worker.update. Сборка — исполняемый файл или каталог из архива
+	// .tar.gz; command (если задан) выполняется в каталоге сборки, без
+	// command запускается сам файл или ./run архива.
 	Release bool `yaml:"release"`
 	// Args — аргументы, дописываемые к command (или к файлу выпуска).
 	Args []string `yaml:"args"`
@@ -179,8 +206,28 @@ type Worker struct {
 	Limits Limits `yaml:"limits"`
 	// User — пользователь, от которого запускается воркер; агенту нужен root.
 	User string `yaml:"user"`
+	// InheritEnv — какие ещё переменные окружения агента передать воркеру
+	// сверх обычных (PATH, HOME, LANG и др.); "PREFIX_*" — все с этим
+	// началом. Переменные AGENT_* агента воркеру не передаются никогда.
+	InheritEnv []string `yaml:"inheritEnv"`
+	// Backoff — пауза перед перезапуском упавшего воркера: от min до max,
+	// растёт с каждым падением подряд (по умолчанию 1s и 30s).
+	Backoff Backoff `yaml:"backoff"`
+	// MaxRestarts — перезапусков подряд не больше (0 — без предела);
+	// превышено — копия остаётся остановленной, статус degraded, вернуть —
+	// worker.restart или перечитывание настроек.
+	MaxRestarts int `yaml:"maxRestarts"`
+	// RegisterTimeout — сколько ждать worker.register после запуска (по
+	// умолчанию 120s); не дождались — перезапуск как упавшего.
+	RegisterTimeout Duration `yaml:"registerTimeout"`
 	// Dir выпуска — <dataDir>/workers/<name>; заполняет Validate для release.
 	ReleaseDir string `yaml:"-"`
+}
+
+// Backoff — пауза перед перезапуском воркера.
+type Backoff struct {
+	Min Duration `yaml:"min"`
+	Max Duration `yaml:"max"`
 }
 
 // Файлы воркера из выпуска в его каталоге ReleaseDir.
@@ -189,16 +236,21 @@ const (
 	ReleaseVersion         = "version"
 	ReleasePrevious        = "previous"
 	ReleasePreviousVersion = "previous.version"
+	// ReleaseRun — что запускать в сборке-архиве, если command не задан.
+	ReleaseRun = "run"
 )
 
-// Argv — команда запуска: command + args; для воркера из выпуска —
-// <ReleaseDir>/current + args.
+// Argv — команда запуска: command + args; для воркера из выпуска без
+// command — <ReleaseDir>/current + args.
 func (w Worker) Argv() []string {
-	if w.Release {
+	if w.Release && len(w.Command) == 0 {
 		return append([]string{filepath.Join(w.ReleaseDir, ReleaseCurrent)}, w.Args...)
 	}
 	return append(slices.Clone(w.Command), w.Args...)
 }
+
+// Current — сборка воркера из выпуска (<ReleaseDir>/current).
+func (w Worker) Current() string { return filepath.Join(w.ReleaseDir, ReleaseCurrent) }
 
 // ReleasesDir — каталог воркеров из выпуска в dataDir.
 func ReleasesDir(dataDir string) string { return filepath.Join(dataDir, "workers") }
@@ -216,8 +268,11 @@ func Defaults() Config {
 			GPU: "auto", Metrics: slices.Clone(DefaultMetrics), Disks: []string{"/"}, InventoryInterval: Duration(10 * time.Minute),
 			ExcludeInterfaces: slices.Clone(DefaultExcludeInterfaces), Backlog: 720,
 		},
-		Update: Update{Mode: "self"},
-		State:  State{ResyncInterval: Duration(10 * time.Minute)},
+		Update:   Update{Mode: "self"},
+		State:    State{ResyncInterval: Duration(10 * time.Minute), ApplyTimeout: Duration(5 * time.Minute)},
+		Commands: Commands{MaxConcurrent: 8},
+		Jobs:     Jobs{CancelTimeout: Duration(30 * time.Second)},
+		Outbox:   Outbox{MaxMessages: 10000},
 	}
 }
 
@@ -332,6 +387,18 @@ func (c *Config) Validate() error {
 	if c.State.ResyncInterval < 0 {
 		errs = append(errs, errors.New("state.resyncInterval (AGENT_STATE_RESYNC): не меньше 0 (0 — выключено)"))
 	}
+	if c.State.ApplyTimeout <= 0 {
+		c.State.ApplyTimeout = Duration(5 * time.Minute)
+	}
+	if c.Commands.MaxConcurrent <= 0 {
+		c.Commands.MaxConcurrent = 8
+	}
+	if c.Jobs.CancelTimeout <= 0 {
+		c.Jobs.CancelTimeout = Duration(30 * time.Second)
+	}
+	if c.Outbox.MaxMessages <= 0 {
+		c.Outbox.MaxMessages = 10000
+	}
 	for _, g := range c.Telemetry.Metrics {
 		if !slices.Contains(message.MetricGroups, g) {
 			errs = append(errs, fmt.Errorf("telemetry.metrics (AGENT_TELEMETRY_METRICS): неизвестная группа %q (%s)",
@@ -370,8 +437,6 @@ func (c *Config) Validate() error {
 	for i := range c.Workers {
 		w := &c.Workers[i]
 		switch {
-		case w.Release && len(w.Command) > 0:
-			errs = append(errs, fmt.Errorf("workers[%d] (%s): при release: true command не задаётся — исполняемый файл ведёт агент (args — аргументы)", i, w.Name))
 		case w.Release && !message.ValidName(w.Name):
 			errs = append(errs, fmt.Errorf("workers[%d]: имя воркера из выпуска %q — латиница, цифры, «.», «_», «-», до 64 символов", i, w.Name))
 		case w.Name == "" || (!w.Release && len(w.Command) == 0):
@@ -390,6 +455,26 @@ func (c *Config) Validate() error {
 		}
 		if w.StopTimeout <= 0 {
 			w.StopTimeout = Duration(30 * time.Second)
+		}
+		if w.RegisterTimeout <= 0 {
+			w.RegisterTimeout = Duration(120 * time.Second)
+		}
+		if w.Backoff.Min <= 0 {
+			w.Backoff.Min = Duration(time.Second)
+		}
+		if w.Backoff.Max <= 0 {
+			w.Backoff.Max = max(Duration(30*time.Second), w.Backoff.Min)
+		}
+		if w.Backoff.Max < w.Backoff.Min {
+			errs = append(errs, fmt.Errorf("workers[%d].backoff: max не меньше min", i))
+		}
+		if w.MaxRestarts < 0 {
+			errs = append(errs, fmt.Errorf("workers[%d].maxRestarts: не меньше 0 (0 — без предела)", i))
+		}
+		for _, name := range w.InheritEnv {
+			if name == "" || strings.HasPrefix(name, "AGENT_") || strings.ContainsAny(name, "= ") {
+				errs = append(errs, fmt.Errorf("workers[%d].inheritEnv: %q — имя переменной (AGENT_* воркеру не передаются)", i, name))
+			}
 		}
 		if !oneOf(w.Restart, "", RestartRolling, RestartStopFirst) {
 			errs = append(errs, fmt.Errorf("workers[%d].restart: rolling | stop-first, а не %q", i, w.Restart))

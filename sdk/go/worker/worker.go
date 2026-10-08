@@ -14,6 +14,10 @@
 //	w.Cleanup(removeRules)                                // уборка при удалении агента
 //	if err := w.Run(context.Background()); err != nil { … }
 //
+// SetHealth, Pause, Resume, RequestRestart, Report и Event можно вызывать и до
+// Run: сообщения уходят сразу после worker.ready. На worker.ping SDK отвечает
+// worker.pong сам. Итог больше 16 МБ — ошибка RESULT_TOO_LARGE агенту.
+//
 // Остановка: worker.drain от агента и SIGTERM/SIGINT — новые задачи не
 // берутся, текущие задачи и команды дорабатываются, Run возвращает nil.
 // Канал закрыт (агента нет) — всё отменяется, Run возвращает nil. Отмена ctx
@@ -29,6 +33,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"reflect"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -43,7 +48,9 @@ import (
 const SDKVersion = "1.1.0"
 
 // JobHandler — обработчик задачи очереди: результат — в job.complete, ошибка —
-// job.fail (Fail — с кодом). ctx отменяется при job.cancel и остановке.
+// job.fail (Fail — с кодом). ctx отменяется при job.cancel и остановке. После
+// job.cancel итог обработчика не отправляется: когда он вернулся, SDK сам шлёт
+// агенту job.fail с кодом CANCELLED — обработчику достаточно вернуться.
 type JobHandler func(ctx context.Context, job *Job) (any, error)
 
 // CommandHandler — обработчик команды: результат — итог cmd.done, ошибка —
@@ -77,6 +84,15 @@ type queue struct {
 	concurrency int
 	fn          JobHandler
 	sem         chan struct{}
+}
+
+// earlyLimit — сколько сообщений копится до worker.ready; лишние вытесняют
+// самые старые.
+const earlyLimit = 1000
+
+type earlyMessage struct {
+	typ  string
+	data any
 }
 
 type poller struct {
@@ -119,6 +135,13 @@ type Worker struct {
 	drainCh   chan struct{}
 	wake      chan struct{}
 	readyOnce sync.Once
+
+	// Сообщения воркера до worker.ready (SetHealth, Pause, Report, Event…):
+	// копятся и уходят сразу после него (см. control).
+	earlyMu      sync.Mutex
+	early        []earlyMessage
+	earlyDropped bool
+	ready        bool
 
 	// Контекст агента (worker.context): ctxChanged закрывается при новом.
 	wctx       Context
@@ -259,6 +282,8 @@ func (w *Worker) Telemetry(channelName string, interval time.Duration, fn func()
 // ─── из обработчиков ───────────────────────────────────────────────────
 
 // Report — последние данные канала телеметрии: уйдут в ближайший metrics агента.
+// До worker.ready (и до Run) данные копятся (см. control); больше 16 МБ — не
+// отправляются (ошибка и запись в лог).
 func (w *Worker) Report(channelName string, data any) error {
 	if !slices.Contains(w.channels, channelName) {
 		return fmt.Errorf("worker: канал %q не объявлен (Channel)", channelName)
@@ -267,10 +292,12 @@ func (w *Worker) Report(channelName string, data any) error {
 	if err != nil {
 		return fmt.Errorf("worker: телеметрия %s: %w", channelName, err)
 	}
-	return w.send(message.TypeTelemetry, message.Telemetry{Channel: channelName, Data: raw}, "")
+	return w.control(message.TypeTelemetry, message.Telemetry{Channel: channelName, Data: raw})
 }
 
 // Event — событие воркера серверу (надёжно: агент хранит до подтверждения).
+// До worker.ready (и до Run) событие копится (см. control); больше 16 МБ — не
+// отправляется (ошибка и запись в лог).
 func (w *Worker) Event(typ string, data any) error {
 	e := message.Event{Type: truncate(typ, 50)}
 	if data != nil {
@@ -280,7 +307,7 @@ func (w *Worker) Event(typ string, data any) error {
 		}
 		e.Data = raw
 	}
-	return w.send(message.TypeEvent, e, "")
+	return w.control(message.TypeEvent, e)
 }
 
 // Rejected — имена, которые агент отклонил (зарезервированы или заняты).
@@ -320,6 +347,40 @@ func (w *Worker) send(typ string, data any, re string) error {
 	return err
 }
 
+// control — сообщение воркера от его имени (SetHealth, Pause, Resume,
+// RequestRestart, Report, Event): до worker.ready (в том числе до Run) — в
+// очередь (не больше earlyLimit, лишние вытесняют старые), после — сразу.
+func (w *Worker) control(typ string, data any) error {
+	w.earlyMu.Lock()
+	if !w.ready {
+		if len(w.early) >= earlyLimit {
+			w.early = slices.Delete(w.early, 0, 1)
+			if !w.earlyDropped {
+				w.earlyDropped = true
+				w.log.Warn("до worker.ready накоплено больше сообщений, чем помещается: старые отброшены", "limit", earlyLimit)
+			}
+		}
+		w.early = append(w.early, earlyMessage{typ, data})
+		w.earlyMu.Unlock()
+		return nil
+	}
+	w.earlyMu.Unlock()
+	return w.send(typ, data, "")
+}
+
+// flushEarly — worker.ready: накопленные сообщения агенту по порядку.
+func (w *Worker) flushEarly() {
+	w.earlyMu.Lock()
+	defer w.earlyMu.Unlock()
+	if w.ready {
+		return
+	}
+	for _, m := range w.early {
+		_ = w.send(m.typ, m.data, "")
+	}
+	w.early, w.ready = nil, true
+}
+
 func (w *Worker) poke() {
 	select {
 	case w.wake <- struct{}{}:
@@ -340,6 +401,7 @@ func (w *Worker) registration() register {
 		WorkerRegister: message.WorkerRegister{
 			Name: w.name, Version: w.version, SDK: "go/" + SDKVersion,
 			Commands: w.cmdNames, Domains: w.domNames, Channels: w.channels,
+			Ping: true,
 		},
 		Queues: []message.QueueCapacity{},
 	}
@@ -452,7 +514,10 @@ func (w *Worker) dispatch(env message.Envelope) {
 			w.log.Warn("агент отклонил имена (зарезервированы или заняты)", "rejected", ready.Rejected)
 		}
 		w.log.Info("воркер зарегистрирован у агента", "agentVersion", ready.AgentVersion)
+		w.flushEarly()
 		w.readyOnce.Do(w.startPollers)
+	case message.TypeWorkerPing:
+		_ = w.send(message.TypeWorkerPong, struct{}{}, env.ID)
 	case message.TypeJobAssign:
 		var a message.JobAssign
 		if err := env.Decode(&a); err != nil {
@@ -551,9 +616,13 @@ func (w *Worker) assign(a message.JobAssign) {
 		}, "")
 		return
 	}
-	if prev := w.jobs[a.JobID]; prev != nil && prev.Attempt == a.Attempt {
-		w.mu.Unlock() // повторная доставка той же попытки
+	prev := w.jobs[a.JobID]
+	if prev != nil && prev.Attempt >= a.Attempt {
+		w.mu.Unlock() // повторная доставка той же (или прежней) попытки
 		return
+	}
+	if prev != nil {
+		prev.abort() // новая попытка той же задачи: прежняя уже не нужна
 	}
 	job := newJob(w, a)
 	w.jobs[a.JobID] = job
@@ -576,22 +645,31 @@ func (w *Worker) execute(q *queue, job *Job) {
 	select {
 	case q.sem <- struct{}{}:
 	case <-job.ctx.Done():
+		w.confirmCancel(job)
 		return
 	}
 	defer func() { <-q.sem }()
 
 	result, err := w.safeCall("job "+q.name, func() (any, error) { return q.fn(job.ctx, job) })
-	if job.cancelled.Load() || w.ch.isClosed() {
-		return // отменена или агента нет: итог не нужен
+	if w.ch.isClosed() {
+		return // агента нет: итог некому отдать
+	}
+	if job.cancelled.Load() {
+		w.confirmCancel(job) // итог обработчика не нужен
+		return
 	}
 	job.flush()
 	if err == nil {
 		raw, merr := marshalResult(result)
 		if merr == nil {
-			_ = w.send(message.TypeJobComplete, message.JobComplete{JobRef: job.ref(), Result: raw}, "")
-			return
+			serr := w.send(message.TypeJobComplete, message.JobComplete{JobRef: job.ref(), Result: raw}, "")
+			if !errors.Is(serr, errTooLarge) {
+				return
+			}
+			err = Fail(CodeResultTooLarge, "результат задачи больше 16 МБ: крупные данные — выходным файлом", false)
+		} else {
+			err = fmt.Errorf("результат не сериализуется: %w", merr)
 		}
-		err = fmt.Errorf("результат не сериализуется: %w", merr)
 	}
 	fail := message.JobFail{JobRef: job.ref(), Code: CodeWorkerError, Message: err.Error(), Retryable: true}
 	var jf *JobFailed
@@ -603,6 +681,18 @@ func (w *Worker) execute(q *queue, job *Job) {
 	fail.Code, fail.Message = normalizeCode(fail.Code, fail.Message, CodeWorkerError)
 	fail.Message = truncate(fail.Message, 2000)
 	_ = w.send(message.TypeJobFail, fail, "")
+}
+
+// confirmCancel — обработчик отменённой задачи завершился (или не начинался):
+// job.fail с кодом CANCELLED подтверждает агенту, что место свободно. Агент
+// серверу его не передаёт.
+func (w *Worker) confirmCancel(job *Job) {
+	if !job.cancelled.Load() || w.ch.isClosed() {
+		return
+	}
+	_ = w.send(message.TypeJobFail, message.JobFail{
+		JobRef: job.ref(), Code: message.ErrCancelled, Message: "задача отменена",
+	}, "")
 }
 
 // ─── команды и состояние ───────────────────────────────────────────────
@@ -656,7 +746,12 @@ func (w *Worker) runCommand(run message.CommandRun) {
 		if cmd.cancelled.Load() || w.ch.isClosed() {
 			return // срок истёк: итог уже не нужен
 		}
-		_ = w.send(message.TypeCmdDone, done, "")
+		if errors.Is(w.send(message.TypeCmdDone, done, ""), errTooLarge) {
+			done = message.CommandDone{CommandID: run.CommandID, Error: &message.CommandError{
+				Code: CodeResultTooLarge, Message: "итог команды больше 16 МБ",
+			}}
+			_ = w.send(message.TypeCmdDone, done, "")
+		}
 	}()
 }
 
@@ -700,7 +795,11 @@ func (w *Worker) applyState(id string, put message.StatePut) {
 				applied.OK = true
 			}
 		}
-		_ = w.send(message.TypeStateApplied, applied, id)
+		if errors.Is(w.send(message.TypeStateApplied, applied, id), errTooLarge) {
+			applied = message.StateApplied{Domain: put.Domain, Version: put.Version,
+				Error: CodeResultTooLarge + ": отчёт состояния больше 16 МБ"}
+			_ = w.send(message.TypeStateApplied, applied, id)
+		}
 	}()
 }
 
@@ -725,7 +824,9 @@ func (w *Worker) runCleanup(id string) {
 				cleaned = message.WorkerCleaned{Error: truncate(err.Error(), 2000)}
 			}
 		}
-		_ = w.send(message.TypeWorkerCleaned, cleaned, id)
+		if errors.Is(w.send(message.TypeWorkerCleaned, cleaned, id), errTooLarge) {
+			_ = w.send(message.TypeWorkerCleaned, message.WorkerCleaned{Error: CodeResultTooLarge + ": итог уборки больше 16 МБ"}, id)
+		}
 	}()
 }
 
@@ -752,14 +853,21 @@ func (w *Worker) pollWait(p poller, last time.Time) bool {
 	}
 }
 
+// startPollers — опрос источников телеметрии; каналы, которые агент
+// отклонил (worker.ready.rejected), не опрашиваются.
 func (w *Worker) startPollers() {
+	rejected := w.Rejected()
 	for _, p := range w.pollers {
+		if slices.Contains(rejected, p.channel) {
+			w.log.Warn("канал телеметрии отклонён агентом — не опрашивается", "channel", p.channel)
+			continue
+		}
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
 			for {
 				data, err := w.safeCall("telemetry "+p.channel, func() (any, error) { return p.fn(), nil })
-				if err == nil && data != nil {
+				if err == nil && !isNil(data) {
 					if err := w.Report(p.channel, data); err != nil && !errors.Is(err, errClosed) {
 						w.log.Warn("телеметрия не отправлена", "channel", p.channel, "err", err)
 					}
@@ -770,4 +878,17 @@ func (w *Worker) startPollers() {
 			}
 		}()
 	}
+}
+
+// isNil — nil, в том числе типизированный (nil-карта, nil-указатель):
+// источник телеметрии вернул «нет данных».
+func isNil(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch rv := reflect.ValueOf(v); rv.Kind() {
+	case reflect.Map, reflect.Pointer, reflect.Slice, reflect.Interface, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	}
+	return false
 }

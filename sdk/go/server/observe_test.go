@@ -18,9 +18,7 @@ func TestInventoryAndBackfillExamples(t *testing.T) {
 	agents := newTestAgents(t, Options{})
 	id, _ := enroll(t, agents, "a")
 	ss := open(t, agents, id, exampleEnv(t, "hello"))
-	agents.mu.Lock()
-	agents.streams[id].lastSeq = 0
-	agents.unlock()
+	resetSeq(t, agents, id)
 	for _, name := range []string{"inventory", "metrics", "metrics.backfill"} {
 		env := exampleEnv(t, name)
 		out := handle(agents, ss, env)

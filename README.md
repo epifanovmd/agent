@@ -61,8 +61,10 @@ scripts/              go.sh (Go в контейнере), release.sh (выпус
 test/integration/     настоящий агент против сервера на Go-SDK
 test/conformance/     одна проверка для серверов на всех трёх SDK
 test/testserver/      сервер на Go-SDK для этих проверок
-docs/ARCHITECTURE.md  как устроен агент, настройки, установка, обновление
+docs/ARCHITECTURE.md  как устроен агент, настройки, установка, работа на узле, обновление
 CONTRIBUTING.md       правила разработки
+SECURITY.md           как сообщить об уязвимости
+.github/              CI, выпуск по тегу, обновления зависимостей (dependabot)
 VERSION               версия агента, SDK и примеров
 ```
 
@@ -127,7 +129,8 @@ Node ≥ 24 и python3 нужны на машине. Список целей —
 Версия одна на агента и все SDK: файл `VERSION`. Записать новую везде — `make version V=1.2.0`;
 `make check` (и CI) проверяет, что она совпадает во всех местах.
 
-Тег `v<VERSION>` → CI выкладывает в GitHub Release:
+Тег `v<VERSION>` → CI выкладывает в GitHub Release (тег с «-», например `v1.2.0-rc.1`, —
+предварительный выпуск):
 
 - подписанные сборки агента, `manifest.json`, `install.sh`;
 - SDK: архив для Node (`agent-sdk-<версия>.tgz`) и пакет для Python
@@ -137,12 +140,17 @@ Node ≥ 24 и python3 нужны на машине. Список целей —
 Всё ставится с GitHub, без npm и PyPI — команды установки в [sdk/docs](sdk/docs/README.md).
 
 Подпись: `agent keygen` выдаёт пару ключей. Закрытый (`AGENT_SIGNING_KEY`) — секрет репозитория
-для CI, открытый (`AGENT_UPDATE_PUBLIC_KEY`) — в настройки агентов и бэкенда.
+для CI. Открытый (`AGENT_UPDATE_PUBLIC_KEY`) — переменная репозитория: CI вшивает его в сборки
+агента, и они проверяют обновления без настройки; бэкенду он нужен в опции `publicKey`. Как
+поставить агента прямо из GitHub Release — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#установка).
+
+Об уязвимостях сообщайте не в открытых issue — см. [SECURITY.md](SECURITY.md).
 
 ## Требования
 
-- Агент: Linux или macOS, amd64 или arm64. Установка службой — Linux с systemd.
-- SDK: Go 1.26, Node.js ≥ 24, Python ≥ 3.10 (без зависимостей).
+- Агент: Linux или macOS, amd64 или arm64. Установка службой — Linux с systemd (Debian/Ubuntu,
+  RHEL/Fedora, SUSE и т. п.); без systemd (Alpine и другие) — в контейнере.
+- SDK: Go ≥ 1.25, Node.js ≥ 24, Python ≥ 3.10 (без зависимостей).
 - Разработка: Docker, Node ≥ 24, python3.
 
 ## Лицензия

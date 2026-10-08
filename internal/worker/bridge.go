@@ -5,8 +5,11 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"slices"
+	"sort"
+	"sync"
 
 	"github.com/epifanovmd/agent/internal/commands"
 	"github.com/epifanovmd/agent/internal/state"
@@ -23,6 +26,9 @@ type Bridge struct {
 	Events    EventSender
 	// Changed — возможности агента изменились: сообщить серверу (capabilities).
 	Changed func()
+	// Narrowed — воркер перестал объявлять часть имён: серверу нужен новый
+	// hello (capabilities только добавляет).
+	Narrowed func()
 }
 
 // TelemetrySink — каналы телеметрии агента (telemetry.Collector).
@@ -193,6 +199,24 @@ func (s *Supervisor) route(name string) *instance {
 	return best
 }
 
+// routeAll — все копии воркера, принимающие вызовы, от самой новой.
+func (s *Supervisor) routeAll(name string) []*instance {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w := s.workers[name]
+	if w == nil {
+		return nil
+	}
+	var out []*instance
+	for _, sl := range w.slots {
+		if inst := sl.current; inst != nil && inst.registered() && inst.Accepting() {
+			out = append(out, inst)
+		}
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].started.After(out[b].started) })
+	return out
+}
+
 // owns — имя принадлежит воркеру.
 func (s *Supervisor) owns(worker, kind, name string) bool {
 	s.mu.Lock()
@@ -220,12 +244,38 @@ type domainProxy struct {
 
 func (d domainProxy) Domain() string { return d.domain }
 
+// Apply — снимок получают все копии воркера (у каждой своё состояние);
+// применён — когда применили все; ошибка любой — ошибка (с её отчётом),
+// отчёт успеха — самой новой копии.
 func (d domainProxy) Apply(ctx context.Context, version int64, spec json.RawMessage) (any, error) {
-	inst := d.s.route(d.worker)
-	if inst == nil {
+	insts := d.s.routeAll(d.worker)
+	if len(insts) == 0 {
 		return nil, &message.Error{Code: "WORKER_UNAVAILABLE", Message: "воркер " + d.worker + " не запущен"}
 	}
-	return inst.applyState(ctx, message.StatePut{Domain: d.domain, Version: version, Spec: spec})
+	type result struct {
+		report any
+		err    error
+	}
+	results := make([]result, len(insts))
+	var wg sync.WaitGroup
+	for n, inst := range insts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := inst.applyState(ctx, message.StatePut{Domain: d.domain, Version: version, Spec: spec})
+			results[n] = result{r, err}
+		}()
+	}
+	wg.Wait()
+	for n, r := range results {
+		if r.err != nil {
+			if len(insts) > 1 {
+				r.err = fmt.Errorf("копия %s: %w", insts[n].id, r.err)
+			}
+			return r.report, r.err
+		}
+	}
+	return results[0].report, nil
 }
 
 // Available — воркер-владелец домена запущен и принимает вызовы

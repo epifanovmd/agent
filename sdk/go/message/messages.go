@@ -57,6 +57,11 @@ const (
 	TypeWorkerCleanup = "worker.cleanup"
 	// TypeWorkerCleaned — итог уборки (W→A, re = id запроса).
 	TypeWorkerCleaned = "worker.cleaned"
+	// TypeWorkerPing — проверка «жив ли воркер» (A→W, с id); только воркеру
+	// с WorkerRegister.Ping.
+	TypeWorkerPing = "worker.ping"
+	// TypeWorkerPong — ответ на worker.ping (W→A, re = id запроса).
+	TypeWorkerPong = "worker.pong"
 )
 
 // WorkerRegister — воркер объявляет себя и что обслуживает: очереди,
@@ -69,6 +74,8 @@ type WorkerRegister struct {
 	Commands []string        `json:"commands,omitempty"`
 	Domains  []string        `json:"domains,omitempty"`
 	Channels []string        `json:"channels,omitempty"`
+	// Ping — воркер отвечает на worker.ping: агент проверяет, не завис ли он.
+	Ping bool `json:"ping,omitempty"`
 }
 
 // WorkerCleaned — итог worker.cleanup: ok или текст ошибки.
@@ -584,6 +591,9 @@ const (
 	ErrQueueNotServed = "QUEUE_NOT_SERVED"
 	ErrQueueBusy      = "QUEUE_BUSY"
 	ErrUploadFailed   = "UPLOAD_FAILED"
+	// ErrCancelled — отмена: итог cmd.done после cmd.cancel; от воркера —
+	// job.fail отменённой задачи (подтверждение, серверу не уходит).
+	ErrCancelled = "CANCELLED"
 )
 
 // ─── Команды ───────────────────────────────────────────────────────────

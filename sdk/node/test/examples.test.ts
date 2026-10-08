@@ -61,6 +61,21 @@ test("worker: worker.register совпадает со схемой образц�
   await done;
 });
 
+test("worker: worker.ping → worker.pong по образцам", async () => {
+  const ping = example("worker.ping");
+  const pong = example("worker.pong");
+  const a = fakeAgent();
+  a.worker.channel("example.app");
+  const done = a.worker.run({ signals: false });
+  assert.equal((await a.inbox.wait("worker.register")).data.ping, true);
+  a.send(ping.type, ping.data, { id: ping.id });
+  const got = await a.inbox.wait(pong.type);
+  assert.equal(got.re, pong.re);
+  assert.deepEqual(got.data, pong.data);
+  a.close();
+  await done;
+});
+
 test("worker: понимает агент → воркер (ready, state.put, cmd.cancel, drain) и шлёт telemetry/event/state.applied по образцам", async () => {
   const applied = example("state.applied@worker");
   const telemetry = example("telemetry");
@@ -90,7 +105,7 @@ test("worker: понимает агент → воркер (ready, state.put, cm
   a.worker.event(event.data.type, event.data.data);
   assert.deepEqual((await a.inbox.wait("event")).data, event.data);
 
-  const cancel = example("cmd.cancel");
+  const cancel = example("cmd.cancel@agent");
   a.send("cmd.run", { commandId: cancel.data.commandId, name: "example.app.slow", timeoutSec: 1 });
   await sleep(10);
   a.send(cancel.type, cancel.data);
@@ -192,6 +207,8 @@ test("worker: worker.health, worker.pause, worker.resume, worker.restart — п�
   const a = fakeAgent();
   a.worker.job("example.convert", async () => null);
   const done = a.worker.run({ signals: false });
+  await a.inbox.wait("worker.register");
+  a.send("worker.ready", { agentVersion: "1.1.0" });
   for (const [f, call] of cases) {
     const env = example(f);
     const before = a.inbox.all(env.type).length;

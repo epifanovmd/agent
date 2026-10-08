@@ -54,6 +54,9 @@ const (
 	CodeWorkerStopping = "WORKER_STOPPING"
 	CodeCommandFailed  = "COMMAND_FAILED"
 	CodeCommandUnknown = "COMMAND_UNKNOWN"
+	// CodeResultTooLarge — итог (результат задачи, команды, отчёт состояния)
+	// не уместился в строку канала (16 МБ).
+	CodeResultTooLarge = "RESULT_TOO_LARGE"
 )
 
 var codeRe = regexp.MustCompile(`^[A-Z0-9_]{1,64}$`)

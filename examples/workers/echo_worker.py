@@ -5,6 +5,8 @@
 
 Данные задачи: ``{"text": "...", "sleep"?: секунд, "fail"?: "retry" | "fatal"}``;
 входной файл ``source`` дописывается к тексту, выход ``echo`` — загружается.
+
+Команда ``example.echo.wait`` ``{"seconds"?: 30}`` ждёт столько секунд или отмены.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import logging
 import os
 import time
 
-from agent_sdk.worker import Job, JobFailed, Worker
+from agent_sdk.worker import Command, Job, JobFailed, Worker
 
 logging.basicConfig(
     level=os.environ.get("WORKER_LOG_LEVEL", "INFO").upper(),
@@ -49,6 +51,15 @@ def echo(job: Job) -> dict:
         job.upload("echo", text.encode("utf-8"))
 
     return {"echo": text}
+
+
+@worker.command("example.echo.wait")
+def wait(cmd: Command) -> dict:
+    seconds = float((cmd.args or {}).get("seconds", 30))
+    cmd.write(f"жду {seconds:g} с\n")
+    cmd.wait(seconds)
+    cmd.check_cancelled()
+    return {"waited": seconds}
 
 
 if __name__ == "__main__":

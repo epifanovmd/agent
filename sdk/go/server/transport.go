@@ -36,16 +36,28 @@ func (a *Agents) Mount(mux *http.ServeMux) {
 	}
 }
 
-// requestBase — адрес сервера, по которому агент до него дошёл.
-func requestBase(r *http.Request) string {
-	scheme := "http"
+// requestBase — адрес сервера, по которому агент до него дошёл: Host и TLS
+// запроса; при TrustProxy — X-Forwarded-Host и X-Forwarded-Proto (первые
+// значения), если они есть.
+func (a *Agents) requestBase(r *http.Request) string {
+	scheme, host := "http", r.Host
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
-		scheme = strings.TrimSpace(strings.Split(p, ",")[0])
+	if a.opts.TrustProxy {
+		if p := firstValue(r.Header.Get("X-Forwarded-Proto")); p != "" {
+			scheme = p
+		}
+		if h := firstValue(r.Header.Get("X-Forwarded-Host")); h != "" {
+			host = h
+		}
 	}
-	return scheme + "://" + r.Host
+	return scheme + "://" + host
+}
+
+// firstValue — первое значение заголовка-списка через запятую.
+func firstValue(header string) string {
+	return strings.TrimSpace(strings.Split(header, ",")[0])
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -59,8 +71,13 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 }
 
 // handleEnroll — POST /api/v1/agent-link/enroll: токен → учётные данные.
+// Тело — не больше 64 КБ (больше — 413), читается до проверки токена;
+// неверный токен и запрос не по правилам — в счёт неудач адреса клиента.
 func (a *Agents) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	client := clientAddr(r)
+	client := a.agentAddress(r)
+	if client == "" {
+		client = "*"
+	}
 	if wait := a.enrollBlocked(client); wait > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int((wait+time.Second-1)/time.Second)))
 		writeError(w, http.StatusTooManyRequests, "ENROLL_RATE_LIMITED", "Слишком много неудачных регистраций — повторите позже")
@@ -70,13 +87,18 @@ func (a *Agents) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		Token  string            `json:"token"`
 		Name   string            `json:"name"`
 		Labels map[string]string `json:"labels"`
+		Host   json.RawMessage   `json:"host"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, enrollBodyLimit)).Decode(&req); err != nil {
 		a.enrollFailed(client)
+		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "MESSAGE_INVALID", "Запрос регистрации больше 64 КБ")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "MESSAGE_INVALID", "Нужны token и name")
 		return
 	}
-	id, secret, err := a.Enroll(req.Token, req.Name, req.Labels)
+	id, secret, err := a.Enroll(req.Token, EnrollInfo{Name: req.Name, Labels: req.Labels, Host: req.Host})
 	if err != nil {
 		var pe *message.Error
 		switch {
@@ -95,19 +117,7 @@ func (a *Agents) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"agentId": id, "secret": secret})
 }
 
-// clientAddr — адрес клиента для ограничения регистраций: хост из
-// RemoteAddr (без порта); неизвестен — "*".
-func clientAddr(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && host != "" {
-		return host
-	}
-	if r.RemoteAddr != "" {
-		return r.RemoteAddr
-	}
-	return "*"
-}
-
-// agentAddress — адрес агента в подключении (Agent.Address): при TrustProxy —
+// agentAddress — адрес клиента (Agent.Address, счёт неудачных регистраций): при TrustProxy —
 // первый адрес X-Forwarded-For, иначе хост из RemoteAddr; IP без порта.
 func (a *Agents) agentAddress(r *http.Request) string {
 	if a.opts.TrustProxy {
@@ -205,7 +215,7 @@ func (a *Agents) handleLink(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	a.mu.Lock()
-	ss := a.newSession(agentID, TransportWS, requestBase(r))
+	ss := a.newSession(agentID, TransportWS, a.requestBase(r))
 	ss.address = a.agentAddress(r)
 	a.mu.Unlock()
 	written := make(chan struct{})
@@ -351,7 +361,7 @@ func (a *Agents) handleSync(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "AGENT_HELLO_REQUIRED", "Первое сообщение — hello")
 			return
 		}
-		ss = a.newSession(agentID, TransportHTTP, requestBase(r))
+		ss = a.newSession(agentID, TransportHTTP, a.requestBase(r))
 		ss.address = a.agentAddress(r)
 		a.open(ss, messages[0])
 		messages = messages[1:]

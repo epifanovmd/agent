@@ -111,9 +111,12 @@ worker.job("example.render", { concurrency: 2 }, async (job) => ({ pages: 3, rep
 - повтор `job.assign` той же попытки (после переподключения) — только `job.accept`, задача не
   запускается дважды.
 
-**Воркер.** `concurrency` — сколько задач очереди он выполняет одновременно. Задача, пришедшая,
-когда воркер уже останавливается, возвращается с `job.fail WORKER_STOPPING` (`retryable`), и
-сервер отдаст её другим.
+**Воркер.** `concurrency` — сколько задач очереди он выполняет одновременно; остальные ждут
+места. Задача, пришедшая, когда воркер уже останавливается, возвращается с `job.fail
+WORKER_STOPPING` (`retryable`), и сервер отдаст её другим. Повторный `job.assign` той же задачи
+с той же попыткой SDK пропускает; с большей попыткой — отменяет прежнюю так же, как по отмене
+(её итог не уходит, агенту — `job.fail` с кодом `CANCELLED`), и выполняет новую. Задача,
+отменённая, пока ждала места, обработчик не вызывает.
 
 **Результат.** `job.status: "running"`, `job.agentId`, затем `job.accepted: true`; у агента —
 `agent.status.slots`, `agent.status.capacity`, `agent.status.jobs`.
@@ -205,7 +208,10 @@ throw new Error("временная ошибка"); // WORKER_ERROR, повто�
 ```
 
 Код — заглавные латинские буквы, цифры и `_`, до 64 символов; иначе SDK подставит
-`WORKER_ERROR`. Паника или исключение в обработчике — `WORKER_ERROR`, воркер не падает.
+`WORKER_ERROR`, а исходный код допишет в начало текста. Паника или исключение в обработчике —
+`WORKER_ERROR`, воркер не падает. Результат, который не превращается в JSON (Node: `BigInt`,
+цикл; Python: объект, `NaN`), — `WORKER_ERROR`. Результат больше 16 МБ (предел строки канала с
+агентом) — `RESULT_TOO_LARGE` без повторов: крупные данные отдавайте выходным файлом.
 
 **Результат.**
 
@@ -214,8 +220,8 @@ throw new Error("временная ошибка"); // WORKER_ERROR, повто�
   `error` — ошибка прошлой попытки; задача уйдёт любому подходящему агенту;
 - иначе — `status: "failed"`, `error: {code, message}`, `finishedAt`.
 
-Коды, которые ставят агент, SDK и сервер: `WORKER_ERROR`, `WORKER_CRASHED`, `WORKER_STOPPING`,
-`AGENT_LOST`, `LEASE_EXPIRED`.
+Коды, которые ставят агент, SDK и сервер: `WORKER_ERROR`, `RESULT_TOO_LARGE`, `WORKER_CRASHED`,
+`WORKER_STOPPING`, `AGENT_LOST`, `LEASE_EXPIRED`.
 
 ## Отмена и «закончи пораньше»
 
@@ -243,11 +249,18 @@ await agents.stop_job(job_id)
 на связи — `job.stop` придёт при переподключении (флаг `stopRequested` хранится в задаче);
 отменённую задачу агент из `hello` получит `job.cancel`.
 
-**Агент** (`internal/jobs`): `job.cancel` — передаёт воркеру и забывает задачу, итог не
-отправит; отмена пришла раньше назначения — помнит её 10 минут и назначение пропустит.
-`job.stop` — передаёт воркеру.
+**Агент** (`internal/jobs`): `job.cancel` — передаёт воркеру и забывает задачу, итог серверу не
+отправит; место задачи занято, пока воркер не подтвердит отмену (`job.fail` с кодом `CANCELLED`),
+но не дольше `jobs.cancelTimeout` (30 с) — потом агент заменяет копию воркера новой. Отмена
+пришла раньше назначения — агент помнит её 10 минут и назначение пропустит. `job.stop` —
+передаёт воркеру.
 
-**Воркер.**
+**Воркер.** Обработчику достаточно заметить отмену и вернуться — как угодно: с результатом,
+с ошибкой или исключением. Этот итог SDK не отправляет: когда обработчик вернулся, SDK сам шлёт
+агенту подтверждение `job.fail` с кодом `CANCELLED` — ровно один раз, и агент освобождает место.
+Задача, отменённая, пока ждала места, подтверждается сразу. Обработчик, который отмену не
+замечает, держит место до своего конца; дольше `jobs.cancelTimeout` — агент заменяет копию
+воркера.
 
 ```python
 @worker.job("example.batch")
@@ -260,6 +273,17 @@ def batch(job: Job) -> dict:
         process(item)
         done += 1
     return {"done": done}
+```
+
+Ждать в Python — через `job.wait(секунд)`: вернёт `True`, если задачу отменили, не дожидаясь
+конца паузы (`job.cancel_event` — тот же `threading.Event`). Пауза SDK между попытками загрузки
+файла тоже прерывается отменой.
+
+```python
+while not job.wait(5):                 # раз в 5 с, пока не отменили
+    if poll_done():
+        return {"ok": True}
+raise Cancelled(job.id)                # отменили: итог не уйдёт
 ```
 
 ```go
@@ -438,7 +462,10 @@ await job.upload("report", pdfBytes); // Uint8Array или путь к файл�
 Ещё: `download(name, target)` — скачать в своё место; `inputs`, `outputs` — имена файлов;
 `refreshUrls(inputs?, outputs?)` (`refresh_urls`, `RefreshURLs`) — свежие ссылки вручную. Ссылка
 истекает меньше чем через минуту — SDK берёт свежую сам. Загрузка не удалась — до 4 попыток с
-растущей паузой, каждая со свежей ссылкой. Временный каталог задачи удаляется после её конца.
+растущей паузой, каждая со свежей ссылкой; отмена задачи прерывает паузу. Временный каталог
+задачи создаётся при первом `input_path` / `InputPath` / `inputPath` и удаляется после конца
+задачи. Имя файла в нём — только последняя часть имени входа: каталоги и `..` отбрасываются
+(`"../a/b.csv"` → `b.csv`).
 
 **Результат.** `job.inputs`, `job.outputs` — имена файлов; содержимое — в вашем хранилище (у
 `MemoryFiles` — `files.get(jobId, "out", name)`, в Node при загрузке — ещё событие `job`).
@@ -471,20 +498,28 @@ await job.upload("report", pdfBytes); // Uint8Array или путь к файл�
 ```ts
 const job = await agents.getJob(id); // Job | undefined
 const running = await agents.listJobs({ status: "running", queue: "example.render", agentId }); // новые первыми
+const next = await agents.listJobs({ limit: 50, after: page.at(-1)?.id }); // следующая страница
 ```
 
 ```go
 job, err := agents.Job(id) // server.ErrNotFound — нет
-all, err := agents.Jobs()  // новые первыми
+running, err := agents.Jobs(server.JobFilter{Status: server.JobRunning, Queue: "example.render", AgentID: agentID}) // новые первыми
+next, err := agents.Jobs(server.JobFilter{Limit: 50, After: lastID}) // следующая страница
 ```
 
 ```python
 job = await agents.get_job(job_id)  # None — нет
 jobs = await agents.list_jobs(status="running", queue="example.render", agent_id=agent_id)  # новые первыми
+page = await agents.list_jobs(limit=50, after=last_id)  # следующая страница
 ```
+
+`after` — id последней задачи прошлой страницы; страница — задачи после неё в том же порядке,
+`limit ≤ 0` — все. Задачи `after` нет (её убрала уборка) — страница пустая
+([store.md](store.md#методы-по-языкам)).
 
 Поля `Job`: `id`, `queue`, `data`, `status` (`queued` | `running` | `completed` | `failed` |
 `cancelled`), `attempt`, `maxAttempts`, `leaseSeconds`, `agentId`, `pinnedAgentId`, `accepted`,
 `progress`, `text`, `log`, `events`, `result`, `error`, `stopRequested`, `inputs`, `outputs`,
 `createdAt`, `finishedAt`, `actor`. `MemoryStore` хранит ограниченное число завершённых задач;
-в работе — свой `Store` ([store.md](store.md)).
+в работе — свой `Store` ([store.md](store.md)), старые завершённые убирает `prune`
+([store.md](store.md#уборка)).

@@ -20,7 +20,8 @@ examples/
 │   ├── src/selfcheck.ts проверки воркеров (в интерфейсе и в терминале)
 │   └── selfcheck.cli.ts самопроверка из терминала
 ├── workers/
-│   ├── echo_worker.py   Python: очередь example.echo — текст, входной и выходной файлы, повторы
+│   ├── echo_worker.py   Python: очередь example.echo — текст, входной и выходной файлы, повторы;
+│   │                    команда example.echo.wait — ждёт или отмены
 │   ├── batch_worker.py  Python: пакетная обработка example.batch — этапы, событие stage, досрочная
 │   │                    остановка, файл-результат, команда example.batch.status, показатели
 │   ├── kv_worker.py     Python: хранилище ключей — состояние example.kv, команда, показатели, события,

@@ -381,6 +381,8 @@ export interface WorkerRegister {
   commands?: string[];
   domains?: string[];
   channels?: string[];
+  /** Воркер отвечает на worker.ping: агент проверяет, не завис ли он. */
+  ping?: boolean;
 }
 
 /** worker.ready (§10). */

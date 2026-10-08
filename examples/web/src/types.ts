@@ -195,7 +195,7 @@ export interface Job {
   actor?: string;
 }
 
-export type CommandStatus = "pending" | "running" | "succeeded" | "failed";
+export type CommandStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled";
 
 export interface Command {
   id: string;

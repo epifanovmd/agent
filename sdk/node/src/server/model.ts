@@ -62,6 +62,12 @@ export interface AgentRecord extends Omit<Agent, "revoked"> {
    * не может. Нет поля — выданных меток нет.
    */
   grantedLabels?: Record<string, string>;
+  /** Время текущей точки metrics по часам сервера, мс: точка старше не заменяет текущие метрики. */
+  metricsAt?: number;
+  /** Активные уведомления о проблемах агента (active: true); нет поля — проблем нет. */
+  alerts?: Alert[];
+  /** Версия записи: Store.updateAgent пишет, только если она не изменилась с чтения. */
+  rev: number;
 }
 
 /** Точка истории метрик. */
@@ -176,9 +182,12 @@ export interface Job {
 export interface JobRecord extends Job {
   leaseUntil: number;
   eventSeq: number;
+  /** Версия записи: Store.updateJob пишет, только если она не изменилась с чтения. */
+  rev: number;
 }
 
-export type CommandStatus = "pending" | "running" | "succeeded" | "failed";
+/** cancelled — отменена (Agents.cancelCommand); итог агента после отмены не учитывается. */
+export type CommandStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled";
 
 export interface Command {
   id: string;
@@ -199,6 +208,22 @@ export interface Command {
   actor?: string;
 }
 
+/** Команда в хранилище: версия записи. */
+export interface CommandRecord extends Command {
+  /** Версия записи: Store.updateCommand пишет, только если она не изменилась с чтения. */
+  rev: number;
+}
+
+/** Команда завершена: итог есть, дальше не меняется. */
+export function commandFinished(c: Pick<Command, "status">): boolean {
+  return c.status === "succeeded" || c.status === "failed" || c.status === "cancelled";
+}
+
+/** Задача завершена: итог есть, дальше не меняется. */
+export function jobFinished(j: Pick<Job, "status">): boolean {
+  return j.status === "completed" || j.status === "failed" || j.status === "cancelled";
+}
+
 export interface DesiredState {
   domain: string;
   /** Пусто — общий снимок домена; иначе — для этого агента (важнее общего). */
@@ -216,10 +241,12 @@ export type AuditAction =
   | "job.cancel"
   | "job.stop"
   | "command"
+  | "command.cancel"
   | "state.set"
   | "state.delete"
   | "state.rollback"
   | "agent.revoke"
+  | "agent.delete"
   | "agent.update"
   | "agent.rotateKey"
   | "worker.update"
@@ -297,16 +324,54 @@ export interface Change {
   id: string;
 }
 
-export interface JobFilter {
+/**
+ * Постраничное чтение (новые первыми): after — id последней записи прошлой страницы, страница —
+ * записи после неё в том же порядке; limit ≤ 0 или нет — все. Записи after нет в хранилище — пусто.
+ */
+export interface PageFilter {
+  limit?: number;
+  after?: string;
+}
+
+export interface JobFilter extends PageFilter {
   status?: JobStatus | JobStatus[];
   queue?: string;
   agentId?: string;
 }
 
-export interface CommandFilter {
+export interface CommandFilter extends PageFilter {
   status?: CommandStatus | CommandStatus[];
   agentId?: string;
 }
+
+/** Store.prune: границы по времени, мс; нет или 0 — этот вид записей не трогать. */
+export interface StorePruneOptions {
+  /** Завершённые задачи с finishedAt раньше. */
+  jobsBefore?: number;
+  /** Завершённые команды с finishedAt раньше. */
+  commandsBefore?: number;
+  /** События с at раньше. */
+  eventsBefore?: number;
+}
+
+/** Agents.prune: возраст, мс; нет или 0 — этот вид записей не трогать. */
+export interface PruneOptions {
+  /** Завершённые задачи, завершённые раньше, чем столько мс назад. */
+  jobsOlderThanMs?: number;
+  /** Завершённые команды, завершённые раньше, чем столько мс назад. */
+  commandsOlderThanMs?: number;
+  /** События старше стольких мс. */
+  eventsOlderThanMs?: number;
+}
+
+/** Предел тела POST enroll, байт (читается до проверки токена; больше — 413). */
+export const ENROLL_MAX_BODY = 64 << 10;
+/** Предел длины имени агента при регистрации, символов. */
+export const ENROLL_MAX_NAME = 128;
+/** Предел числа меток при регистрации. */
+export const ENROLL_MAX_LABELS = 64;
+/** Предел длины ключа и значения метки при регистрации, символов. */
+export const ENROLL_MAX_LABEL = 256;
 
 /** Ошибка API приложения: код ошибки и HTTP-статус для ответа. */
 export class AgentsError extends Error {
@@ -324,7 +389,7 @@ export class AgentsError extends Error {
 }
 
 export function publicAgent(a: AgentRecord): Agent {
-  const { secretHash, pendingSecretHash, bootId, lastSeq, grantedLabels, ...agent } = a;
+  const { secretHash, pendingSecretHash, bootId, lastSeq, grantedLabels, metricsAt, alerts, rev, ...agent } = a;
   return { ...agent, revoked: agent.revoked ?? false };
 }
 
@@ -340,6 +405,11 @@ export function helloLabels(
 }
 
 export function publicJob(j: JobRecord): Job {
-  const { leaseUntil, eventSeq, ...job } = j;
+  const { leaseUntil, eventSeq, rev, ...job } = j;
   return job;
+}
+
+export function publicCommand(c: CommandRecord): Command {
+  const { rev, ...cmd } = c;
+  return cmd;
 }

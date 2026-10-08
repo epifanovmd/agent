@@ -56,6 +56,10 @@ _ = w.Event("backup.done", map[string]int{"sizeBytes": 1234567})
 worker.event("backup.done", { sizeBytes: 1234567 });
 ```
 
+Событие можно отправить и до запуска воркера — оно уйдёт после регистрации
+([workers.md](workers.md#здоровье)). Данные не в JSON — ошибка сразу у вызова; событие больше
+16 МБ не отправляется, запись в лог воркера.
+
 **Результат.** `AgentEvent {agentId, agentName, source, type, data, at}` в `Store`; повтор
 сервер узнаёт по `id` сообщения и не сохраняет второй раз. Событие `change` `{kind: "event", id}`
 с `id` сообщения, в Node — ещё `event` с готовым объектом. `listEvents` / `Events` /
@@ -103,17 +107,17 @@ agents.on("alert", (a) => {
   if (a.active) notify(`${a.agentName}: ${a.type} — ${a.message}`);
   else resolve(a.type, a.agentId, a.domain ?? a.worker);
 });
-const active = agents.alerts(); // активные сейчас
+const active = await agents.alerts(); // активные сейчас
 ```
 
 ```go
 agents := server.New(server.Options{EnrollToken: token, OnAlert: func(a server.Alert) { notify(a) }})
-active := agents.Alerts()
+active, err := agents.Alerts()
 ```
 
 ```python
 agents.on("alert", notify)   # Alert(type, agent_id, agent_name, active, message, at, domain, worker)
-active = agents.alerts()
+active = await agents.alerts()
 ```
 
 | `type`           | Когда начинается                                                                                                                            | `message` при начале                                        | Когда заканчивается                        | Доп. поле |
@@ -134,9 +138,10 @@ active = agents.alerts()
 
 **Воркер** влияет через [здоровье](workers.md#здоровье) и [падения](workers.md#остановка-и-падение).
 
-**Результат.** `alert` и `agents.alerts()`. Активные уведомления хранятся в памяти **этого**
-процесса бэкенда: после его перезапуска проблемы приходят заново по ближайшему `status` или
-`state.applied`. Отозванный агент — все его уведомления заканчиваются.
+**Результат.** `alert` и `agents.alerts()`. Активные уведомления хранятся в записи агента в
+`Store` ([store.md](store.md#служебные-поля)), поэтому `alerts()` в любом процессе бэкенда
+отдаёт одно и то же, а начало и конец проблемы приходят событием `alert` один раз — в том
+процессе, который их записал. Отозванный агент — все его уведомления заканчиваются.
 
 ## Журнал аудита
 
@@ -161,8 +166,8 @@ await agents.by(user.login).set_state("example.report", spec, agent_id=agent_id)
 agents.on("audit", save_audit)
 ```
 
-`by(actor)` есть у: `enqueue`, `cancelJob`, `stopJob`, `command`, `call`, `setState`,
-`deleteState`, `rollbackState`, `revoke`, `updateAgent`, `updateWorker`, `rotateKey`,
+`by(actor)` есть у: `enqueue`, `cancelJob`, `stopJob`, `command`, `call`, `cancelCommand`,
+`setState`, `deleteState`, `rollbackState`, `revoke`, `deleteAgent`, `updateAgent`, `updateWorker`, `rotateKey`,
 `pauseWorker`, `resumeWorker` (в Go и Python — те же имена в стиле языка).
 
 | `action`          | Метод             | `target`   | `details`                      |
@@ -171,10 +176,12 @@ agents.on("audit", save_audit)
 | `job.cancel`      | `cancelJob`       | id задачи  | —                              |
 | `job.stop`        | `stopJob`         | id задачи  | —                              |
 | `command`         | `command`, `call` | id команды | `{name}`                       |
+| `command.cancel`  | `cancelCommand`   | id команды | —                              |
 | `state.set`       | `setState`        | раздел     | `{version}`                    |
 | `state.delete`    | `deleteState`     | раздел     | —                              |
 | `state.rollback`  | `rollbackState`   | раздел     | `{fromVersion, version}`       |
 | `agent.revoke`    | `revoke`          | id агента  | —                              |
+| `agent.delete`    | `deleteAgent`     | id агента  | —                              |
 | `agent.update`    | `updateAgent`     | id агента  | `{commandId, version}`         |
 | `agent.rotateKey` | `rotateKey`       | id агента  | `{commandId}`                  |
 | `worker.update`   | `updateWorker`    | id агента  | `{worker, version, commandId}` |

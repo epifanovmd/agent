@@ -11,7 +11,8 @@ upgrade — 404, агент в режиме auto сам переходит на 
 
 Выпуск агента (обновления, install.sh): RELEASES_DIR — каталог выпуска (dist/<VERSION>),
 PUBLIC_KEY — ключ проверки релизов (base64), подставляется в install.sh.
-TRUST_PROXY=1 — сервер за прокси: адрес агента берётся из X-Forwarded-For.
+TRUST_PROXY=1 — сервер за прокси: адрес агента берётся из X-Forwarded-For, адрес сервера — из
+X-Forwarded-Host и X-Forwarded-Proto.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ sys.path.insert(0, str(HERE.parents[1] / "sdk" / "python"))
 from agent_sdk.message import (  # noqa: E402
     ENROLL_PATH, INSTALL_PATH, LINK_PATH, RELEASES_PATH, SYNC_PATH, now_ms,
 )
-from agent_sdk.server import Agents, AgentsError, Job  # noqa: E402
+from agent_sdk.server import Agents, AgentsError, HttpReply, Job  # noqa: E402
 
 from http11 import Request, Response, WebSocket, accept_websocket, serve, websocket_refusal  # noqa: E402
 from live import Live  # noqa: E402
@@ -62,11 +63,6 @@ def actor_of(req: Request) -> str:
     return (req.headers.get("x-actor") or "").strip()[:100] or "web"
 
 
-def base_url(req: Request) -> str:
-    """Адрес сервера, по которому агент до него дошёл (ссылки на файлы задач)."""
-    return f"{req.headers.get('x-forwarded-proto', 'http')}://{req.headers.get('host', 'localhost')}"
-
-
 class App:
     def __init__(self, agents: Agents, web_dir: Path, enroll_token: str = "<ENROLL_TOKEN>") -> None:
         self.agents = agents
@@ -75,6 +71,13 @@ class App:
         self.enroll_token = enroll_token
         #: Поток для интерфейса (WebSocket /api/ws).
         self.live = Live(agents, snapshot=self.snapshot, job_view=self.job_view, log=log)
+
+    def base_url(self, req: Request) -> str:
+        """Адрес сервера, по которому агент до него дошёл (ссылки на файлы задач, install.sh);
+        X-Forwarded-Host и X-Forwarded-Proto — только с TRUST_PROXY."""
+        return self.agents.request_base(req.headers.get("host") or "localhost",
+                                        forwarded_host=req.headers.get("x-forwarded-host"),
+                                        forwarded_proto=req.headers.get("x-forwarded-proto"))
 
     async def job_view(self, job: Job) -> Dict[str, Any]:
         """Задача для интерфейса — с ``files`` (загруженные выходы)."""
@@ -92,7 +95,7 @@ class App:
             "commands": [c.to_dict() for c in await self.agents.list_commands()],
             "states": [s.to_dict() for s in await self.agents.list_states()],
             "events": [e.to_dict() for e in await self.agents.list_events(500)],
-            "alerts": [a.to_dict() for a in self.agents.alerts()],
+            "alerts": [a.to_dict() for a in await self.agents.alerts()],
         }
 
     async def __call__(self, req: Request) -> Optional[Response]:
@@ -105,18 +108,26 @@ class App:
 
     async def route(self, req: Request) -> Optional[Response]:
         method, path = req.method, req.path
+        forwarded_for = req.headers.get("x-forwarded-for")
+        # Тело больше предела (agents.body_limit) не прочитано: 413.
+        if req.too_large:
+            if path == ENROLL_PATH:
+                reply = self.agents.enroll_too_large(req.remote or None, forwarded_for=forwarded_for)
+            else:
+                reply = HttpReply(413, {"code": "MESSAGE_INVALID", "message": "Слишком большой запрос"})
+            status, body = reply
+            return as_json(status, body, reply.headers)
         # ── связь с агентом ──
         if path == ENROLL_PATH and method == "POST":
-            # Адрес клиента — для ограничения неудачных регистраций (429 с Retry-After).
-            reply = await self.agents.handle_enroll(req.body, remote=req.remote or None)
+            # Адрес клиента — для ограничения неудачных регистраций (429 с Retry-After); как Agent.address.
+            reply = await self.agents.handle_enroll(req.body, remote=req.remote or None, forwarded_for=forwarded_for)
             status, body = reply
             return as_json(status, body, reply.headers)
         if path == SYNC_PATH and method == "POST":
             # Адрес клиента и X-Forwarded-For — для Agent.address (заголовок — только с trust_proxy).
             status, body = await self.agents.handle_sync(req.headers.get("authorization"), req.body,
-                                                      req.disconnected, base_url=base_url(req),
-                                                      remote=req.remote or None,
-                                                      forwarded_for=req.headers.get("x-forwarded-for"))
+                                                      req.disconnected, base_url=self.base_url(req),
+                                                      remote=req.remote or None, forwarded_for=forwarded_for)
             return None if status == 499 else as_json(status, body)
         if path == LINK_PATH:
             # WebSocket не поддерживается: 404 на upgrade — агент переходит на HTTP sync.
@@ -126,7 +137,7 @@ class App:
             return Response(status, data, {"Content-Type": "application/octet-stream"})
         # Выпуск агента — публично: сборки подписаны, секретов в них нет.
         if (path == INSTALL_PATH or path.startswith(RELEASES_PATH + "/")) and method in ("GET", "HEAD"):
-            status, data, kind = await self.agents.handle_release(path, base_url(req))
+            status, data, kind = await self.agents.handle_release(path, self.base_url(req))
             return Response(status, data, {"Content-Type": kind})
 
         # ── API приложения ── (изменяющие действия — от имени X-Actor: поле actor и аудит)
@@ -160,6 +171,10 @@ class App:
             cmd = await by.command(b.get("name"), b.get("args"), timeout_sec=b.get("timeoutSec") or 60,
                                    agent_id=b.get("agentId"))
             return as_json(201, cmd.to_dict())
+        # Отмена команды: ждущая или выполняющаяся → cancelled (агенту — cmd.cancel, если уже отправлена).
+        m = re.fullmatch(r"/api/commands/([^/]+)/cancel", path)
+        if m and method == "POST":
+            return as_json(200, (await by.cancel_command(m.group(1))).to_dict())
         m = re.fullmatch(r"/api/commands/([^/]+)", path)
         if m and method == "GET":
             cmd = await self.agents.get_command(m.group(1))
@@ -202,6 +217,11 @@ class App:
         if m and method == "DELETE":
             await self.agents.unsubscribe(m.group(1), m.group(2))
             return as_json(200, {})
+        # Удалить отозванного агента (его запись и историю метрик).
+        m = re.fullmatch(r"/api/agents/([^/]+)", path)
+        if m and method == "DELETE":
+            await by.delete_agent(m.group(1))
+            return as_json(200, {})
         # Агенты: история метрик, отзыв, обновление, смена ключа.
         m = re.fullmatch(r"/api/agents/([^/]+)/(metrics|revoke|update|rotate-key)", path)
         if m:
@@ -230,7 +250,7 @@ class App:
             return as_json(201, (await control(agent_id, name, queues)).to_dict())
         # Выпуск агента: манифест, кандидаты на обновление агентов и воркеров, команда установки.
         if path == "/api/releases" and method == "GET":
-            install = self.agents.install_command(base_url=self.agents.base_url or base_url(req),
+            install = self.agents.install_command(base_url=self.agents.base_url or self.base_url(req),
                                                   token=self.enroll_token)
             return as_json(200, {"release": await self.agents.release(),
                                  "candidates": [c.to_dict() for c in await self.agents.update_candidates()],
@@ -290,7 +310,7 @@ async def main() -> None:
               public_key=os.environ.get("PUBLIC_KEY", ""),
               trust_proxy=os.environ.get("TRUST_PROXY", "").lower() in ("1", "true"))
     app = App(agents, web_dir, token)
-    server = await serve(app, host, port)
+    server = await serve(app, host, port, body_limit=agents.body_limit)
     log(f"сервер (Python) на :{port}", {"enrollToken": token, "webDir": str(web_dir), "releasesDir": releases_dir})
 
     stop = asyncio.Event()

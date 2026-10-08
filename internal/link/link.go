@@ -32,6 +32,9 @@ const (
 	replacedPause = 30 * time.Second
 	// outboxRetry — повтор надёжного сообщения, отклонённого с retryable.
 	outboxRetry = 30 * time.Second
+	// maxRetryAfter — верхняя граница паузы, которую просит сервер (4429,
+	// HTTP 429/503 с Retry-After).
+	maxRetryAfter = 10 * time.Minute
 )
 
 // Handler — что сессия сообщает агенту.
@@ -273,6 +276,9 @@ func (l *Link) Run(ctx context.Context) error {
 			delay = time.Duration(time.Now().UnixNano()%1000) * time.Millisecond
 		case errors.As(err, &ce) && ce.Code == message.CloseReplaced:
 			delay = replacedPause
+		case retryAfter(err) > 0:
+			delay = retryAfter(err)
+			l.opts.Log.Warn("link: сервер перегружен — подключение позже", "err", err, "retryIn", delay)
 		case errors.As(err, &ce) && ce.Code == message.CloseUnauthorized,
 			errors.As(err, &de) && de.Status == http.StatusUnauthorized:
 			if l.opts.Auth.Fallback() {
@@ -315,6 +321,22 @@ func (l *Link) Run(ctx context.Context) error {
 		case <-time.After(delay):
 		}
 	}
+}
+
+// retryAfter — через сколько сервер просит подключиться снова: код
+// закрытия 4429 (секунды в reason) или HTTP 429/503 с Retry-After; не больше
+// maxRetryAfter. 0 — сервер срок не назвал.
+func retryAfter(err error) time.Duration {
+	var ce *CloseError
+	var de *DialError
+	var d time.Duration
+	switch {
+	case errors.As(err, &ce) && ce.Code == message.CloseOverloaded:
+		d = parseRetryAfter(ce.Reason)
+	case errors.As(err, &de) && (de.Status == http.StatusTooManyRequests || de.Status == http.StatusServiceUnavailable):
+		d = de.RetryAfter
+	}
+	return min(d, maxRetryAfter)
 }
 
 // fallbackStatus — отказ upgrade, после которого WebSocket нет смысла повторять:
@@ -559,23 +581,23 @@ func (l *Link) outboxLoop(ctx context.Context, c conn) error {
 }
 
 func (l *Link) sendPending(ctx context.Context, c conn) error {
-	pending, err := l.opts.Outbox.Pending()
-	if err != nil {
-		l.opts.Log.Error("link: outbox не читается", "err", err)
-		return nil
-	}
 	now := time.Now()
-	for _, env := range pending {
+	// Файл читается, только когда сообщение пора отправить.
+	for _, id := range l.opts.Outbox.IDs() {
 		l.mu.Lock()
-		retryAt, sent := l.inflight[env.ID]
+		retryAt, sent := l.inflight[id]
 		due := !sent || (!retryAt.IsZero() && now.After(retryAt))
-		if due {
-			l.inflight[env.ID] = time.Time{}
-		}
 		l.mu.Unlock()
 		if !due {
 			continue
 		}
+		env, ok := l.opts.Outbox.Read(id)
+		if !ok {
+			continue
+		}
+		l.mu.Lock()
+		l.inflight[id] = time.Time{}
+		l.mu.Unlock()
 		if err := c.Send(ctx, env); err != nil {
 			return err
 		}

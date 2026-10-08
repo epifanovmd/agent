@@ -8,7 +8,8 @@
 #   COPY agent.yaml /etc/agent/agent.yaml
 #
 # Обновление — новым образом (update.mode=external); учётные данные и outbox —
-# в томе /var/lib/agent.
+# в томе /var/lib/agent. Агент работает от uid 10001: каталог, подключённый как
+# том с машины (bind mount), должен принадлежать ему (chown 10001 <каталог>).
 ARG GO_VERSION=1.26
 ARG PYTHON_VERSION=3.12
 

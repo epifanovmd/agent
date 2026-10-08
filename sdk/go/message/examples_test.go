@@ -50,6 +50,7 @@ var serverToAgent = map[string]func() any{
 	TypeJobCancel: func() any { return &JobRef{} },
 	TypeJobStop:   func() any { return &JobRef{} },
 	TypeCmdRun:    func() any { return &CommandRun{} },
+	TypeCmdCancel: func() any { return &CommandRef{} },
 	TypeStatePut:  func() any { return &StatePut{} },
 }
 
@@ -64,6 +65,8 @@ var workerToAgent = map[string]func() any{
 	TypeWorkerPause:    func() any { return &WorkerPause{} },
 	TypeWorkerResume:   func() any { return &WorkerResume{} },
 	TypeWorkerRestart:  func() any { return &WorkerRestartRequest{} },
+	TypeWorkerPong:     func() any { return &struct{}{} },
+	TypeJobFail:        func() any { return &JobFail{} },
 }
 
 var agentToWorker = map[string]func() any{
@@ -73,6 +76,7 @@ var agentToWorker = map[string]func() any{
 	TypeStatePut:      func() any { return &StatePut{} },
 	TypeWorkerCleanup: func() any { return &struct{}{} },
 	TypeWorkerContext: func() any { return &WorkerContext{} },
+	TypeWorkerPing:    func() any { return &struct{}{} },
 }
 
 func normalize(t *testing.T, raw []byte) any {

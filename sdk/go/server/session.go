@@ -105,13 +105,33 @@ func (a *Agents) open(ss *session, env message.Envelope) {
 		ss.close(message.CloseUnsupported)
 		return
 	}
-	agent, err := a.store.GetAgent(ss.agentID)
-	if err != nil || agent.Revoked {
-		ss.close(message.CloseUnauthorized)
-		return
-	}
 	if a.closed {
 		ss.close(message.CloseRestart)
+		return
+	}
+	caps := hello.Capabilities
+	var ev alertEvents
+	var revoked bool
+	agent, _, err := a.mutateAgent(ss.agentID, func(ag *Agent) bool {
+		if revoked = ag.Revoked; revoked {
+			return false
+		}
+		ev = nil
+		// Новый запуск агента — seq потока снова с начала.
+		if ag.BootID != hello.Agent.BootID {
+			ag.BootID, ag.LastSeq = hello.Agent.BootID, 0
+		}
+		ag.Hello, ag.Capabilities, ag.Status = &hello, &caps, nil
+		ag.Labels = helloLabels(ag, hello.Labels)
+		ag.Online, ag.Transport, ag.LastSeenAt = true, ss.mode, now()
+		if ss.address != "" {
+			ag.Address = ss.address
+		}
+		ev.set(ag, AlertOffline, "", false, "")
+		return true
+	})
+	if err != nil || revoked {
+		ss.close(message.CloseUnauthorized)
 		return
 	}
 	if prev := a.sessions[agent.ID]; prev != nil && prev != ss {
@@ -120,22 +140,12 @@ func (a *Agents) open(ss *session, env message.Envelope) {
 	a.sessions[agent.ID] = ss
 	// Переподключился в пределах отсрочки — online не менялся.
 	if t := a.offline[agent.ID]; t != nil {
-		t.Stop()
+		t.timer.Stop()
 		delete(a.offline, agent.ID)
 	}
-	if st := a.streams[agent.ID]; st == nil || st.bootID != hello.Agent.BootID {
-		a.streams[agent.ID] = &stream{bootID: hello.Agent.BootID}
-	}
-	caps := hello.Capabilities
 	ss.greeted, ss.caps = true, &caps
-	agent.Hello, agent.Capabilities, agent.Status = &hello, &caps, nil
-	agent.Labels = helloLabels(agent, hello.Labels)
-	agent.Online, agent.Transport, agent.LastSeenAt = true, ss.mode, now()
-	if ss.address != "" {
-		agent.Address = ss.address
-	}
-	a.saveAgent(agent)
-	a.setAlert(agent, AlertOffline, "", false, "")
+	a.emit(ChangeAgent, agent.ID)
+	a.queueAlerts(ev)
 	a.learnDomains(ss, &caps)
 	cfg := message.SessionConfig{
 		StatusIntervalMs:  a.opts.StatusInterval.Milliseconds(),
@@ -150,17 +160,38 @@ func (a *Agents) open(ss *session, env message.Envelope) {
 	}, "")
 	a.log.Info("агент на связи", "agent", agent.Name, "transport", ss.mode)
 	a.reconcile(ss, hello.Jobs)
+	a.trackRunning(ss)
 	a.deliver(ss)
+}
+
+// trackRunning — выполняющиеся команды агента (приняты в прошлой сессии,
+// может быть, другим процессом) отслеживаются как отправленные в этой: их
+// отмену в другом процессе Refresh доставит агенту (cmd.cancel).
+func (a *Agents) trackRunning(ss *session) {
+	cmds, err := a.store.ListCommands(CommandFilter{Status: CommandRunning, AgentID: ss.agentID})
+	if err != nil {
+		a.log.Error("команды не прочитаны", "err", err)
+	}
+	for _, cmd := range cmds {
+		ss.sent[cmd.ID] = true
+	}
 }
 
 // helloLabels — метки агента после hello: hello.labels, поверх — выданные
 // бэкендом при регистрации (GrantedLabels главнее — иначе узел выдал бы себя
-// за другой). Изменение меток попадает в уведомление change agent (saveAgent).
+// за другой).
 func helloLabels(agent *Agent, labels map[string]string) map[string]string {
 	out := map[string]string{}
 	maps.Copy(out, labels)
 	maps.Copy(out, agent.GrantedLabels)
 	return out
+}
+
+// offlineTimer — отложенный переход агента в offline: since — когда закрылась
+// его сессия в этом процессе.
+type offlineTimer struct {
+	timer *time.Timer
+	since int64
 }
 
 // closeSession — сессия закрыта: если она текущая, агент без связи — после
@@ -173,39 +204,48 @@ func (a *Agents) closeSession(ss *session, code int) {
 	delete(a.sessions, ss.agentID)
 	agentID := ss.agentID
 	if a.closed {
-		a.setOffline(agentID)
+		a.setOffline(agentID, now())
 		return
 	}
 	if t := a.offline[agentID]; t != nil {
-		t.Stop()
+		t.timer.Stop()
 	}
-	var timer *time.Timer
-	timer = time.AfterFunc(a.offlineGrace, func() {
+	ot := &offlineTimer{since: now()}
+	ot.timer = time.AfterFunc(a.offlineGrace, func() {
 		a.mu.Lock()
 		defer a.unlock()
-		if a.offline[agentID] == timer && a.sessions[agentID] == nil {
-			a.setOffline(agentID)
+		if a.offline[agentID] == ot && a.sessions[agentID] == nil {
+			a.setOffline(agentID, ot.since)
 		}
 	})
-	a.offline[agentID] = timer
+	a.offline[agentID] = ot
 }
 
-// setOffline — агент без связи (отсрочка истекла или не нужна).
-func (a *Agents) setOffline(agentID string) {
+// setOffline — агент без связи (отсрочка истекла или не нужна). Вести от
+// агента позже since (он подключился к другому процессу) — не трогать.
+func (a *Agents) setOffline(agentID string, since int64) {
 	if t := a.offline[agentID]; t != nil {
-		t.Stop()
+		t.timer.Stop()
 		delete(a.offline, agentID)
 	}
-	agent, err := a.store.GetAgent(agentID)
-	if err != nil || !agent.Online {
+	var ev alertEvents
+	agent, written, _ := a.mutateAgent(agentID, func(ag *Agent) bool {
+		if !ag.Online || ag.LastSeenAt > since {
+			return false
+		}
+		ev = nil
+		ag.Online = false
+		if !a.closed {
+			ev.set(ag, AlertOffline, "", true, "Агент без связи")
+		}
+		return true
+	})
+	if !written {
 		return
 	}
-	agent.Online = false
-	a.saveAgent(agent)
+	a.emit(ChangeAgent, agentID)
+	a.queueAlerts(ev)
 	a.log.Info("агент без связи", "agent", agent.Name)
-	if !a.closed {
-		a.setAlert(agent, AlertOffline, "", true, "Агент без связи")
-	}
 }
 
 // sweepOffline — сверка (sweep): агент online без сессии в этом процессе и
@@ -227,41 +267,25 @@ func (a *Agents) sweepOffline(ts int64) {
 		if !stale(agent) {
 			continue
 		}
-		// Перечитать: другой процесс мог обновить запись после ListAgents.
-		cur, err := a.store.GetAgent(agent.ID)
-		if err != nil || !stale(cur) {
+		var ev alertEvents
+		// Условие — по свежей записи: другой процесс мог обновить её после ListAgents.
+		cur, written, _ := a.mutateAgent(agent.ID, func(ag *Agent) bool {
+			if !stale(ag) {
+				return false
+			}
+			ev = nil
+			ag.Online = false
+			ev.set(ag, AlertOffline, "", true, "Агент без связи")
+			return true
+		})
+		if !written {
 			continue
 		}
-		cur.Online = false
-		a.saveAgent(cur)
+		a.emit(ChangeAgent, cur.ID)
+		a.queueAlerts(ev)
 		a.log.Info("агент без вестей — без связи", "agent", cur.Name, "lastSeenAt", cur.LastSeenAt)
-		a.setAlert(cur, AlertOffline, "", true, "Агент без связи")
 	}
 	a.sweepOfflineSubscriptions(list, ts)
-}
-
-func (a *Agents) saveAgent(agent *Agent) {
-	if a.storeAgent(agent) {
-		a.emit(ChangeAgent, agent.ID)
-	}
-}
-
-// storeAgent — сохранить агента без уведомления (lastSeenAt, неизменный status).
-func (a *Agents) storeAgent(agent *Agent) bool {
-	if err := a.store.UpdateAgent(agent); err != nil {
-		a.log.Error("агент не сохранён", "agent", agent.ID, "err", err)
-		return false
-	}
-	return true
-}
-
-func (a *Agents) saveJob(job *Job) bool {
-	if err := a.store.UpdateJob(job); err != nil {
-		a.log.Error("задача не сохранена", "job", job.ID, "err", err)
-		return false
-	}
-	a.emit(ChangeJob, job.ID)
-	return true
 }
 
 // handle — сообщение открытой сессии; ack или error по классу доставки (§4).
@@ -270,20 +294,11 @@ func (a *Agents) handle(ss *session, env message.Envelope) {
 		return
 	}
 	isStream := streamTypes[env.Type] && env.Seq > 0
-	if isStream {
-		st := a.streams[ss.agentID]
-		if st == nil {
-			st = &stream{}
-			a.streams[ss.agentID] = st
-		}
-		if env.Seq <= st.lastSeq {
-			ss.send(message.TypeAck, message.Ack{Seq: st.lastSeq}, "")
-			return
-		}
-		st.lastSeq = env.Seq
-	}
-	err := a.dispatch(ss, env)
+	dup, lastSeq, err := a.dispatch(ss, env, isStream)
 	switch {
+	case ss.closed:
+	case dup:
+		ss.send(message.TypeAck, message.Ack{Seq: lastSeq}, "")
 	case err != nil:
 		ss.send(message.TypeError, err, env.ID)
 	case reliableTypes[env.Type] && env.ID != "":
@@ -310,136 +325,206 @@ func leaseLost() *message.Error {
 }
 
 func internal(err error) *message.Error {
+	if err == errBusy {
+		return &message.Error{Code: errBusy.Code, Message: errBusy.Message, Retryable: true}
+	}
 	return &message.Error{Code: "INTERNAL", Message: err.Error(), Retryable: true}
 }
 
-func (a *Agents) dispatch(ss *session, env message.Envelope) *message.Error {
-	agent, err := a.store.GetAgent(ss.agentID)
-	if err != nil {
-		return internal(err)
-	}
-	agent.LastSeenAt = now()
+// dispatch — сообщение агента: одна условная запись агента на сообщение
+// (lastSeenAt, seq потока и поля, которые меняет сообщение), затем — то, что
+// следует из записанного. Сообщение потока с seq ≤ Agent.LastSeq — повтор
+// (dup): уже обработано, возможно другим процессом; ответ — ack {seq: lastSeq}.
+func (a *Agents) dispatch(ss *session, env message.Envelope, isStream bool) (dup bool, lastSeq int64, perr *message.Error) {
+	// change — изменение записи агента сообщением (может вызываться повторно);
+	// after — действия после записи (запись — свежая).
+	var change func(*Agent)
+	var after func(*Agent) *message.Error
 	switch env.Type {
 	case message.TypeStatus:
 		var st message.Status
 		if err := env.Decode(&st); err != nil {
-			return invalid(env.Type, err)
+			return false, 0, invalid(env.Type, err)
 		}
-		// Тот же status (пульс) — сохранить без уведомления: интерфейсу нечего обновлять.
-		same := agent.Status != nil && reflect.DeepEqual(*agent.Status, st)
-		agent.Status, ss.status = &st, &st
-		if same {
-			a.storeAgent(agent)
-		} else {
-			a.saveAgent(agent)
-			a.statusAlerts(agent, &st)
-		}
-		lease := time.Now()
-		for _, ref := range st.Jobs {
-			delete(ss.pending, ref.JobID)
-			if job := a.held(agent.ID, message.JobRef{JobID: ref.JobID, Attempt: ref.Attempt}); job != nil {
-				job.LeaseUntil = lease.Add(time.Duration(job.LeaseSeconds) * time.Second).UnixMilli()
-				if err := a.store.UpdateJob(job); err != nil {
-					return internal(err)
-				}
+		var same bool
+		var ev alertEvents
+		change = func(ag *Agent) {
+			ev = nil
+			// Тот же status (пульс) — без уведомления: интерфейсу нечего обновлять.
+			same = ag.Status != nil && reflect.DeepEqual(*ag.Status, st)
+			ag.Status = &st
+			if !same {
+				ev.statusAlerts(ag, &st)
 			}
 		}
-		a.dispatchJobs()
-		return nil
+		after = func(ag *Agent) *message.Error {
+			ss.status = &st
+			if !same {
+				a.emit(ChangeAgent, ag.ID)
+				a.queueAlerts(ev)
+			}
+			return a.extendLeases(ss, st.Jobs)
+		}
 	case message.TypeMetrics:
 		var m message.Metrics
 		if err := env.Decode(&m); err != nil {
-			return invalid(env.Type, err)
+			return false, 0, invalid(env.Type, err)
 		}
-		if err := a.addMetrics(agent, m); err != nil {
-			return internal(err)
+		at := metricsAt(m, now())
+		change = func(ag *Agent) { currentMetrics(ag, &m, at) }
+		after = func(ag *Agent) *message.Error {
+			if err := a.storeMetrics(ag.ID, MetricsPoint{At: at, Backfill: m.Backfill, Metrics: m}); err != nil {
+				return internal(err)
+			}
+			if !m.Backfill { // досланная точка не меняет текущие метрики агента
+				a.emit(ChangeAgent, ag.ID)
+			}
+			return nil
 		}
-		if m.Backfill {
-			a.storeAgent(agent) // досланная точка не меняет текущие метрики агента
-		} else {
-			a.saveAgent(agent)
-		}
-		return nil
 	case message.TypeLog:
-		return a.receiveLog(agent, env)
+		var l message.LogBatch
+		if err := env.Decode(&l); err != nil {
+			return false, 0, invalid(env.Type, err)
+		}
+		after = func(ag *Agent) *message.Error {
+			a.receiveLog(ag.ID, l.Entries)
+			return nil
+		}
 	case message.TypeInventory:
 		var inv message.Inventory
 		if err := env.Decode(&inv); err != nil {
-			return invalid(env.Type, err)
+			return false, 0, invalid(env.Type, err)
 		}
-		agent.Inventory = &inv
-		a.saveAgent(agent)
-		return nil
+		change = func(ag *Agent) { ag.Inventory = &inv }
+		after = func(ag *Agent) *message.Error {
+			a.emit(ChangeAgent, ag.ID)
+			return nil
+		}
 	case message.TypeCapabilities:
 		var caps message.Capabilities
 		if err := env.Decode(&caps); err != nil {
-			return invalid(env.Type, err)
+			return false, 0, invalid(env.Type, err)
 		}
-		merged := mergeCapabilities(agent.Capabilities, caps)
-		agent.Capabilities, ss.caps = merged, merged
-		a.saveAgent(agent)
-		a.learnDomains(ss, &caps)
-		a.deliver(ss)
-		return nil
+		change = func(ag *Agent) { ag.Capabilities = mergeCapabilities(ag.Capabilities, caps) }
+		after = func(ag *Agent) *message.Error {
+			ss.caps = ag.Capabilities
+			a.emit(ChangeAgent, ag.ID)
+			a.learnDomains(ss, &caps)
+			a.deliver(ss)
+			return nil
+		}
 	case message.TypeEvent:
 		var e message.Event
 		if err := env.Decode(&e); err != nil || e.Type == "" {
-			return invalid(env.Type, err)
+			return false, 0, invalid(env.Type, err)
 		}
-		a.storeAgent(agent) // lastSeenAt: событие агента не меняет
-		if env.ID != "" && a.seen[env.ID] {
-			return nil // повтор
-		}
-		source := e.Source
-		if source == "" {
-			source = "agent"
-		}
-		at := env.TS
-		if at == 0 {
-			at = now()
-		}
-		if err := a.store.AddEvent(AgentEvent{AgentID: agent.ID, AgentName: agent.Name, Source: source, Type: e.Type, Data: e.Data, At: at}); err != nil {
-			return internal(err)
-		}
-		a.remember(env.ID)
-		id := env.ID
-		if id == "" {
-			id = newID()
-		}
-		a.emit(ChangeEvent, id)
-		return nil
+		after = func(ag *Agent) *message.Error { return a.receiveEvent(ag, env, e) }
 	case message.TypeStateApplied:
 		var applied message.StateApplied
 		if err := env.Decode(&applied); err != nil || applied.Domain == "" {
-			return invalid(env.Type, err)
+			return false, 0, invalid(env.Type, err)
 		}
-		if agent.StateApplied == nil {
-			agent.StateApplied = map[string]message.StateApplied{}
+		var ev alertEvents
+		change = func(ag *Agent) {
+			ev = nil
+			if ag.StateApplied == nil {
+				ag.StateApplied = map[string]message.StateApplied{}
+			}
+			ag.StateApplied[applied.Domain] = applied
+			ev.set(ag, AlertStateFailed, applied.Domain, !applied.OK, applied.Error)
 		}
-		agent.StateApplied[applied.Domain] = applied
-		a.saveAgent(agent)
-		if applied.OK {
-			a.setAlert(agent, AlertStateFailed, applied.Domain, false, "")
-		} else {
-			a.setAlert(agent, AlertStateFailed, applied.Domain, true, applied.Error)
+		after = func(ag *Agent) *message.Error {
+			a.emit(ChangeAgent, ag.ID)
+			a.queueAlerts(ev)
+			if applied.OK && applied.Version > ss.known[applied.Domain] {
+				ss.known[applied.Domain] = applied.Version
+			}
+			a.emit(ChangeState, applied.Domain)
+			return nil
 		}
-		if applied.OK && applied.Version > ss.known[applied.Domain] {
-			ss.known[applied.Domain] = applied.Version
-		}
-		a.emit(ChangeState, applied.Domain)
-		return nil
-	}
-	if err := a.store.UpdateAgent(agent); err != nil { // lastSeenAt
-		return internal(err)
-	}
-	switch env.Type {
 	case message.TypeJobAccept, message.TypeJobProgress, message.TypeJobEvent, message.TypeJobURLs,
 		message.TypeJobComplete, message.TypeJobFail, message.TypeJobReject:
-		return a.dispatchJob(ss, env)
+		after = func(*Agent) *message.Error { return a.dispatchJob(ss, env) }
 	case message.TypeCmdAccept, message.TypeCmdOutput, message.TypeCmdDone:
-		return a.dispatchCommand(ss, env)
+		after = func(*Agent) *message.Error { return a.dispatchCommand(ss, env) }
+	default:
+		after = func(*Agent) *message.Error {
+			return &message.Error{Code: "UNKNOWN_TYPE", Message: "Неизвестный тип: " + env.Type}
+		}
 	}
-	return &message.Error{Code: "UNKNOWN_TYPE", Message: "Неизвестный тип: " + env.Type}
+	var revoked bool
+	agent, _, err := a.mutateAgent(ss.agentID, func(ag *Agent) bool {
+		if revoked = ag.Revoked; revoked {
+			return false
+		}
+		if dup = isStream && env.Seq <= ag.LastSeq; dup {
+			lastSeq = ag.LastSeq
+			return false
+		}
+		ag.LastSeenAt = now()
+		if isStream {
+			ag.LastSeq = env.Seq
+		}
+		if change != nil {
+			change(ag)
+		}
+		return true
+	})
+	switch {
+	case revoked:
+		// Отозван другим процессом: сессия — 4401.
+		a.dropRevoked(ss.agentID)
+		return false, 0, nil
+	case err != nil:
+		return false, 0, internal(err)
+	case dup:
+		return true, lastSeq, nil
+	}
+	return false, 0, after(agent)
+}
+
+// extendLeases — status перечислил задачи агента: продлить их аренду (у
+// задач, всё ещё за агентом в этой попытке), выданные — больше не ждут
+// перечисления; раздать ждущие задачи.
+func (a *Agents) extendLeases(ss *session, jobs []message.StatusJob) *message.Error {
+	for _, ref := range jobs {
+		delete(ss.pending, ref.JobID)
+		_, _, _, err := a.updateHeld(ss.agentID, message.JobRef{JobID: ref.JobID, Attempt: ref.Attempt}, func(j *Job) bool {
+			j.LeaseUntil = time.Now().Add(time.Duration(j.LeaseSeconds) * time.Second).UnixMilli()
+			return true
+		})
+		if err != nil {
+			return internal(err)
+		}
+	}
+	a.dispatchJobs()
+	return nil
+}
+
+// receiveEvent — событие агента или воркера (важное): в Store; повтор по id
+// — только ack.
+func (a *Agents) receiveEvent(agent *Agent, env message.Envelope, e message.Event) *message.Error {
+	if env.ID != "" && a.seen[env.ID] {
+		return nil // повтор
+	}
+	source := e.Source
+	if source == "" {
+		source = "agent"
+	}
+	at := env.TS
+	if at == 0 {
+		at = now()
+	}
+	if err := a.store.AddEvent(AgentEvent{AgentID: agent.ID, AgentName: agent.Name, Source: source, Type: e.Type, Data: e.Data, At: at}); err != nil {
+		return internal(err)
+	}
+	a.remember(env.ID)
+	id := env.ID
+	if id == "" {
+		id = newID()
+	}
+	a.emit(ChangeEvent, id)
+	return nil
 }
 
 // remember — id принятого события (повтор — только ack).
@@ -464,47 +549,67 @@ func (a *Agents) dispatchJob(ss *session, env message.Envelope) *message.Error {
 			return invalid(env.Type, err)
 		}
 		// Слот освобождается из pending, когда задачу перечислит status.
-		if job := a.held(agentID, ref); job != nil && !job.Accepted {
-			job.Accepted = true
-			a.saveJob(job)
+		job, _, written, err := a.updateHeld(agentID, ref, func(j *Job) bool {
+			if j.Accepted {
+				return false
+			}
+			j.Accepted = true
+			return true
+		})
+		if err != nil {
+			return internal(err)
+		}
+		if written {
+			a.emit(ChangeJob, job.ID)
 		}
 	case message.TypeJobProgress:
 		var p message.JobProgress
 		if err := env.Decode(&p); err != nil {
 			return invalid(env.Type, err)
 		}
-		job := a.held(agentID, p.JobRef)
-		if job == nil {
-			return nil
+		job, _, written, err := a.updateHeld(agentID, p.JobRef, func(j *Job) bool {
+			if p.Progress != nil {
+				j.Progress = *p.Progress
+			}
+			if p.Text != nil {
+				j.Text = *p.Text
+			}
+			j.Log = append(j.Log, p.Log...)
+			if len(j.Log) > keepJobLog {
+				j.Log = slices.Clone(j.Log[len(j.Log)-keepJobLog:])
+			}
+			return true
+		})
+		if err != nil {
+			return internal(err)
 		}
-		if p.Progress != nil {
-			job.Progress = *p.Progress
+		if written {
+			a.emit(ChangeJob, job.ID)
 		}
-		if p.Text != nil {
-			job.Text = *p.Text
-		}
-		job.Log = append(job.Log, p.Log...)
-		if len(job.Log) > keepJobLog {
-			job.Log = slices.Clone(job.Log[len(job.Log)-keepJobLog:])
-		}
-		a.saveJob(job)
 	case message.TypeJobEvent:
 		var e message.JobEvent
 		if err := env.Decode(&e); err != nil {
 			return invalid(env.Type, err)
 		}
-		job := a.held(agentID, e.JobRef)
-		if job == nil {
-			return leaseLost()
+		at := env.TS
+		if at == 0 {
+			at = now()
 		}
-		if e.Seq > job.EventSeq {
-			at := env.TS
-			if at == 0 {
-				at = now()
+		job, held, written, err := a.updateHeld(agentID, e.JobRef, func(j *Job) bool {
+			if e.Seq <= j.EventSeq {
+				return false // повтор
 			}
-			job.EventSeq = e.Seq
-			job.Events = append(job.Events, JobEvent{Seq: e.Seq, Type: e.Type, Data: e.Data, At: at})
-			a.saveJob(job)
+			j.EventSeq = e.Seq
+			j.Events = append(j.Events, JobEvent{Seq: e.Seq, Type: e.Type, Data: e.Data, At: at})
+			return true
+		})
+		switch {
+		case err != nil:
+			return internal(err)
+		case !held:
+			return leaseLost()
+		case written:
+			a.emit(ChangeJob, job.ID)
 		}
 	case message.TypeJobURLs:
 		var req message.JobURLsRequest
@@ -529,42 +634,57 @@ func (a *Agents) dispatchJob(ss *session, env message.Envelope) *message.Error {
 		if err := env.Decode(&c); err != nil {
 			return invalid(env.Type, err)
 		}
-		job := a.held(agentID, c.JobRef)
-		if job == nil {
+		job, held, written, err := a.updateHeld(agentID, c.JobRef, func(j *Job) bool {
+			j.Status, j.Result, j.Progress, j.Error, j.FinishedAt = JobCompleted, c.Result, 1, nil, now()
+			return true
+		})
+		switch {
+		case err != nil:
+			return internal(err)
+		case !held:
 			if a.settled(agentID, c.JobRef, JobCompleted) {
 				return nil // повтор итога
 			}
 			return leaseLost()
+		case written:
+			delete(ss.pending, job.ID)
+			a.emit(ChangeJob, job.ID)
+			a.log.Info("задача выполнена", "job", job.ID, "queue", job.Queue)
+			a.dispatchJobs()
 		}
-		delete(ss.pending, job.ID)
-		job.Status, job.Result, job.Progress, job.Error, job.FinishedAt = JobCompleted, c.Result, 1, nil, now()
-		a.saveJob(job)
-		a.log.Info("задача выполнена", "job", job.ID, "queue", job.Queue)
-		a.dispatchJobs()
 	case message.TypeJobFail:
 		var f message.JobFail
 		if err := env.Decode(&f); err != nil {
 			return invalid(env.Type, err)
 		}
-		job := a.held(agentID, f.JobRef)
-		if job == nil {
+		held, _, requeued, err := a.failAttempt(agentID, f.JobRef, f.Code, f.Message, f.Retryable, nil)
+		switch {
+		case err != nil:
+			return internal(err)
+		case !held:
 			if a.settled(agentID, f.JobRef, JobFailed) {
 				return nil
 			}
 			return leaseLost()
+		case requeued:
+			a.dispatchJobs()
 		}
-		a.failAttempt(job, f.Code, f.Message, f.Retryable)
 	case message.TypeJobReject:
 		var r message.JobReject
 		if err := env.Decode(&r); err != nil {
 			return invalid(env.Type, err)
 		}
 		delete(ss.pending, r.JobID)
-		if job := a.held(agentID, r.JobRef); job != nil {
-			job.Status, job.AgentID, job.Accepted = JobQueued, "", false
-			if a.saveJob(job) {
-				a.dispatchJobs()
-			}
+		job, _, written, err := a.updateHeld(agentID, r.JobRef, func(j *Job) bool {
+			j.Status, j.AgentID, j.Accepted, j.LeaseUntil = JobQueued, "", false, 0
+			return true
+		})
+		if err != nil {
+			return internal(err)
+		}
+		if written {
+			a.emit(ChangeJob, job.ID)
+			a.dispatchJobs()
 		}
 	}
 	return nil
@@ -581,61 +701,88 @@ func pick[V any](all map[string]V, names []string) map[string]V {
 }
 
 func (a *Agents) dispatchCommand(ss *session, env message.Envelope) *message.Error {
+	// update — изменить команду агента сессии; fn говорит, писать ли.
+	update := func(id string, fn func(*Command) bool) (*Command, bool, *message.Error) {
+		cmd, written, err := a.mutateCommand(id, func(c *Command) bool { return c.AgentID == ss.agentID && fn(c) })
+		switch {
+		case errors.Is(err, ErrNotFound):
+			return nil, false, nil
+		case err != nil:
+			return nil, false, internal(err)
+		}
+		return cmd, written, nil
+	}
 	switch env.Type {
 	case message.TypeCmdAccept:
 		var ref message.CommandRef
 		if err := env.Decode(&ref); err != nil {
 			return invalid(env.Type, err)
 		}
-		if cmd := a.agentCommand(ss.agentID, ref.CommandID); cmd != nil && cmd.Status == CommandPending {
-			cmd.Status = CommandRunning
-			a.saveCommand(cmd)
+		cmd, written, perr := update(ref.CommandID, func(c *Command) bool {
+			if c.Status != CommandPending {
+				return false
+			}
+			c.Status = CommandRunning
+			return true
+		})
+		if written {
+			a.commandSaved(cmd)
 		}
+		return perr
 	case message.TypeCmdOutput:
 		var out message.CommandOutput
 		if err := env.Decode(&out); err != nil {
 			return invalid(env.Type, err)
 		}
-		if cmd := a.agentCommand(ss.agentID, out.CommandID); cmd != nil && !cmd.Finished() {
-			cmd.Output += out.Chunk
-			if len(cmd.Output) > keepCmdOutput {
-				cmd.Output = cmd.Output[len(cmd.Output)-keepCmdOutput:]
+		cmd, written, perr := update(out.CommandID, func(c *Command) bool {
+			if c.Finished() {
+				return false
 			}
-			a.saveCommand(cmd)
+			c.Output += out.Chunk
+			if len(c.Output) > keepCmdOutput {
+				c.Output = c.Output[len(c.Output)-keepCmdOutput:]
+			}
+			return true
+		})
+		if written {
+			a.commandSaved(cmd)
 		}
+		return perr
 	case message.TypeCmdDone:
 		var done message.CommandDone
 		if err := env.Decode(&done); err != nil {
 			return invalid(env.Type, err)
 		}
-		if cmd := a.agentCommand(ss.agentID, done.CommandID); cmd != nil && !cmd.Finished() {
-			cmd.Status = CommandFailed
+		delete(ss.sent, done.CommandID)
+		// Итог только у незавершённой: после отмены (CancelCommand) и срока
+		// (TIMEOUT) поздний итог не учитывается, ответ — обычный ack.
+		cmd, written, perr := update(done.CommandID, func(c *Command) bool {
+			if c.Finished() {
+				return false
+			}
+			c.Status = CommandFailed
 			if done.OK {
-				cmd.Status = CommandSucceeded
+				c.Status = CommandSucceeded
 			}
-			cmd.Result, cmd.Error, cmd.ExitCode, cmd.FinishedAt = done.Result, done.Error, done.ExitCode, now()
-			a.saveCommand(cmd)
-			// Новый секрет — переподключиться с ним сразу (1012) после ack.
-			if done.OK && cmd.Name == message.CommandRotateKey && a.rotated(ss.agentID, done.Result) {
-				ss.closeAfter = message.CloseRestart
-			}
+			c.Result, c.Error, c.ExitCode, c.FinishedAt = done.Result, done.Error, done.ExitCode, now()
+			return true
+		})
+		if !written {
+			return perr
+		}
+		a.commandSaved(cmd)
+		// Новый секрет — переподключиться с ним сразу (1012) после ack.
+		if done.OK && cmd.Name == message.CommandRotateKey && a.rotated(ss.agentID, done.Result) {
+			ss.closeAfter = message.CloseRestart
 		}
 	}
 	return nil
 }
 
-func (a *Agents) agentCommand(agentID, id string) *Command {
-	cmd, err := a.store.GetCommand(id)
-	if err != nil || cmd.AgentID != agentID {
-		return nil
-	}
-	return cmd
-}
-
-// held — задача за агентом в этой попытке и выполняется.
+// held — задача за агентом в этой попытке и выполняется (чтение).
 func (a *Agents) held(agentID string, ref message.JobRef) *Job {
 	job, err := a.store.GetJob(ref.JobID)
-	if err != nil || job.Status != JobRunning || job.AgentID != agentID || job.Attempt != ref.Attempt {
+	if err != nil || !heldBy(job, agentID, ref) {
 		return nil
 	}
 	return job
@@ -657,6 +804,7 @@ func (a *Agents) reconcile(ss *session, reported []message.JobRef) {
 	if err != nil {
 		a.log.Error("сверка задач: задачи не прочитаны", "err", err)
 	}
+	requeued := false
 	for _, job := range jobs {
 		switch {
 		case listed[job.Ref()]:
@@ -665,18 +813,30 @@ func (a *Agents) reconcile(ss *session, reported []message.JobRef) {
 			}
 		case !job.Accepted:
 			// Выдана, но агент её не видел: выдать заново.
-			job.LeaseUntil = time.Now().Add(time.Duration(job.LeaseSeconds) * time.Second).UnixMilli()
-			a.saveJob(job)
-			ss.pending[job.ID] = job.Queue
-			ss.send(message.TypeJobAssign, a.assignment(ss, job), "")
+			fresh, _, written, _ := a.updateHeld(ss.agentID, job.Ref(), func(j *Job) bool {
+				if j.Accepted {
+					return false
+				}
+				j.LeaseUntil = time.Now().Add(time.Duration(j.LeaseSeconds) * time.Second).UnixMilli()
+				return true
+			})
+			if written {
+				a.emit(ChangeJob, fresh.ID)
+				ss.pending[fresh.ID] = fresh.Queue
+				ss.send(message.TypeJobAssign, a.assignment(ss, fresh), "")
+			}
 		default:
-			a.failAttempt(job, "AGENT_LOST", "Агент перезапустился и потерял задачу", true)
+			_, _, again, _ := a.failAttempt(ss.agentID, job.Ref(), "AGENT_LOST", "Агент перезапустился и потерял задачу", true, nil)
+			requeued = requeued || again
 		}
 	}
 	for _, ref := range reported {
 		if a.held(ss.agentID, ref) == nil {
 			ss.send(message.TypeJobCancel, ref, "")
 		}
+	}
+	if requeued {
+		a.dispatchJobs()
 	}
 }
 
@@ -739,7 +899,8 @@ func (a *Agents) effectiveState(domain, agentID string) *DesiredState {
 
 // dispatchJobs — раздать ждущие задачи по свободным слотам (status.slots):
 // каждую — наименее загруженному агенту (задач в работе и выданных),
-// закреплённую — только своему.
+// закреплённую — только своему. Задачу, которую тем временем взял другой
+// процесс, условная запись не выдаст второй раз.
 func (a *Agents) dispatchJobs() {
 	queued, err := a.store.ListJobs(JobFilter{Status: JobQueued})
 	if err != nil {
@@ -793,14 +954,23 @@ func (ss *session) free(queue string) int {
 	return n
 }
 
+// assign — выдать ждущую задачу агенту сессии: только если она всё ещё ждёт в
+// той же попытке (иначе её взял другой процесс — пропустить).
 func (a *Agents) assign(ss *session, job *Job) {
-	job.Status, job.AgentID, job.Accepted = JobRunning, ss.agentID, false
-	job.LeaseUntil = time.Now().Add(time.Duration(job.LeaseSeconds) * time.Second).UnixMilli()
-	if !a.saveJob(job) {
+	fresh, written, _ := a.mutateJob(job.ID, func(j *Job) bool {
+		if j.Status != JobQueued || j.Attempt != job.Attempt || j.PinnedAgentID != job.PinnedAgentID {
+			return false
+		}
+		j.Status, j.AgentID, j.Accepted = JobRunning, ss.agentID, false
+		j.LeaseUntil = time.Now().Add(time.Duration(j.LeaseSeconds) * time.Second).UnixMilli()
+		return true
+	})
+	if !written {
 		return
 	}
-	ss.pending[job.ID] = job.Queue
-	ss.send(message.TypeJobAssign, a.assignment(ss, job), "")
+	a.emit(ChangeJob, fresh.ID)
+	ss.pending[fresh.ID] = fresh.Queue
+	ss.send(message.TypeJobAssign, a.assignment(ss, fresh), "")
 }
 
 func (a *Agents) assignment(ss *session, job *Job) message.JobAssign {
@@ -825,23 +995,37 @@ func (a *Agents) assignment(ss *session, job *Job) message.JobAssign {
 
 func (a *Agents) baseURL(ss *session) string { return a.serverURL(ss.baseURL) }
 
-// failAttempt — провал попытки: повтор, если попытки остались.
-func (a *Agents) failAttempt(job *Job, code, msg string, retryable bool) {
-	if ss := a.sessions[job.AgentID]; ss != nil {
+// failAttempt — провал попытки ref задачи агента (по свежей записи: задача
+// выполняется у него в этой попытке и cond, если задано, верно): повтор, если
+// попытки остались. held — задача была за агентом; failed — попытка
+// записана проваленной; requeued — задача снова ждёт (раздать — dispatchJobs
+// у вызывающего).
+func (a *Agents) failAttempt(agentID string, ref message.JobRef, code, msg string, retryable bool,
+	cond func(*Job) bool) (held, failed, requeued bool, err error) {
+	job, held, written, err := a.updateHeld(agentID, ref, func(j *Job) bool {
+		if cond != nil && !cond(j) {
+			return false
+		}
+		j.Error = &JobError{Code: code, Message: msg}
+		if requeued = retryable && j.Attempt+1 < j.MaxAttempts; requeued {
+			j.Status, j.Attempt, j.AgentID, j.Accepted = JobQueued, j.Attempt+1, "", false
+			j.EventSeq, j.LeaseUntil, j.Progress, j.StopRequested = 0, 0, 0, false
+		} else {
+			j.Status, j.FinishedAt = JobFailed, now()
+		}
+		return true
+	})
+	if !written {
+		return held, false, false, err
+	}
+	if ss := a.sessions[agentID]; ss != nil {
 		delete(ss.pending, job.ID)
 	}
-	job.Error = &JobError{Code: code, Message: msg}
-	if retryable && job.Attempt+1 < job.MaxAttempts {
-		job.Status, job.Attempt, job.AgentID, job.Accepted = JobQueued, job.Attempt+1, "", false
-		job.EventSeq, job.LeaseUntil, job.StopRequested = 0, 0, false
-		if a.saveJob(job) {
-			a.dispatchJobs()
-		}
-		return
+	a.emit(ChangeJob, job.ID)
+	if !requeued {
+		a.log.Info("задача провалена", "job", job.ID, "code", code)
 	}
-	job.Status, job.FinishedAt = JobFailed, now()
-	a.saveJob(job)
-	a.log.Info("задача провалена", "job", job.ID, "code", code)
+	return true, true, requeued, nil
 }
 
 // mergeCapabilities — объединение возможностей (§6.1): новые имена

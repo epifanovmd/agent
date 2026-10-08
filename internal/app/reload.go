@@ -108,6 +108,12 @@ func (a *App) Reload(next config.Config) {
 	if diff.Resync {
 		a.state.SetResync(next.State.ResyncInterval.Std())
 	}
+	if diff.Tuning {
+		a.state.SetApplyTimeout(next.State.ApplyTimeout.Std())
+		a.commands.SetMaxConcurrent(next.Commands.MaxConcurrent)
+		a.jobs.SetCancelTimeout(next.Jobs.CancelTimeout.Std())
+		a.outbox.SetLimit(next.Outbox.MaxMessages, nil)
+	}
 	a.applyBuiltins(next)
 	var removed []string
 	if diff.Workers {
@@ -118,7 +124,7 @@ func (a *App) Reload(next config.Config) {
 	renew := diff.Hello || len(removed) > 0 ||
 		!slices.Equal(channels, a.telemetry.Channels()) || !slices.Equal(cmds, a.commands.Names())
 	a.log.Info("настройки перечитаны и применены", "log", diff.Log, "telemetry", diff.Telemetry,
-		"resync", diff.Resync, "workers", diff.Workers, "hello", renew)
+		"resync", diff.Resync, "tuning", diff.Tuning, "workers", diff.Workers, "hello", renew)
 	if renew {
 		// Возможности сузились или изменилось приветствие: capabilities
 		// только добавляет — серверу нужен новый hello. Очередь сохраняется.

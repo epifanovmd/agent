@@ -38,6 +38,12 @@ type Sender interface {
 // retryEvery — повтор применения после ошибки.
 const retryEvery = 30 * time.Second
 
+// DefaultApplyTimeout — сколько ждать применения снимка по умолчанию.
+const DefaultApplyTimeout = 5 * time.Minute
+
+// ErrTimeout — код в ошибке применения, не уложившегося в срок.
+const ErrTimeout = "STATE_TIMEOUT"
+
 type cached struct {
 	Version int64           `json:"version"`
 	Spec    json.RawMessage `json:"spec"`
@@ -64,6 +70,8 @@ type Manager struct {
 	// resyncChanged — закрывается при смене resync (циклы доменов перечитывают).
 	resyncChanged chan struct{}
 	retry         time.Duration // повтор после ошибки (retryEvery; в тестах — короче)
+	// applyTimeout — срок одного применения (state.applyTimeout).
+	applyTimeout time.Duration
 
 	// unseal — раскрытие запечатанных значений снимка перед передачей
 	// исполнителю (nil — снимок как есть).
@@ -78,7 +86,18 @@ type Manager struct {
 // New — менеджер; снимки — в dir.
 func New(dir string, sender Sender, log *slog.Logger) *Manager {
 	return &Manager{dir: dir, sender: sender, log: log, retry: retryEvery, domains: map[string]*domain{},
-		resyncChanged: make(chan struct{})}
+		resyncChanged: make(chan struct{}), applyTimeout: DefaultApplyTimeout}
+}
+
+// SetApplyTimeout — срок одного применения: исполнитель не ответил — раздел
+// не применён (ошибка STATE_TIMEOUT), повтор по обычному правилу.
+func (m *Manager) SetApplyTimeout(d time.Duration) {
+	if d <= 0 {
+		d = DefaultApplyTimeout
+	}
+	m.mu.Lock()
+	m.applyTimeout = d
+	m.mu.Unlock()
 }
 
 // ErrUnseal — запечатанное значение снимка не раскрылось ключом агента.
@@ -362,7 +381,8 @@ func (m *Manager) loop(ctx context.Context, name string, d *domain) {
 	}
 }
 
-// apply — раскрыть запечатанные значения и передать снимок исполнителю.
+// apply — раскрыть запечатанные значения и передать снимок исполнителю не
+// дольше applyTimeout.
 func (m *Manager) apply(ctx context.Context, r Reconciler, snapshot cached) (any, error) {
 	spec := snapshot.Spec
 	if m.unseal != nil {
@@ -372,7 +392,16 @@ func (m *Manager) apply(ctx context.Context, r Reconciler, snapshot cached) (any
 		}
 		spec = open
 	}
-	return r.Apply(ctx, snapshot.Version, spec)
+	m.mu.Lock()
+	timeout := m.applyTimeout
+	m.mu.Unlock()
+	actx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	report, err := r.Apply(actx, snapshot.Version, spec)
+	if err != nil && actx.Err() != nil && ctx.Err() == nil {
+		return report, fmt.Errorf("%s: исполнитель не применил снимок за %s", ErrTimeout, timeout)
+	}
+	return report, err
 }
 
 // resyncable — повторное применение по интервалу: последний снимок применён

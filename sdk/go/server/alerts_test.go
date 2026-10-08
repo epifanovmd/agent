@@ -57,7 +57,7 @@ func TestAlerts(t *testing.T) {
 	handle(agents, ss, statusWith(message.StateDegraded, "воркеры перезапускаются",
 		message.StatusWorker{Name: "w1", State: "backoff"}, message.StatusWorker{Name: "w2", State: "running"}))
 	expectAlerts(t, alerts.take(), id, "node")
-	if act := agents.Alerts(); len(act) != 2 {
+	if act := mustAlerts(t, agents); len(act) != 2 {
 		t.Fatalf("активные: %+v", act)
 	}
 	// Воркер пропал из списка, агент в норме — обе закончились.
@@ -73,7 +73,7 @@ func TestAlerts(t *testing.T) {
 	if got[0].Message != "не применилось" {
 		t.Fatalf("message: %q", got[0].Message)
 	}
-	if act := agents.Alerts(); len(act) != 1 || act[0].Domain != "d" || !act[0].Active {
+	if act := mustAlerts(t, agents); len(act) != 1 || act[0].Domain != "d" || !act[0].Active {
 		t.Fatalf("активные: %+v", act)
 	}
 	handle(agents, ss, reliableEnv(message.TypeStateApplied, message.StateApplied{Domain: "d", Version: 3, OK: true}))
@@ -86,11 +86,11 @@ func TestAlerts(t *testing.T) {
 	if got := alerts.take(); len(got) != 0 {
 		t.Fatalf("offline до отсрочки: %+v", got)
 	}
-	eventually(t, "offline", func() bool { return len(agents.Alerts()) == 1 })
+	eventually(t, "offline", func() bool { return len(mustAlerts(t, agents)) == 1 })
 	expectAlerts(t, alerts.take(), id, "node", alertWant{AlertOffline, true, ""})
 	ss = open(t, agents, id, helloEnv("b", message.Capabilities{}))
 	expectAlerts(t, alerts.take(), id, "node", alertWant{AlertOffline, false, ""})
-	if act := agents.Alerts(); len(act) != 0 {
+	if act := mustAlerts(t, agents); len(act) != 0 {
 		t.Fatalf("активные: %+v", act)
 	}
 
@@ -161,7 +161,7 @@ func TestAlertMessages(t *testing.T) {
 	agents.mu.Lock()
 	agents.closeSession(ss, message.CloseNormal)
 	agents.unlock()
-	eventually(t, "offline", func() bool { return len(agents.Alerts()) == 1 })
+	eventually(t, "offline", func() bool { return len(mustAlerts(t, agents)) == 1 })
 	expect([2]string{"offline начало", "Агент без связи"})
 	ss = open(t, agents, id, helloEnv("b", message.Capabilities{}))
 	expect([2]string{"offline конец", "Агент без связи"})
@@ -203,7 +203,7 @@ func TestOfflineAfterWithoutSession(t *testing.T) {
 	// Вестей нет 2 мин (процесс local «упал»).
 	ag, _ := shared.GetAgent(id)
 	ag.LastSeenAt = now() - 2*time.Minute.Milliseconds()
-	if err := shared.UpdateAgent(ag); err != nil {
+	if _, err := shared.UpdateAgent(ag); err != nil {
 		t.Fatal(err)
 	}
 	sweep(local) // сессия здесь — не трогаем
@@ -221,4 +221,14 @@ func TestOfflineAfterWithoutSession(t *testing.T) {
 	}
 	sweep(remote)
 	expectAlerts(t, alerts.take(), id, "node")
+}
+
+// mustAlerts — активные проблемы (Agents.Alerts) без ошибки.
+func mustAlerts(t *testing.T, agents *Agents) []Alert {
+	t.Helper()
+	list, err := agents.Alerts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return list
 }

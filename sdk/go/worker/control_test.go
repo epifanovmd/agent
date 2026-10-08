@@ -77,14 +77,10 @@ func TestContextFromAgent(t *testing.T) {
 	}
 }
 
-// SetHealth, Pause, Resume, RequestRestart — сообщения по образцам воркер → агент; до
-// Run — ошибка.
+// SetHealth, Pause, Resume, RequestRestart — сообщения по образцам воркер → агент.
 func TestSelfControlMatchesExamples(t *testing.T) {
 	w, a := newWorker(t, "report")
 	w.Job("example.echo", 1, func(context.Context, *Job) (any, error) { return nil, nil })
-	if err := w.SetHealth(false, "x"); err == nil {
-		t.Fatal("SetHealth до Run")
-	}
 	start(t, w, a)
 
 	steps := []struct {
@@ -95,7 +91,7 @@ func TestSelfControlMatchesExamples(t *testing.T) {
 	}{
 		{func() error { return w.SetHealth(true, "") }, message.TypeWorkerHealth, "worker.health", ""},
 		{func() error { return w.SetHealth(false, "example.db недоступна") }, message.TypeWorkerHealth, "worker.health.degraded", ""},
-		{func() error { return w.SetHealth(true, "лишнее") }, message.TypeWorkerHealth, "", `{"ok":true}`},
+		{func() error { return w.SetHealth(true, "пояснение") }, message.TypeWorkerHealth, "", `{"ok":true,"message":"пояснение"}`},
 		{func() error { return w.Pause("example.echo") }, message.TypeWorkerPause, "worker.pause", ""},
 		{func() error { return w.Resume("example.echo") }, message.TypeWorkerResume, "worker.resume", ""},
 		{func() error { return w.Pause() }, message.TypeWorkerPause, "", `{}`},
@@ -176,4 +172,62 @@ func TestTelemetryAutoIntervalChannel(t *testing.T) {
 		<-a.in
 	}
 	a.quiet(300 * time.Millisecond)
+}
+
+// Вызовы до worker.ready (и до Run) копятся и уходят сразу после него по
+// порядку; накоплено больше earlyLimit — старые вытесняются.
+func TestEarlyMessagesAfterReady(t *testing.T) {
+	w, a := newWorker(t, "report")
+	w.Job("example.echo", 1, func(context.Context, *Job) (any, error) { return nil, nil })
+	w.Channel("example.app")
+	calls := []func() error{
+		func() error { return w.SetHealth(false, "example.db недоступна") },
+		func() error { return w.Pause("example.echo") },
+		func() error { return w.Resume("example.echo") },
+		func() error { return w.RequestRestart("новые настройки example.app") },
+		func() error { return w.Event("app.started", map[string]int{"port": 8080}) },
+		func() error { return w.Report("example.app", map[string]int{"n": 1}) },
+	}
+	for i, call := range calls {
+		if err := call(); err != nil {
+			t.Fatalf("вызов %d до Run: %v", i, err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- w.Run(context.Background()) }()
+	t.Cleanup(func() { a.conn.Close(); <-done })
+	a.expect(message.TypeWorkerRegister, nil)
+	a.quiet(100 * time.Millisecond) // до worker.ready — ничего
+	a.send(message.TypeWorkerReady, message.WorkerReady{AgentVersion: "test"}, "")
+	sameAsExample(t, a.next(), "worker.health.degraded")
+	sameAsExample(t, a.next(), "worker.pause")
+	sameAsExample(t, a.next(), "worker.resume")
+	sameAsExample(t, a.next(), "worker.restart")
+	if env := a.next(); env.Type != message.TypeEvent {
+		t.Fatalf("ждали event: %s", env.Type)
+	}
+	if env := a.next(); env.Type != message.TypeTelemetry {
+		t.Fatalf("ждали telemetry: %s", env.Type)
+	}
+	a.quiet(100 * time.Millisecond)
+}
+
+func TestEarlyMessagesLimit(t *testing.T) {
+	w, a := newWorker(t, "report")
+	w.Channel("example.app")
+	for i := range earlyLimit + 5 {
+		if err := w.Event("example.n", i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start(t, w, a)
+	var first message.Event
+	a.expect(message.TypeEvent, &first)
+	if string(first.Data) != "5" {
+		t.Fatalf("старые не вытеснены: первое %s", first.Data)
+	}
+	for range earlyLimit - 1 {
+		a.expect(message.TypeEvent, nil)
+	}
+	a.quiet(100 * time.Millisecond)
 }

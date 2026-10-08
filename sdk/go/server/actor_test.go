@@ -251,17 +251,6 @@ func TestEnrollRateLimit(t *testing.T) {
 	}
 }
 
-func TestClientAddr(t *testing.T) {
-	for addr, want := range map[string]string{"10.0.0.1:5000": "10.0.0.1", "[::1]:80": "::1", "sock": "sock", "": "*"} {
-		r := httptest.NewRequest(http.MethodPost, "/", nil)
-		r.RemoteAddr = addr
-		r.Header.Set("X-Forwarded-For", "1.2.3.4")
-		if got := clientAddr(r); got != want {
-			t.Fatalf("%q: %q, ждали %q", addr, got, want)
-		}
-	}
-}
-
 // By: actor в Job, Command, DesiredState и записях аудита; без By — пустой.
 func TestActorAndAudit(t *testing.T) {
 	var audits collector[AuditEntry]

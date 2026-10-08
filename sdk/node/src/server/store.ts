@@ -1,39 +1,59 @@
 // Хранилище Agents: агенты, задачи, команды, желаемое состояние, события.
 // MemoryStore — в памяти процесса (разработка, один процесс); свой Store
 // (Postgres и т. п.) — та же механика связи с данными в БД.
-import type {
-  AgentEvent,
-  AgentRecord,
-  CommandFilter,
-  Command,
-  DesiredState,
-  JobFilter,
-  JobRecord,
-  MetricsPoint,
+import {
+  commandFinished,
+  jobFinished,
+  type AgentEvent,
+  type AgentRecord,
+  type CommandFilter,
+  type CommandRecord,
+  type DesiredState,
+  type JobFilter,
+  type JobRecord,
+  type MetricsPoint,
+  type PageFilter,
+  type StorePruneOptions,
 } from "./model";
 
 /**
- * Хранилище. Методы асинхронны; Agents сериализует изменения сам (одна операция
- * за раз), поэтому Store не обязан уметь транзакции между вызовами.
- * Записи передаются целиком: update* заменяет запись.
+ * Хранилище. Методы асинхронны и могут вызываться одновременно (в том числе из
+ * нескольких процессов бэкенда с общим Store). Записи агента, задачи и команды
+ * передаются целиком; update* — условная запись по версии rev: Store пишет запись,
+ * только если в хранилище rev такой же, как у переданной (запись не менялась с
+ * чтения), и сохраняет её с rev + 1 (у переданной rev тоже становится rev + 1).
+ * Результат false — запись изменилась (или её нет): Agents перечитает и повторит.
+ * В SQL: UPDATE … SET record = $2, rev = rev + 1 WHERE id = $1 AND rev = $3.
  */
 export interface Store {
+  /** Сохранить новую запись как есть (Agents создаёт с rev = 0). */
   createAgent(agent: AgentRecord): Promise<void>;
   getAgent(id: string): Promise<AgentRecord | undefined>;
-  updateAgent(agent: AgentRecord): Promise<void>;
+  /** Условная запись по rev; false — запись изменилась или её нет. */
+  updateAgent(agent: AgentRecord): Promise<boolean>;
   listAgents(): Promise<AgentRecord[]>;
+  /** Удалить запись агента и его историю метрик; false — её не было. */
+  deleteAgent(id: string): Promise<boolean>;
 
   createJob(job: JobRecord): Promise<void>;
   getJob(id: string): Promise<JobRecord | undefined>;
-  updateJob(job: JobRecord): Promise<void>;
-  /** Новые первыми. */
+  /** Условная запись по rev; false — запись изменилась или её нет. */
+  updateJob(job: JobRecord): Promise<boolean>;
+  /** Новые первыми; limit и after — постраничное чтение (PageFilter). */
   listJobs(filter?: JobFilter): Promise<JobRecord[]>;
 
-  createCommand(cmd: Command): Promise<void>;
-  getCommand(id: string): Promise<Command | undefined>;
-  updateCommand(cmd: Command): Promise<void>;
-  /** Новые первыми. */
-  listCommands(filter?: CommandFilter): Promise<Command[]>;
+  createCommand(cmd: CommandRecord): Promise<void>;
+  getCommand(id: string): Promise<CommandRecord | undefined>;
+  /** Условная запись по rev; false — запись изменилась или её нет. */
+  updateCommand(cmd: CommandRecord): Promise<boolean>;
+  /** Новые первыми; limit и after — постраничное чтение (PageFilter). */
+  listCommands(filter?: CommandFilter): Promise<CommandRecord[]>;
+
+  /**
+   * Уборка: завершённые задачи и команды с finishedAt раньше границы, события с at раньше
+   * границы (нет границы или 0 — не трогать). Результат — сколько записей удалено.
+   */
+  prune(opts: StorePruneOptions): Promise<number>;
 
   /**
    * Новый снимок домена (общий — agentId пусто). Версия монотонна в пределах
@@ -83,7 +103,7 @@ const has = <T>(want: T | T[] | undefined, v: T) =>
 export class MemoryStore implements Store {
   private agents = new Map<string, AgentRecord>();
   private jobs = new Map<string, JobRecord>();
-  private commands = new Map<string, Command>();
+  private commands = new Map<string, CommandRecord>();
   private states = new Map<string, DesiredState>();
   private history = new Map<string, DesiredState[]>(); // stateKey → снимки, старые первыми
   private domainVersion = new Map<string, number>();
@@ -111,49 +131,68 @@ export class MemoryStore implements Store {
     return a && clone(a);
   }
   async updateAgent(agent: AgentRecord) {
-    if (this.agents.has(agent.id)) this.agents.set(agent.id, clone(agent));
+    return put(this.agents, agent);
   }
   async listAgents() {
     return [...this.agents.values()].map(clone);
   }
+  async deleteAgent(id: string) {
+    this.metrics.delete(id);
+    return this.agents.delete(id);
+  }
 
   async createJob(job: JobRecord) {
     this.jobs.set(job.id, clone(job));
-    trim(this.jobs, this.keepJobs, (j) => j.status !== "queued" && j.status !== "running");
+    trim(this.jobs, this.keepJobs, jobFinished);
   }
   async getJob(id: string) {
     const j = this.jobs.get(id);
     return j && clone(j);
   }
   async updateJob(job: JobRecord) {
-    if (this.jobs.has(job.id)) this.jobs.set(job.id, clone(job));
+    return put(this.jobs, job);
   }
   async listJobs(f: JobFilter = {}) {
-    const out: JobRecord[] = [];
-    for (const j of this.jobs.values()) {
-      if (has(f.status, j.status) && (!f.queue || j.queue === f.queue) && (!f.agentId || j.agentId === f.agentId))
-        out.push(clone(j));
-    }
-    return out.reverse();
+    return page(
+      this.jobs,
+      f,
+      (j) => has(f.status, j.status) && (!f.queue || j.queue === f.queue) && (!f.agentId || j.agentId === f.agentId),
+    );
   }
 
-  async createCommand(cmd: Command) {
+  async createCommand(cmd: CommandRecord) {
     this.commands.set(cmd.id, clone(cmd));
-    trim(this.commands, this.keepCommands, (c) => c.status === "succeeded" || c.status === "failed");
+    trim(this.commands, this.keepCommands, commandFinished);
   }
   async getCommand(id: string) {
     const c = this.commands.get(id);
     return c && clone(c);
   }
-  async updateCommand(cmd: Command) {
-    if (this.commands.has(cmd.id)) this.commands.set(cmd.id, clone(cmd));
+  async updateCommand(cmd: CommandRecord) {
+    return put(this.commands, cmd);
   }
   async listCommands(f: CommandFilter = {}) {
-    const out: Command[] = [];
-    for (const c of this.commands.values()) {
-      if (has(f.status, c.status) && (!f.agentId || c.agentId === f.agentId)) out.push(clone(c));
+    return page(this.commands, f, (c) => has(f.status, c.status) && (!f.agentId || c.agentId === f.agentId));
+  }
+
+  async prune(opts: StorePruneOptions) {
+    let removed = 0;
+    const before = (v: number | undefined) => (v && v > 0 ? v : undefined);
+    const jobs = before(opts.jobsBefore);
+    if (jobs !== undefined)
+      for (const [id, j] of this.jobs)
+        if (jobFinished(j) && (j.finishedAt ?? 0) < jobs && this.jobs.delete(id)) removed++;
+    const commands = before(opts.commandsBefore);
+    if (commands !== undefined)
+      for (const [id, c] of this.commands)
+        if (commandFinished(c) && (c.finishedAt ?? 0) < commands && this.commands.delete(id)) removed++;
+    const events = before(opts.eventsBefore);
+    if (events !== undefined) {
+      const left = this.events.filter((e) => e.at >= events);
+      removed += this.events.length - left.length;
+      this.events = left;
     }
-    return out.reverse();
+    return removed;
   }
 
   async setState(domain: string, agentId: string | undefined, spec: unknown, actor?: string) {
@@ -223,6 +262,32 @@ export class MemoryStore implements Store {
     }
     return removed;
   }
+}
+
+/**
+ * Условная запись (проверка и запись — без await между ними): rev в хранилище равен rev
+ * записи — сохранить с rev + 1. Записи нет или rev другой — false.
+ */
+function put<T extends { id: string; rev: number }>(map: Map<string, T>, rec: T): boolean {
+  const cur = map.get(rec.id);
+  if (!cur || (cur.rev ?? 0) !== (rec.rev ?? 0)) return false;
+  rec.rev = (rec.rev ?? 0) + 1;
+  map.set(rec.id, clone(rec));
+  return true;
+}
+
+/** Записи по условию, новые первыми, с постраничным чтением (map — в порядке создания). */
+function page<T extends { id: string }>(map: Map<string, T>, f: PageFilter, match: (v: T) => boolean): T[] {
+  const all = [...map.values()];
+  let end = all.length; // записи до end (старее after)
+  if (f.after) {
+    end = all.findIndex((v) => v.id === f.after);
+    if (end < 0) return [];
+  }
+  const limit = f.limit && f.limit > 0 ? Math.floor(f.limit) : Infinity;
+  const out: T[] = [];
+  for (let i = end - 1; i >= 0 && out.length < limit; i--) if (match(all[i])) out.push(clone(all[i]));
+  return out;
 }
 
 const stateKey = (domain: string, agentId?: string) => `${domain}\u0000${agentId ?? ""}`;

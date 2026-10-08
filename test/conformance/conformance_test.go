@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -54,6 +55,19 @@ type control interface {
 	observed(t *testing.T) (points []point, inventory bool)
 	// rotateKey — сменить ключ агента (agent.rotateKey); id команды.
 	rotateKey(t *testing.T, agentID string) string
+	// commandFor — команда агенту agentID (может быть им не объявлена); id команды.
+	commandFor(t *testing.T, agentID, name string) string
+	// cancelCommand — отменить команду: статус после отмены или код ошибки.
+	cancelCommand(t *testing.T, id string) (status, code string)
+	// rollback — откатить раздел к версии (новая версия с тем же снимком).
+	rollback(t *testing.T, domain string, version int64, agentID string) int64
+	// subscribe — подписка id на агента: группы метрик узла сверх настройки агента.
+	subscribe(t *testing.T, agentID, id string, groups []string)
+	unsubscribe(t *testing.T, agentID, id string)
+	// workerCommand — пауза (pause) или снятие паузы (resume) воркера; id команды.
+	workerCommand(t *testing.T, agentID, name, action string) string
+	// deleteAgent — удалить агента: код ошибки ("" — удалён).
+	deleteAgent(t *testing.T, agentID string) string
 	// url — адрес сервера (транспорт агента и раздача выпуска).
 	url() string
 }
@@ -64,7 +78,8 @@ type point struct {
 	Backfill bool  `json:"backfill"`
 	Metrics  struct {
 		Host *struct {
-			MemTotalBytes uint64 `json:"memTotalBytes"`
+			MemTotalBytes uint64          `json:"memTotalBytes"`
+			TCP           json.RawMessage `json:"tcp"`
 		} `json:"host"`
 	} `json:"metrics"`
 }
@@ -270,6 +285,34 @@ func scenario(t *testing.T, python, url string, c control) {
 		return applied(t, c, "example.kv") == version && reads(value)()
 	})
 
+	// Откат: новый общий снимок, затем откат к прежней версии — тот же снимок под новой версией.
+	newer := value + "-next"
+	c.setState(t, "example.kv", "", map[string]string{"key": newer})
+	var nextVersion int64
+	eventually(t, "новый общий снимок применён", 30*time.Second, func() bool {
+		nextVersion = applied(t, c, "example.kv")
+		return nextVersion > version && reads(newer)()
+	})
+	rolled := c.rollback(t, "example.kv", version, "")
+	if rolled <= nextVersion {
+		t.Fatalf("откат: версия %d, последняя %d", rolled, nextVersion)
+	}
+	eventually(t, "откат применён", 30*time.Second, func() bool {
+		return applied(t, c, "example.kv") == rolled && reads(value)()
+	})
+
+	subscription(t, c, model.ID)
+	pauseWorker(t, c, model.ID)
+	cancelCommands(t, c, model.ID)
+
+	// Удалить можно только отозванного агента.
+	if code := c.deleteAgent(t, model.ID); code != "AGENT_NOT_REVOKED" {
+		t.Fatalf("удаление неотозванного: %q", code)
+	}
+	if code := c.deleteAgent(t, "nope"); code != "AGENT_NOT_FOUND" {
+		t.Fatalf("удаление неизвестного: %q", code)
+	}
+
 	// Смена ключа: команда agent.rotateKey с хешем нового секрета; сервер
 	// закрывает сессию (1012), агент переподключается с новым секретом, старый
 	// больше не принимается.
@@ -298,6 +341,109 @@ func scenario(t *testing.T, python, url string, c control) {
 	eventually(t, "после смены ключа агент на связи и выполняет команду", 30*time.Second, func() bool {
 		return c.declares(t, "example.kv.get", "example.kv") && reads(value)()
 	})
+}
+
+// subscription — подписка доходит до агента (config.subscription): группа
+// sockets появляется в его метриках; снятие (config.subscription {}) её убирает.
+func subscription(t *testing.T, c control, agentID string) {
+	tcpSince := func(since int64, want bool) func() bool {
+		return func() bool {
+			points, _ := c.observed(t)
+			if len(points) == 0 {
+				return false
+			}
+			last := points[len(points)-1]
+			return last.At > since && last.Metrics.Host != nil && (len(last.Metrics.Host.TCP) > 0) == want
+		}
+	}
+	if points, _ := c.observed(t); len(points) > 0 && points[len(points)-1].Metrics.Host != nil &&
+		len(points[len(points)-1].Metrics.Host.TCP) > 0 {
+		t.Fatal("группа sockets в метриках до подписки")
+	}
+	c.subscribe(t, agentID, "conformance", []string{"sockets"})
+	eventually(t, "подписка: группа sockets в метриках", 30*time.Second, tcpSince(time.Now().UnixMilli(), true))
+	c.unsubscribe(t, agentID, "conformance")
+	eventually(t, "подписка снята: группы sockets нет", 30*time.Second, tcpSince(time.Now().UnixMilli()+500, false))
+}
+
+// pauseWorker — пауза воркера с сервера: задача его очереди ждёт; снятие
+// паузы — задача выполняется.
+func pauseWorker(t *testing.T, c control, agentID string) {
+	succeeded := func(id string, paused bool) func() bool {
+		return func() bool {
+			status, result := c.commandDone(t, id)
+			if status == "failed" || status == "cancelled" {
+				t.Fatalf("команда воркеру %s: %s", status, result)
+			}
+			var r struct {
+				Name   string `json:"name"`
+				Paused bool   `json:"paused"`
+			}
+			_ = json.Unmarshal(result, &r)
+			return status == "succeeded" && r.Name == "echo" && r.Paused == paused
+		}
+	}
+	reported := func(paused bool) func() bool {
+		return func() bool {
+			var a struct {
+				Status struct {
+					Workers []struct {
+						Name   string `json:"name"`
+						Paused bool   `json:"paused"`
+					} `json:"workers"`
+				} `json:"status"`
+			}
+			_ = json.Unmarshal(c.agent(t), &a)
+			for _, w := range a.Status.Workers {
+				if w.Name == "echo" {
+					return w.Paused == paused
+				}
+			}
+			return false
+		}
+	}
+	eventually(t, "worker.pause выполнена", 30*time.Second, succeeded(c.workerCommand(t, agentID, "echo", "pause"), true))
+	eventually(t, "status: воркер echo на паузе", 30*time.Second, reported(true))
+	job := c.enqueue(t, "example.echo", map[string]string{"text": "после паузы"})
+	time.Sleep(time.Second)
+	if status, _ := c.job(t, job); status != "queued" {
+		t.Fatalf("задача воркеру на паузе: %s", status)
+	}
+	eventually(t, "worker.resume выполнена", 30*time.Second, succeeded(c.workerCommand(t, agentID, "echo", "resume"), false))
+	eventually(t, "status: пауза снята", 30*time.Second, reported(false))
+	eventually(t, "задача после снятия паузы выполнена", 30*time.Second, func() bool {
+		status, _ := c.job(t, job)
+		return status == "completed"
+	})
+}
+
+// cancelCommands — отмена ждущей (у сервера, без сообщения) и выполняющейся
+// команды (агенту cmd.cancel, его итог CANCELLED итог не меняет).
+func cancelCommands(t *testing.T, c control, agentID string) {
+	idle := c.commandFor(t, agentID, "example.none")
+	if status, code := c.cancelCommand(t, idle); status != "cancelled" || code != "" {
+		t.Fatalf("отмена ждущей: %q %q", status, code)
+	}
+	if _, code := c.cancelCommand(t, idle); code != "COMMAND_NOT_ACTIVE" {
+		t.Fatalf("повторная отмена: %q", code)
+	}
+	if _, code := c.cancelCommand(t, "nope"); code != "COMMAND_NOT_FOUND" {
+		t.Fatalf("отмена неизвестной: %q", code)
+	}
+
+	running := c.commandFor(t, agentID, "example.echo.wait")
+	eventually(t, "команда example.echo.wait выполняется", 30*time.Second, func() bool {
+		status, _ := c.commandDone(t, running)
+		return status == "running"
+	})
+	if status, code := c.cancelCommand(t, running); status != "cancelled" || code != "" {
+		t.Fatalf("отмена выполняющейся: %q %q", status, code)
+	}
+	// Агент прервал команду и прислал итог CANCELLED: итог сервера прежний.
+	time.Sleep(time.Second)
+	if status, _ := c.commandDone(t, running); status != "cancelled" {
+		t.Fatalf("после итога агента: %s", status)
+	}
 }
 
 // credentials — файл учётных данных агента в каталоге данных.
@@ -477,6 +623,71 @@ func (g goControl) rotateKey(t *testing.T, agentID string) string {
 	return cmd.ID
 }
 
+func (g goControl) commandFor(t *testing.T, agentID, name string) string {
+	cmd, err := g.agents.Command(server.CommandRequest{AgentID: agentID, Name: name, TimeoutSec: 60})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cmd.ID
+}
+
+func (g goControl) cancelCommand(t *testing.T, id string) (string, string) {
+	cmd, err := g.agents.CancelCommand(id)
+	if err != nil {
+		return "", errCode(t, err)
+	}
+	return cmd.Status, ""
+}
+
+func (g goControl) rollback(t *testing.T, domain string, version int64, agentID string) int64 {
+	st, err := g.agents.RollbackState(domain, version, agentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.Version
+}
+
+func (g goControl) subscribe(t *testing.T, agentID, id string, groups []string) {
+	_, err := g.agents.Subscribe(agentID, server.SubscribeRequest{ID: id, TTL: time.Minute, Metrics: &server.MetricsSpec{Groups: groups}})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (g goControl) unsubscribe(t *testing.T, agentID, id string) {
+	if err := g.agents.Unsubscribe(agentID, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (g goControl) workerCommand(t *testing.T, agentID, name, action string) string {
+	control := g.agents.PauseWorker
+	if action == "resume" {
+		control = g.agents.ResumeWorker
+	}
+	cmd, err := control(agentID, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cmd.ID
+}
+
+func (g goControl) deleteAgent(t *testing.T, agentID string) string {
+	if err := g.agents.DeleteAgent(agentID); err != nil {
+		return errCode(t, err)
+	}
+	return ""
+}
+
+// errCode — код ошибки API (message.Error); другая ошибка — тест падает.
+func errCode(t *testing.T, err error) string {
+	var pe *message.Error
+	if !errors.As(err, &pe) {
+		t.Fatal(err)
+	}
+	return pe.Code
+}
+
 func (g goControl) setState(t *testing.T, domain, agentID string, spec any) {
 	if _, err := g.agents.SetState(domain, spec, agentID); err != nil {
 		t.Fatal(err)
@@ -495,11 +706,11 @@ func (g goControl) deleteState(t *testing.T, domain, agentID string) int64 {
 }
 
 func (g goControl) lists(t *testing.T) (jobs, commands []string) {
-	js, err := g.agents.Jobs()
+	js, err := g.agents.Jobs(server.JobFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cs, err := g.agents.Commands()
+	cs, err := g.agents.Commands(server.CommandFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,6 +835,100 @@ func (h httpControl) rotateKey(t *testing.T, agentID string) string {
 	var cmd record
 	h.call(t, "POST", "/api/agents/"+agentID+"/rotate-key", nil, &cmd)
 	return cmd.ID
+}
+
+// try — запрос API: HTTP-статус и код ошибки ответа ("" — успех, out заполнен).
+func (h httpControl) try(t *testing.T, method, path string, body any, out any) (int, string) {
+	var r io.Reader
+	if body != nil {
+		raw, _ := json.Marshal(body)
+		r = bytes.NewReader(raw)
+	}
+	req, _ := http.NewRequest(method, h.base+path, r)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		var e struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal(raw, &e) != nil || e.Code == "" {
+			t.Fatalf("%s %s: HTTP %d %s", method, path, resp.StatusCode, raw)
+		}
+		return resp.StatusCode, e.Code
+	}
+	if out != nil {
+		if err := json.Unmarshal(raw, out); err != nil {
+			t.Fatalf("%s %s: %v: %s", method, path, err, raw)
+		}
+	}
+	return resp.StatusCode, ""
+}
+
+func (h httpControl) commandFor(t *testing.T, agentID, name string) string {
+	var cmd record
+	h.call(t, "POST", "/api/commands", map[string]any{"name": name, "agentId": agentID, "timeoutSec": 60}, &cmd)
+	return cmd.ID
+}
+
+// errStatus — HTTP-статус ошибки API по коду.
+var errStatus = map[string]int{
+	"COMMAND_NOT_FOUND": http.StatusNotFound, "COMMAND_NOT_ACTIVE": http.StatusConflict,
+	"AGENT_NOT_FOUND": http.StatusNotFound, "AGENT_NOT_REVOKED": http.StatusConflict,
+}
+
+func checkStatus(t *testing.T, status int, code string) {
+	if want, ok := errStatus[code]; ok && status != want {
+		t.Fatalf("%s: HTTP %d, нужен %d", code, status, want)
+	}
+}
+
+func (h httpControl) cancelCommand(t *testing.T, id string) (string, string) {
+	var cmd record
+	status, code := h.try(t, "POST", "/api/commands/"+id+"/cancel", nil, &cmd)
+	checkStatus(t, status, code)
+	return cmd.Status, code
+}
+
+func (h httpControl) rollback(t *testing.T, domain string, version int64, agentID string) int64 {
+	var st struct {
+		Version int64 `json:"version"`
+	}
+	body := map[string]any{"version": version}
+	if agentID != "" {
+		body["agentId"] = agentID
+	}
+	h.call(t, "POST", "/api/state/"+domain+"/rollback", body, &st)
+	return st.Version
+}
+
+func (h httpControl) subscribe(t *testing.T, agentID, id string, groups []string) {
+	h.call(t, "POST", "/api/agents/"+agentID+"/subscriptions",
+		map[string]any{"id": id, "ttlMs": 60_000, "metrics": map[string]any{"groups": groups}}, nil)
+}
+
+func (h httpControl) unsubscribe(t *testing.T, agentID, id string) {
+	var out map[string]any
+	h.call(t, "DELETE", "/api/agents/"+agentID+"/subscriptions/"+id, nil, &out)
+	if len(out) != 0 {
+		t.Fatalf("снятие подписки: %v", out)
+	}
+}
+
+func (h httpControl) workerCommand(t *testing.T, agentID, name, action string) string {
+	var cmd record
+	h.call(t, "POST", "/api/agents/"+agentID+"/workers/"+name+"/"+action, map[string]any{}, &cmd)
+	return cmd.ID
+}
+
+func (h httpControl) deleteAgent(t *testing.T, agentID string) string {
+	status, code := h.try(t, "DELETE", "/api/agents/"+agentID, nil, nil)
+	checkStatus(t, status, code)
+	return code
 }
 
 func (h httpControl) setState(t *testing.T, domain, agentID string, spec any) {

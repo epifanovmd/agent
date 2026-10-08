@@ -60,7 +60,7 @@ func (k *releaseKit) addWorker(name, version string, content []byte) {
 	hash, _ := update.FileHash(path)
 	k.m.Workers = append(k.m.Workers, message.WorkerArtifact{
 		Name: name, Version: version, OS: goruntime.GOOS, Arch: goruntime.GOARCH,
-		File: file, SHA256: hash, Signature: update.Sign(k.priv, hash),
+		File: file, SHA256: hash, Signature: update.Sign(k.priv, update.Local(name, version, hash)),
 	})
 	k.write()
 }

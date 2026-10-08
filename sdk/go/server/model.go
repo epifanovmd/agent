@@ -23,6 +23,8 @@ const (
 	CommandRunning   = "running"
 	CommandSucceeded = "succeeded"
 	CommandFailed    = "failed"
+	// CommandCancelled — команду отменили (Agents.CancelCommand).
+	CommandCancelled = "cancelled"
 )
 
 // Транспорт сессии агента.
@@ -70,6 +72,15 @@ type Agent struct {
 	// при каждом hello Labels = hello.labels + GrantedLabels, выданные узел
 	// переписать не может. Служебное.
 	GrantedLabels map[string]string `json:"-"`
+	// BootID, LastSeq — учёт seq потока агента (§4): запуск агента и
+	// последний принятый seq; повтор (seq ≤ LastSeq) не обрабатывается
+	// второй раз ни одним процессом. Служебные.
+	BootID  string `json:"-"`
+	LastSeq int64  `json:"-"`
+	// Alerts — активные уведомления о проблемах агента (Agents.Alerts). Служебное.
+	Alerts []Alert `json:"-"`
+	// Rev — версия записи для условной записи (Store.UpdateAgent). Служебное.
+	Rev int64 `json:"-"`
 }
 
 // MetricsPoint — точка истории метрик: At — время точки по часам сервера
@@ -91,6 +102,7 @@ func (a *Agent) Clone() *Agent {
 	c.Labels = maps.Clone(a.Labels)
 	c.GrantedLabels = maps.Clone(a.GrantedLabels)
 	c.StateApplied = maps.Clone(a.StateApplied)
+	c.Alerts = slices.Clone(a.Alerts)
 	if a.Subscriptions != nil {
 		c.Subscriptions = make([]Subscription, len(a.Subscriptions))
 		for i, s := range a.Subscriptions {
@@ -144,6 +156,8 @@ type Job struct {
 	// seq событий попытки. Служебные: хранит Store, наружу не отдаются.
 	LeaseUntil int64 `json:"-"`
 	EventSeq   int64 `json:"-"`
+	// Rev — версия записи для условной записи (Store.UpdateJob). Служебное.
+	Rev int64 `json:"-"`
 }
 
 // Ref — задача и текущая попытка.
@@ -182,10 +196,14 @@ type Command struct {
 	FinishedAt int64                 `json:"finishedAt,omitempty"`
 	// Actor — кто поручил команду (Agents.By); пусто — не указан.
 	Actor string `json:"actor,omitempty"`
+	// Rev — версия записи для условной записи (Store.UpdateCommand). Служебное.
+	Rev int64 `json:"-"`
 }
 
-// Finished — команда завершена.
-func (c *Command) Finished() bool { return c.Status == CommandSucceeded || c.Status == CommandFailed }
+// Finished — команда завершена (выполнена, провалена или отменена).
+func (c *Command) Finished() bool {
+	return c.Status == CommandSucceeded || c.Status == CommandFailed || c.Status == CommandCancelled
+}
 
 // Clone — копия.
 func (c *Command) Clone() *Command {
@@ -271,12 +289,14 @@ const (
 	AuditJobCancel      = "job.cancel"
 	AuditJobStop        = "job.stop"
 	AuditCommand        = "command"
+	AuditCommandCancel  = "command.cancel"
 	AuditStateSet       = "state.set"
 	AuditStateDelete    = "state.delete"
 	AuditStateRollback  = "state.rollback"
 	AuditAgentRevoke    = "agent.revoke"
 	AuditAgentUpdate    = "agent.update"
 	AuditAgentRotateKey = "agent.rotateKey"
+	AuditAgentDelete    = "agent.delete"
 	AuditWorkerUpdate   = "worker.update"
 	AuditWorkerPause    = "worker.pause"
 	AuditWorkerResume   = "worker.resume"

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/epifanovmd/agent/internal/backoff"
 	"github.com/epifanovmd/agent/internal/cgroup"
+	"github.com/epifanovmd/agent/internal/commands"
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/jobs"
 	"github.com/epifanovmd/agent/sdk/go/message"
@@ -27,13 +29,26 @@ import (
 // healthyAfter — проработал дольше — счётчик неудач сбрасывается.
 const healthyAfter = time.Minute
 
-var restartPolicy = backoff.Policy{Min: time.Second, Max: 30 * time.Second}
+// restartPolicy — пауза перед перезапуском по настройкам воркера (backoff).
+func restartPolicy(spec config.Worker) backoff.Policy {
+	p := backoff.Policy{Min: spec.Backoff.Min.Std(), Max: spec.Backoff.Max.Std()}
+	if p.Min <= 0 {
+		p.Min = time.Second
+	}
+	if p.Max < p.Min {
+		p.Max = max(30*time.Second, p.Min)
+	}
+	return p
+}
 
 // slot — место одного экземпляра: текущий процесс и история неудач.
 type slot struct {
 	current  *instance
 	failures int
 	state    string // starting | running | backoff | stopped
+	// gaveUp — перезапусков подряд больше maxRestarts: копия остаётся
+	// остановленной до worker.restart или перечитывания настроек (wake).
+	gaveUp bool
 	// removed, gone — место убрано (меньше replicas или воркер удалён из
 	// настроек): цикл слота завершается, экземпляр дорабатывает и уходит.
 	removed bool
@@ -96,6 +111,11 @@ type Supervisor struct {
 	// готовится при первом запуске воркера с limits; nil — недоступна.
 	cgOnce sync.Once
 	cg     *cgroup.Manager
+
+	// pauseFile — где хранится пауза сервера ("" — только в памяти);
+	// savedPause — прочитанная при запуске (для воркеров, добавленных позже).
+	pauseFile  string
+	savedPause map[string]pauseJSON
 }
 
 // New — супервизор воркеров из конфигурации.
@@ -176,8 +196,10 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop — SIGTERM всем экземплярам, доработка задач до срока ctx, затем SIGKILL.
-func (s *Supervisor) Stop(ctx context.Context) {
+// Stop — SIGTERM всем экземплярам сразу; не вышедший за свой stopTimeout
+// получает SIGKILL. Срок у каждого воркера свой и от общего срока остановки
+// агента (ctx) не зависит.
+func (s *Supervisor) Stop(context.Context) {
 	s.mu.Lock()
 	s.stopping = true
 	var all []*instance
@@ -197,7 +219,7 @@ func (s *Supervisor) Stop(ctx context.Context) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			stopCtx, cancel := context.WithTimeout(ctx, inst.spec.StopTimeout.Std())
+			stopCtx, cancel := context.WithTimeout(context.Background(), inst.spec.StopTimeout.Std())
 			defer cancel()
 			inst.terminate(stopCtx)
 		}()
@@ -236,6 +258,9 @@ func (s *Supervisor) ContributeStatus(st *message.Status) {
 		}
 		switch {
 		case item.Instances == len(w.slots):
+		case anyGaveUp(w.slots):
+			item.State = "stopped"
+			degraded = append(degraded, fmt.Sprintf("%s: перезапусков подряд больше maxRestarts (%d) — остановлен", name, w.spec.MaxRestarts))
 		case anyState(w.slots, "backoff"):
 			item.State = "backoff"
 			reason := name
@@ -266,10 +291,19 @@ func (s *Supervisor) ContributeStatus(st *message.Status) {
 		st.State = message.StateDegraded
 		var parts []string
 		if len(degraded) > 0 {
-			parts = append(parts, "воркеры перезапускаются: "+strings.Join(degraded, "; "))
+			parts = append(parts, "воркеры не работают: "+strings.Join(degraded, "; "))
 		}
 		st.Message = strings.Join(append(parts, unhealthy...), "; ")
 	}
+}
+
+func anyGaveUp(slots []*slot) bool {
+	for _, sl := range slots {
+		if sl.gaveUp {
+			return true
+		}
+	}
+	return false
 }
 
 func anyState(slots []*slot, state string) bool {
@@ -313,9 +347,31 @@ func (s *Supervisor) Restart(ctx context.Context, name string) error {
 		return errors.New("worker: агент останавливается")
 	}
 	s.mu.Lock()
-	slots := append([]*slot(nil), w.slots...)
+	if w.updating {
+		s.mu.Unlock()
+		return commands.Errorf(message.ErrWorkerUpdateInProgress, "воркер %q обновляется (worker.update) — перезапуск после обновления", name)
+	}
+	slots := s.reviveLocked(w)
 	s.mu.Unlock()
 	return s.replace(ctx, w, slots)
+}
+
+// reviveLocked — остановленные после maxRestarts места запускаются снова;
+// возвращает остальные места (их заменяют). Под s.mu.
+func (s *Supervisor) reviveLocked(w *worker) []*slot {
+	var rest []*slot
+	for _, sl := range w.slots {
+		if !sl.gaveUp {
+			rest = append(rest, sl)
+			continue
+		}
+		sl.gaveUp, sl.failures = false, 0
+		select {
+		case sl.wake <- struct{}{}:
+		default:
+		}
+	}
+	return rest
 }
 
 // replace — заменить экземпляры мест slots по стратегии воркера (rolling или
@@ -421,7 +477,15 @@ func (s *Supervisor) spawn(w *worker) (*instance, error) {
 			s.dropTelemetry(w)
 			s.mu.Lock()
 			delete(s.leaving, inst)
+			removed := s.workers[w.spec.Name] != w
 			s.mu.Unlock()
+			if inst.retired.Load() && !removed && !s.cleaning {
+				// Ушла заменённая копия: имена, которых нет у оставшихся, снимаются.
+				s.prune(w, nil)
+			}
+			if removed {
+				s.removeGroupOf(w)
+			}
 		}()
 	}
 	return inst, err
@@ -447,7 +511,7 @@ func (s *Supervisor) keep(ctx context.Context, w *worker, sl *slot) {
 				s.mu.Lock()
 				sl.err = err.Error()
 				s.mu.Unlock()
-				if !s.pause(ctx, sl) {
+				if !s.pause(ctx, w, sl) {
 					return
 				}
 				continue
@@ -508,22 +572,55 @@ func (s *Supervisor) keep(ctx context.Context, w *worker, sl *slot) {
 			s.setState(sl, "stopped")
 			return
 		}
-		s.log.Warn("воркер завершился — перезапуск", "instance", inst.id, "reason", reason)
 		if time.Since(inst.started) > healthyAfter {
 			s.mu.Lock()
 			sl.failures = 0
 			s.mu.Unlock()
 		}
-		if !s.pause(ctx, sl) {
+		s.mu.Lock()
+		limit := w.spec.MaxRestarts
+		giveUp := limit > 0 && sl.failures >= limit
+		s.mu.Unlock()
+		if giveUp {
+			s.log.Error("воркер падает раз за разом — остановлен (maxRestarts); вернуть — worker.restart",
+				"instance", inst.id, "reason", reason, "maxRestarts", limit)
+			if !s.wait(ctx, sl) {
+				return
+			}
+			continue
+		}
+		s.log.Warn("воркер завершился — перезапуск", "instance", inst.id, "reason", reason)
+		if !s.pause(ctx, w, sl) {
 			return
 		}
 	}
 }
 
-func (s *Supervisor) pause(ctx context.Context, sl *slot) bool {
+// wait — место остановлено после maxRestarts: ждать worker.restart или
+// перечитывания настроек (wake).
+func (s *Supervisor) wait(ctx context.Context, sl *slot) bool {
+	s.mu.Lock()
+	sl.gaveUp = true
+	sl.state = "stopped"
+	s.mu.Unlock()
+	s.changed()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-sl.gone:
+		return false
+	case <-sl.wake:
+	}
+	s.mu.Lock()
+	sl.gaveUp, sl.failures = false, 0
+	s.mu.Unlock()
+	return true
+}
+
+func (s *Supervisor) pause(ctx context.Context, w *worker, sl *slot) bool {
 	s.setState(sl, "backoff")
 	s.mu.Lock()
-	delay := restartPolicy.Delay(sl.failures)
+	delay := restartPolicy(w.spec).Delay(sl.failures)
 	sl.failures++
 	s.mu.Unlock()
 	select {
@@ -617,6 +714,9 @@ func (s *Supervisor) Apply(specs []config.Worker) (removed []string) {
 		w, ok := s.workers[spec.Name]
 		if !ok {
 			w = &worker{spec: spec}
+			if p, ok := s.savedPause[spec.Name]; ok {
+				w.pause.set = p.set()
+			}
 			s.workers[spec.Name] = w
 			s.growLocked(w, spec.Replicas)
 			s.log.Info("воркер добавлен", "worker", spec.Name, "replicas", spec.Replicas)
@@ -636,7 +736,7 @@ func (s *Supervisor) Apply(specs []config.Worker) (removed []string) {
 			w.slots = w.slots[:spec.Replicas]
 		}
 		if changed && s.ctx != nil {
-			replace = append(replace, job{w: w, slots: append([]*slot(nil), w.slots...)})
+			replace = append(replace, job{w: w, slots: s.reviveLocked(w)})
 		}
 		s.growLocked(w, spec.Replicas)
 		s.log.Info("воркер изменён", "worker", spec.Name, "replicas", spec.Replicas, "replace", changed)
@@ -671,10 +771,62 @@ func sameSpec(a, b config.Worker) bool {
 
 // release — снять имена удалённого воркера: команды, разделы состояния, каналы.
 func (s *Supervisor) release(name string) {
+	s.unbridge(name, func(owned) bool { return true })
+}
+
+// prune — снять имена воркера w, которые не объявляет ни одна его живая
+// зарегистрированная копия (self — копия, регистрирующаяся сейчас). Сервер
+// узнаёт о сужении возможностей новым hello (Bridge.Narrowed).
+func (s *Supervisor) prune(w *worker, self *instance) {
+	s.mu.Lock()
+	if s.workers[w.spec.Name] != w {
+		s.mu.Unlock()
+		return
+	}
+	var insts []*instance
+	for _, sl := range w.slots {
+		if sl.current != nil {
+			insts = append(insts, sl.current)
+		}
+	}
+	for inst := range s.leaving {
+		if inst.w == w {
+			insts = append(insts, inst)
+		}
+	}
+	s.mu.Unlock()
+	if self != nil && !slices.Contains(insts, self) {
+		insts = append(insts, self)
+	}
+	live := map[owned]bool{}
+	for _, inst := range insts {
+		if inst.hasExited() || (inst != self && !inst.registered()) {
+			continue
+		}
+		inst.mu.Lock()
+		for key := range inst.accepted {
+			live[key] = true
+		}
+		inst.mu.Unlock()
+	}
+	if s.unbridge(w.spec.Name, func(key owned) bool { return !live[key] }) {
+		s.log.Info("воркер больше не объявляет часть имён — сняты", "worker", w.spec.Name)
+		s.mu.Lock()
+		narrowed := s.bridge.Narrowed
+		s.mu.Unlock()
+		if narrowed != nil {
+			narrowed()
+		}
+	}
+}
+
+// unbridge — снять имена воркера name, для которых drop — true; true —
+// снято хоть одно подключённое к агенту.
+func (s *Supervisor) unbridge(name string, drop func(owned) bool) bool {
 	s.mu.Lock()
 	var keys []owned
 	for key, owner := range s.owners {
-		if owner != name {
+		if owner != name || !drop(key) {
 			continue
 		}
 		delete(s.owners, key)
@@ -694,5 +846,69 @@ func (s *Supervisor) release(name string) {
 		case kindChannel:
 			b.Telemetry.Undeclare(key.name)
 		}
+	}
+	return len(keys) > 0
+}
+
+// removeGroupOf — подгруппа cgroup воркера, удалённого из настроек, — когда
+// ушла последняя его копия.
+func (s *Supervisor) removeGroupOf(w *worker) {
+	s.mu.Lock()
+	cg := s.cg
+	if cg == nil || w.spec.Limits.Empty() {
+		s.mu.Unlock()
+		return
+	}
+	for _, sl := range w.slots {
+		if sl.current != nil && !sl.current.hasExited() {
+			s.mu.Unlock()
+			return
+		}
+	}
+	for inst := range s.leaving {
+		if inst.w == w {
+			s.mu.Unlock()
+			return
+		}
+	}
+	if other, ok := s.workers[w.spec.Name]; ok && other != w {
+		s.mu.Unlock()
+		return // воркер с тем же именем снова в настройках
+	}
+	s.mu.Unlock()
+	if err := cg.RemoveWorker(w.spec.Name); err != nil {
+		s.log.Debug("подгруппа удалённого воркера не удалена", "worker", w.spec.Name, "err", err)
+	}
+}
+
+// replaceStuck — копия inst не завершила отменённую задачу за срок:
+// заменить её новой; старая, не ушедшая за stopTimeout, завершается.
+func (s *Supervisor) replaceStuck(inst *instance, reason string) {
+	if s.cleaning || inst.retired.Load() || inst.stopping.Load() || inst.hasExited() {
+		return
+	}
+	s.mu.Lock()
+	ctx, w := s.ctx, inst.w
+	var sl *slot
+	for _, x := range w.slots {
+		if x.current == inst {
+			sl = x
+		}
+	}
+	if ctx == nil || s.stopping || sl == nil || w.updating || s.workers[w.spec.Name] != w {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	inst.log.Warn("копия воркера заменяется: " + reason)
+	if err := s.replace(ctx, w, []*slot{sl}); err != nil && ctx.Err() == nil {
+		inst.log.Error("копия воркера не заменена", "err", err)
+	}
+	select {
+	case <-inst.exited:
+	case <-time.After(inst.spec.StopTimeout.Std()):
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		inst.terminate(stopCtx)
 	}
 }

@@ -419,3 +419,44 @@ func TestWorkerContextState(t *testing.T) {
 		t.Fatal("повторный разрыв уведомил")
 	}
 }
+
+// stopCap — этап остановки: blocking ждёт общего срока (задачи), остальные
+// записывают, когда их позвали.
+type stopCap struct {
+	blocking bool
+	called   chan time.Time
+}
+
+func (s *stopCap) Declare(*message.Capabilities)                  {}
+func (s *stopCap) Handles() []string                              { return nil }
+func (s *stopCap) Handle(context.Context, message.Envelope) error { return nil }
+func (s *stopCap) Stop(ctx context.Context) {
+	s.called <- time.Now()
+	if s.blocking {
+		<-ctx.Done()
+	}
+}
+
+// Этапы остановки идут одновременно: ожидание задач не задерживает сигнал
+// воркерам (иначе они получили бы SIGKILL сразу после SIGTERM).
+func TestStopStagesConcurrent(t *testing.T) {
+	rt := New(Info{Name: "a"}, logx.Discard())
+	rt.SetSender(&fakeSender{})
+	jobs := &stopCap{blocking: true, called: make(chan time.Time, 1)}
+	workers := &stopCap{called: make(chan time.Time, 1)}
+	rt.Register(jobs)
+	rt.Register(workers)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = rt.Run(ctx, func(ctx context.Context) error { <-ctx.Done(); return nil }, 500*time.Millisecond)
+		close(done)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	if at := <-workers.called; at.Sub(start) > 200*time.Millisecond {
+		t.Fatalf("воркеры позваны через %v — после ожидания задач", at.Sub(start))
+	}
+	<-done
+}

@@ -12,38 +12,65 @@ import (
 // ErrNotFound — записи нет.
 var ErrNotFound = errors.New("server: не найдено")
 
-// JobFilter — отбор задач; пустые поля не фильтруют.
+// JobFilter — отбор задач; пустые поля не фильтруют. Limit, After —
+// постраничное чтение: After — id последней записи прошлой страницы
+// (страница — записи после неё в том же порядке; такой записи нет — пусто),
+// Limit — не больше стольких записей (≤ 0 — все).
 type JobFilter struct {
 	Status  string
 	Queue   string
 	AgentID string
+	Limit   int
+	After   string
 }
 
-// CommandFilter — отбор команд; пустые поля не фильтруют.
+// CommandFilter — отбор команд; пустые поля не фильтруют. Limit, After — как
+// в JobFilter.
 type CommandFilter struct {
 	Status  string
 	AgentID string
+	Limit   int
+	After   string
 }
 
-// Store — хранение агентов, задач, команд, состояния и событий. Agents вызывает
-// его из одного процесса последовательно; объекты передаются копиями (Agents
-// меняет копию и сохраняет Update*). Нет записи — ErrNotFound. Задачи и
-// команды (ListJobs, ListCommands) — новые первыми; агенты и снимки — в
-// порядке создания.
+// PruneBefore — уборка (Store.Prune), время в мс: завершённые задачи и
+// команды с FinishedAt раньше Jobs и Commands, события с At раньше Events;
+// 0 — этот вид записей не трогать.
+type PruneBefore struct {
+	Jobs     int64
+	Commands int64
+	Events   int64
+}
+
+// Store — хранение агентов, задач, команд, состояния и событий. Его вызывают
+// одновременно горутины Agents и другие процессы бэкенда с тем же
+// хранилищем; объекты передаются копиями (Agents меняет копию и сохраняет
+// Update*). Нет записи — ErrNotFound. Задачи и команды (ListJobs,
+// ListCommands) — новые первыми; агенты и снимки — в порядке создания.
+//
+// Update* — условная запись по версии Rev: запись сохраняется, только если Rev
+// в хранилище равен Rev переданной записи (её не меняли с чтения), и хранится
+// с Rev + 1; при успехе Rev переданной записи тоже увеличивается на 1, ответ —
+// true. Запись изменилась — false, nil (Agents перечитает и повторит); записи
+// нет — false, ErrNotFound. Проверка и запись — атомарно (в SQL: UPDATE …
+// SET …, rev = rev + 1 WHERE id = $1 AND rev = $2). Create* сохраняет запись
+// как есть.
 type Store interface {
 	CreateAgent(a *Agent) error
 	GetAgent(id string) (*Agent, error)
-	UpdateAgent(a *Agent) error
+	UpdateAgent(a *Agent) (bool, error)
 	ListAgents() ([]*Agent, error)
+	// DeleteAgent — удалить запись агента и его историю метрик; true — была.
+	DeleteAgent(id string) (bool, error)
 
 	CreateJob(j *Job) error
 	GetJob(id string) (*Job, error)
-	UpdateJob(j *Job) error
+	UpdateJob(j *Job) (bool, error)
 	ListJobs(f JobFilter) ([]*Job, error)
 
 	CreateCommand(c *Command) error
 	GetCommand(id string) (*Command, error)
-	UpdateCommand(c *Command) error
+	UpdateCommand(c *Command) (bool, error)
 	ListCommands(f CommandFilter) ([]*Command, error)
 
 	// SetState — новый снимок домена (общий при agentID == ""); actor — кто
@@ -71,6 +98,9 @@ type Store interface {
 	// PruneMetrics — удалить точки всех агентов с At < before (срок хранения,
 	// Options.MetricsRetention); возвращает число удалённых.
 	PruneMetrics(before int64) (int, error)
+	// Prune — удалить завершённые задачи и команды и события старше сроков
+	// PruneBefore; возвращает число удалённых записей.
+	Prune(p PruneBefore) (int, error)
 }
 
 // MemoryStore — Store в памяти процесса (разработка, один процесс). Хранит
@@ -132,14 +162,19 @@ func (s *MemoryStore) GetAgent(id string) (*Agent, error) {
 	return a.Clone(), nil
 }
 
-func (s *MemoryStore) UpdateAgent(a *Agent) error {
+func (s *MemoryStore) UpdateAgent(a *Agent) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.agents[a.ID]; !ok {
-		return ErrNotFound
+	cur, ok := s.agents[a.ID]
+	if !ok {
+		return false, ErrNotFound
 	}
+	if cur.Rev != a.Rev {
+		return false, nil
+	}
+	a.Rev++
 	s.agents[a.ID] = a.Clone()
-	return nil
+	return true, nil
 }
 
 func (s *MemoryStore) ListAgents() ([]*Agent, error) {
@@ -150,6 +185,18 @@ func (s *MemoryStore) ListAgents() ([]*Agent, error) {
 		out = append(out, s.agents[id].Clone())
 	}
 	return out, nil
+}
+
+func (s *MemoryStore) DeleteAgent(id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.agents[id]; !ok {
+		return false, nil
+	}
+	delete(s.agents, id)
+	delete(s.metrics, id)
+	s.agentList = slices.DeleteFunc(s.agentList, func(x string) bool { return x == id })
+	return true, nil
 }
 
 func (s *MemoryStore) CreateJob(j *Job) error {
@@ -180,21 +227,29 @@ func (s *MemoryStore) GetJob(id string) (*Job, error) {
 	return j.Clone(), nil
 }
 
-func (s *MemoryStore) UpdateJob(j *Job) error {
+func (s *MemoryStore) UpdateJob(j *Job) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.jobs[j.ID]; !ok {
-		return ErrNotFound
+	cur, ok := s.jobs[j.ID]
+	if !ok {
+		return false, ErrNotFound
 	}
+	if cur.Rev != j.Rev {
+		return false, nil
+	}
+	j.Rev++
 	s.jobs[j.ID] = j.Clone()
-	return nil
+	return true, nil
 }
 
 func (s *MemoryStore) ListJobs(f JobFilter) ([]*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*Job
-	for _, id := range slices.Backward(s.jobList) {
+	for _, id := range page(s.jobList, f.After) {
+		if f.Limit > 0 && len(out) >= f.Limit {
+			break
+		}
 		j := s.jobs[id]
 		if (f.Status == "" || j.Status == f.Status) && (f.Queue == "" || j.Queue == f.Queue) &&
 			(f.AgentID == "" || j.AgentID == f.AgentID) {
@@ -202,6 +257,21 @@ func (s *MemoryStore) ListJobs(f JobFilter) ([]*Job, error) {
 		}
 	}
 	return out, nil
+}
+
+// page — id списка (он в порядке создания) от новых к старым после after:
+// after пусто — все; такого id нет — ни одного.
+func page(list []string, after string) []string {
+	ids := slices.Clone(list)
+	slices.Reverse(ids)
+	if after == "" {
+		return ids
+	}
+	i := slices.Index(ids, after)
+	if i < 0 {
+		return nil
+	}
+	return ids[i+1:]
 }
 
 func (s *MemoryStore) CreateCommand(c *Command) error {
@@ -231,21 +301,29 @@ func (s *MemoryStore) GetCommand(id string) (*Command, error) {
 	return c.Clone(), nil
 }
 
-func (s *MemoryStore) UpdateCommand(c *Command) error {
+func (s *MemoryStore) UpdateCommand(c *Command) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.cmds[c.ID]; !ok {
-		return ErrNotFound
+	cur, ok := s.cmds[c.ID]
+	if !ok {
+		return false, ErrNotFound
 	}
+	if cur.Rev != c.Rev {
+		return false, nil
+	}
+	c.Rev++
 	s.cmds[c.ID] = c.Clone()
-	return nil
+	return true, nil
 }
 
 func (s *MemoryStore) ListCommands(f CommandFilter) ([]*Command, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*Command
-	for _, id := range slices.Backward(s.cmdList) {
+	for _, id := range page(s.cmdList, f.After) {
+		if f.Limit > 0 && len(out) >= f.Limit {
+			break
+		}
 		c := s.cmds[id]
 		if (f.Status == "" || c.Status == f.Status) && (f.AgentID == "" || c.AgentID == f.AgentID) {
 			out = append(out, c.Clone())
@@ -382,6 +460,40 @@ func (s *MemoryStore) PruneMetrics(before int64) (int, error) {
 		} else {
 			s.metrics[agentID] = slices.Clone(points[i:])
 		}
+	}
+	return n, nil
+}
+
+func (s *MemoryStore) Prune(p PruneBefore) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	if p.Jobs > 0 {
+		s.jobList = slices.DeleteFunc(s.jobList, func(id string) bool {
+			j := s.jobs[id]
+			if j.Status == JobQueued || j.Status == JobRunning || j.FinishedAt >= p.Jobs {
+				return false
+			}
+			delete(s.jobs, id)
+			n++
+			return true
+		})
+	}
+	if p.Commands > 0 {
+		s.cmdList = slices.DeleteFunc(s.cmdList, func(id string) bool {
+			c := s.cmds[id]
+			if !c.Finished() || c.FinishedAt >= p.Commands {
+				return false
+			}
+			delete(s.cmds, id)
+			n++
+			return true
+		})
+	}
+	if p.Events > 0 {
+		was := len(s.events)
+		s.events = slices.DeleteFunc(s.events, func(e AgentEvent) bool { return e.At < p.Events })
+		n += was - len(s.events)
 	}
 	return n, nil
 }

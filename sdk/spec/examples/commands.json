@@ -167,7 +167,33 @@
       }
     }
   },
-  "cmd.cancel": {
+  "cmd.cancel@server": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "cmd.cancel",
+      "data": {
+        "commandId": "22222222-2222-4222-8222-222222222222"
+      }
+    }
+  },
+  "cmd.done.cancelled": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "cmd.done",
+      "id": "01JACMDDONE000000000000004",
+      "data": {
+        "commandId": "22222222-2222-4222-8222-222222222222",
+        "ok": false,
+        "error": {
+          "code": "CANCELLED",
+          "message": "команду отменил сервер"
+        }
+      }
+    }
+  },
+  "cmd.cancel@agent": {
     "from": "agent",
     "to": "worker",
     "message": {

@@ -1,41 +1,56 @@
 package server
 
 import (
+	"slices"
 	"sort"
 
 	"github.com/epifanovmd/agent/sdk/go/message"
 )
 
-// alertKey — проблема: тип, агент, раздел (stateFailed) или воркер
-// (workerDown, workerDegraded).
-type alertKey struct{ typ, agentID, sub string }
+// Активные уведомления о проблемах агента хранятся в его записи
+// (Agent.Alerts) и меняются той же условной записью, что и их причина
+// (status, state.applied, переход в offline, отзыв). Событие OnAlert — только
+// у процесса, который записал изменение.
 
-// setAlert — проблема началась (active) или закончилась: событие — только при
-// смене (активные держатся в памяти процесса). Конец проблемы — с текстом её
-// начала, msg тогда не нужен. Под a.mu.
-func (a *Agents) setAlert(agent *Agent, typ, sub string, active bool, msg string) {
-	key := alertKey{typ, agent.ID, sub}
-	started, was := a.alerts[key]
-	if was == active {
+// alertEvents — начала и концы проблем одного изменения записи; уходят в
+// OnAlert после успешной записи (queueAlerts).
+type alertEvents []Alert
+
+// alertSub — раздел (stateFailed) или воркер (workerDown, workerDegraded) проблемы.
+func alertSub(al Alert) string { return al.Domain + al.Worker }
+
+// set — проблема в записи агента началась (active) или закончилась: событие —
+// только при смене. Конец проблемы — с текстом её начала, msg тогда не нужен.
+func (ev *alertEvents) set(agent *Agent, typ, sub string, active bool, msg string) {
+	i := slices.IndexFunc(agent.Alerts, func(al Alert) bool { return al.Type == typ && alertSub(al) == sub })
+	if (i >= 0) == active {
 		return
 	}
-	if !active {
-		msg = started.Message
-	}
-	al := Alert{Type: typ, AgentID: agent.ID, AgentName: agent.Name, Active: active, Message: msg, At: now()}
-	switch typ {
-	case AlertStateFailed:
-		al.Domain = sub
-	case AlertWorkerDown, AlertWorkerDegraded:
-		al.Worker = sub
-	}
 	if active {
-		a.alerts[key] = al
-	} else {
-		delete(a.alerts, key)
+		al := Alert{Type: typ, AgentID: agent.ID, AgentName: agent.Name, Active: true, Message: msg, At: now()}
+		switch typ {
+		case AlertStateFailed:
+			al.Domain = sub
+		case AlertWorkerDown, AlertWorkerDegraded:
+			al.Worker = sub
+		}
+		agent.Alerts = append(agent.Alerts, al)
+		*ev = append(*ev, al)
+		return
 	}
+	al := agent.Alerts[i]
+	agent.Alerts = slices.Delete(agent.Alerts, i, i+1)
+	if len(agent.Alerts) == 0 {
+		agent.Alerts = nil
+	}
+	al.Active, al.AgentName, al.At = false, agent.Name, now()
+	*ev = append(*ev, al)
+}
+
+// queueAlerts — события записанного изменения — в OnAlert (при снятии блокировки). Под a.mu.
+func (a *Agents) queueAlerts(ev alertEvents) {
 	if a.opts.OnAlert != nil {
-		a.alertQ = append(a.alertQ, al)
+		a.alertQ = append(a.alertQ, ev...)
 	}
 }
 
@@ -49,22 +64,22 @@ func workerFailed(state string) bool {
 	return false
 }
 
-// statusAlerts — degraded, workerDown и workerDegraded по новому status. Под a.mu.
-func (a *Agents) statusAlerts(agent *Agent, st *message.Status) {
+// statusAlerts — degraded, workerDown и workerDegraded по новому status (в записи агента).
+func (ev *alertEvents) statusAlerts(agent *Agent, st *message.Status) {
 	if st.State == message.StateDegraded {
 		msg := st.Message
 		if msg == "" {
 			msg = "Агент не в порядке"
 		}
-		a.setAlert(agent, AlertDegraded, "", true, msg)
+		ev.set(agent, AlertDegraded, "", true, msg)
 	} else {
-		a.setAlert(agent, AlertDegraded, "", false, "")
+		ev.set(agent, AlertDegraded, "", false, "")
 	}
 	down, degraded := map[string]bool{}, map[string]bool{}
 	for _, w := range st.Workers {
 		if workerFailed(w.State) {
 			down[w.Name] = true
-			a.setAlert(agent, AlertWorkerDown, w.Name, true, "Воркер "+w.Name+": "+w.State)
+			ev.set(agent, AlertWorkerDown, w.Name, true, "Воркер "+w.Name+": "+w.State)
 		}
 		if w.Health == message.WorkerHealthDegraded {
 			degraded[w.Name] = true
@@ -72,50 +87,53 @@ func (a *Agents) statusAlerts(agent *Agent, st *message.Status) {
 			if msg == "" {
 				msg = "Воркер " + w.Name + " не в порядке"
 			}
-			a.setAlert(agent, AlertWorkerDegraded, w.Name, true, msg)
+			ev.set(agent, AlertWorkerDegraded, w.Name, true, msg)
 		}
 	}
-	for _, key := range a.agentAlerts(agent.ID) {
+	for _, al := range sortedAlerts(agent.Alerts) {
 		switch {
-		case key.typ == AlertWorkerDown && !down[key.sub]:
-			a.setAlert(agent, AlertWorkerDown, key.sub, false, "")
-		case key.typ == AlertWorkerDegraded && !degraded[key.sub]:
-			a.setAlert(agent, AlertWorkerDegraded, key.sub, false, "")
+		case al.Type == AlertWorkerDown && !down[al.Worker]:
+			ev.set(agent, AlertWorkerDown, al.Worker, false, "")
+		case al.Type == AlertWorkerDegraded && !degraded[al.Worker]:
+			ev.set(agent, AlertWorkerDegraded, al.Worker, false, "")
 		}
 	}
 }
 
-// clearAlerts — закончить все проблемы агента (отозван). Под a.mu.
-func (a *Agents) clearAlerts(agent *Agent) {
-	for _, key := range a.agentAlerts(agent.ID) {
-		a.setAlert(agent, key.typ, key.sub, false, "")
+// clearAlerts — закончить все проблемы агента (отозван).
+func (ev *alertEvents) clearAlerts(agent *Agent) {
+	for _, al := range sortedAlerts(agent.Alerts) {
+		ev.set(agent, al.Type, alertSub(al), false, "")
 	}
 }
 
-// agentAlerts — ключи активных проблем агента по порядку.
-func (a *Agents) agentAlerts(agentID string) []alertKey {
-	var keys []alertKey
-	for key := range a.alerts {
-		if key.agentID == agentID {
-			keys = append(keys, key)
+// sortedAlerts — копия проблем по типу и разделу (воркеру).
+func sortedAlerts(list []Alert) []Alert {
+	out := slices.Clone(list)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Type != out[j].Type {
+			return out[i].Type < out[j].Type
 		}
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].typ != keys[j].typ {
-			return keys[i].typ < keys[j].typ
-		}
-		return keys[i].sub < keys[j].sub
+		return alertSub(out[i]) < alertSub(out[j])
 	})
-	return keys
+	return out
 }
 
-// Alerts — активные проблемы агентов (этого процесса), по времени начала.
-func (a *Agents) Alerts() []Alert {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	out := make([]Alert, 0, len(a.alerts))
-	for _, al := range a.alerts {
-		out = append(out, al)
+// Alerts — активные проблемы агентов по записям в Store (видны всем
+// процессам с общим Store), по времени начала.
+func (a *Agents) Alerts() ([]Alert, error) {
+	list, err := a.store.ListAgents()
+	if err != nil {
+		return nil, err
+	}
+	out := []Alert{}
+	for _, agent := range list {
+		for _, al := range agent.Alerts {
+			if al.Active {
+				al.AgentName = agent.Name
+				out = append(out, al)
+			}
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
 		x, y := out[i], out[j]
@@ -127,7 +145,7 @@ func (a *Agents) Alerts() []Alert {
 		case x.Type != y.Type:
 			return x.Type < y.Type
 		}
-		return x.Domain+x.Worker < y.Domain+y.Worker
+		return alertSub(x) < alertSub(y)
 	})
-	return out
+	return out, nil
 }

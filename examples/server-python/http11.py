@@ -1,7 +1,8 @@
 """Минимальный HTTP/1.1-сервер на asyncio (только стандартная библиотека).
 
 Ровно столько, сколько нужно примеру: keep-alive, тело по Content-Length или
-chunked, ответы целиком и WebSocket (RFC 6455: handshake, текстовые сообщения,
+chunked (не больше предела для пути: больше — тело не читается, ``Request.too_large``),
+ответы целиком и WebSocket (RFC 6455: handshake, текстовые сообщения,
 ping/pong/close, ограничение размера). Не продакшен: без TLS, HTTP/2 и расширений
 WebSocket (сжатие) — для продакшена берите uvicorn/aiohttp, ``Agents`` от транспорта не зависит.
 """
@@ -16,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
-#: Наибольшее тело запроса.
+#: Наибольшее тело запроса, если предел для пути не задан.
 MAX_BODY = 64 << 20
 #: Наибольшая строка запроса или заголовка.
 MAX_LINE = 64 << 10
@@ -38,6 +39,8 @@ class Request:
     writer: asyncio.StreamWriter
     #: Адрес клиента (IP соединения; пусто — неизвестен).
     remote: str = ""
+    #: Тело больше предела: не прочитано (``body`` пусто), соединение закроется после ответа.
+    too_large: bool = False
 
     def disconnected(self) -> bool:
         """Клиент закрыл соединение (для long-poll)."""
@@ -53,6 +56,8 @@ class Response:
 
 #: Обработчик: ответ целиком или ``None`` — ответил сам (поток), соединение закрыть.
 Handler = Callable[[Request], Awaitable[Optional[Response]]]
+#: Предел тела запроса по пути, байт.
+BodyLimit = Callable[[str], int]
 
 
 def head(status: int, headers: Dict[str, str]) -> bytes:
@@ -62,11 +67,13 @@ def head(status: int, headers: Dict[str, str]) -> bytes:
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
 
-async def serve(handler: Handler, host: str, port: int) -> asyncio.AbstractServer:
+async def serve(handler: Handler, host: str, port: int,
+                body_limit: Optional[BodyLimit] = None) -> asyncio.AbstractServer:
+    """Сервер на ``host:port``; ``body_limit(path)`` — предел тела запроса (нет — ``MAX_BODY``)."""
     async def connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             while True:
-                request = await _read_request(reader, writer)
+                request = await _read_request(reader, writer, body_limit)
                 if request is None:
                     return
                 try:
@@ -75,7 +82,7 @@ async def serve(handler: Handler, host: str, port: int) -> asyncio.AbstractServe
                     response = Response(500, f"{type(err).__name__}: {err}".encode())
                 if response is None:
                     return
-                keep = request.headers.get("connection", "").lower() != "close"
+                keep = request.headers.get("connection", "").lower() != "close" and not request.too_large
                 headers = {"Content-Length": str(len(response.body)),
                            "Connection": "keep-alive" if keep else "close", **response.headers}
                 writer.write(head(response.status, headers) + (b"" if request.method == "HEAD" else response.body))
@@ -98,7 +105,8 @@ class _BadRequest(Exception):
         self.status = status
 
 
-async def _read_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> Optional[Request]:
+async def _read_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                        body_limit: Optional[BodyLimit] = None) -> Optional[Request]:
     line = await reader.readline()
     if not line:
         return None
@@ -113,34 +121,46 @@ async def _read_request(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             break
         name, _, value = raw.decode("latin-1").partition(":")
         headers[name.strip().lower()] = value.strip()
-    if headers.get("expect", "").lower() == "100-continue":
-        writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
-    if headers.get("transfer-encoding", "").lower() == "chunked":
-        body = await _read_chunked(reader)
-    else:
-        length = int(headers.get("content-length") or 0)
-        if length > MAX_BODY:
-            raise _BadRequest(413)
-        body = await reader.readexactly(length) if length else b""
     url = urlsplit(target)
+    path = unquote(url.path)
+    limit = min(body_limit(path), MAX_BODY) if body_limit is not None else MAX_BODY
+    chunked = headers.get("transfer-encoding", "").lower() == "chunked"
+    try:
+        length = 0 if chunked else int(headers.get("content-length") or 0)
+    except ValueError:
+        raise _BadRequest() from None
+    # Content-Length больше предела — тело не читается (и 100 Continue не отправляется).
+    too_large = length > limit
+    body = b""
+    if not too_large:
+        if headers.get("expect", "").lower() == "100-continue":
+            writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        if chunked:
+            body, too_large = await _read_chunked(reader, limit)
+        elif length:
+            body = await reader.readexactly(length)
     query = {k: v[-1] for k, v in parse_qs(url.query).items()}
     peer = writer.get_extra_info("peername")
     remote = str(peer[0]) if isinstance(peer, (tuple, list)) and peer else ""
-    return Request(method.upper(), unquote(url.path), query, headers, body, reader, writer, remote)
+    return Request(method.upper(), path, query, headers, body, reader, writer, remote, too_large)
 
 
-async def _read_chunked(reader: asyncio.StreamReader) -> bytes:
+async def _read_chunked(reader: asyncio.StreamReader, limit: int) -> Tuple[bytes, bool]:
+    """Тело chunked → ``(тело, больше ли предела)``; больше — чтение прекращается."""
     chunks = []
     size_total = 0
     while True:
-        size = int((await reader.readline()).split(b";")[0].strip() or b"0", 16)
+        try:
+            size = int((await reader.readline()).split(b";")[0].strip() or b"0", 16)
+        except ValueError:
+            raise _BadRequest() from None
         if size == 0:
             while (await reader.readline()) not in (b"\r\n", b"\n", b""):
                 pass
-            return b"".join(chunks)
+            return b"".join(chunks), False
         size_total += size
-        if size_total > MAX_BODY:
-            raise _BadRequest(413)
+        if size_total > limit:
+            return b"", True
         chunks.append(await reader.readexactly(size))
         await reader.readline()
 

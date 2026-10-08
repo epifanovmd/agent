@@ -1,12 +1,14 @@
 #!/bin/sh
 # Установка агента как службы systemd (Linux): исполняемый файл, конфигурация,
 # каталог данных, служба. Повторный запуск обновляет файл и службу, не трогая
-# учётные данные агента.
+# учётные данные агента. Нужен узел с systemd (Debian/Ubuntu, RHEL/Fedora, SUSE
+# и т. п.); без него установщик сразу завершается, ничего не меняя. Узлы без
+# systemd (Alpine и другие) — агент в контейнере (deploy/Dockerfile).
 #
 # Одной командой — с сервера (он раздаёт этот скрипт со своим адресом и сборки):
 #   curl -fsSL https://сервер/api/v1/agent-link/install.sh | sudo sh -s -- --token <токен регистрации>
 #
-# Из локальной сборки:
+# Из GitHub Release или локальной сборки:
 #   sudo sh install.sh --binary ./agent-linux-amd64 --server https://api.example.com --token <токен> \
 #     [--public-key <ключ релизов>] [--name node-01] [--config agent.yaml] [--user agent|root] \
 #     [--ca-file ca.pem] [--kill-mode mixed|process] \
@@ -18,7 +20,8 @@
 #
 # --worker NAME (повторяемый) — воркер из выпуска: сборка под эту машину из
 # manifest.json сервера (старшая версия; sha256 сверяется) кладётся в
-# /var/lib/agent/workers/NAME/current (+ version); в создаваемый agent.yaml
+# /var/lib/agent/workers/NAME/current (+ version); архив .tar.gz распаковывается
+# в каталог current (command — из манифеста, иначе агент запускает ./run архива); в создаваемый agent.yaml
 # дописывается запись `- name: NAME, release: true` (+ restart/stopTimeout из
 # манифеста). Готовый agent.yaml (есть или --config) не меняется. Дальше
 # обновлять воркер может сервер (команда worker.update).
@@ -33,7 +36,8 @@
 # параметры заданы и их значения до установки — в журнале /etc/agent/install-state.
 # --uninstall сначала даёт воркерам убрать за собой (agent cleanup), затем
 # удаляет службу, файл параметров ядра и возвращает их значения до установки;
-# --purge — ещё конфигурацию, данные и пакеты, поставленные установкой.
+# --purge — ещё конфигурацию, данные, пакеты и пользователя службы, если их
+# создала установка (root и пользователей, которые уже были, не трогает).
 #
 # --kill-mode: mixed (по умолчанию) — при остановке службы systemd добивает
 # все процессы агента по истечении срока; process — только агент (он сам
@@ -45,6 +49,7 @@
 #
 # По умолчанию агент — системный пользователь agent в защищённой службе: система
 # только для чтения, запись — в /var/lib/agent, /opt/agent и каталоги --rw-path.
+# --user NAME — другой пользователь службы; если его нет, он создаётся.
 # Воркерам, которые настраивают узел (сеть, firewall, системные конфиги), нужен
 # --privileged: агент и воркеры — root без ограничений файловой системы. Только
 # если воркерам это действительно нужно.
@@ -112,7 +117,9 @@ if [ -n "$TOKEN_FILE" ]; then
   [ -n "$TOKEN" ] || die "--token-file: файл $TOKEN_FILE пуст"
 fi
 [ "$(id -u)" -eq 0 ] || die "нужен root (sudo)"
-command -v systemctl >/dev/null || die "нужен systemd"
+# systemd должен быть запущен, а не только установлен (как в контейнере).
+command -v systemctl >/dev/null && [ -d /run/systemd/system ] ||
+  die "нужен узел с systemd (Debian/Ubuntu, RHEL/Fedora, SUSE и т. п.); без systemd — агент в контейнере (deploy/Dockerfile)"
 
 # Менеджер пакетов узла: apt | dnf | yum | apk | zypper (пусто — не найден).
 pkg_manager() {
@@ -187,10 +194,17 @@ if [ -n "$UNINSTALL" ]; then
         *) false ;;
       esac || echo "install.sh: предупреждение: пакеты не удалены:$DELIVERED" >&2
     fi
+    # Пользователи службы, созданные установкой (не root и не те, что были до неё).
+    CREATED_USERS="$( [ ! -f "$STATE" ] || sed -n 's/^user //p' "$STATE" | tr '\n' ' ')"
     rm -rf /etc/agent /var/lib/agent
-    id agent >/dev/null 2>&1 && userdel agent || true
+    for u in $CREATED_USERS; do
+      [ "$u" != root ] || continue
+      if id "$u" >/dev/null 2>&1; then
+        userdel "$u" || echo "install.sh: предупреждение: пользователь $u не удалён" >&2
+      fi
+    done
   fi
-  echo "Агент удалён${PURGE:+ вместе с конфигурацией, данными и поставленными пакетами}"
+  echo "Агент удалён${PURGE:+ вместе с конфигурацией, данными и тем, что поставила установка (пакеты, пользователь службы)}"
   exit 0
 fi
 
@@ -206,7 +220,7 @@ if [ -n "$CA_FILE" ]; then
   grep -q 'BEGIN CERTIFICATE' "$CA_FILE" || die "--ca-file: в $CA_FILE нет сертификата PEM"
   [ "$CA_FILE" = "$CA_PEM" ] || install -m 0644 "$CA_FILE" "$CA_PEM"
 fi
-[ -s "$STATE" ] || echo "# Журнал установки агента: package — пакет поставлен установкой, sysctl — параметр ядра агента, sysctl-prev — его значение до установки, kill-mode — режим остановки службы" >"$STATE"
+[ -s "$STATE" ] || echo "# Журнал установки агента: package — пакет поставлен установкой, user — пользователь службы создан установкой, sysctl — параметр ядра агента, sysctl-prev — его значение до установки, kill-mode — режим остановки службы" >"$STATE"
 
 # Режим остановки службы: заданный — запоминается, без --kill-mode — прежний (или mixed).
 [ -n "$KILL_MODE" ] || KILL_MODE="$(sed -n 's/^kill-mode //p' "$STATE" | tail -n 1)"
@@ -305,8 +319,15 @@ if [ -z "$BINARY" ]; then
 fi
 [ -f "$BINARY" ] || die "--binary: путь к сборке agent-linux-<arch>"
 
+# Пользователь службы: нет — создаётся и записывается в журнал (--purge удалит только его).
 if [ "$USER_NAME" != "root" ] && ! id "$USER_NAME" >/dev/null 2>&1; then
-  useradd --system --home-dir /var/lib/agent --shell /usr/sbin/nologin "$USER_NAME"
+  command -v useradd >/dev/null || die "--user $USER_NAME: нет useradd — создайте пользователя заранее"
+  NOLOGIN=/bin/false
+  for f in /usr/sbin/nologin /sbin/nologin /usr/bin/nologin; do
+    if [ -x "$f" ]; then NOLOGIN="$f"; break; fi
+  done
+  useradd --system --home-dir /var/lib/agent --no-create-home --shell "$NOLOGIN" "$USER_NAME"
+  grep -qx "user $USER_NAME" "$STATE" || echo "user $USER_NAME" >>"$STATE"
 fi
 
 install -d -m 0700 -o "$USER_NAME" /var/lib/agent
@@ -324,19 +345,41 @@ for w in $WORKERS; do
   [ -n "$WFILE" ] && [ -n "$WSUM" ] && [ "$WFILE" = "$(basename "$WFILE")" ] || die "--worker $w: запись манифеста неполная"
   WDIR="/var/lib/agent/workers/$w"
   install -d -m 0755 -o "$USER_NAME" /var/lib/agent/workers "$WDIR"
-  curl -fsSL ${CA_FILE:+--cacert "$CA_PEM"} "$RELEASES/$WFILE" -o "$WDIR/current.new" || { rm -f "$WDIR/current.new"; die "--worker $w: сборка $WFILE не скачана"; }
-  GOT="$(sha256sum "$WDIR/current.new" | cut -d' ' -f1)"
-  [ "$GOT" = "$WSUM" ] || { rm -f "$WDIR/current.new"; die "--worker $w: sha256 сборки не сходится: $GOT"; }
-  chmod 0755 "$WDIR/current.new"
+  curl -fsSL ${CA_FILE:+--cacert "$CA_PEM"} "$RELEASES/$WFILE" -o "$WDIR/download.new" || { rm -f "$WDIR/download.new"; die "--worker $w: сборка $WFILE не скачана"; }
+  GOT="$(sha256sum "$WDIR/download.new" | cut -d' ' -f1)"
+  [ "$GOT" = "$WSUM" ] || { rm -f "$WDIR/download.new"; die "--worker $w: sha256 сборки не сходится: $GOT"; }
+  rm -rf "$WDIR/current.new"
+  case "$WFILE" in
+    *.tar.gz)
+      # Архив — каталог current: command воркера запускается в нём.
+      mkdir "$WDIR/current.new"
+      tar -xzf "$WDIR/download.new" -C "$WDIR/current.new" --no-same-owner ||
+        { rm -rf "$WDIR/download.new" "$WDIR/current.new"; die "--worker $w: архив $WFILE не распакован"; }
+      rm -f "$WDIR/download.new"
+      WARCHIVE=1 ;;
+    *)
+      chmod 0755 "$WDIR/download.new"
+      mv -f "$WDIR/download.new" "$WDIR/current.new"
+      WARCHIVE="" ;;
+  esac
+  rm -rf "$WDIR/current"
   mv -f "$WDIR/current.new" "$WDIR/current"
   echo "$VERSION" >"$WDIR/version"
-  chown "$USER_NAME" "$WDIR/current" "$WDIR/version"
+  chown -R "$USER_NAME" "$WDIR/current" "$WDIR/version"
   echo "Воркер $w $VERSION поставлен: $WDIR/current"
+  # command архива — путь внутри него (manifest.workers[].command); без него агент запускает ./run.
+  WCMD=""
+  [ -z "$WARCHIVE" ] || WCMD="$(field "$ENTRY" command)"
+  case "$WCMD" in
+    "") ;;
+    /* | */../* | ../* | */.. | .. | *[!A-Za-z0-9._/-]*) die "--worker $w: command в манифесте — не путь внутри архива: $WCMD" ;;
+  esac
   RESTART="$(field "$ENTRY" restart)"
   WSTOP="$(field "$ENTRY" stopTimeout)"
   WORKERS_YAML="${WORKERS_YAML}  - name: $w
     release: true
-${RESTART:+    restart: $RESTART
+${WCMD:+    command: ["./${WCMD#./}"]
+}${RESTART:+    restart: $RESTART
 }${WSTOP:+    stopTimeout: $WSTOP
 }"
 done

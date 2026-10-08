@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import type { JobAssign, JobRef, JobUrls, OutputUrl } from "../index";
 import type { Channel } from "./channel";
+import { MessageTooLargeError } from "./errors";
 
 /** Настройки задач (тесты уменьшают паузы). */
 export const jobDefaults = {
@@ -27,8 +28,9 @@ type Logger = (level: "info" | "warn" | "error", msg: string) => void;
 
 /**
  * Задача, выданная воркеру агентом. Связь с сервером, повторы и досылка после
- * обрыва — забота агента. Отмена (`job.cancel`) — `signal` прерывается, итог не
- * отправляется; остановка (`job.stop`) — `stopRequested`: довести шаг и
+ * обрыва — забота агента. Отмена (`job.cancel`) — `signal` прерывается, итог
+ * обработчика не отправляется: когда обработчик вернулся, SDK сам шлёт агенту
+ * `job.fail` с кодом `CANCELLED`; остановка (`job.stop`) — `stopRequested`: довести шаг и
  * вернуть результат как обычно.
  */
 export class Job {
@@ -39,6 +41,10 @@ export class Job {
   readonly attempt: number;
   readonly leaseSeconds: number;
   private readonly ac = new AbortController();
+  /** @internal Отменена агентом (job.cancel или новая попытка): нужно подтверждение CANCELLED. */
+  cancelledByAgent = false;
+  /** @internal Подтверждение CANCELLED отправлено (или не нужно). */
+  cancelConfirmed = false;
   private stop = false;
   private inputUrls: Record<string, string>;
   private outputUrls: Record<string, OutputUrl>;
@@ -99,11 +105,21 @@ export class Job {
     else this.schedule();
   }
 
-  /** Доменное событие задачи (итог этапа и т. п.): надёжно, по порядку (`seq`). */
+  /**
+   * Доменное событие задачи (итог этапа и т. п.): надёжно, по порядку (`seq`).
+   * Данные не превращаются в JSON — TypeError; событие больше 16 МБ отбрасывается с записью в лог.
+   */
   event(type: string, data?: unknown): void {
     this.flush();
-    this.eventSeq++;
-    this.channel.send("job.event", { ...this.ref, seq: this.eventSeq, type: String(type).slice(0, 50), data });
+    const seq = this.eventSeq + 1;
+    try {
+      this.channel.send("job.event", { ...this.ref, seq, type: String(type).slice(0, 50), data });
+    } catch (err) {
+      if (!(err instanceof MessageTooLargeError)) throw err;
+      this.logger("warn", `событие ${type} задачи ${this.id} больше 16 МБ — не отправлено`);
+      return;
+    }
+    this.eventSeq = seq;
   }
 
   get inputs(): string[] {
@@ -114,9 +130,14 @@ export class Job {
     return Object.keys(this.outputUrls);
   }
 
-  /** Скачать входной файл во временный каталог задачи (один раз); путь к нему. */
+  /**
+   * Скачать входной файл во временный каталог задачи (один раз); путь к нему. Имя
+   * файла в каталоге — только последняя часть name: каталоги и «..» отбрасываются.
+   */
   async inputPath(name: string): Promise<string> {
-    const target = join(await this.tmpDir(), "inputs", name);
+    const base = baseName(name);
+    if (!(name in this.inputUrls)) throw new Error(`нет входного файла ${name}`);
+    const target = join(await this.tmpDir(), "inputs", base);
     const exists = await stat(target).then(
       () => true,
       () => false,
@@ -187,12 +208,17 @@ export class Job {
     this.pendingProgress = undefined;
     this.pendingText = undefined;
     this.lastSent = Date.now();
-    this.channel.send("job.progress", update);
+    try {
+      this.channel.send("job.progress", update);
+    } catch (err) {
+      this.logger("warn", `прогресс задачи ${this.id} не отправлен: ${(err as Error).message}`);
+    }
     if (this.pendingLog.length) this.schedule();
   }
 
   /** @internal */
-  cancel(reason = "задача отменена"): void {
+  cancel(reason = "задача отменена", byAgent = false): void {
+    if (byAgent) this.cancelledByAgent = true;
     if (!this.cancelled) this.logger("info", `задача ${this.id}: ${reason}`);
     this.ac.abort(new DOMException(reason, "AbortError"));
   }
@@ -223,9 +249,17 @@ export class Job {
   }
 
   private tmpDir(): Promise<string> {
-    this.tmp ??= mkdtemp(join(tmpdir(), `job-${this.id.slice(0, 8)}-`));
+    this.tmp ??= mkdtemp(join(tmpdir(), `job-${this.id.slice(0, 8).replace(/[/\\.]/g, "_")}-`));
     return this.tmp;
   }
+}
+
+/** Последняя часть имени файла (разделители «/» и «\»); пусто, «.» и «..» — ошибка. */
+export function baseName(name: string): string {
+  const base = String(name).split(/[/\\]/).pop() ?? "";
+  if (base === "" || base === "." || base === "..")
+    throw new Error(`неверное имя входного файла ${JSON.stringify(name)}`);
+  return base;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

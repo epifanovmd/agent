@@ -23,11 +23,15 @@ type Diff struct {
 	Hello bool
 	// Workers — набор воркеров или их настройки.
 	Workers bool
+	// Tuning — пределы и сроки, которые применяются сразу:
+	// state.applyTimeout, commands.maxConcurrent, jobs.cancelTimeout,
+	// outbox.maxMessages.
+	Tuning bool
 }
 
 // Changed — есть что применять или о чём предупредить.
 func (d Diff) Changed() bool {
-	return len(d.Restart) > 0 || d.Log || d.Telemetry || d.Resync || d.Hello || d.Workers
+	return len(d.Restart) > 0 || d.Log || d.Telemetry || d.Resync || d.Hello || d.Workers || d.Tuning
 }
 
 // Compare — разница настроек old → next (обе после Validate).
@@ -55,6 +59,8 @@ func Compare(old, next Config) Diff {
 	d.Hello = old.Name != next.Name || !maps.Equal(old.Labels, next.Labels) ||
 		!sameSet(old.Commands.Disabled, next.Commands.Disabled)
 	d.Workers = !reflect.DeepEqual(old.Workers, next.Workers)
+	d.Tuning = old.State.ApplyTimeout != next.State.ApplyTimeout || old.Commands.MaxConcurrent != next.Commands.MaxConcurrent ||
+		old.Jobs != next.Jobs || old.Outbox != next.Outbox
 	return d
 }
 

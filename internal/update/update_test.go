@@ -31,16 +31,16 @@ func TestInstallVerifiesAndBootCounts(t *testing.T) {
 	bin := filepath.Join(dir, "agent")
 	_ = os.WriteFile(bin, []byte("#!old"), 0o755)
 	p := NewPaths(bin)
-	rel := Release{Version: "2", URL: srv.URL, SHA256: hash, Signature: Sign(priv, hash)}
+	rel := Release{Version: "2", URL: srv.URL, SHA256: hash, Signature: Sign(priv, Local(AgentName, "2", hash))}
 
 	forged := rel
-	forged.Signature = Sign(priv, "другой")
+	forged.Signature = Sign(priv, Local(AgentName, "3", hash)) // подпись другой версии
 	if err := Install(context.Background(), srv.Client(), "Agent a.s", p, pub, forged); err == nil {
-		t.Fatal("чужая подпись должна отвергаться")
+		t.Fatal("подпись другой версии должна отвергаться")
 	}
 	bad := rel
 	bad.SHA256 = hex.EncodeToString(make([]byte, 32))
-	bad.Signature = Sign(priv, bad.SHA256)
+	bad.Signature = Sign(priv, Local(AgentName, "2", bad.SHA256))
 	if err := Install(context.Background(), srv.Client(), "Agent a.s", p, pub, bad); err == nil {
 		t.Fatal("несовпадение sha256 должно отвергаться")
 	}
@@ -98,24 +98,46 @@ func TestFetch(t *testing.T) {
 	defer srv.Close()
 	dst := filepath.Join(t.TempDir(), "current.new")
 	ctx := context.Background()
+	b := Local("report", "1.0.0", hash)
 
-	if err := Fetch(ctx, srv.Client(), "", nil, srv.URL, hash, Sign(priv, hash), dst); !errors.Is(err, ErrNotVerified) {
+	if err := Fetch(ctx, srv.Client(), "", nil, b, srv.URL, Sign(priv, b), dst); !errors.Is(err, ErrNotVerified) {
 		t.Fatalf("без ключа: %v", err)
 	}
-	if err := Fetch(ctx, srv.Client(), "", pub, srv.URL, hash, Sign(priv, "другой"), dst); err == nil {
-		t.Fatal("чужая подпись")
+	other := b
+	other.Name = "other" // подпись сборки другого воркера
+	if err := Fetch(ctx, srv.Client(), "", pub, b, srv.URL, Sign(priv, other), dst); err == nil {
+		t.Fatal("подпись другого воркера")
 	}
-	wrong := hex.EncodeToString(make([]byte, 32))
-	if err := Fetch(ctx, srv.Client(), "", pub, srv.URL, wrong, Sign(priv, wrong), dst); err == nil {
+	wrong := Local("report", "1.0.0", hex.EncodeToString(make([]byte, 32)))
+	if err := Fetch(ctx, srv.Client(), "", pub, wrong, srv.URL, Sign(priv, wrong), dst); err == nil {
 		t.Fatal("sha256 не сходится")
 	}
 	if _, err := os.Stat(dst); !os.IsNotExist(err) {
 		t.Fatal("после отказа файла быть не должно")
 	}
-	if err := Fetch(ctx, srv.Client(), "", pub, srv.URL, hash, Sign(priv, hash), dst); err != nil {
+	if err := Fetch(ctx, srv.Client(), "", pub, b, srv.URL, Sign(priv, b), dst); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := os.ReadFile(dst); string(got) != string(body) {
 		t.Fatalf("файл: %q", got)
+	}
+}
+
+// Подписываемая строка — по §7: шесть строк через \n, sha256 строчными;
+// подпись другой платформы не подходит.
+func TestBuildPayload(t *testing.T) {
+	b := Build{Name: "agent", Version: "1.2.0", OS: "linux", Arch: "amd64", SHA256: "AB01"}
+	if got := b.Payload(); got != "agent-release/1\nagent\n1.2.0\nlinux\namd64\nab01" {
+		t.Fatalf("строка: %q", got)
+	}
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	sig := Sign(priv, b)
+	if Verify(pub, b, sig) != nil {
+		t.Fatal("своя подпись")
+	}
+	arm := b
+	arm.Arch = "arm64"
+	if Verify(pub, arm, sig) == nil {
+		t.Fatal("подпись другой платформы")
 	}
 }

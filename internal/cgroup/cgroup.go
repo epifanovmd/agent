@@ -37,6 +37,9 @@ type Limits struct {
 type Manager struct {
 	dir string
 	log *slog.Logger
+	// removeDir — удаление пустой подгруппы (в подставном корне тестов
+	// каталоги — обычные, с файлами внутри).
+	removeDir func(string) error
 
 	mu          sync.Mutex
 	controllers map[string]bool
@@ -54,7 +57,10 @@ func Detect(root string, procSelf []byte, log *slog.Logger) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := &Manager{dir: dir, log: log}
+	m := &Manager{dir: dir, log: log, removeDir: os.Remove}
+	if filepath.Clean(root) != Root {
+		m.removeDir = os.RemoveAll
+	}
 	if err := m.prepare(); err != nil {
 		return nil, err
 	}
@@ -126,8 +132,11 @@ func (m *Manager) prepare() error {
 // Dir — каталог группы агента.
 func (m *Manager) Dir() string { return m.dir }
 
-// Group — подгруппа воркера.
-type Group struct{ dir string }
+// Group — подгруппа воркера или его копии.
+type Group struct {
+	dir       string
+	removeDir func(string) error
+}
 
 // Worker — подгруппа worker-<name> с ограничениями l (существующая
 // обновляется: снятое ограничение — "max"). Контроллер недоступен —
@@ -160,7 +169,42 @@ func (m *Manager) Worker(name string, l Limits) (*Group, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Group{dir: dir}, nil
+	return &Group{dir: dir, removeDir: m.removeDir}, nil
+}
+
+// RemoveWorker — убрать подгруппу воркера name (воркер удалён из настроек,
+// все его копии завершились). Нет её — не ошибка.
+func (m *Manager) RemoveWorker(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	err := m.removeDir(filepath.Join(m.dir, "worker-"+safeName(name)))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// Instance — подгруппа копии воркера id внутри группы воркера.
+func (g *Group) Instance(id string) (*Group, error) {
+	dir := filepath.Join(g.dir, "i-"+safeName(id))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("подгруппа копии воркера: %w", err)
+	}
+	return &Group{dir: dir, removeDir: g.removeDir}, nil
+}
+
+// Kill — завершить все процессы группы (cgroup.kill, ядро 5.14+).
+func (g *Group) Kill() error {
+	return writeFile(filepath.Join(g.dir, "cgroup.kill"), "1")
+}
+
+// Remove — убрать пустую группу (процессов в ней не осталось).
+func (g *Group) Remove() error {
+	err := g.removeDir(g.dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // Add — перенести процесс pid в группу.

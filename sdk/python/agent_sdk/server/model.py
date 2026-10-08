@@ -3,7 +3,7 @@
 Поля — как в контракте SDK (§2 ``sdk/README.md``); JSON — camelCase
 (``to_dict``). Служебные поля (секрет, ``seq`` потока, аренда) помечены
 ``hidden``: наружу не отдаются, но хранятся (``to_record``/``from_record`` —
-для своего ``Store``).
+для своего ``Store``). ``rev`` — версия записи для условной записи ``Store.update_*``.
 
 ``Agents`` не меняет вложенные списки и словари на месте — присваивает новые:
 хранилищу достаточно поверхностной копии.
@@ -29,6 +29,8 @@ CMD_PENDING = "pending"
 CMD_RUNNING = "running"
 CMD_SUCCEEDED = "succeeded"
 CMD_FAILED = "failed"
+#: Команду отменили (``cancel_command``).
+CMD_CANCELLED = "cancelled"
 #: Команда ещё не завершена.
 CMD_ACTIVE = (CMD_PENDING, CMD_RUNNING)
 
@@ -122,6 +124,12 @@ class Agent(Model):
     #: ``labels = {**hello.labels, **granted_labels}`` — выданные узел переписать не может.
     #: ``None`` — выданных меток нет.
     granted_labels: Optional[Dict[str, str]] = field(default=None, metadata=_hidden())
+    #: Время точки ``metrics`` (часы сервера), из которой взяты текущие ``metrics``.
+    metrics_at: int = field(default=0, metadata=_hidden())
+    #: Активные уведомления о проблемах агента (``Alert.to_record()`` с ``active``).
+    alerts: List[Dict[str, Any]] = field(default_factory=list, metadata=_hidden())
+    #: Версия записи: ``Store.update_agent`` пишет, только если она не изменилась с чтения.
+    rev: int = field(default=0, metadata=_hidden())
 
     def to_dict(self) -> Dict[str, Any]:
         """Наружу: без служебных полей; ``subscriptions`` — только если есть."""
@@ -169,6 +177,8 @@ class Job(Model):
     lease_until: int = field(default=0, metadata=_hidden())
     #: Последний принятый ``seq`` событий попытки.
     event_seq: int = field(default=0, metadata=_hidden())
+    #: Версия записи: ``Store.update_job`` пишет, только если она не изменилась с чтения.
+    rev: int = field(default=0, metadata=_hidden())
 
 
 @dataclass
@@ -191,6 +201,12 @@ class Command(Model):
     finished_at: Optional[int] = None
     #: Кто отправил (``agents.by(actor)``); ``None`` — не указано.
     actor: Optional[str] = None
+    #: Версия записи: ``Store.update_command`` пишет, только если она не изменилась с чтения.
+    rev: int = field(default=0, metadata=_hidden())
+
+    def finished(self) -> bool:
+        """Команда завершена: ``succeeded``, ``failed`` или ``cancelled``."""
+        return self.status not in CMD_ACTIVE
 
 
 @dataclass
@@ -262,8 +278,9 @@ class AuditEntry(Model):
     """Запись аудита: изменяющее действие API приложения (событие ``audit``).
 
     ``action``: ``job.enqueue``, ``job.cancel``, ``job.stop``, ``command`` (и ``call``),
-    ``state.set``, ``state.delete``, ``state.rollback``, ``agent.revoke``, ``agent.update``,
-    ``agent.rotateKey``, ``worker.update``, ``worker.pause``, ``worker.resume``. ``target`` — id задачи или команды, раздел состояния, id агента.
+    ``command.cancel``, ``state.set``, ``state.delete``, ``state.rollback``, ``agent.revoke``,
+    ``agent.delete``, ``agent.update``, ``agent.rotateKey``, ``worker.update``, ``worker.pause``,
+    ``worker.resume``. ``target`` — id задачи или команды, раздел состояния, id агента.
     ``actor`` — из ``agents.by(actor)``, без него пусто.
     """
 

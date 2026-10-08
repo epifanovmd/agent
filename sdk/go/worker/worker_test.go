@@ -323,6 +323,7 @@ func TestJobCancelAndStop(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	a.send(message.TypeJobCancel, message.JobRef{JobID: "c", Attempt: 0}, "")
 	a.send(message.TypeJobStop, message.JobRef{JobID: "s", Attempt: 0}, "") // чужая попытка — мимо
+	expectCancelled(t, a, "c", 0)
 	a.quiet(200 * time.Millisecond)
 	a.send(message.TypeJobStop, message.JobRef{JobID: "s", Attempt: 1}, "")
 	var c message.JobComplete
@@ -333,6 +334,73 @@ func TestJobCancelAndStop(t *testing.T) {
 	a.quiet(200 * time.Millisecond)
 	if !cancelled.Load() {
 		t.Fatal("ctx отменённой задачи не отменён")
+	}
+}
+
+// expectCancelled — подтверждение отмены: job.fail с кодом CANCELLED.
+func expectCancelled(t *testing.T, a *fakeAgent, id string, attempt int) {
+	t.Helper()
+	var f message.JobFail
+	a.expect(message.TypeJobFail, &f)
+	if f.JobID != id || f.Attempt != attempt || f.Code != message.ErrCancelled || f.Retryable || f.Message == "" {
+		t.Fatalf("подтверждение отмены: %+v", f)
+	}
+}
+
+// После job.cancel итог обработчика не отправляется: SDK шлёт job.fail
+// CANCELLED ровно один раз — и когда обработчик вернул результат, и когда
+// задача ждала места и обработчик не вызывался.
+func TestJobCancelConfirmed(t *testing.T) {
+	w, a := newWorker(t, "jobs")
+	release := make(chan struct{})
+	var runs atomic.Int32
+	w.Job("example.q", 1, func(ctx context.Context, job *Job) (any, error) {
+		runs.Add(1)
+		<-release // отмену обработчик не замечает и возвращает результат
+		return "ok", nil
+	})
+	start(t, w, a)
+	a.send(message.TypeJobAssign, assign("run", 0), "")
+	a.send(message.TypeJobAssign, assign("wait", 0), "")
+	time.Sleep(50 * time.Millisecond)
+	a.send(message.TypeJobCancel, message.JobRef{JobID: "wait", Attempt: 0}, "")
+	expectCancelled(t, a, "wait", 0)
+	a.send(message.TypeJobCancel, message.JobRef{JobID: "run", Attempt: 0}, "")
+	a.send(message.TypeJobCancel, message.JobRef{JobID: "run", Attempt: 0}, "") // повтор — без последствий
+	a.quiet(100 * time.Millisecond)
+	close(release)
+	expectCancelled(t, a, "run", 0)
+	a.quiet(200 * time.Millisecond)
+	if runs.Load() != 1 {
+		t.Fatalf("обработчик вызван %d раз", runs.Load())
+	}
+}
+
+// Канал закрыт после отмены — подтверждение не отправляется.
+func TestJobCancelChannelClosed(t *testing.T) {
+	w, a := newWorker(t, "jobs")
+	release := make(chan struct{})
+	returned := make(chan struct{})
+	w.Job("example.q", 1, func(context.Context, *Job) (any, error) {
+		<-release
+		defer close(returned)
+		return "ok", nil
+	})
+	wait := start(t, w, a)
+	a.send(message.TypeJobAssign, assign("j", 0), "")
+	time.Sleep(50 * time.Millisecond)
+	a.send(message.TypeJobCancel, message.JobRef{JobID: "j", Attempt: 0}, "")
+	time.Sleep(50 * time.Millisecond)
+	a.conn.Close()
+	close(release)
+	<-returned
+	if err := wait(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for env := range a.in {
+		if env.Type == message.TypeJobFail {
+			t.Fatalf("после закрытия канала отправлен job.fail: %s", env.Data)
+		}
 	}
 }
 
@@ -628,8 +696,8 @@ func TestRunErrors(t *testing.T) {
 	if err := w.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "AGENT_IPC_FD") {
 		t.Fatalf("без канала: %v", err)
 	}
-	if err := w.Event("x", nil); err == nil {
-		t.Fatal("событие до Run")
+	if err := w.Event("x", nil); err != nil {
+		t.Fatalf("событие до Run копится: %v", err)
 	}
 }
 

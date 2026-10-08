@@ -486,3 +486,38 @@ func TestServerURLsRoundRobin(t *testing.T) {
 		}
 	}
 }
+
+// Перегрузка сервера: 4429 с секундами в reason, HTTP 429/503 с Retry-After —
+// пауза не меньше указанной и не больше maxRetryAfter.
+func TestRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	_, err := dialWS(context.Background(), srv.Client(), srv.URL, "Agent a.s")
+	var de *DialError
+	if !errors.As(err, &de) || de.Status != http.StatusTooManyRequests || de.RetryAfter != 7*time.Second {
+		t.Fatalf("отказ: %#v", err)
+	}
+	cases := []struct {
+		err  error
+		want time.Duration
+	}{
+		{err, 7 * time.Second},
+		{&CloseError{Code: message.CloseOverloaded, Reason: "30"}, 30 * time.Second},
+		{&CloseError{Code: message.CloseOverloaded, Reason: "100000"}, maxRetryAfter},
+		{&CloseError{Code: message.CloseOverloaded, Reason: "скоро"}, 0},
+		{&DialError{Status: http.StatusServiceUnavailable, RetryAfter: 2 * time.Second}, 2 * time.Second},
+		{&DialError{Status: http.StatusBadGateway, RetryAfter: 2 * time.Second}, 0},
+		{&CloseError{Code: message.CloseRestart, Reason: "5"}, 0},
+	}
+	for _, c := range cases {
+		if got := retryAfter(c.err); got != c.want {
+			t.Errorf("retryAfter(%v) = %v, нужно %v", c.err, got, c.want)
+		}
+	}
+	if d := parseRetryAfter(time.Now().Add(time.Minute).UTC().Format(http.TimeFormat)); d < 58*time.Second || d > time.Minute {
+		t.Fatalf("дата HTTP: %v", d)
+	}
+}

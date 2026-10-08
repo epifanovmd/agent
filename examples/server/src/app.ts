@@ -58,12 +58,13 @@ const MIME: Record<string, string> = {
  * состояние, события, активные уведомления о проблемах.
  */
 export async function snapshot(agents: Agents, files: MemoryFiles) {
-  const [list, jobs, commands, states, events] = await Promise.all([
+  const [list, jobs, commands, states, events, alerts] = await Promise.all([
     agents.listAgents(),
     agents.listJobs(),
     agents.listCommands(),
     agents.listStates(),
     agents.listEvents(500),
+    agents.alerts(),
   ]);
   return {
     serverTime: Date.now(),
@@ -72,7 +73,7 @@ export async function snapshot(agents: Agents, files: MemoryFiles) {
     commands,
     states,
     events,
-    alerts: agents.alerts(),
+    alerts,
   };
 }
 
@@ -128,6 +129,9 @@ async function api(
   if (method === "POST" && path === "/api/commands") return reply(201, await as.command(await readJSON(req)));
   if (method === "GET" && (m = path.match(/^\/api\/commands\/([^/]+)$/)))
     return found(await agents.getCommand(m[1]), "Команда");
+  // Отмена команды: ждущая или выполняющаяся → cancelled (агенту — cmd.cancel, если уже отправлена).
+  if (method === "POST" && (m = path.match(/^\/api\/commands\/([^/]+)\/cancel$/)))
+    return reply(200, await as.cancelCommand(decodeURIComponent(m[1])));
   if (method === "PUT" && (m = path.match(/^\/api\/state\/([^/]+)$/))) {
     const agentId = url.searchParams.get("agentId") || undefined;
     return reply(200, await as.setState(decodeURIComponent(m[1]), await readJSON(req), { agentId }));
@@ -167,6 +171,11 @@ async function api(
   }
   if (method === "DELETE" && (m = path.match(/^\/api\/agents\/([^/]+)\/subscriptions\/([^/]+)$/))) {
     await agents.unsubscribe(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+    return reply(200, {});
+  }
+  // Удалить отозванного агента (его запись и историю метрик).
+  if (method === "DELETE" && (m = path.match(/^\/api\/agents\/([^/]+)$/))) {
+    await as.deleteAgent(decodeURIComponent(m[1]));
     return reply(200, {});
   }
   // Агенты: история метрик, отзыв, обновление, смена ключа.

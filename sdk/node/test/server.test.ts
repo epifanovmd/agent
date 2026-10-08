@@ -25,6 +25,7 @@ import {
   MemoryFiles,
   MemoryStore,
   Session,
+  type AgentsOptions,
   type Change,
   type SubscribeOptions,
 } from "../src/server/index";
@@ -154,6 +155,23 @@ async function connect(auth: string, name: string, helloExtra: Record<string, un
   a.send(hello(name, helloExtra));
   await inbox.wait("welcome");
   return a;
+}
+
+/** Отдельный HTTP-сервер со своим Agents на время fn. */
+async function withAgents(opts: AgentsOptions, fn: (base: string, a: Agents) => Promise<void>): Promise<void> {
+  const own = new Agents(opts);
+  const srv = createServer(async (req, res) => {
+    if (!(await own.handle(req, res))) res.writeHead(404).end();
+  });
+  own.attach(srv);
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  try {
+    await fn(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`, own);
+  } finally {
+    own.close();
+    srv.closeAllConnections();
+    srv.close();
+  }
 }
 
 async function eventually<T>(what: string, probe: () => Promise<T | undefined | false>, timeoutMs = 3000): Promise<T> {
@@ -932,24 +950,25 @@ test("выпуск: manifest.json, сборка только из манифес
   const sh = await (await fetch(base + INSTALL_PATH)).text();
   assert.match(sh, new RegExp(`^DEFAULT_SERVER="${base}"$`, "m"));
   assert.match(sh, /^DEFAULT_PUBLIC_KEY="UFVCS0VZ"$/m);
-  const forwarded = await (
-    await fetch(base + INSTALL_PATH, {
-      headers: { "X-Forwarded-Proto": "https", "X-Forwarded-Host": "agents.example.com" },
-    })
-  ).text();
-  assert.match(forwarded, /^DEFAULT_SERVER="https:\/\/agents\.example\.com"$/m);
+  const forwardedHeaders = { "X-Forwarded-Proto": "https", "X-Forwarded-Host": "agents.example.com" };
+  const direct = await (await fetch(base + INSTALL_PATH, { headers: forwardedHeaders })).text();
+  assert.match(direct, new RegExp(`^DEFAULT_SERVER="${base}"$`, "m"), "без trustProxy X-Forwarded-* не учитываются");
 
-  // Опасный адрес — 400, а не вырезание символов.
-  const bads: Record<string, string>[] = [
-    { "X-Forwarded-Proto": 'https"; rm -rf /; "' },
-    { "X-Forwarded-Host": "a.example.com$(id)" },
-    { "X-Forwarded-Proto": "ftp" },
-  ];
-  for (const headers of bads) {
-    const r = await fetch(base + INSTALL_PATH, { headers });
-    assert.equal(r.status, 400, JSON.stringify(headers));
-    assert.equal((await r.json()).code, "MESSAGE_INVALID");
-  }
+  await withAgents({ enrollToken: "x", releasesDir, trustProxy: true }, async (pbase) => {
+    const forwarded = await (await fetch(pbase + INSTALL_PATH, { headers: forwardedHeaders })).text();
+    assert.match(forwarded, /^DEFAULT_SERVER="https:\/\/agents\.example\.com"$/m);
+    // Опасный адрес — 400, а не вырезание символов.
+    const bads: Record<string, string>[] = [
+      { "X-Forwarded-Proto": 'https"; rm -rf /; "' },
+      { "X-Forwarded-Host": "a.example.com$(id)" },
+      { "X-Forwarded-Proto": "ftp" },
+    ];
+    for (const headers of bads) {
+      const r = await fetch(pbase + INSTALL_PATH, { headers });
+      assert.equal(r.status, 400, JSON.stringify(headers));
+      assert.equal((await r.json()).code, "MESSAGE_INVALID");
+    }
+  });
 
   // Без releasesDir — пути выпуска не обслуживаются.
   const bare = new Agents({ enrollToken: "x" });
@@ -1214,6 +1233,7 @@ test("имена: неверное имя очереди, команды, раз
       capabilities: { state: { domains: { "example.kv": null } } },
       secretHash: "",
       lastSeq: 0,
+      rev: 0,
     });
     await store.createAgent({
       id: "a2",
@@ -1224,6 +1244,7 @@ test("имена: неверное имя очереди, команды, раз
       stateApplied: {},
       secretHash: "",
       lastSeq: 0,
+      rev: 0,
     });
     const warned = () => logs.filter(([msg]) => msg.startsWith("раздел состояния")).map(([, extra]) => extra);
 
@@ -1533,7 +1554,7 @@ test("alert: degraded, workerDown, stateFailed, offline — одно событ�
   assert.equal(got[0].message, "воркеры перезапускаются");
   assert.equal(got[1].message, "Воркер w1: backoff");
   assert.equal(got[0].agentName, "alert-agent");
-  assert.equal(agents.alerts().filter((x) => x.agentId === agentId).length, 2);
+  assert.equal((await agents.alerts()).filter((x) => x.agentId === agentId).length, 2);
 
   a.stream("status", { ...status({}), workers: [{ name: "w2", state: "running", instances: 1 }] });
   await eventually("конец", async () => got.length >= 4);
@@ -1572,11 +1593,11 @@ test("alert: degraded, workerDown, stateFailed, offline — одно событ�
   a.ws.close();
   await eventually("offline", async () => got.length >= 9, 2000);
   assert.deepEqual([got[8].type, got[8].active, got[8].message], ["offline", true, "Агент без связи"]);
-  assert.ok(agents.alerts().some((x) => x.agentId === agentId && x.type === "offline"));
+  assert.ok((await agents.alerts()).some((x) => x.agentId === agentId && x.type === "offline"));
   a = await connect(auth, "alert-agent");
   await eventually("снова online", async () => got.length >= 10);
   assert.deepEqual([got[9].type, got[9].active, got[9].message], ["offline", false, "Агент без связи"]);
-  assert.equal(agents.alerts().filter((x) => x.agentId === agentId).length, 0);
+  assert.equal((await agents.alerts()).filter((x) => x.agentId === agentId).length, 0);
   agents.off("alert", onAlert);
   a.ws.close();
 });
@@ -1666,7 +1687,7 @@ test("несколько процессов: агент без вестей до
       "одно уведомление, повторно не поднимается",
     );
     assert.ok(changes.length >= 1, "change agent");
-    assert.ok(other.alerts().some((x) => x.agentId === agentId && x.type === "offline"));
+    assert.ok((await other.alerts()).some((x) => x.agentId === agentId && x.type === "offline"));
     // Свою сессию процесс не трогает.
     const own = new Agents({ enrollToken: "x", store: new MemoryStore(), offlineAfterMs: 100 });
     try {

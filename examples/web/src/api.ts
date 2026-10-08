@@ -38,6 +38,8 @@ export const api = {
   stopJob: (id: string) => call<Job>("POST", `/api/jobs/${id}/stop`),
   command: (req: { agentId?: string; name: string; args?: unknown; timeoutSec?: number }) =>
     call<Command>("POST", "/api/commands", req),
+  /** Отменить ждущую или выполняющуюся команду. */
+  cancelCommand: (id: string) => call<Command>("POST", `/api/commands/${encodeURIComponent(id)}/cancel`),
   /** Снимок домена: общий или для агента (agentId). */
   setState: (domain: string, spec: unknown, agentId?: string) =>
     call<DesiredState>(

@@ -85,6 +85,48 @@ func TestDetectAndWorker(t *testing.T) {
 	}
 }
 
+// Копия воркера — в своей подгруппе: cgroup.kill, удаление пустой, удаление
+// группы воркера.
+func TestInstanceKillRemove(t *testing.T) {
+	root, service := fakeRoot(t, "memory pids")
+	m, err := Detect(root, []byte("0::/system.slice/agent.service\n"), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := m.Worker("report", Limits{PidsMax: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst, err := g.Instance("report#2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.Dir() != filepath.Join(service, "worker-report", "i-report_2") {
+		t.Fatalf("подгруппа копии: %s", inst.Dir())
+	}
+	if err := inst.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(read(t, filepath.Join(inst.Dir(), "cgroup.kill"))); got != "1" {
+		t.Fatalf("cgroup.kill = %q", got)
+	}
+	if err := inst.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(inst.Dir()); !os.IsNotExist(err) {
+		t.Fatal("подгруппа копии осталась")
+	}
+	if err := m.RemoveWorker("report"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(g.Dir()); !os.IsNotExist(err) {
+		t.Fatal("группа воркера осталась")
+	}
+	if err := m.RemoveWorker("report"); err != nil {
+		t.Fatalf("повторно — не ошибка: %v", err)
+	}
+}
+
 // Перезапуск внутри подгруппы agent — группа агента та же.
 func TestDetectFromAgentSubgroup(t *testing.T) {
 	root, service := fakeRoot(t, "memory pids")

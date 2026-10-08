@@ -359,7 +359,7 @@ func (a *Agents) handleInstall(w http.ResponseWriter, r *http.Request) {
 	}
 	// Значения попадают в строку shell в кавычках — только безопасные символы.
 	a.mu.Lock()
-	server := a.serverURL(requestBase(r))
+	server := a.serverURL(a.requestBase(r))
 	a.mu.Unlock()
 	if !safeServer.MatchString(server) {
 		writeError(w, http.StatusBadRequest, "MESSAGE_INVALID", "Некорректный адрес сервера")

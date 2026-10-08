@@ -2,13 +2,18 @@
 
 Свой ``Store`` (Postgres и т. п.) — та же механика связи с данными в БД:
 модели сериализуются ``to_record``/``from_record``. Методы асинхронные.
+
+Записи агента, задачи и команды меняются условно — по версии ``rev`` (несколько процессов
+бэкенда на одном хранилище не затирают изменения друг друга)::
+
+    UPDATE jobs SET record = $2, status = $3, …, rev = rev + 1 WHERE id = $1 AND rev = $4
 """
 
 from __future__ import annotations
 
 import abc
 from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 from ..message import now_ms
 from .model import CMD_ACTIVE, JOB_ACTIVE, Agent, AgentEvent, Command, DesiredState, Job, MetricsPoint
@@ -20,6 +25,14 @@ class Store(abc.ABC):
     ``get_*`` возвращают копию или ``None``; ``Agents`` меняет копию и сохраняет её
     ``update_*``. Задачи и команды (``list_jobs``, ``list_commands``) — новые первыми; агенты и
     снимки — в порядке создания.
+
+    ``create_*`` сохраняет запись как есть. ``update_*`` — условная запись: пишет, только если
+    ``rev`` в хранилище равен ``rev`` записи (её не меняли с чтения), и сохраняет с ``rev + 1``;
+    при успехе ``rev`` переданной записи тоже увеличивается на 1. Результат — записалось ли
+    (``False`` — запись изменилась или её нет). Проверка и запись — атомарно.
+
+    Постраничное чтение задач и команд: ``after`` — id последней записи прошлой страницы,
+    страница — записи после неё в том же порядке; ``limit`` ≤ 0 — все.
     """
 
     # ── агенты ──
@@ -30,10 +43,14 @@ class Store(abc.ABC):
     async def get_agent(self, agent_id: str) -> Optional[Agent]: ...
 
     @abc.abstractmethod
-    async def update_agent(self, agent: Agent) -> None: ...
+    async def update_agent(self, agent: Agent) -> bool: ...
 
     @abc.abstractmethod
     async def list_agents(self) -> List[Agent]: ...
+
+    @abc.abstractmethod
+    async def delete_agent(self, agent_id: str) -> bool:
+        """Удалить запись агента и его историю метрик. Была ли запись."""
 
     # ── задачи ──
     @abc.abstractmethod
@@ -43,11 +60,11 @@ class Store(abc.ABC):
     async def get_job(self, job_id: str) -> Optional[Job]: ...
 
     @abc.abstractmethod
-    async def update_job(self, job: Job) -> None: ...
+    async def update_job(self, job: Job) -> bool: ...
 
     @abc.abstractmethod
     async def list_jobs(self, *, status: Optional[str] = None, queue: Optional[str] = None,
-                        agent_id: Optional[str] = None) -> List[Job]: ...
+                        agent_id: Optional[str] = None, limit: int = 0, after: Optional[str] = None) -> List[Job]: ...
 
     # ── команды ──
     @abc.abstractmethod
@@ -57,11 +74,11 @@ class Store(abc.ABC):
     async def get_command(self, command_id: str) -> Optional[Command]: ...
 
     @abc.abstractmethod
-    async def update_command(self, command: Command) -> None: ...
+    async def update_command(self, command: Command) -> bool: ...
 
     @abc.abstractmethod
-    async def list_commands(self, *, status: Optional[str] = None,
-                            agent_id: Optional[str] = None) -> List[Command]: ...
+    async def list_commands(self, *, status: Optional[str] = None, agent_id: Optional[str] = None,
+                            limit: int = 0, after: Optional[str] = None) -> List[Command]: ...
 
     # ── желаемое состояние ──
     @abc.abstractmethod
@@ -110,6 +127,14 @@ class Store(abc.ABC):
         ``Agents`` вызывает при старте и раз в час (срок хранения ``metrics_retention_ms``).
         """
 
+    # ── уборка ──
+    @abc.abstractmethod
+    async def prune(self, *, jobs_before: Optional[int] = None, commands_before: Optional[int] = None,
+                    events_before: Optional[int] = None) -> int:
+        """Удалить завершённые задачи и команды с ``finished_at`` раньше ``jobs_before`` и
+        ``commands_before`` и события с ``at`` раньше ``events_before`` (мс; ``None`` или 0 — не
+        трогать). Сколько удалено всего."""
+
 
 class MemoryStore(Store):
     """Хранилище в памяти процесса: для разработки и одного процесса.
@@ -146,12 +171,15 @@ class MemoryStore(Store):
         agent = self._agents.get(agent_id)
         return agent.copy() if agent else None
 
-    async def update_agent(self, agent: Agent) -> None:
-        if agent.id in self._agents:
-            self._agents[agent.id] = agent.copy()
+    async def update_agent(self, agent: Agent) -> bool:
+        return _swap(self._agents, agent)
 
     async def list_agents(self) -> List[Agent]:
         return [a.copy() for a in self._agents.values()]
+
+    async def delete_agent(self, agent_id: str) -> bool:
+        self._metrics.pop(agent_id, None)
+        return self._agents.pop(agent_id, None) is not None
 
     # ── задачи ──
     async def create_job(self, job: Job) -> None:
@@ -162,15 +190,14 @@ class MemoryStore(Store):
         job = self._jobs.get(job_id)
         return job.copy() if job else None
 
-    async def update_job(self, job: Job) -> None:
-        if job.id in self._jobs:
-            self._jobs[job.id] = job.copy()
+    async def update_job(self, job: Job) -> bool:
+        return _swap(self._jobs, job)
 
     async def list_jobs(self, *, status: Optional[str] = None, queue: Optional[str] = None,
-                        agent_id: Optional[str] = None) -> List[Job]:
-        return [j.copy() for j in reversed(self._jobs.values())
-                if (status is None or j.status == status) and (queue is None or j.queue == queue)
-                and (agent_id is None or j.agent_id == agent_id)]
+                        agent_id: Optional[str] = None, limit: int = 0, after: Optional[str] = None) -> List[Job]:
+        return _page(self._jobs, limit, after,
+                     lambda j: (status is None or j.status == status) and (queue is None or j.queue == queue)
+                     and (agent_id is None or j.agent_id == agent_id))
 
     # ── команды ──
     async def create_command(self, command: Command) -> None:
@@ -181,14 +208,13 @@ class MemoryStore(Store):
         cmd = self._commands.get(command_id)
         return cmd.copy() if cmd else None
 
-    async def update_command(self, command: Command) -> None:
-        if command.id in self._commands:
-            self._commands[command.id] = command.copy()
+    async def update_command(self, command: Command) -> bool:
+        return _swap(self._commands, command)
 
-    async def list_commands(self, *, status: Optional[str] = None,
-                            agent_id: Optional[str] = None) -> List[Command]:
-        return [c.copy() for c in reversed(self._commands.values())
-                if (status is None or c.status == status) and (agent_id is None or c.agent_id == agent_id)]
+    async def list_commands(self, *, status: Optional[str] = None, agent_id: Optional[str] = None,
+                            limit: int = 0, after: Optional[str] = None) -> List[Command]:
+        return _page(self._commands, limit, after,
+                     lambda c: (status is None or c.status == status) and (agent_id is None or c.agent_id == agent_id))
 
     # ── желаемое состояние ──
     async def set_state(self, domain: str, agent_id: Optional[str], spec: object, *,
@@ -255,6 +281,22 @@ class MemoryStore(Store):
                 del self._metrics[agent_id]
         return removed
 
+    # ── уборка ──
+    async def prune(self, *, jobs_before: Optional[int] = None, commands_before: Optional[int] = None,
+                    events_before: Optional[int] = None) -> int:
+        removed = 0
+        if jobs_before:
+            removed += _drop(self._jobs, lambda j: j.status not in JOB_ACTIVE
+                             and j.finished_at is not None and j.finished_at < jobs_before)
+        if commands_before:
+            removed += _drop(self._commands, lambda c: c.status not in CMD_ACTIVE
+                             and c.finished_at is not None and c.finished_at < commands_before)
+        if events_before:
+            kept = [e for e in self._events if e.at >= events_before]
+            removed += len(self._events) - len(kept)
+            self._events = kept
+        return removed
+
 
 def _trim(items: "OrderedDict[str, object]", keep: int, removable) -> None:  # type: ignore[no-untyped-def]
     """Удалить старые завершённые сверх ``keep``."""
@@ -264,3 +306,41 @@ def _trim(items: "OrderedDict[str, object]", keep: int, removable) -> None:  # t
         if len(items) <= keep:
             return
         del items[key]
+
+
+R = TypeVar("R", Agent, Job, Command)
+
+
+def _swap(items: "OrderedDict[str, R]", record: R) -> bool:
+    """Условная запись по ``rev`` (без ``await`` между проверкой и записью — атомарно)."""
+    stored = items.get(record.id)
+    if stored is None or stored.rev != record.rev:
+        return False
+    record.rev += 1
+    items[record.id] = record.copy()
+    return True
+
+
+def _page(items: "OrderedDict[str, R]", limit: int, after: Optional[str], match: Callable[[R], bool]) -> List[R]:
+    """Записи по ``match``, новые первыми; ``after`` — только старше этой записи (её нет — пусто);
+    ``limit`` > 0 — не больше стольких."""
+    if after and after not in items:
+        return []
+    started = not after
+    out: List[R] = []
+    for r in reversed(items.values()):
+        if not started:
+            started = r.id == after
+            continue
+        if match(r):
+            out.append(r.copy())
+            if 0 < limit <= len(out):
+                break
+    return out
+
+
+def _drop(items: "OrderedDict[str, R]", removable: Callable[[R], bool]) -> int:
+    keys = [k for k, v in items.items() if removable(v)]
+    for key in keys:
+        del items[key]
+    return len(keys)

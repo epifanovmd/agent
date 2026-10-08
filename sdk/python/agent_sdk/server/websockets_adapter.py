@@ -57,10 +57,12 @@ async def serve(agents: Any, host: str, port: int, **kwargs: Any) -> Any:
         return None
 
     async def handler(ws: Any) -> None:
-        host_header = ws.request.headers.get("Host", "")
+        headers = ws.request.headers
         peer = getattr(ws, "remote_address", None)
-        await agents.serve_websocket(_authorization(ws), WebsocketsConnection(ws),
-                                  base_url=f"http://{host_header}" if host_header else "",
+        # X-Forwarded-Host и X-Forwarded-Proto — только с trust_proxy (request_base).
+        base_url = agents.request_base(headers.get("Host"), forwarded_host=headers.get("X-Forwarded-Host"),
+                                       forwarded_proto=headers.get("X-Forwarded-Proto"))
+        await agents.serve_websocket(_authorization(ws), WebsocketsConnection(ws), base_url=base_url,
                                   remote=str(peer[0]) if isinstance(peer, (tuple, list)) and peer else None,
                                   forwarded_for=ws.request.headers.get("X-Forwarded-For"))
 

@@ -7,7 +7,7 @@
 
     agents = Agents(enroll_token="demo-token")
 
-    reply = await agents.handle_enroll(raw_body, remote=client_ip)           # POST …/enroll
+    reply = await agents.handle_enroll(raw_body, remote=client_ip)           # POST …/enroll (тело ≤ body_limit)
     status, body = reply                                                      # reply.headers — Retry-After у 429
     status, body = await agents.handle_sync(authorization, raw_body, is_gone,
                                             remote=client_ip)                  # POST …/sync
@@ -31,6 +31,17 @@
     agents.on("log", lambda agent_id, entries: print(agent_id, len(entries)))  # логи агентов (SDK их не хранит)
     sealed = await agents.seal(agent_id, {"password": "…"})                     # {"$sealed": …}, нужен extra crypto
     status, body, content_type = await agents.handle_release(path, base_url)  # GET …/releases/*, …/install.sh
+
+    await agents.cancel_command(cmd.id)                                        # агенту — cmd.cancel
+    await agents.revoke(agent_id); await agents.delete_agent(agent_id)         # удалить — только отозванного
+    await agents.prune(jobs_older_than_ms=30 * 86400_000)                      # уборка старых записей
+    page = await agents.list_jobs(limit=50, after=last_id)                     # постранично
+    active = await agents.alerts()                                             # активные проблемы (из Store)
+
+Готовый транспорт без зависимостей — ASGI (uvicorn, FastAPI/Starlette)::
+
+    from agent_sdk.server.asgi import AgentsApp
+    app = AgentsApp(agents, fallback=api)
 """
 
 from .files import Files, MemoryFiles

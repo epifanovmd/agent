@@ -144,7 +144,8 @@ workers:
 ## Сервер (`agent_sdk.server`)
 
 `Agents` работает на asyncio и не привязан к веб-фреймворку: все методы API — корутины
-(`await agents.enqueue(…)`), кроме `on`, `off`, `by`, `alerts` и `install_command`. Бэкенд
+(`await agents.enqueue(…)`, `await agents.alerts()`), кроме `on`, `off`, `by`, `body_limit` и
+`install_command`. Бэкенд
 передаёт ему запросы своего HTTP-сервера, а он сам делает всё, что связано с агентами. Полный
 пример на стандартной библиотеке — [examples/server-python](../../examples/server-python/README.md).
 
@@ -167,16 +168,21 @@ agents.on("alert", lambda a: a.active and print(a.type, a.agent_name, a.message)
 `enroll_token`, `enroll`, `store`, `files`, `status_interval_ms`, `metrics_interval_ms`,
 `offline_grace_ms`, `offline_after_ms`, `metrics_store_interval_ms`, `metrics_retention_ms`,
 `enroll_failure_limit`, `enroll_failure_window_ms`, `releases_dir`, `public_key`, `base_url`,
-`trust_proxy`, `log` (`logging.Logger` или `fn(msg, extra)`). `enroll(token)` может быть функцией
-или корутиной и возвращает `{"labels": {…}}` или `None`.
+`trust_proxy`, `log` (`logging.Logger` или `fn(msg, extra)`), `max_body` (предел тела запроса,
+32 МБ). `enroll(token, info)` получает токен и `info = {"name", "labels", "host"}` из запроса, может
+быть функцией или корутиной и возвращает `{"labels": {…}}` или `None` (отказ).
 
-**Подключение к веб-фреймворку.** Вместо одного `handle` у Python-версии — отдельный метод на
-каждый маршрут. Пример на FastAPI/Starlette:
+**Подключение к веб-фреймворку.** Проще всего — ASGI-приложение маршрутов агентов:
+`AgentsApp(agents, fallback=api)` из `agent_sdk.server.asgi` (FastAPI, Starlette — `api`; тело
+читается с пределом, адрес клиента и `X-Forwarded-For` — сами). Иначе — отдельный метод на каждый маршрут;
+тело читайте не больше `agents.body_limit(path)` (регистрация — 64 КБ, остальное — `max_body`;
+больше — ответ `413`). Пример на FastAPI/Starlette:
 
 ```python
 @app.post("/api/v1/agent-link/enroll")
 async def enroll(request: Request):
-    reply = await agents.handle_enroll(await request.body(), remote=request.client.host)
+    reply = await agents.handle_enroll(await request.body(), remote=request.client.host,
+                                       forwarded_for=request.headers.get("x-forwarded-for"))
     status, body = reply
     return JSONResponse(body, status, headers=reply.headers)
 
@@ -211,7 +217,7 @@ async def release(request: Request):
 
 | Метод                                                                                                                                     | Что                                                                                                                                                              |
 | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `await agents.handle_enroll(body, remote=None)` → `HttpReply`                                                                             | регистрация; `remote` — адрес клиента для ограничения попыток. Ответ распаковывается как `(status, dict)`, заголовки (`Retry-After` у `429`) — в `reply.headers` |
+| `await agents.handle_enroll(body, remote=None, *, forwarded_for=None)` → `HttpReply`                                                      | регистрация; `remote` — адрес клиента для ограничения попыток. Ответ распаковывается как `(status, dict)`, заголовки (`Retry-After` у `429`) — в `reply.headers` |
 | `await agents.authenticate(authorization)` → `Agent \| None`                                                                              | проверить ключ агента до того, как принять WebSocket                                                                                                             |
 | `await agents.handle_sync(authorization, body, is_disconnected=None, *, base_url="", remote=None, forwarded_for=None)` → `(status, dict)` | обмен по HTTP; `is_disconnected()` (функция или корутина) — клиент ушёл, неотданное остаётся до следующего запроса                                               |
 | `await agents.serve_websocket(authorization, conn, *, base_url="", remote=None, forwarded_for=None)`                                      | обслужить принятый WebSocket: у `conn` нужны `receive_text()`, `send_text(str)`, `close(code)`; ping — забота веб-сервера                                        |
@@ -233,11 +239,16 @@ inputs=None, outputs=None, agent_id=None)`, `command(name, args, *, timeout_sec=
 agent_id=None)`, `subscribe(agent_id, *, id=None, ttl_ms=30000, status=None, metrics=None,
 logs=None, channels=None)` (части подписки — словари с ключами в camelCase:
   `{"intervalMs": 1000}`), `install_command(token=…, packages=[…], …)`;
-- ошибки — `AgentsError(code, message, status)`;
+- ошибки — `AgentsError(code, message, status)`; `status` — HTTP-статус для ответа (например,
+  `COMMAND_NOT_FOUND` — 404, `COMMAND_NOT_ACTIVE`, `AGENT_NOT_REVOKED`, `STORE_CONFLICT` — 409);
+- `cancel_command(command_id) -> Command`, `delete_agent(agent_id) -> None` (только отозванного),
+  `prune(*, jobs_older_than_ms=None, commands_older_than_ms=None, events_older_than_ms=None) -> int`,
+  `list_jobs(…, limit=0, after=None)` и `list_commands(…, limit=0, after=None)` — постранично;
 - модели — dataclass'ы: `to_dict()` — JSON для интерфейса, без ключа агента и служебных полей;
   `to_record()` / `from_record()` — все поля, для своего `Store`;
-- `Store` — асинхронный интерфейс с методами в `snake_case` (`create_agent`, `set_state(domain,
-agent_id, spec, *, actor=None)`, `prune_metrics(before)`, …), список и правила —
+- `Store` — асинхронный интерфейс с методами в `snake_case` (`create_agent`, `update_agent(agent)
+-> bool` — условная запись по `rev`, `set_state(domain, agent_id, spec, *, actor=None)`,
+  `prune_metrics(before)`, `prune(…)`, …), список и правила —
   [sdk/docs/store.md](../docs/store.md).
 
 ## Тесты

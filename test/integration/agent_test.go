@@ -125,10 +125,11 @@ func goWorker() {
 		return map[string]bool{"ok": true}, nil
 	})
 	w.Command("it.print", func(_ context.Context, cmd *worker.Command) (any, error) {
-		// Вывод воркера агент пишет в свой лог (и отправляет серверу по порогу).
+		// Вывод воркера агент пишет в свой лог (stdout — info) и отправляет
+		// серверу по порогу.
 		var text string
 		_ = json.Unmarshal(cmd.Args, &text)
-		fmt.Fprintln(os.Stderr, text)
+		fmt.Fprintln(os.Stdout, text)
 		return nil, nil
 	})
 	w.State("it", func(_ context.Context, version int64, spec json.RawMessage) (any, error) {

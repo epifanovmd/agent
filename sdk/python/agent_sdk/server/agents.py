@@ -6,7 +6,8 @@ sync), классы доставки и подтверждения, сверку
 Бэкенду остаются его данные и решения (API приложения) и HTTP-сервер, который
 передаёт ``Agents`` запросы транспорта:
 
-- ``POST /api/v1/agent-link/enroll`` → ``await agents.handle_enroll(body, remote)`` (``reply.headers`` — ``Retry-After``);
+- ``POST /api/v1/agent-link/enroll`` → ``await agents.handle_enroll(body, remote, forwarded_for=…)``
+  (``reply.headers`` — ``Retry-After``);
 - ``POST /api/v1/agent-link/sync`` → ``await agents.handle_sync(authorization, body, is_disconnected)``;
 - WebSocket ``/api/v1/agent-link`` → ``await agents.authenticate(authorization)`` до upgrade,
   затем ``await agents.serve_websocket(authorization, conn)``;
@@ -14,8 +15,12 @@ sync), классы доставки и подтверждения, сверку
 - ``GET /api/v1/agent-link/releases/…`` и ``GET /api/v1/agent-link/install.sh`` →
   ``await agents.handle_release(path, base_url)`` (``releases_dir``).
 
+Тело запроса транспорт читает не больше ``agents.body_limit(path)``; готовый транспорт без
+зависимостей — ``agent_sdk.server.asgi`` (ASGI: uvicorn, FastAPI/Starlette).
+
 Все операции ``Agents`` выполняются по одной (``asyncio.Lock``): сессии агентов живут
-в этом процессе.
+в этом процессе. Записи в ``Store`` меняются условно (версия ``rev``) с повтором при конфликте:
+несколько процессов бэкенда на одном хранилище не затирают изменения друг друга.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ import re
 import time
 from collections import OrderedDict
 from urllib.parse import quote
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple, TypeVar, Union
 
 from ..message import (
     LOG_LEVELS, MESSAGE_VERSION, NAME_PATTERN, RELEASES_PATH, RELIABLE, STREAM, Close, merge_capabilities, new_id,
@@ -41,7 +46,7 @@ from .files import Files, MemoryFiles
 from .install import install_command
 from .seal import seal_value
 from .model import (
-    CMD_ACTIVE, CMD_FAILED, CMD_PENDING, CMD_RUNNING, CMD_SUCCEEDED, JOB_ACTIVE, JOB_CANCELLED, JOB_COMPLETED,
+    CMD_ACTIVE, CMD_CANCELLED, CMD_FAILED, CMD_PENDING, CMD_RUNNING, CMD_SUCCEEDED, JOB_ACTIVE, JOB_CANCELLED, JOB_COMPLETED,
     JOB_FAILED, JOB_QUEUED, JOB_RUNNING, ALERT_DEGRADED, ALERT_OFFLINE, ALERT_STATE_FAILED, ALERT_WORKER_DEGRADED,
     ALERT_WORKER_DOWN,
     Agent, AgentEvent, Alert, AuditEntry, Change, Command, DesiredState, Job, MetricsPoint, UpdateCandidate,
@@ -98,6 +103,12 @@ WORKER_DOWN_STATES = frozenset({"backoff", "crashed", "failed", "error"})
 _SECRET_HASH = re.compile(r"[0-9a-f]{64}")
 #: Имя группы метрик узла (``subscribe(metrics={"groups": …})``): ``sockets``, ``cpu.cores``.
 _METRICS_GROUP = re.compile(r"[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*")
+#: Сколько раз повторять чтение-изменение-запись при конфликте версии записи.
+MUTATE_ATTEMPTS = 8
+#: Предел тела запроса транспорта по умолчанию (``max_body``), байт.
+MAX_BODY = 32 << 20
+#: Поля записи агента, которые меняют сообщения его сессии (status, metrics, …).
+_MESSAGE_FIELDS = ("last_seen_at", "status", "metrics", "metrics_at", "inventory", "capabilities", "state_applied")
 #: Кто выполняет действие: ставит ``Actor`` (``agents.by``) на время вызова.
 _ACTOR: "contextvars.ContextVar[str]" = contextvars.ContextVar("agent_sdk_actor", default="")
 
@@ -106,14 +117,16 @@ Listener = Callable[[Change], Union[None, Awaitable[None]]]
 MetricsListener = Callable[[str, MetricsPoint], Union[None, Awaitable[None]]]
 #: Подписчик ``log``: ``fn(agent_id, entries)`` — функция или корутина.
 LogListener = Callable[[str, List[Dict[str, Any]]], Union[None, Awaitable[None]]]
-EnrollCheck = Callable[[str], Union[Optional[Dict[str, Any]], Awaitable[Optional[Dict[str, Any]]]]]
+#: Хук регистрации: ``fn(token, {"name", "labels", "host"}) -> {labels?} | None`` — функция или корутина.
+EnrollCheck = Callable[[str, Dict[str, Any]], Union[Optional[Dict[str, Any]], Awaitable[Optional[Dict[str, Any]]]]]
+T = TypeVar("T", Agent, Job, Command)
 
 
 class Agents(Transport):
     """Движок связи с агентами для бэкенда.
 
-    ``enroll_token`` — общий токен регистрации или ``enroll(token) -> {labels?} | None``
-    (своя проверка; функция или корутина). ``store`` — хранилище (``MemoryStore``),
+    ``enroll_token`` — общий токен регистрации или ``enroll(token, info) -> {labels?} | None``
+    (своя проверка; функция или корутина; ``info`` — ``{"name", "labels", "host"}`` из запроса). ``store`` — хранилище (``MemoryStore``),
     ``files`` — провайдер ссылок на файлы задач (``MemoryFiles``). ``base_url`` —
     адрес сервера для ссылок, если транспорт его не передал. ``log`` — ``logging.Logger``
     или ``fn(msg, extra)``.
@@ -134,12 +147,16 @@ class Agents(Transport):
     (0 — хранить всегда).
 
     ``enroll_failure_limit`` — сколько неудачных регистраций (неверный токен или запрос) одного клиента
-    (адрес ``remote`` в ``handle_enroll``) допускается за ``enroll_failure_window_ms``; дальше —
-    ``429 ENROLL_RATE_LIMITED`` до конца окна (0 — без ограничения).
+    (адрес клиента в ``handle_enroll`` — как ``Agent.address``) допускается за
+    ``enroll_failure_window_ms``; дальше — ``429 ENROLL_RATE_LIMITED`` до конца окна (0 — без ограничения).
 
-    ``trust_proxy`` — бэкенд за прокси: адрес агента (``Agent.address``) — первый адрес
-    ``X-Forwarded-For`` (параметр ``forwarded_for`` у ``handle_sync`` и ``serve_websocket``), а не
-    ``remote``. Без прокси не включать: заголовок подделывает любой клиент.
+    ``trust_proxy`` — бэкенд за прокси: адрес агента (``Agent.address``) и клиента регистрации — первый
+    адрес ``X-Forwarded-For`` (параметр ``forwarded_for`` у ``handle_enroll``, ``handle_sync`` и
+    ``serve_websocket``), а не ``remote``; адрес сервера (``request_base``) — с учётом
+    ``X-Forwarded-Host`` и ``X-Forwarded-Proto``. Без прокси не включать: заголовки подделывает любой клиент.
+
+    ``max_body`` — предел тела запроса транспорта, байт (по умолчанию 32 МБ); предел для пути —
+    ``body_limit(path)`` (регистрация — 64 КБ).
     """
 
     def __init__(self, *, enroll_token: Optional[str] = None, enroll: Optional[EnrollCheck] = None,
@@ -150,7 +167,7 @@ class Agents(Transport):
                  metrics_store_interval_ms: int = METRICS_STORE_INTERVAL_MS,
                  metrics_retention_ms: int = METRICS_RETENTION_MS,
                  enroll_failure_limit: int = 10, enroll_failure_window_ms: int = 60000,
-                 offline_after_ms: Optional[int] = None, trust_proxy: bool = False) -> None:
+                 offline_after_ms: Optional[int] = None, trust_proxy: bool = False, max_body: int = MAX_BODY) -> None:
         if not enroll_token and enroll is None:
             raise ValueError("нужен enroll_token или enroll")
         self.store: Store = store if store is not None else MemoryStore()
@@ -170,6 +187,7 @@ class Agents(Transport):
         self.public_key = public_key or ""
         self.base_url = base_url
         self.trust_proxy = bool(trust_proxy)
+        self.max_body = max(1, int(max_body or MAX_BODY))
         self._enroll_token = enroll_token
         self._enroll = enroll
         self._logger = log if log is not None else logging.getLogger("agent_sdk.server")
@@ -188,13 +206,11 @@ class Agents(Transport):
         self._audits: List[AuditEntry] = []
         self._alert_listeners: List[Any] = []
         self._alerts_out: List[Alert] = []
-        #: Активные проблемы: (тип, агент, раздел или воркер) → Alert.
-        self._active_alerts: Dict[Tuple[str, str, str], Alert] = {}
         #: (агент, досланная ли) → ``at`` последней сохранённой точки метрик (прореживание;
         #: в памяти). Досланные прореживаются отдельно: их время раньше уже сохранённых живых.
         self._stored_at: Dict[Tuple[str, bool], int] = {}
-        #: Сессия закрылась: агент → когда счесть его без связи, мс.
-        self._offline: Dict[str, int] = {}
+        #: Сессия закрылась: агент → (когда счесть его без связи, ``last_seen_at`` сессии), мс.
+        self._offline: Dict[str, Tuple[int, int]] = {}
         self._tasks: Set[asyncio.Future] = set()
         self._lock: Optional[asyncio.Lock] = None
         self._reaper: Optional[asyncio.Task] = None
@@ -280,48 +296,13 @@ class Agents(Transport):
         self._audits.append(AuditEntry(at=now_ms(), actor=_ACTOR.get(), action=action, target=target,
                                        agent_id=agent_id or None, details=details))
 
-    def _alert(self, type: str, agent: Agent, active: bool, message: str = "", *,
-               domain: Optional[str] = None, worker: Optional[str] = None) -> None:
-        """Начало или конец проблемы: событие ``alert`` — только при смене (без повторов)."""
-        key = (type, agent.id, domain or worker or "")
-        if active == (key in self._active_alerts):
-            return
-        if not active:
-            # Конец проблемы — с тем же текстом, что был при её начале.
-            message = self._active_alerts.pop(key).message
-        alert = Alert(type=type, agent_id=agent.id, agent_name=agent.name, active=active, message=message,
-                      at=now_ms(), domain=domain, worker=worker)
-        if active:
-            self._active_alerts[key] = alert
-        self._alerts_out.append(alert)
-
-    def _status_alerts(self, agent: Agent, status: Dict[str, Any]) -> None:
-        """``degraded`` и ``workerDown`` по ``status``."""
-        self._alert(ALERT_DEGRADED, agent, status.get("state") == "degraded",
-                    str(status.get("message") or "Агент не в порядке"))
-        down: Dict[str, str] = {}
-        for w in status.get("workers") or []:
-            if isinstance(w, dict) and isinstance(w.get("name"), str) and w.get("state") in WORKER_DOWN_STATES:
-                down[w["name"]] = str(w["state"])
-        for name, state in down.items():
-            self._alert(ALERT_WORKER_DOWN, agent, True, f"Воркер {name}: {state}", worker=name)
-        degraded: Dict[str, str] = {}
-        for w in status.get("workers") or []:
-            if isinstance(w, dict) and isinstance(w.get("name"), str) and w.get("health") == "degraded":
-                degraded[w["name"]] = str(w.get("message") or f"Воркер {w['name']} не в порядке")
-        for name, message in degraded.items():
-            self._alert(ALERT_WORKER_DEGRADED, agent, True, message, worker=name)
-        for (type, agent_id, worker) in list(self._active_alerts):
-            if agent_id != agent.id:
-                continue
-            if type == ALERT_WORKER_DOWN and worker not in down:
-                self._alert(ALERT_WORKER_DOWN, agent, False, worker=worker)
-            elif type == ALERT_WORKER_DEGRADED and worker not in degraded:
-                self._alert(ALERT_WORKER_DEGRADED, agent, False, worker=worker)
-
-    def alerts(self) -> List[Alert]:
-        """Активные проблемы (``alert`` с ``active``), известные этому процессу."""
-        return [a.copy() for a in self._active_alerts.values()]
+    async def alerts(self) -> List[Alert]:
+        """Активные проблемы (``alert`` с ``active``) всех агентов — из записей в Store (видны
+        любому процессу бэкенда), по времени начала."""
+        out = [Alert.from_record(a) for agent in await self.store.list_agents()
+               for a in agent.alerts or [] if isinstance(a, dict)]
+        out.sort(key=lambda a: a.at)
+        return out
 
     def by(self, actor: str) -> "Actor":
         """Те же изменяющие действия от имени ``actor``: поле ``actor`` в задаче, команде,
@@ -393,6 +374,38 @@ class Agents(Transport):
         else:
             self._log(msg)
 
+    def _error(self, msg: str, **extra: Any) -> None:
+        if isinstance(self._logger, logging.Logger):
+            self._logger.error("%s %s", msg, json.dumps(extra, ensure_ascii=False) if extra else "")
+        elif callable(self._logger):
+            self._logger(msg, extra)
+
+    async def _mutate(self, kind: str, get: Callable[[str], Awaitable[Optional[T]]],
+                      update: Callable[[T], Awaitable[bool]], record_id: str,
+                      fn: Callable[[T], bool]) -> Optional[T]:
+        """Чтение-изменение-запись: ``fn(свежая запись)`` меняет её и возвращает, писать ли
+        (``False`` — условие не выполнено). Запись условная (``rev``): изменилась с чтения —
+        перечитать и повторить (до ``MUTATE_ATTEMPTS`` раз). Результат — записанная запись;
+        ``None`` — записи нет или ``fn`` отказал. ``fn`` может вызываться не раз: побочные
+        действия — после записи, по результату последнего вызова."""
+        for _ in range(MUTATE_ATTEMPTS):
+            rec = await get(record_id)
+            if rec is None or not fn(rec):
+                return None
+            if await update(rec):
+                return rec
+        self._error("запись меняется одновременно: изменение не записано", kind=kind, id=record_id)
+        raise AgentsError("STORE_CONFLICT", f"Запись {kind} {record_id} меняется одновременно: повторите", 409)
+
+    async def _mutate_agent(self, agent_id: str, fn: Callable[[Agent], bool]) -> Optional[Agent]:
+        return await self._mutate("agent", self.store.get_agent, self.store.update_agent, agent_id, fn)
+
+    async def _mutate_job(self, job_id: str, fn: Callable[[Job], bool]) -> Optional[Job]:
+        return await self._mutate("job", self.store.get_job, self.store.update_job, job_id, fn)
+
+    async def _mutate_command(self, command_id: str, fn: Callable[[Command], bool]) -> Optional[Command]:
+        return await self._mutate("command", self.store.get_command, self.store.update_command, command_id, fn)
+
     async def close(self) -> None:
         """Остановка: сессиям — 1012 (агенты переподключатся сразу, итоги ждут в outbox)."""
         self._closed = True
@@ -419,32 +432,41 @@ class Agents(Transport):
         if MESSAGE_VERSION not in hello["versions"]:
             ss.close(Close.UNSUPPORTED)
             return
-        agent = await self.store.get_agent(ss.agent.id)
-        if agent is None or agent.revoked:
+        boot_id = hello["agent"].get("bootId")
+        now = now_ms()
+        events: List[Alert] = []
+
+        def fn(rec: Agent) -> bool:
+            events.clear()
+            if rec.revoked:
+                return False
+            if rec.boot_id != boot_id:
+                rec.boot_id, rec.last_seq = boot_id, 0
+            rec.hello = hello
+            rec.online = True
+            rec.transport = ss.mode
+            if ss.address:
+                rec.address = ss.address
+            rec.last_seen_at = now
+            rec.capabilities = hello.get("capabilities") or {}
+            rec.labels = hello_labels(rec, hello.get("labels"))
+            rec.subscriptions = _active(rec.subscriptions, now)  # истёкшие удаляются
+            events.extend(_some(_apply_alert(rec, ALERT_OFFLINE, False)))
+            return True
+
+        agent = await self._mutate_agent(ss.agent.id, fn)
+        if agent is None:
             ss.close(Close.UNAUTHORIZED)
             return
+        self._alerts_out.extend(events)
         ss.agent = agent
         self._offline.pop(agent.id, None)
         prev = self._sessions.get(agent.id)
         if prev is not None and prev is not ss:
             prev.close(Close.REPLACED)
         self._sessions[agent.id] = ss
-        boot_id = hello["agent"].get("bootId")
-        if agent.boot_id != boot_id:
-            agent.boot_id = boot_id
-            agent.last_seq = 0
-        agent.hello = hello
-        agent.online = True
-        agent.transport = ss.mode
-        if ss.address:
-            agent.address = ss.address
-        agent.last_seen_at = now_ms()
-        agent.capabilities = hello.get("capabilities") or {}
-        agent.labels = hello_labels(agent, hello.get("labels"))
-        agent.subscriptions = _active(agent.subscriptions, now_ms())  # истёкшие удаляются
         self._learn_domains(ss, agent.capabilities)
-        self._alert(ALERT_OFFLINE, agent, False)
-        ss.subscription = _summary(agent.subscriptions, now_ms())
+        ss.subscription = _summary(agent.subscriptions, now)
         config: Dict[str, Any] = {"statusIntervalMs": self.status_interval_ms,
                                   "metricsIntervalMs": self.metrics_interval_ms}
         if ss.subscription:
@@ -453,9 +475,12 @@ class Agents(Transport):
             "version": MESSAGE_VERSION, "agentId": agent.id, "sessionId": ss.id, "serverTime": now_ms(),
             "config": config,
         })
-        await self.store.update_agent(agent)
         self._log("агент на связи", agent=agent.name, transport=ss.mode)
         await self._reconcile(ss, hello.get("jobs") or [])
+        # Выполняющиеся команды (приняты в прошлой сессии, может быть, другим процессом) — как
+        # отправленные в этой: их отмену в другом процессе ``refresh`` доставит агенту.
+        for cmd in await self.store.list_commands(status=CMD_RUNNING, agent_id=agent.id):
+            ss.sent.add(cmd.id)
         await self._deliver(ss)
         self._changed("agent", agent.id)
 
@@ -465,47 +490,53 @@ class Agents(Transport):
         ss.close(Close.NORMAL)
         if self._sessions.get(ss.agent.id) is ss:
             del self._sessions[ss.agent.id]
+            seen = ss.agent.last_seen_at or 0
             if self.offline_grace_ms > 0:
-                self._offline[ss.agent.id] = now_ms() + self.offline_grace_ms
-                await self._save_agent(ss.agent, now_ms())
+                self._offline[ss.agent.id] = (now_ms() + self.offline_grace_ms, seen)
                 return
-            await self._go_offline(ss.agent)
+            await self._go_offline(ss.agent.id, seen)
 
-    async def _go_offline(self, agent: Agent) -> None:
-        agent.online = False
-        await self._save_agent(agent, now_ms())
+    async def _go_offline(self, agent_id: str, seen: int) -> None:
+        """Агент без связи — если с тех пор (``seen`` — последние вести закрытой сессии) он не
+        подключился к другому процессу бэкенда."""
+        events: List[Alert] = []
+
+        def fn(rec: Agent) -> bool:
+            events.clear()
+            if not rec.online or (rec.last_seen_at or 0) > seen:
+                return False
+            rec.online = False
+            if not rec.revoked:
+                events.extend(_some(_apply_alert(rec, ALERT_OFFLINE, True, "Агент без связи")))
+            return True
+
+        agent = await self._mutate_agent(agent_id, fn)
+        if agent is None:
+            return
+        self._alerts_out.extend(events)
         self._log("Агент без связи", agent=agent.name)
-        if not agent.revoked:
-            self._alert(ALERT_OFFLINE, agent, True, "Агент без связи")
         self._changed("agent", agent.id)
 
-    async def _save_agent(self, agent: Agent, now: int) -> None:
-        """Сохранить агента сессии. Отзыв и подписки меняют и другие процессы бэкенда —
-        они берутся из записи (истёкшие подписки удаляются)."""
-        stored = await self.store.get_agent(agent.id)
-        if stored is not None:
-            agent.revoked = stored.revoked
-            agent.subscriptions = stored.subscriptions
-            # Учётные данные меняют authenticate (повышение ключа) и revoke — тоже из записи.
-            agent.secret_hash = stored.secret_hash
-            agent.pending_secret_hash = stored.pending_secret_hash
-            if agent.revoked:
-                agent.online = False
-        agent.subscriptions = _active(agent.subscriptions, now)
-        await self.store.update_agent(agent)
-
-    async def _sync_session(self, ss: Session, now: int) -> bool:
-        """Сохранить агента сессии и применить запись: отозван — сессия закрывается кодом
-        4401 (``False``); сводная подписка изменилась — ``config``."""
-        await self._save_agent(ss.agent, now)
-        if ss.agent.revoked:
-            if self._sessions.get(ss.agent.id) is ss:
-                del self._sessions[ss.agent.id]
+    def _revoked_session(self, ss: Session) -> None:
+        """Агент отозван (или удалён) в записи: сессия закрывается кодом 4401."""
+        if self._sessions.get(ss.agent.id) is ss:
+            del self._sessions[ss.agent.id]
+        if not ss.closed:
             ss.close(Close.UNAUTHORIZED)
-            self._offline.pop(ss.agent.id, None)
             self._log("агент отозван", agent=ss.agent.name)
             self._changed("agent", ss.agent.id)
+        self._offline.pop(ss.agent.id, None)
+
+    async def _sync_session(self, ss: Session, now: int) -> bool:
+        """Применить к сессии запись агента: отозван — сессия закрывается кодом 4401 (``False``);
+        истёкшие подписки удаляются из записи; сводная подписка изменилась — ``config``."""
+        agent = await self.store.get_agent(ss.agent.id)
+        if agent is None or agent.revoked:
+            self._revoked_session(ss)
             return False
+        if _expired(agent.subscriptions, now) and self._sessions.get(agent.id) is ss:
+            agent = await self._mutate_agent(agent.id, lambda rec: _drop_expired(rec, now)) or agent
+        ss.agent = agent
         self._apply_subscription(ss, now)
         return True
 
@@ -520,29 +551,48 @@ class Agents(Transport):
             ss.send("config", {"subscription": dict(want)})
 
     async def _handle(self, ss: Session, env: Dict[str, Any]) -> None:
-        """Сообщение открытой сессии; ack или error по классу доставки (§4)."""
+        """Сообщение открытой сессии; ack или error по классу доставки (§4).
+
+        Учёт ``seq`` потока — в записи агента (``last_seq``): повтор после переподключения к
+        другому процессу бэкенда не обрабатывается дважды. Изменённые сообщением поля агента
+        пишутся одной условной записью поверх свежей записи."""
         if ss.closed:
             return
-        agent = ss.agent
         kind, seq, msg_id = env["type"], env.get("seq"), env.get("id")
-        if kind in STREAM and seq:
-            if seq <= agent.last_seq:
-                ss.send("ack", {"seq": agent.last_seq})
-                return
-            agent.last_seq = seq
-        status_before = json.dumps(agent.status, sort_keys=True) if kind == "status" else None
+        fresh = await self.store.get_agent(ss.agent.id)
+        if fresh is None or fresh.revoked:
+            self._revoked_session(ss)
+            return
+        stream_seq = seq if kind in STREAM and _is_int(seq) and seq > 0 else 0
+        if stream_seq and stream_seq <= fresh.last_seq:
+            ss.send("ack", {"seq": fresh.last_seq})
+            return
+        ss.agent = fresh
+        before = fresh.copy()
+        ss.alert_ops = []
+        status_before = json.dumps(fresh.status, sort_keys=True) if kind == "status" else None
         try:
             err = await self._dispatch(ss, env)
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             err = {"code": "MESSAGE_INVALID", "message": f"Некорректное {kind}: {e}", "retryable": False}
+        except AgentsError as e:
+            if e.code != "STORE_CONFLICT":
+                raise
+            # Запись всё время меняют другие процессы — агент повторит сообщение.
+            err = {"code": e.code, "message": e.message, "retryable": True}
+        now = now_ms()
+        agent = await self._commit(ss, before, stream_seq, now)
         if err:
             ss.send("error", err, re=msg_id)
         elif kind in RELIABLE and msg_id:
             ss.send("ack", {"ids": [msg_id]})
-        elif kind in STREAM and seq:
-            ss.send("ack", {"seq": seq})
-        if not await self._sync_session(ss, now_ms()):
+        elif stream_seq:
+            ss.send("ack", {"seq": stream_seq})
+        if agent is None:
+            self._revoked_session(ss)
             return
+        ss.agent = agent
+        self._apply_subscription(ss, now)
         if ss.restart:
             # Ключ сменён (agent.rotateKey): ack уже в очереди — закрыть 1012, агент переподключится
             # с новым секретом.
@@ -561,7 +611,50 @@ class Agents(Transport):
         if notify:
             self._changed("agent", agent.id)
 
+    async def _commit(self, ss: Session, before: Agent, seq: int, now: int) -> Optional[Agent]:
+        """Записать изменённые сообщением поля агента сессии (``_MESSAGE_FIELDS``, ``last_seq``,
+        уведомления о проблемах) поверх свежей записи. ``None`` — агент отозван или удалён."""
+        cur = ss.agent
+        changed = [f for f in _MESSAGE_FIELDS if getattr(cur, f) is not getattr(before, f)]
+        old_applied = before.state_applied or {}
+        domains = {k: v for k, v in (cur.state_applied or {}).items() if old_applied.get(k) is not v}
+        ops = list(ss.alert_ops)
+        current = self._sessions.get(cur.id) is ss
+        events: List[Alert] = []
+
+        def fn(rec: Agent) -> bool:
+            events.clear()
+            if rec.revoked:
+                return False
+            for f in changed:
+                if f == "state_applied":
+                    rec.state_applied = {**(rec.state_applied or {}), **domains}
+                elif f not in ("metrics", "metrics_at"):
+                    setattr(rec, f, getattr(cur, f))
+            # Текущие метрики — последняя по времени точка (досланная не в счёт).
+            if ("metrics" in changed or "metrics_at" in changed) \
+                    and (rec.metrics is None or cur.metrics_at >= rec.metrics_at):
+                rec.metrics, rec.metrics_at = cur.metrics, cur.metrics_at
+            if seq > rec.last_seq and rec.boot_id == before.boot_id:
+                rec.last_seq = seq
+            if _expired(rec.subscriptions, now):
+                rec.subscriptions = _active(rec.subscriptions, now)
+            if current and not rec.online:
+                # Агента сочли без связи (сверка другого процесса), а сессия жива — снова на связи.
+                rec.online = True
+                events.extend(_some(_apply_alert(rec, ALERT_OFFLINE, False)))
+            for op in ops:
+                events.extend(op(rec))
+            return True
+
+        agent = await self._mutate_agent(cur.id, fn)
+        if agent is not None:
+            self._alerts_out.extend(events)
+        return agent
+
     async def _dispatch(self, ss: Session, env: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Обработать сообщение: поля агента меняются в ``ss.agent`` (их запишет ``_commit``),
+        задачи и команды — условной записью сразу."""
         agent = ss.agent
         d = env.get("data") or {}
         kind = env["type"]
@@ -571,13 +664,18 @@ class Agents(Transport):
         if kind == "status":
             agent.status = d
             ss.has_status = True
-            self._status_alerts(agent, d)
+            ss.alert_ops.append(lambda rec: _status_alerts(rec, d))
             for ref in d.get("jobs") or []:
                 ss.pending.pop(ref.get("jobId"), None)
-                job = await self._held(agent.id, ref)
-                if job is not None:
-                    job.lease_until = now + job.lease_seconds * 1000
-                    await self.store.update_job(job)
+                _job_id(ref)
+
+                def extend(rec: Job, ref: Dict[str, Any] = ref) -> bool:
+                    if not _holds(rec, agent.id, ref):
+                        return False
+                    rec.lease_until = now + rec.lease_seconds * 1000
+                    return True
+
+                await self._mutate_job(ref["jobId"], extend)
             await self._fill(ss)
             return None
         if kind == "metrics":
@@ -586,8 +684,8 @@ class Agents(Transport):
             if self._keep_point(agent.id, backfill, point.at):
                 await self.store.add_metrics(agent.id, point)
             self._points.append((agent.id, point))
-            if not backfill:
-                agent.metrics = d
+            if not backfill and (agent.metrics is None or point.at >= agent.metrics_at):
+                agent.metrics, agent.metrics_at = d, point.at
             return None
         if kind == "inventory":
             agent.inventory = d
@@ -622,36 +720,45 @@ class Agents(Transport):
         if kind == "job.accept":
             # Слот выданной задачи занят, пока её не перечислит status (или итог):
             # между accept и следующим status слоты агента ещё не пересчитаны.
-            job = await self._held(agent.id, d)
-            if job is not None and not job.accepted:
-                job.accepted = True
-                await self._save_job(job)
+            def accept(rec: Job) -> bool:
+                if not _holds(rec, agent.id, d) or rec.accepted:
+                    return False
+                rec.accepted = True
+                return True
+
+            self._job_changed(await self._mutate_job(_job_id(d), accept))
             return None
         if kind == "job.progress":
-            job = await self._held(agent.id, d)
-            if job is None:
-                return None
-            if isinstance(d.get("progress"), (int, float)):
-                job.progress = d["progress"]
-            if isinstance(d.get("text"), str):
-                job.text = d["text"]
-            if isinstance(d.get("log"), list):
-                job.log = (job.log + [str(line) for line in d["log"]])[-KEEP_LOG:]
-            await self._save_job(job)
+            def progress(rec: Job) -> bool:
+                if not _holds(rec, agent.id, d):
+                    return False
+                if isinstance(d.get("progress"), (int, float)):
+                    rec.progress = d["progress"]
+                if isinstance(d.get("text"), str):
+                    rec.text = d["text"]
+                if isinstance(d.get("log"), list):
+                    rec.log = (rec.log + [str(line) for line in d["log"]])[-KEEP_LOG:]
+                return True
+
+            self._job_changed(await self._mutate_job(_job_id(d), progress))
             return None
         if kind == "job.event":
-            job = await self._held(agent.id, d)
-            if job is None:
-                return _lease_lost()
             seq = int(d["seq"])
-            if seq > job.event_seq:
-                job.event_seq = seq
+            held = [False]
+
+            def add_event(rec: Job) -> bool:
+                held[0] = _holds(rec, agent.id, d)
+                if not held[0] or seq <= rec.event_seq:
+                    return False
+                rec.event_seq = seq
                 entry: Dict[str, Any] = {"seq": seq, "type": d["type"], "at": env.get("ts") or now}
                 if d.get("data") is not None:
                     entry["data"] = d["data"]
-                job.events = job.events + [entry]
-                await self._save_job(job)
-            return None
+                rec.events = rec.events + [entry]
+                return True
+
+            self._job_changed(await self._mutate_job(_job_id(d), add_event))
+            return None if held[0] else _lease_lost()
         if kind == "job.urls":
             job = await self._held(agent.id, d)
             if job is None:
@@ -665,48 +772,79 @@ class Agents(Transport):
             ss.send("job.urls", {"inputs": inputs, "outputs": outputs, "expiresAt": urls.get("expiresAt")},
                     re=env.get("id"))
             return None
-        if kind in ("job.complete", "job.fail"):
-            job = await self._held(agent.id, d)
+        if kind == "job.complete":
+            def complete(rec: Job) -> bool:
+                if not _holds(rec, agent.id, d):
+                    return False
+                rec.status, rec.result, rec.progress, rec.error = JOB_COMPLETED, d.get("result"), 1, None
+                rec.finished_at = now
+                return True
+
+            job = await self._mutate_job(_job_id(d), complete)
             if job is None:
                 return None if await self._finished_here(agent.id, d) else _lease_lost()
             ss.pending.pop(job.id, None)
-            if kind == "job.complete":
-                job.status, job.result, job.progress, job.error = JOB_COMPLETED, d.get("result"), 1, None
-                job.finished_at = now
-                await self._save_job(job)
-                self._log("задача выполнена", job=job.id, queue=job.queue)
-                await self._fill(ss)
-            else:
-                await self._fail_attempt(job, str(d["code"]), str(d.get("message") or ""), bool(d.get("retryable")))
+            self._changed("job", job.id)
+            self._log("задача выполнена", job=job.id, queue=job.queue)
+            await self._fill(ss)
+            return None
+        if kind == "job.fail":
+            job = await self._held(agent.id, d)
+            if job is None or not await self._fail_attempt(job, str(d["code"]), str(d.get("message") or ""),
+                                                           bool(d.get("retryable"))):
+                return None if await self._finished_here(agent.id, d) else _lease_lost()
             return None
         if kind == "job.reject":
             ss.pending.pop(d["jobId"], None)
-            job = await self._held(agent.id, d)
+
+            def reject(rec: Job) -> bool:
+                if not _holds(rec, agent.id, d):
+                    return False
+                rec.status, rec.agent_id, rec.accepted = JOB_QUEUED, None, False
+                return True
+
+            job = await self._mutate_job(_job_id(d), reject)
             if job is not None:
-                job.status, job.agent_id, job.accepted = JOB_QUEUED, None, False
-                await self._save_job(job)
+                self._changed("job", job.id)
                 await self._fill_all(exclude=ss)
             return None
         if kind == "cmd.accept":
-            cmd = await self.store.get_command(d["commandId"])
-            if cmd is not None and cmd.agent_id == agent.id and cmd.status == CMD_PENDING:
-                cmd.status = CMD_RUNNING
-                await self._save_command(cmd)
+            def run(rec: Command) -> bool:
+                if rec.agent_id != agent.id or rec.status != CMD_PENDING:
+                    return False
+                rec.status = CMD_RUNNING
+                return True
+
+            cmd = await self._mutate_command(str(d["commandId"]), run)
+            if cmd is not None:
+                self._changed("command", cmd.id)
             return None
         if kind == "cmd.output":
-            cmd = await self.store.get_command(d["commandId"])
-            if cmd is not None and cmd.agent_id == agent.id:
-                cmd.output = (cmd.output + str(d.get("chunk") or ""))[-KEEP_OUTPUT:]
-                await self._save_command(cmd)
+            def output(rec: Command) -> bool:
+                if rec.agent_id != agent.id or rec.finished():
+                    return False
+                rec.output = (rec.output + str(d.get("chunk") or ""))[-KEEP_OUTPUT:]
+                return True
+
+            cmd = await self._mutate_command(str(d["commandId"]), output)
+            if cmd is not None:
+                self._changed("command", cmd.id)
             return None
         if kind == "cmd.done":
-            cmd = await self.store.get_command(d["commandId"])
-            if cmd is not None and cmd.agent_id == agent.id and cmd.status in CMD_ACTIVE:
-                cmd.status = CMD_SUCCEEDED if d.get("ok") else CMD_FAILED
-                cmd.result, cmd.error, cmd.finished_at = d.get("result"), d.get("error"), now
+            # Итог завершённой (в том числе отменённой) команды не учитывается: ack как обычно.
+            def done(rec: Command) -> bool:
+                if rec.agent_id != agent.id or rec.finished():
+                    return False
+                rec.status = CMD_SUCCEEDED if d.get("ok") else CMD_FAILED
+                rec.result, rec.error, rec.finished_at = d.get("result"), d.get("error"), now
                 if _is_int(d.get("exitCode")):
-                    cmd.exit_code = d["exitCode"]
-                await self._finish_command(cmd)
+                    rec.exit_code = d["exitCode"]
+                return True
+
+            ss.sent.discard(d["commandId"])
+            cmd = await self._mutate_command(str(d["commandId"]), done)
+            if cmd is not None:
+                self._finish_command(cmd)
                 if cmd.name == ROTATE_KEY_COMMAND and d.get("ok"):
                     await self._rotated(ss, d.get("result"))
             return None
@@ -715,10 +853,16 @@ class Agents(Transport):
             agent.state_applied = {**agent.state_applied, domain: d}
             if d.get("ok") and version > ss.known.get(domain, 0):
                 ss.known[domain] = version
-            self._alert(ALERT_STATE_FAILED, agent, not d.get("ok"), str(d.get("error") or ""), domain=domain)
+            ok, error = bool(d.get("ok")), str(d.get("error") or "")
+            ss.alert_ops.append(lambda rec: _some(_apply_alert(rec, ALERT_STATE_FAILED, not ok, error,
+                                                               domain=domain)))
             self._changed("state", domain)
             return None
         return {"code": "UNKNOWN_TYPE", "message": f"Неизвестный тип: {kind}", "retryable": False}
+
+    def _job_changed(self, job: Optional[Job]) -> None:
+        if job is not None:
+            self._changed("job", job.id)
 
     async def _rotated(self, ss: Session, result: Any) -> None:
         """Итог ``agent.rotateKey``: хеш нового секрета — ожидающий; сессию — закрыть после ack."""
@@ -726,11 +870,15 @@ class Agents(Transport):
         if not isinstance(secret_hash, str) or not _SECRET_HASH.fullmatch(secret_hash):
             self._warn("agent.rotateKey: нет secretHash в итоге", agent=ss.agent.name)
             return
-        stored = await self.store.get_agent(ss.agent.id)
-        if stored is None or stored.revoked:
+
+        def fn(rec: Agent) -> bool:
+            if rec.revoked:
+                return False
+            rec.pending_secret_hash = secret_hash
+            return True
+
+        if await self._mutate_agent(ss.agent.id, fn) is None:
             return
-        stored.pending_secret_hash = secret_hash
-        await self.store.update_agent(stored)
         ss.agent.pending_secret_hash = secret_hash
         ss.restart = True
         self._log("агент сменил ключ: ждём входа с новым", agent=ss.agent.name)
@@ -753,14 +901,8 @@ class Agents(Transport):
 
     async def _held(self, agent_id: str, ref: Dict[str, Any]) -> Optional[Job]:
         """Задача за агентом в этой попытке и выполняется."""
-        job_id = ref.get("jobId")
-        if not isinstance(job_id, str):
-            raise ValueError("нет jobId")
-        job = await self.store.get_job(job_id)
-        if job is not None and job.status == JOB_RUNNING and job.agent_id == agent_id \
-                and job.attempt == ref.get("attempt"):
-            return job
-        return None
+        job = await self.store.get_job(_job_id(ref))
+        return job if job is not None and _holds(job, agent_id, ref) else None
 
     async def _finished_here(self, agent_id: str, ref: Dict[str, Any]) -> bool:
         """Итог этой попытки уже принят (повтор после потерянного ack) — подтвердить."""
@@ -820,13 +962,25 @@ class Agents(Transport):
             if free <= 0:
                 continue
             for job in reversed(await self.store.list_jobs(status=JOB_QUEUED, queue=queue)):  # старые первыми
-                if free <= 0:
+                if free <= 0 or ss.closed:
                     break
                 if job.pinned_agent_id and job.pinned_agent_id != ss.agent.id:
                     continue
-                job.status, job.agent_id, job.accepted = JOB_RUNNING, ss.agent.id, False
-                job.lease_until = now_ms() + job.lease_seconds * 1000
-                await self._save_job(job)
+
+                # Задачу мог взять другой процесс бэкенда: выдаётся, только если она всё ещё ждёт.
+                def take(rec: Job, attempt: int = job.attempt) -> bool:
+                    if rec.status != JOB_QUEUED or rec.attempt != attempt \
+                            or (rec.pinned_agent_id and rec.pinned_agent_id != ss.agent.id):
+                        return False
+                    rec.status, rec.agent_id, rec.accepted = JOB_RUNNING, ss.agent.id, False
+                    rec.lease_until = now_ms() + rec.lease_seconds * 1000
+                    return True
+
+                taken = await self._mutate_job(job.id, take)
+                if taken is None:
+                    continue
+                job = taken
+                self._changed("job", job.id)
                 ss.pending[job.id] = queue
                 ss.send("job.assign", await self._assignment(ss, job))
                 free -= 1
@@ -848,34 +1002,58 @@ class Agents(Transport):
             "outputs": urls.get("outputs") or {}, "urlsExpireAt": urls.get("expiresAt"),
         }
 
-    async def _fail_attempt(self, job: Job, code: str, message: str, retryable: bool) -> None:
-        """Провал попытки: повтор, если попытки остались."""
-        if job.agent_id and (ss := self._sessions.get(job.agent_id)) is not None:
+    async def _fail_attempt(self, job: Job, code: str, message: str, retryable: bool, *,
+                            expired_at: Optional[int] = None, cancel: bool = False) -> bool:
+        """Провал попытки ``job`` (та же попытка за тем же агентом и выполняется): повтор, если
+        попытки остались. ``expired_at`` — только если аренда по свежей записи истекла к этому
+        моменту; ``cancel`` — агенту ``job.cancel``. Записалось ли."""
+        agent_id, attempt = job.agent_id, job.attempt
+
+        def fn(rec: Job) -> bool:
+            if rec.status != JOB_RUNNING or rec.agent_id != agent_id or rec.attempt != attempt:
+                return False
+            if expired_at is not None and expired_at <= rec.lease_until:
+                return False  # аренду продлили (в том числе в другом процессе)
+            rec.error = {"code": code, "message": message}
+            if retryable and rec.attempt + 1 < rec.max_attempts:
+                rec.status, rec.attempt, rec.agent_id = JOB_QUEUED, rec.attempt + 1, None
+                rec.accepted, rec.event_seq, rec.lease_until = False, 0, 0
+                rec.progress, rec.stop_requested = 0, False
+            else:
+                rec.status, rec.finished_at = JOB_FAILED, now_ms()
+            return True
+
+        rec = await self._mutate_job(job.id, fn)
+        if rec is None:
+            return False
+        ss = self._sessions.get(agent_id) if agent_id else None
+        if ss is not None:
             ss.pending.pop(job.id, None)
-        job.error = {"code": code, "message": message}
-        if retryable and job.attempt + 1 < job.max_attempts:
-            job.status, job.attempt, job.agent_id = JOB_QUEUED, job.attempt + 1, None
-            job.accepted, job.event_seq = False, 0
-            await self._save_job(job)
-            await self._fill_all()
-            return
-        job.status, job.finished_at = JOB_FAILED, now_ms()
-        await self._save_job(job)
-        self._log("задача провалена", job=job.id, code=code)
-
-    async def _save_job(self, job: Job) -> None:
-        await self.store.update_job(job)
+            if cancel:
+                ss.send("job.cancel", {"jobId": job.id, "attempt": attempt})
         self._changed("job", job.id)
+        if rec.status == JOB_QUEUED:
+            await self._fill_all()
+        else:
+            self._log("задача провалена", job=job.id, code=code)
+        return True
 
-    async def _save_command(self, cmd: Command) -> None:
-        await self.store.update_command(cmd)
+    def _finish_command(self, cmd: Command) -> None:
+        """Команда завершена (записано): уведомление и ждущие ``call``."""
         self._changed("command", cmd.id)
-
-    async def _finish_command(self, cmd: Command) -> None:
-        await self._save_command(cmd)
         for fut in self._calls.pop(cmd.id, []):
             if not fut.done():
                 fut.set_result(None)
+
+    async def _cancel_sent(self, ss: Session) -> None:
+        """Отменённые команды, отправленные в этой сессии (отменил другой процесс бэкенда), —
+        агенту ``cmd.cancel`` по одному разу; завершённые забываются."""
+        for command_id in list(ss.sent):
+            cmd = await self.store.get_command(command_id)
+            if cmd is None or cmd.finished():
+                ss.sent.discard(command_id)
+                if cmd is not None and cmd.status == CMD_CANCELLED:
+                    ss.send("cmd.cancel", {"commandId": command_id})
 
     # ── фоновая проверка ────────────────────────────────────────────────
 
@@ -915,26 +1093,30 @@ class Agents(Transport):
             for job in await self.store.list_jobs(status=JOB_RUNNING):
                 if now > job.lease_until:
                     # Агент на связи, но задачу не перечисляет: её заберут — прервать.
-                    ss = self._sessions.get(job.agent_id or "")
-                    if ss is not None:
-                        ss.send("job.cancel", _ref(job))
-                    await self._fail_attempt(job, "LEASE_EXPIRED", "Агент перестал отвечать: аренда истекла", True)
+                    await self._fail_attempt(job, "LEASE_EXPIRED", "Агент перестал отвечать: аренда истекла", True,
+                                             expired_at=now, cancel=True)
             for status in CMD_ACTIVE:
                 for cmd in await self.store.list_commands(status=status):
                     if now > cmd.created_at + cmd.timeout_sec * 1000 + COMMAND_GRACE_MS:
-                        cmd.status, cmd.finished_at = CMD_FAILED, now
-                        cmd.error = {"code": "TIMEOUT", "message": "Нет итога от агента"}
-                        await self._finish_command(cmd)
+                        def timeout(rec: Command) -> bool:
+                            if rec.finished():
+                                return False
+                            rec.status, rec.finished_at = CMD_FAILED, now
+                            rec.error = {"code": "TIMEOUT", "message": "Нет итога от агента"}
+                            return True
+
+                        done = await self._mutate_command(cmd.id, timeout)
+                        if done is not None:
+                            self._finish_command(done)
             idle = time.monotonic() - SYNC_IDLE
             for ss in list(self._sessions.values()):
                 if ss.mode == "http" and ss.active == 0 and ss.touched < idle:
                     await self._closed_session(ss)
-            for agent_id, deadline in list(self._offline.items()):
+            for agent_id, (deadline, seen) in list(self._offline.items()):
                 if now >= deadline:
                     del self._offline[agent_id]
-                    agent = await self.store.get_agent(agent_id)
-                    if agent is not None and agent_id not in self._sessions and agent.online:
-                        await self._go_offline(agent)
+                    if agent_id not in self._sessions:
+                        await self._go_offline(agent_id, seen)
             # Срок подписки истёк: агенту на связи здесь — новая сводная, из записи подписка удаляется.
             for ss in list(self._sessions.values()):
                 if _expired(ss.agent.subscriptions, now):
@@ -944,33 +1126,37 @@ class Agents(Transport):
 
     async def _expire_offline(self, now: int) -> None:
         """Истёкшие подписки агентов без связи удаляет сверка любого процесса (у агента на связи —
-        процесс с его сессией). Перед записью — перечитать."""
+        процесс с его сессией)."""
         for agent in await self.store.list_agents():
             if agent.online or agent.id in self._sessions or not _expired(agent.subscriptions, now):
                 continue
-            fresh = await self.store.get_agent(agent.id)
-            if fresh is None or fresh.online or not _expired(fresh.subscriptions, now):
-                continue
-            fresh.subscriptions = _active(fresh.subscriptions, now)
-            await self.store.update_agent(fresh)
+            await self._mutate_agent(agent.id, lambda rec: not rec.online and _drop_expired(rec, now))
 
     async def _stale_offline(self, now: int) -> None:
         """Агенты «на связи» по записи без сессии в этом процессе и без вестей дольше
         ``offline_after_ms``: их процесс бэкенда упал, не сняв ``online``, — снять здесь (с ``alert``).
-        Перед записью — перечитать: агент мог за это время подключиться к другому процессу."""
+        Условие проверяется по свежей записи: агент мог за это время подключиться к другому процессу."""
         stale_before = now - self.offline_after_ms
         for agent in await self.store.list_agents():
             if not agent.online or agent.id in self._sessions or agent.id in self._offline \
                     or (agent.last_seen_at or 0) >= stale_before:
                 continue
-            fresh = await self.store.get_agent(agent.id)
-            if fresh is None or not fresh.online or (fresh.last_seen_at or 0) >= stale_before:
+            events: List[Alert] = []
+
+            def fn(rec: Agent) -> bool:
+                events.clear()
+                if not rec.online or (rec.last_seen_at or 0) >= stale_before or rec.id in self._sessions:
+                    return False
+                rec.online = False
+                if not rec.revoked:
+                    events.extend(_some(_apply_alert(rec, ALERT_OFFLINE, True, "Агент без связи")))
+                return True
+
+            fresh = await self._mutate_agent(agent.id, fn)
+            if fresh is None:
                 continue
-            fresh.online = False
-            await self.store.update_agent(fresh)
+            self._alerts_out.extend(events)
             self._log("агент без вестей — без связи", agent=fresh.name)
-            if not fresh.revoked:
-                self._alert(ALERT_OFFLINE, fresh, True, "Агент без связи")
             self._changed("agent", fresh.id)
 
     # ── API приложения ──────────────────────────────────────────────────
@@ -1008,22 +1194,29 @@ class Agents(Transport):
 
     async def _signal_job(self, job_id: str, kind: str) -> Job:
         async with self._op():
-            job = await self.store.get_job(job_id)
+            was: List[str] = []
+
+            def fn(rec: Job) -> bool:
+                if rec.status not in JOB_ACTIVE:
+                    raise AgentsError("JOB_NOT_ACTIVE", "Задача уже завершена", 409)
+                was[:] = [rec.status]
+                if kind == "stop" and rec.status == JOB_RUNNING:
+                    rec.stop_requested = True
+                else:
+                    rec.status, rec.finished_at = JOB_CANCELLED, now_ms()
+                return True
+
+            job = await self._mutate_job(job_id, fn)
             if job is None:
                 raise AgentsError("JOB_NOT_FOUND", "Задача не найдена", 404)
-            if job.status not in JOB_ACTIVE:
-                raise AgentsError("JOB_NOT_ACTIVE", "Задача уже завершена", 409)
             ss = self._sessions.get(job.agent_id) if job.agent_id else None
-            if kind == "stop" and job.status == JOB_RUNNING:
-                job.stop_requested = True
-                if ss is not None:
+            if ss is not None and was[0] == JOB_RUNNING:
+                if kind == "stop":
                     ss.send("job.stop", _ref(job))
-            else:
-                if ss is not None and job.status == JOB_RUNNING:
+                else:
                     ss.pending.pop(job.id, None)
                     ss.send("job.cancel", _ref(job))
-                job.status, job.finished_at = JOB_CANCELLED, now_ms()
-            await self._save_job(job)
+            self._changed("job", job.id)
             self._audit(f"job.{kind}", job.id, job.agent_id or job.pinned_agent_id)
             return job
 
@@ -1066,7 +1259,7 @@ class Agents(Transport):
 
     async def call(self, name: str, args: Any = None, *, timeout_sec: int = 60,
                    agent_id: Optional[str] = None) -> Command:
-        """Команда и ждать итог: завершённая команда (``succeeded`` или ``failed``).
+        """Команда и ждать итог: завершённая команда (``succeeded``, ``failed`` или ``cancelled``).
 
         Итог ловится тремя путями: завершение в этом процессе (агент подключён сюда),
         проверка store раз в ``CALL_POLL_INTERVAL`` с и по ``refresh`` (агент подключён к
@@ -1080,7 +1273,7 @@ class Agents(Transport):
         try:
             while True:
                 cur = await self.store.get_command(cmd.id)
-                if cur is not None and cur.status in (CMD_SUCCEEDED, CMD_FAILED):
+                if cur is not None and cur.finished():
                     return cur
                 left = deadline - loop.time()
                 if left <= 0:
@@ -1098,6 +1291,37 @@ class Agents(Transport):
                 futures.remove(fut)
             if futures is not None and not futures:
                 self._calls.pop(cmd.id, None)
+
+    async def cancel_command(self, command_id: str) -> Command:
+        """Отменить команду: статус ``cancelled``, ``error`` — ``{code: "CANCELLED"}``.
+
+        Команда уже отправлена агенту (в сессии этого процесса) или выполняется — агенту
+        ``cmd.cancel``; ждущая и не отправленная отменяется без сообщения. Сессия агента в другом
+        процессе — тот отправит ``cmd.cancel`` при ``refresh``. Поздний итог агента (``cmd.done``)
+        отмену не меняет. Нет команды — ``AgentsError COMMAND_NOT_FOUND`` (404), уже завершена —
+        ``COMMAND_NOT_ACTIVE`` (409). Аудит ``command.cancel``."""
+        async with self._op():
+            was: List[str] = []
+
+            def fn(rec: Command) -> bool:
+                if rec.finished():
+                    raise AgentsError("COMMAND_NOT_ACTIVE", "Команда уже завершена", 409)
+                was[:] = [rec.status]
+                rec.status, rec.finished_at = CMD_CANCELLED, now_ms()
+                rec.error = {"code": "CANCELLED", "message": "Команду отменили"}
+                return True
+
+            cmd = await self._mutate_command(command_id, fn)
+            if cmd is None:
+                raise AgentsError("COMMAND_NOT_FOUND", "Команда не найдена", 404)
+            ss = self._sessions.get(cmd.agent_id)
+            if ss is not None:
+                if cmd.id in ss.sent or was[0] == CMD_RUNNING:
+                    ss.send("cmd.cancel", {"commandId": cmd.id})
+                ss.sent.discard(cmd.id)
+            self._finish_command(cmd)
+            self._audit("command.cancel", cmd.id, cmd.agent_id)
+            return cmd
 
     async def set_state(self, domain: str, spec: Any, agent_id: Optional[str] = None) -> DesiredState:
         """Новый снимок домена: общий или для агента ``agent_id``.
@@ -1205,40 +1429,46 @@ class Agents(Transport):
             raise AgentsError("MESSAGE_INVALID", f"Неверный срок подписки {ttl_ms!r}: нужно целое мс больше 0")
         body = _subscription_body(status, metrics, logs, channels)
         async with self._op():
-            agent = await self.store.get_agent(agent_id)
-            if agent is None:
-                raise AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404)
-            if agent.revoked:
-                raise AgentsError("AGENT_REVOKED", "Агент отозван", 409)
             now = now_ms()
             sub_id = id or new_id()
             sub = {"id": sub_id, "until": now + ttl_ms, **body}
-            subs = [s for s in _active(agent.subscriptions, now) if s.get("id") != sub_id]
-            subs.append(sub)
-            await self._set_subscriptions(agent, subs, now)
+
+            def fn(rec: Agent) -> bool:
+                if rec.revoked:
+                    raise AgentsError("AGENT_REVOKED", "Агент отозван", 409)
+                rec.subscriptions = [s for s in _active(rec.subscriptions, now) if s.get("id") != sub_id] + [sub]
+                return True
+
+            agent = await self._mutate_agent(agent_id, fn)
+            if agent is None:
+                raise AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404)
+            self._subscriptions_changed(agent, now)
             return {"id": sub_id, "until": sub["until"]}
 
     async def unsubscribe(self, agent_id: str, id: str) -> None:
         """Снять подписку ``id`` (нет такой — ничего); агенту — новая сводная. Агента нет —
         ``AGENT_NOT_FOUND``."""
         async with self._op():
-            agent = await self.store.get_agent(agent_id)
-            if agent is None:
-                raise AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404)
             now = now_ms()
-            if not any(s.get("id") == id for s in agent.subscriptions or []):
-                return
-            await self._set_subscriptions(agent, [s for s in _active(agent.subscriptions, now)
-                                                  if s.get("id") != id], now)
 
-    async def _set_subscriptions(self, agent: Agent, subs: List[Dict[str, Any]], now: int) -> None:
-        """Записать подписки агента; агенту на связи здесь — сводная, если изменилась."""
-        agent.subscriptions = subs
+            def fn(rec: Agent) -> bool:
+                if not any(s.get("id") == id for s in rec.subscriptions or []):
+                    return False
+                rec.subscriptions = [s for s in _active(rec.subscriptions, now) if s.get("id") != id]
+                return True
+
+            agent = await self._mutate_agent(agent_id, fn)
+            if agent is None:
+                if await self.store.get_agent(agent_id) is None:
+                    raise AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404)
+                return
+            self._subscriptions_changed(agent, now)
+
+    def _subscriptions_changed(self, agent: Agent, now: int) -> None:
+        """Подписки записаны: агенту на связи здесь — сводная, если изменилась."""
         ss = self._sessions.get(agent.id)
         if ss is not None:
-            ss.agent.subscriptions = subs
-        await self.store.update_agent(agent if ss is None else _with_creds(ss.agent, agent))
-        if ss is not None:
+            ss.agent = agent
             self._apply_subscription(ss, now)
 
     async def seal(self, agent_id: str, value: Any) -> Dict[str, str]:
@@ -1263,7 +1493,8 @@ class Agents(Transport):
         вызывает ``refresh`` — доставит тот, у кого сессия агента.
 
         Из записи агента применяются и отзыв (сессия закрывается кодом 4401, как ``revoke``),
-        и подписки (сводная другая — ``config``). Ждущие ``call`` перечитывают итог."""
+        и подписки (сводная другая — ``config``); отменённые команды, отправленные в сессии этого
+        процесса, — агенту ``cmd.cancel``. Ждущие ``call`` перечитывают итог."""
         for futures in list(self._calls.values()):
             for fut in futures:
                 if not fut.done():
@@ -1273,6 +1504,7 @@ class Agents(Transport):
             for sid, ss in list(self._sessions.items()):
                 if agent_id is None or sid == agent_id:
                     if await self._sync_session(ss, now):
+                        await self._cancel_sent(ss)
                         await self._deliver(ss)
             await self._fill_all()
 
@@ -1280,24 +1512,69 @@ class Agents(Transport):
         """Отозвать агента: сессия закрывается кодом 4401, учётные данные больше не
         принимаются (WebSocket и HTTP sync — 401). Агенту нужна новая регистрация."""
         async with self._op():
-            agent = await self.store.get_agent(agent_id)
+            events: List[Alert] = []
+
+            def fn(rec: Agent) -> bool:
+                events.clear()
+                rec.revoked, rec.online, rec.subscriptions = True, False, []
+                rec.pending_secret_hash = ""
+                # Отзыв — все проблемы агента заканчиваются.
+                for a in list(rec.alerts or []):
+                    events.extend(_some(_apply_alert(rec, str(a.get("type")), False, domain=a.get("domain"),
+                                                     worker=a.get("worker"))))
+                return True
+
+            agent = await self._mutate_agent(agent_id, fn)
             if agent is None:
                 raise AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404)
             ss = self._sessions.pop(agent_id, None)
             if ss is not None:
                 ss.close(Close.UNAUTHORIZED)
             self._offline.pop(agent_id, None)
-            agent.revoked, agent.online, agent.subscriptions = True, False, []
-            agent.pending_secret_hash = ""
-            await self.store.update_agent(agent)
+            self._alerts_out.extend(events)
             self._log("агент отозван", agent=agent.name)
             self._changed("agent", agent.id)
             self._audit("agent.revoke", agent.id, agent.id)
-            for (type, agent_id, sub) in list(self._active_alerts):
-                if agent_id == agent.id:
-                    al = self._active_alerts[(type, agent_id, sub)]
-                    self._alert(type, agent, False, domain=al.domain, worker=al.worker)
             return agent
+
+    async def delete_agent(self, agent_id: str) -> None:
+        """Удалить запись отозванного агента и его историю метрик (сначала ``revoke``). Задачи,
+        команды, события и снимки состояния остаются. Агента нет — ``AgentsError AGENT_NOT_FOUND``
+        (404), не отозван — ``AGENT_NOT_REVOKED`` (409). Аудит ``agent.delete``."""
+        async with self._op():
+            agent = await self.store.get_agent(agent_id)
+            if agent is None:
+                raise AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404)
+            if not agent.revoked:
+                raise AgentsError("AGENT_NOT_REVOKED", "Удалить можно только отозванного агента", 409)
+            if not await self.store.delete_agent(agent_id):
+                raise AgentsError("AGENT_NOT_FOUND", "Агент не найден", 404)
+            ss = self._sessions.pop(agent_id, None)
+            if ss is not None:
+                ss.close(Close.UNAUTHORIZED)
+            self._offline.pop(agent_id, None)
+            for key in [k for k in self._stored_at if k[0] == agent_id]:
+                del self._stored_at[key]
+            self._log("агент удалён", agent=agent.name)
+            self._changed("agent", agent_id)
+            self._audit("agent.delete", agent_id, agent_id)
+
+    async def prune(self, *, jobs_older_than_ms: Optional[int] = None, commands_older_than_ms: Optional[int] = None,
+                    events_older_than_ms: Optional[int] = None) -> int:
+        """Уборка: удалить завершённые задачи и команды, завершённые раньше, чем столько мс назад,
+        и события старше срока (``None`` или 0 — не трогать). Сколько удалено. Сами ``Agents``
+        уборку не запускают: её вызывает бэкенд (например, раз в сутки)."""
+        now = now_ms()
+
+        def before(ms: Optional[int]) -> Optional[int]:
+            return now - int(ms) if ms and ms > 0 else None
+
+        removed = await self.store.prune(jobs_before=before(jobs_older_than_ms),
+                                         commands_before=before(commands_older_than_ms),
+                                         events_before=before(events_older_than_ms))
+        if removed:
+            self._log("удалены старые записи", count=removed)
+        return removed
 
     async def rotate_key(self, agent_id: str) -> Command:
         """Сменить ключ агента без новой регистрации: команда ``agent.rotateKey`` (срок 60 с).
@@ -1515,16 +1792,18 @@ class Agents(Transport):
         return await self.store.get_job(job_id)
 
     async def list_jobs(self, *, status: Optional[str] = None, queue: Optional[str] = None,
-                        agent_id: Optional[str] = None) -> List[Job]:
-        """Задачи, новые первыми."""
-        return await self.store.list_jobs(status=status, queue=queue, agent_id=agent_id)
+                        agent_id: Optional[str] = None, limit: int = 0, after: Optional[str] = None) -> List[Job]:
+        """Задачи, новые первыми. Постранично: ``after`` — id последней задачи прошлой страницы,
+        ``limit`` — размер страницы (≤ 0 — все)."""
+        return await self.store.list_jobs(status=status, queue=queue, agent_id=agent_id, limit=limit, after=after)
 
     async def get_command(self, command_id: str) -> Optional[Command]:
         return await self.store.get_command(command_id)
 
-    async def list_commands(self, *, status: Optional[str] = None, agent_id: Optional[str] = None) -> List[Command]:
-        """Команды, новые первыми."""
-        return await self.store.list_commands(status=status, agent_id=agent_id)
+    async def list_commands(self, *, status: Optional[str] = None, agent_id: Optional[str] = None,
+                            limit: int = 0, after: Optional[str] = None) -> List[Command]:
+        """Команды, новые первыми; постранично — как ``list_jobs``."""
+        return await self.store.list_commands(status=status, agent_id=agent_id, limit=limit, after=after)
 
     async def list_states(self) -> List[DesiredState]:
         return await self.store.list_states()
@@ -1672,10 +1951,73 @@ def _check_domain(domain: Any) -> None:
     _check_name("domain", domain)
 
 
-def _with_creds(agent: Agent, stored: Agent) -> Agent:
-    """Агент сессии с учётными данными из записи (их меняют authenticate и revoke)."""
-    agent.secret_hash, agent.pending_secret_hash = stored.secret_hash, stored.pending_secret_hash
-    return agent
+def _drop_expired(agent: Agent, now: int) -> bool:
+    """Удалить из записи истёкшие подписки; ``False`` — их нет (писать нечего)."""
+    if not _expired(agent.subscriptions, now):
+        return False
+    agent.subscriptions = _active(agent.subscriptions, now)
+    return True
+
+
+def _job_id(ref: Dict[str, Any]) -> str:
+    job_id = ref.get("jobId")
+    if not isinstance(job_id, str):
+        raise ValueError("нет jobId")
+    return job_id
+
+
+def _holds(job: Job, agent_id: str, ref: Dict[str, Any]) -> bool:
+    """Задача выполняется за агентом в попытке из ``ref``."""
+    return job.status == JOB_RUNNING and job.agent_id == agent_id and job.attempt == ref.get("attempt")
+
+
+def _some(alert: Optional[Alert]) -> List[Alert]:
+    return [alert] if alert is not None else []
+
+
+def _apply_alert(agent: Agent, type: str, active: bool, message: str = "", *,
+                 domain: Optional[str] = None, worker: Optional[str] = None) -> Optional[Alert]:
+    """Начало или конец проблемы в записи агента (``agent.alerts``). Событие ``alert`` —
+    только при смене: начало — если в записи её не было, конец — если была (с тем же текстом)."""
+    sub = domain or worker or ""
+    alerts = [a for a in agent.alerts or [] if isinstance(a, dict)]
+    cur = next((a for a in alerts if a.get("type") == type and (a.get("domain") or a.get("worker") or "") == sub),
+               None)
+    if active == (cur is not None):
+        return None
+    if cur is not None:
+        message = str(cur.get("message") or "")
+        alerts = [a for a in alerts if a is not cur]
+    alert = Alert(type=type, agent_id=agent.id, agent_name=agent.name, active=active, message=message,
+                  at=now_ms(), domain=domain or None, worker=worker or None)
+    agent.alerts = alerts + [alert.to_record()] if active else alerts
+    return alert
+
+
+def _status_alerts(agent: Agent, status: Dict[str, Any]) -> List[Alert]:
+    """``degraded``, ``workerDown`` и ``workerDegraded`` по ``status`` — в записи агента."""
+    out = _some(_apply_alert(agent, ALERT_DEGRADED, status.get("state") == "degraded",
+                             str(status.get("message") or "Агент не в порядке")))
+    down: Dict[str, str] = {}
+    degraded: Dict[str, str] = {}
+    for w in status.get("workers") or []:
+        if not isinstance(w, dict) or not isinstance(w.get("name"), str):
+            continue
+        if w.get("state") in WORKER_DOWN_STATES:
+            down[w["name"]] = str(w["state"])
+        if w.get("health") == "degraded":
+            degraded[w["name"]] = str(w.get("message") or f"Воркер {w['name']} не в порядке")
+    for name, state in down.items():
+        out += _some(_apply_alert(agent, ALERT_WORKER_DOWN, True, f"Воркер {name}: {state}", worker=name))
+    for name, message in degraded.items():
+        out += _some(_apply_alert(agent, ALERT_WORKER_DEGRADED, True, message, worker=name))
+    for a in list(agent.alerts or []):
+        worker = a.get("worker")
+        if a.get("type") == ALERT_WORKER_DOWN and worker not in down:
+            out += _some(_apply_alert(agent, ALERT_WORKER_DOWN, False, worker=worker))
+        elif a.get("type") == ALERT_WORKER_DEGRADED and worker not in degraded:
+            out += _some(_apply_alert(agent, ALERT_WORKER_DEGRADED, False, worker=worker))
+    return out
 
 
 def _invalid(kind: str) -> Dict[str, Any]:
@@ -1725,8 +2067,14 @@ class Actor:
     async def rollback_state(self, domain: str, version: int, agent_id: Optional[str] = None) -> DesiredState:
         return await self._run(self.agents.rollback_state, domain, version, agent_id)
 
+    async def cancel_command(self, command_id: str) -> Command:
+        return await self._run(self.agents.cancel_command, command_id)
+
     async def revoke(self, agent_id: str) -> Agent:
         return await self._run(self.agents.revoke, agent_id)
+
+    async def delete_agent(self, agent_id: str) -> None:
+        return await self._run(self.agents.delete_agent, agent_id)
 
     async def update_agent(self, agent_id: str) -> Command:
         return await self._run(self.agents.update_agent, agent_id)

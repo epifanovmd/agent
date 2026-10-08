@@ -20,6 +20,10 @@ export { type InstallOptions, type PackageManager, PACKAGE_MANAGERS } from "./in
 export { baseUrl, clientAddress, readBody, readJSON, sendJSON } from "./http";
 export {
   AgentsError,
+  ENROLL_MAX_BODY,
+  ENROLL_MAX_LABEL,
+  ENROLL_MAX_LABELS,
+  ENROLL_MAX_NAME,
   type Agent,
   type AgentRecord,
   type AgentSubscription,
@@ -29,6 +33,7 @@ export {
   type JobStatus,
   type JobEventRecord,
   type Command,
+  type CommandRecord,
   type CommandStatus,
   type DesiredState,
   type JobRequest,
@@ -37,6 +42,9 @@ export {
   type ChangeKind,
   type JobFilter,
   type CommandFilter,
+  type PageFilter,
+  type PruneOptions,
+  type StorePruneOptions,
   type MetricsPoint,
   type ReleaseArtifact,
   type ReleaseManifest,

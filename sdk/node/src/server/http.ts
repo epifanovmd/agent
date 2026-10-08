@@ -1,14 +1,21 @@
 // Мелочи HTTP без фреймворка: тело запроса, ответ JSON, адрес сервера.
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { AgentsError } from "./model";
 
 const MAX_BODY = 32 << 20;
 
+/**
+ * Тело запроса не больше limit байт; больше — AgentsError MESSAGE_INVALID со статусом 413
+ * (по Content-Length — сразу, без чтения).
+ */
 export async function readBody(req: IncomingMessage, limit = MAX_BODY): Promise<Buffer> {
+  const tooLarge = () => new AgentsError("MESSAGE_INVALID", `Тело запроса больше ${limit} байт`, 413);
+  if (Number(req.headers["content-length"]) > limit) throw tooLarge();
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > limit) throw new Error("тело запроса слишком большое");
+    if (size > limit) throw tooLarge();
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
@@ -29,12 +36,22 @@ export function sendJSON(res: ServerResponse, status: number, body: unknown): vo
   res.end(raw);
 }
 
-/** Адрес сервера, по которому клиент до него дошёл (ссылки на файлы задач). */
-export function baseUrl(req: IncomingMessage): string {
-  const proto = String(req.headers["x-forwarded-proto"] ?? "http")
-    .split(",")[0]
-    .trim();
-  const host = String(req.headers["x-forwarded-host"] ?? req.headers.host ?? "localhost");
+/**
+ * Адрес сервера, по которому клиент до него дошёл (ссылки на файлы задач): Host и TLS сокета;
+ * trustProxy (за доверенным прокси) — X-Forwarded-Host и X-Forwarded-Proto, если они есть.
+ */
+export function baseUrl(req: IncomingMessage, trustProxy = false): string {
+  const first = (v: string | string[] | undefined) =>
+    String(Array.isArray(v) ? v[0] : (v ?? ""))
+      .split(",")[0]
+      .trim();
+  const tls = (req.socket as { encrypted?: boolean } | undefined)?.encrypted === true;
+  let proto = tls ? "https" : "http";
+  let host = req.headers.host || "localhost";
+  if (trustProxy) {
+    proto = first(req.headers["x-forwarded-proto"]) || proto;
+    host = first(req.headers["x-forwarded-host"]) || host;
+  }
   return `${proto}://${host}`;
 }
 

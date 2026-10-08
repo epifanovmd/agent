@@ -165,18 +165,32 @@ func TestReleasesServed(t *testing.T) {
 		t.Fatalf("Release: %+v", rel)
 	}
 
-	// install.sh — адрес сервера из запроса (за прокси — X-Forwarded-Proto) и ключ.
-	code, body = s.get(InstallPath, http.Header{"X-Forwarded-Proto": {"https"}})
+	// install.sh — адрес сервера из запроса и ключ; X-Forwarded-Proto и
+	// X-Forwarded-Host без TrustProxy не учитываются.
 	host := strings.TrimPrefix(s.srv.URL, "http://")
-	if code != http.StatusOK || !strings.Contains(body, `DEFAULT_SERVER="https://`+host+`"`) ||
+	forwarded := http.Header{"X-Forwarded-Proto": {"https"}, "X-Forwarded-Host": {"agents.example.com"}}
+	code, body = s.get(InstallPath, forwarded)
+	if code != http.StatusOK || !strings.Contains(body, `DEFAULT_SERVER="http://`+host+`"`) ||
 		!strings.Contains(body, `DEFAULT_PUBLIC_KEY="UFVCS0VZ"`) || !strings.Contains(body, `SERVER="$DEFAULT_SERVER"`) {
 		t.Fatalf("install.sh: %d\n%s", code, body)
 	}
-	if _, body := s.get(InstallPath, nil); !strings.Contains(body, `DEFAULT_SERVER="http://`+host+`"`) {
-		t.Fatalf("install.sh без прокси:\n%s", body)
+	// За доверенным прокси (TrustProxy) — адрес из X-Forwarded-Proto и X-Forwarded-Host.
+	proxied := releaseStandWith(t, Options{TrustProxy: true})
+	if code, body := proxied.get(InstallPath, forwarded); code != http.StatusOK ||
+		!strings.Contains(body, `DEFAULT_SERVER="https://agents.example.com"`) {
+		t.Fatalf("install.sh за прокси: %d\n%s", code, body)
 	}
-	if code, _ := s.get(InstallPath, http.Header{"X-Forwarded-Proto": {`https"; rm -rf /; "`}}); code != http.StatusBadRequest {
-		t.Fatalf("небезопасный адрес: %d", code)
+	proxiedHost := strings.TrimPrefix(proxied.srv.URL, "http://")
+	if _, body := proxied.get(InstallPath, http.Header{"X-Forwarded-Proto": {"https"}}); !strings.Contains(body, `DEFAULT_SERVER="https://`+proxiedHost+`"`) {
+		t.Fatalf("install.sh за прокси без X-Forwarded-Host:\n%s", body)
+	}
+	for _, bad := range []http.Header{
+		{"X-Forwarded-Proto": {`https"; rm -rf /; "`}},
+		{"X-Forwarded-Host": {"example.com/$(id)"}},
+	} {
+		if code, _ := proxied.get(InstallPath, bad); code != http.StatusBadRequest {
+			t.Fatalf("небезопасный адрес %v: %d", bad, code)
+		}
 	}
 
 	// PublicURL важнее адреса из запроса; с путём — можно, символы shell — 400.

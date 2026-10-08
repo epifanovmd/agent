@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -207,5 +208,164 @@ func TestCancelBeforeAssignIsRemembered(t *testing.T) {
 	}
 	if len(m.RunningJobs()) != 0 || len(s.of(message.TypeJobAccept)) != 0 {
 		t.Fatal("отменённая задача не должна числиться и подтверждаться")
+	}
+}
+
+// stubRunner — исполнитель без собственной логики: отмены и замены записываются.
+type stubRunner struct {
+	mu        sync.Mutex
+	cancelled []message.JobRef
+	stuck     []message.JobRef
+	run       []message.JobRef
+}
+
+func (r *stubRunner) ID() string             { return "stub" }
+func (r *stubRunner) Queues() map[string]int { return map[string]int{"q": 1} }
+func (r *stubRunner) Accepting() bool        { return true }
+func (r *stubRunner) Stop(message.JobRef)    {}
+func (r *stubRunner) Run(a message.JobAssign) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.run = append(r.run, a.Ref())
+	return nil
+}
+func (r *stubRunner) Cancel(ref message.JobRef) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cancelled = append(r.cancelled, ref)
+}
+func (r *stubRunner) ReplaceStuck(ref message.JobRef) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stuck = append(r.stuck, ref)
+}
+func (r *stubRunner) counts() (run, cancelled, stuck int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.run), len(r.cancelled), len(r.stuck)
+}
+
+func freeSlots(m *Manager) int {
+	st := message.Status{Slots: map[string]int{}}
+	m.ContributeStatus(&st)
+	return st.Slots["q"]
+}
+
+// job.cancel: место занято, пока исполнитель не подтвердил завершение
+// (итог отменённой серверу не уходит) или не истёк срок — тогда исполнитель
+// заменяется. Задача в status и hello уже не числится.
+func TestCancelHoldsSlotUntilDone(t *testing.T) {
+	s := &fakeSender{}
+	m := New(s, logx.Discard(), func() {})
+	r := &stubRunner{}
+	m.Attach(r)
+	m.SetCancelTimeout(100 * time.Millisecond)
+
+	_ = m.Handle(context.Background(), assign("a", "q"))
+	_ = m.Handle(context.Background(), message.MustNew(message.TypeJobCancel, message.JobRef{JobID: "a"}))
+	if freeSlots(m) != 0 || len(m.RunningJobs()) != 0 {
+		t.Fatalf("место отменённой занято, задача не числится: %d %v", freeSlots(m), m.RunningJobs())
+	}
+	m.Fail(message.JobFail{JobRef: message.JobRef{JobID: "a"}, Code: message.ErrCancelled})
+	if freeSlots(m) != 1 || len(s.of(message.TypeJobFail)) != 0 {
+		t.Fatal("подтверждение отмены освобождает место и серверу не уходит")
+	}
+
+	_ = m.Handle(context.Background(), assign("b", "q"))
+	_ = m.Handle(context.Background(), message.MustNew(message.TypeJobCancel, message.JobRef{JobID: "b"}))
+	wait(t, "срок отмены", func() bool { _, _, stuck := r.counts(); return stuck == 1 })
+	if freeSlots(m) != 1 {
+		t.Fatal("после срока место свободно")
+	}
+}
+
+// Новая попытка той же задачи отменяет старую у исполнителя; старая попытка
+// после новой не запускается.
+func TestNewAttemptCancelsOld(t *testing.T) {
+	s := &fakeSender{}
+	m := New(s, logx.Discard(), func() {})
+	r := &stubRunner{}
+	m.Attach(r)
+	m.SetCancelTimeout(time.Hour)
+	_ = m.Handle(context.Background(), assign("a", "q"))
+	next := message.MustNew(message.TypeJobAssign, message.JobAssign{JobID: "a", Attempt: 1, Queue: "q"})
+	_ = m.Handle(context.Background(), next)
+	run, cancelled, _ := r.counts()
+	if cancelled != 1 || r.cancelled[0].Attempt != 0 {
+		t.Fatalf("старая попытка не отменена: %+v", r.cancelled)
+	}
+	// Место старой ещё занято (воркер её не завершил) — новой некуда.
+	if run != 1 || len(s.of(message.TypeJobReject)) != 1 {
+		t.Fatalf("запуски %d, отказы %v", run, s.of(message.TypeJobReject))
+	}
+	m.Fail(message.JobFail{JobRef: message.JobRef{JobID: "a"}, Code: message.ErrCancelled})
+	_ = m.Handle(context.Background(), next)
+	if run, _, _ := r.counts(); run != 2 {
+		t.Fatal("новая попытка после освобождения места")
+	}
+	old := message.MustNew(message.TypeJobAssign, message.JobAssign{JobID: "a", Attempt: 0, Queue: "q"})
+	_ = m.Handle(context.Background(), old)
+	if run, _, _ := r.counts(); run != 2 {
+		t.Fatal("старая попытка после новой не запускается")
+	}
+}
+
+// job.progress прореживается: первый — сразу, частые — одним сообщением не
+// раньше progressEvery, строки log копятся; накопленное уходит до итога.
+func TestProgressThrottled(t *testing.T) {
+	defer func(d time.Duration) { progressEvery = d }(progressEvery)
+	progressEvery = 200 * time.Millisecond
+	s := &fakeSender{}
+	m := New(s, logx.Discard(), func() {})
+	m.Attach(&stubRunner{})
+	_ = m.Handle(context.Background(), assign("p", "q"))
+	ref := message.JobRef{JobID: "p"}
+	for i := range 5 {
+		v := float64(i) / 10
+		m.Progress(message.JobProgress{JobRef: ref, Progress: &v, Log: []string{"строка"}})
+	}
+	if n := len(s.of(message.TypeJobProgress)); n != 1 {
+		t.Fatalf("сразу — только первый: %d", n)
+	}
+	wait(t, "слитый прогресс", func() bool { return len(s.of(message.TypeJobProgress)) == 2 })
+	merged := s.of(message.TypeJobProgress)[1].(message.JobProgress)
+	if *merged.Progress != 0.4 || len(merged.Log) != 4 {
+		t.Fatalf("слитый: %v %v", *merged.Progress, merged.Log)
+	}
+	v := 0.9
+	m.Progress(message.JobProgress{JobRef: ref, Progress: &v})
+	m.Complete(message.JobComplete{JobRef: ref})
+	msgs := s.msgs
+	if last := msgs[len(msgs)-1]; last.typ != message.TypeJobComplete || msgs[len(msgs)-2].typ != message.TypeJobProgress {
+		t.Fatalf("прогресс до итога: %+v", msgs[len(msgs)-2:])
+	}
+}
+
+// urlsSender — первый запрос job.urls без ответа (срок), второй — ответ.
+type urlsSender struct {
+	fakeSender
+	calls int
+}
+
+func (u *urlsSender) Request(ctx context.Context, typ string, data any, out any) error {
+	u.mu.Lock()
+	u.calls++
+	n := u.calls
+	u.mu.Unlock()
+	if n == 1 {
+		return fmt.Errorf("link: %s: %w", typ, context.DeadlineExceeded)
+	}
+	return u.fakeSender.Request(ctx, typ, data, out)
+}
+
+// job.urls без ответа — новый запрос (§4).
+func TestURLsRetried(t *testing.T) {
+	s := &urlsSender{}
+	m := New(s, logx.Discard(), func() {})
+	m.Attach(&stubRunner{})
+	_ = m.Handle(context.Background(), assign("u", "q"))
+	urls, err := m.URLs(context.Background(), message.JobURLsRequest{JobRef: message.JobRef{JobID: "u"}})
+	if err != nil || urls.ExpiresAt != 1 || s.calls != 2 {
+		t.Fatalf("%+v %v %d", urls, err, s.calls)
 	}
 }

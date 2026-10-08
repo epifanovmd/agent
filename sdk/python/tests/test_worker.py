@@ -145,12 +145,15 @@ class WorkerMessagesTest(unittest.TestCase):
         self.assertIn("ValueError", fails["f2"]["message"])
         self.assertEqual(fails["f3"]["code"], "WORKER_STOPPING")
 
-    def test_cancel_sends_nothing_and_stop_completes(self) -> None:
+    def test_cancel_confirmed_and_stop_completes(self) -> None:
         self.agent.send("job.assign", assign("c1", data={"text": "x", "wait": True}))
         self.assertTrue(self.started.wait(5))
         self.agent.send("job.cancel", {"jobId": "c1", "attempt": 0})
+        fail = self.agent.wait("job.fail")[0]["data"]
+        self.assertEqual(fail, {"jobId": "c1", "attempt": 0, "code": "CANCELLED", "message": "задача отменена",
+                                "retryable": False})
         time.sleep(0.2)
-        self.assertFalse([m for m in self.agent.got if m["type"] in ("job.complete", "job.fail")])
+        self.assertEqual(len([m for m in self.agent.got if m["type"] in ("job.complete", "job.fail")]), 1)
 
         self.started.clear()
         self.agent.send("job.assign", assign("s1", data={"text": "x", "wait": True}))
@@ -184,7 +187,8 @@ class MinimalRegisterTest(unittest.TestCase):
         thread.start()
         register = agent.wait("worker.register")[0]["data"]
         want = message("worker.register.minimal")["data"]
-        self.assertEqual(set(register) - {"version", "sdk"}, set(want), "пустые списки не отправляются")
+        self.assertEqual(set(register) - {"version", "sdk", "ping"}, set(want), "пустые списки не отправляются")
+        self.assertIs(register["ping"], True)
         self.assertEqual(register["queues"], want["queues"])
         drain = message("worker.drain")
         agent.sock.sendall(json.dumps(drain).encode() + b"\n")
@@ -269,7 +273,7 @@ class PrimitivesTest(unittest.TestCase):
     def test_cancelled_command_sends_no_result(self) -> None:
         self.agent.send("cmd.run", {"commandId": "w1", "name": "example.app.reload", "args": {"wait": True}})
         self.agent.wait("cmd.output")
-        cancel = message("cmd.cancel")
+        cancel = message("cmd.cancel@agent")
         self.agent.send("cmd.cancel", {"commandId": "w1"})
         self.assertEqual(set(cancel["data"]), {"commandId"})
         time.sleep(0.2)
@@ -348,7 +352,7 @@ class ContextAndControlTest(unittest.TestCase):
         self.direct: List[str] = []
         self.assertIsNotNone(self.worker.on_context(lambda ctx: self.direct.append(ctx.mode)))
         self.worker.on_context(lambda ctx: 1 / 0)  # сбой подписчика не мешает остальным
-        # До run: уйдёт сразу после регистрации.
+        # До run: уйдёт сразу после worker.ready.
         self.worker.set_health(False, "example.db недоступна")
         self.thread = threading.Thread(target=self.worker.run, kwargs={"install_signals": False}, daemon=True)
         self.thread.start()
@@ -390,9 +394,11 @@ class ContextAndControlTest(unittest.TestCase):
         self.assertEqual(self.direct, ["run", "cleanup"])
 
     def test_control_messages_match_examples(self) -> None:
-        register_at = self.agent.got.index(self.agent.wait("worker.register")[0])
+        self.agent.wait("worker.register")
+        time.sleep(0.1)
+        self.assertFalse(self.agent.of("worker.health"), "до worker.ready — копится")
+        self.agent.send("worker.ready", {"agentVersion": "1"})
         health = self.agent.wait("worker.health")
-        self.assertGreater(self.agent.got.index(health[0]), register_at, "после регистрации")
         self.assertEqual(health[0]["data"], message("worker.health.degraded")["data"])
         self.worker.set_health(True)
         self.worker.pause(["example.echo"])

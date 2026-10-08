@@ -6,6 +6,7 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -45,6 +47,10 @@ const SDK = "go/1.1.0"
 
 // streamLimit — потоковых сообщений в памяти до подтверждения.
 const streamLimit = 2000
+
+// BuiltinUpdateKey — ключ проверки сборок, вшитый при сборке (cmd/agent,
+// -ldflags "-X main.updateKey=…"); настройка update.publicKey важнее.
+var BuiltinUpdateKey string
 
 // ErrRestart — агент остановлен для перезапуска (команда или обновление):
 // процесс завершается, менеджер (systemd, Docker) запускает его снова.
@@ -78,6 +84,8 @@ type App struct {
 
 	restart atomic.Bool
 	cancel  context.CancelFunc
+	// lock — блокировка каталога данных (снимается после Run или Close).
+	lock *Lock
 }
 
 // New — агент по конфигурации.
@@ -90,13 +98,21 @@ func New(cfg config.Config, version string) (*App, error) {
 		log.Warn("связь без шифрования — ключ агента и состояние (в нём могут быть секреты) идут открытым текстом; нужен https://",
 			"server", strings.Join(cfg.Server.Addresses(), ", "))
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
-		return nil, fmt.Errorf("agent: каталог данных: %w", err)
+	lock, err := LockDataDir(cfg.DataDir)
+	if err != nil {
+		return nil, err
 	}
+	ok := false
+	defer func() {
+		if !ok {
+			lock.Unlock()
+		}
+	}()
 	ob, err := outbox.Open(filepath.Join(cfg.DataDir, "outbox"))
 	if err != nil {
 		return nil, err
 	}
+	ob.SetLimit(cfg.Outbox.MaxMessages, log)
 	client, err := httpClient(cfg.Server)
 	if err != nil {
 		return nil, err
@@ -110,9 +126,10 @@ func New(cfg config.Config, version string) (*App, error) {
 		ring:    ring,
 		client:  client,
 		outbox:  ob,
+		lock:    lock,
 	}
-	if cfg.Update.PublicKey != "" {
-		if a.pubKey, err = update.ParsePublicKey(cfg.Update.PublicKey); err != nil {
+	if key := cmp.Or(cfg.Update.PublicKey, BuiltinUpdateKey); key != "" {
+		if a.pubKey, err = update.ParsePublicKey(key); err != nil {
 			return nil, err
 		}
 	}
@@ -150,17 +167,22 @@ func New(cfg config.Config, version string) (*App, error) {
 	a.rt.SetTelemetry(cfg.Telemetry.Backlog, cfg.Telemetry.InventoryInterval.Std())
 	a.jobs = jobs.New(a.link, log, a.rt.Changed)
 	a.jobs.SetUnreported(ob.JobRefs)
+	a.jobs.SetCancelTimeout(cfg.Jobs.CancelTimeout.Std())
 	a.commands = commands.New(a.link, log)
+	a.commands.SetMaxConcurrent(cfg.Commands.MaxConcurrent)
 	a.state = state.New(filepath.Join(cfg.DataDir, "state"), a.link, log)
 	a.state.SetUnseal(func(spec json.RawMessage) (json.RawMessage, error) { return sealed.Unseal(encKey, spec) })
 	a.state.SetResync(cfg.State.ResyncInterval.Std())
+	a.state.SetApplyTimeout(cfg.State.ApplyTimeout.Std())
 	a.workers = worker.New(cfg.Workers, a.jobs, log, a.rt.Changed, version)
+	// Пауза очередей от сервера переживает перезапуск агента.
+	a.workers.SetPauseFile(filepath.Join(cfg.DataDir, "worker-pause.json"))
 	if cfg.Server.CAFile != "" {
 		// Файлы задач воркеры скачивают сами: им тоже нужен CA сервера.
 		ca, _ := filepath.Abs(cfg.Server.CAFile)
-		env := map[string]string{"AGENT_SERVER_CA_FILE": ca}
-		if _, ok := os.LookupEnv("NODE_EXTRA_CA_CERTS"); !ok {
-			env["NODE_EXTRA_CA_CERTS"] = ca // Node.js добавляет его к системным корням
+		env := map[string]string{"AGENT_SERVER_CA_FILE": ca, "NODE_EXTRA_CA_CERTS": ca} // Node.js добавляет его к системным корням
+		if own, ok := os.LookupEnv("NODE_EXTRA_CA_CERTS"); ok {
+			env["NODE_EXTRA_CA_CERTS"] = own
 		}
 		a.workers.SetEnv(env)
 	}
@@ -170,6 +192,7 @@ func New(cfg config.Config, version string) (*App, error) {
 		Telemetry: a.telemetry,
 		Events:    a.link,
 		Changed:   a.rt.CapabilitiesChanged,
+		Narrowed:  a.link.Reconnect,
 	})
 
 	a.applyBuiltins(cfg)
@@ -187,8 +210,13 @@ func New(cfg config.Config, version string) (*App, error) {
 			update.Healthy(a.update)
 		}
 	})
+	ok = true
 	return a, nil
 }
+
+// Close — снять блокировку каталога данных у агента, который не запускался
+// (Run снимает её сам).
+func (a *App) Close() { a.lock.Unlock() }
 
 // Run — работать до отмены ctx (или команды перезапуска); ErrRestart —
 // процесс нужно запустить снова.
@@ -196,6 +224,7 @@ func (a *App) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	a.cancel = cancel
 	defer cancel()
+	defer a.lock.Unlock()
 
 	if err := a.auth.ensure(ctx); err != nil {
 		return err
@@ -210,6 +239,7 @@ func (a *App) Run(ctx context.Context) error {
 	a.rt.Register(telemetryCapability{a.telemetry})
 	a.rt.Register(updateCapability{mode: a.config().Update.Mode})
 	a.rt.Register(logCapability{f: a.forward, link: a.link})
+	a.rt.Register(heartbeat{path: filepath.Join(a.config().DataDir, StatusFile), online: a.rt.Online})
 
 	cfg := a.config()
 	a.log.Info("агент запущен", "version", a.version, "name", cfg.Name, "server", strings.Join(cfg.Server.Addresses(), ", "), "workers", len(cfg.Workers))
@@ -319,6 +349,10 @@ func (a *App) workerRestartCommand(ctx context.Context, args json.RawMessage, ou
 	for _, name := range names {
 		fmt.Fprintf(out, "перезапуск %s…\n", name)
 		if err := a.workers.Restart(ctx, name); err != nil {
+			var ce *commands.Error
+			if errors.As(err, &ce) {
+				return nil, ce
+			}
 			return nil, commands.Errorf("WORKER_RESTART", "%s: %v", name, err)
 		}
 	}
@@ -386,14 +420,28 @@ func (a *App) workerUpdateCommand(ctx context.Context, args json.RawMessage, out
 	if strings.HasPrefix(url, "/") {
 		url = strings.TrimRight(a.link.ServerURL(), "/") + url
 	}
+	// Подпись — над сборкой этого воркера этой версии под эту машину (§7).
+	build := update.Local(req.Name, req.Version, req.SHA256)
 	fetch := func(dst string) error {
-		return update.Fetch(ctx, a.client, a.auth.Session(), a.pubKey, url, req.SHA256, req.Signature, dst)
+		if isArchive(url) {
+			return update.FetchArchive(ctx, a.client, a.auth.Session(), a.pubKey, build, url, req.Signature, dst)
+		}
+		return update.Fetch(ctx, a.client, a.auth.Session(), a.pubKey, build, url, req.Signature, dst)
 	}
 	res, err := a.workers.Update(ctx, req.Name, req.Version, fetch, out)
 	if err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// isArchive — сборка воркера в выпуске — архив .tar.gz (по имени файла в url).
+func isArchive(rawURL string) bool {
+	path := rawURL
+	if u, err := neturl.Parse(rawURL); err == nil {
+		path = u.Path
+	}
+	return strings.HasSuffix(path, ".tar.gz")
 }
 
 func (a *App) updateCommand(ctx context.Context, args json.RawMessage, out io.Writer) (any, error) {
@@ -556,7 +604,8 @@ func (a *auth) Renew(ctx context.Context) error {
 	if a.cfg.Enroll.Token == "" {
 		return errors.New("agent: учётные данные отозваны, токена регистрации нет")
 	}
-	_ = a.store.Forget()
+	// Прежние учётные данные заменяются только новыми: регистрация не
+	// удалась — они остаются (сервер может снова их принять).
 	return a.enroll(ctx)
 }
 

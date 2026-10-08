@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/epifanovmd/agent/internal/logx"
 	"github.com/epifanovmd/agent/sdk/go/message"
@@ -95,5 +97,107 @@ func TestRunOutputDoneAndDedup(t *testing.T) {
 	_ = r.all(message.TypeCmdOutput)[0].Decode(&out)
 	if out.Chunk != "строка\n" {
 		t.Fatalf("вывод: %q", out.Chunk)
+	}
+}
+
+// cmd.cancel: выполняющаяся команда прерывается (ctx) — итог CANCELLED;
+// неизвестная — без последствий; обработчик, не слушающий ctx, — итог без него.
+func TestCancel(t *testing.T) {
+	defer func(d time.Duration) { lateGrace = d }(lateGrace)
+	lateGrace = 50 * time.Millisecond
+	r := &rec{}
+	reg := New(r, logx.Discard())
+	started := make(chan struct{}, 2)
+	reg.Register("wait", func(ctx context.Context, _ json.RawMessage, _ io.Writer) (any, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	reg.Register("deaf", func(context.Context, json.RawMessage, io.Writer) (any, error) {
+		started <- struct{}{}
+		time.Sleep(time.Second)
+		return "поздно", nil
+	})
+	_ = reg.Handle(context.Background(), message.MustNew(message.TypeCmdCancel, message.CommandRef{CommandID: "nope"}))
+	for n, name := range []string{"wait", "deaf"} {
+		id := "c-" + name
+		_ = reg.Handle(context.Background(), run(id, name, `{}`))
+		<-started
+		_ = reg.Handle(context.Background(), message.MustNew(message.TypeCmdCancel, message.CommandRef{CommandID: id}))
+		var done message.CommandDone
+		_ = waitDone(t, r, n+1)[n].Decode(&done)
+		if done.CommandID != id || done.OK || done.Error == nil || done.Error.Code != message.ErrCancelled {
+			t.Fatalf("%s: %+v", name, done)
+		}
+	}
+}
+
+// Не больше MaxConcurrent одновременно: лишняя ждёт места, срок идёт.
+func TestMaxConcurrent(t *testing.T) {
+	r := &rec{}
+	reg := New(r, logx.Discard())
+	reg.SetMaxConcurrent(1)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	active, peak := 0, 0
+	reg.Register("busy", func(ctx context.Context, _ json.RawMessage, _ io.Writer) (any, error) {
+		mu.Lock()
+		active++
+		peak = max(peak, active)
+		mu.Unlock()
+		<-release
+		mu.Lock()
+		active--
+		mu.Unlock()
+		return nil, nil
+	})
+	_ = reg.Handle(context.Background(), run("b1", "busy", `{}`))
+	_ = reg.Handle(context.Background(), run("b2", "busy", `{}`))
+	time.Sleep(50 * time.Millisecond)
+	if len(r.all(message.TypeCmdAccept)) != 2 {
+		t.Fatal("обе приняты")
+	}
+	close(release)
+	waitDone(t, r, 2)
+	if peak != 1 {
+		t.Fatalf("одновременно: %d", peak)
+	}
+	// Не дождалась места за срок — TIMEOUT.
+	hold := make(chan struct{})
+	defer close(hold)
+	holding := make(chan struct{})
+	reg.Register("hold", func(context.Context, json.RawMessage, io.Writer) (any, error) {
+		close(holding)
+		<-hold
+		return nil, nil
+	})
+	_ = reg.Handle(context.Background(), run("h1", "hold", `{}`))
+	<-holding
+	_ = reg.Handle(context.Background(), message.MustNew(message.TypeCmdRun, message.CommandRun{CommandID: "h2", Name: "hold", TimeoutSec: 1}))
+	var done message.CommandDone
+	_ = waitDone(t, r, 3)[2].Decode(&done)
+	if done.CommandID != "h2" || done.Error == nil || done.Error.Code != "TIMEOUT" {
+		t.Fatalf("ожидание места: %+v", done)
+	}
+}
+
+// Вывод режется по 64 КБ без разрыва символа UTF-8.
+func TestOutputChunksUTF8(t *testing.T) {
+	r := &rec{}
+	o := newOutput(r, "x")
+	text := "a" + strings.Repeat("ж", chunkMax) // 1 + 2·64К байт
+	_, _ = o.Write([]byte(text))
+	o.Close()
+	var joined string
+	for _, env := range r.all(message.TypeCmdOutput) {
+		var out message.CommandOutput
+		_ = env.Decode(&out)
+		if !utf8.ValidString(out.Chunk) || len(out.Chunk) > chunkMax {
+			t.Fatalf("кусок %d байт, UTF-8 %v", len(out.Chunk), utf8.ValidString(out.Chunk))
+		}
+		joined += out.Chunk
+	}
+	if joined != text {
+		t.Fatal("вывод не совпал")
 	}
 }

@@ -10,6 +10,7 @@
 - [Команда с ожиданием итога](#команда-с-ожиданием-итога)
 - [Вывод по мере работы](#вывод-по-мере-работы)
 - [Срок команды](#срок-команды)
+- [Отменить команду](#отменить-команду)
 - [Ошибки](#ошибки)
 - [Встроенные команды агента](#встроенные-команды-агента)
 - [Прочитать команды](#прочитать-команды)
@@ -86,7 +87,7 @@ worker.command("example.report.reload", async (cmd) => {
 ([workers.md](workers.md#регистрация-и-имена)).
 
 **Результат.** `Command` со `status: "pending"`, затем `running` (после `cmd.accept`), затем
-`succeeded` или `failed`; поля `output`, `result`, `error`, `finishedAt`. Событие
+`succeeded`, `failed` или `cancelled` ([отмена](#отменить-команду)); поля `output`, `result`, `error`, `finishedAt`. Событие
 `change` `{kind: "command"}` (в Node — ещё `command`).
 
 ## Команда с ожиданием итога
@@ -115,7 +116,7 @@ cmd = await agents.call("example.report.reload", agent_id=agent_id, timeout_sec=
 
 **Что уходит по сети, агент, воркер** — как у [command](#отправить-команду).
 
-**Результат** — завершённая `Command` (`succeeded` | `failed`).
+**Результат** — завершённая `Command` (`succeeded` | `failed` | `cancelled`).
 
 ## Вывод по мере работы
 
@@ -162,6 +163,8 @@ cmd.write("шаг 1 из 3\n");
 for row in rows:
     cmd.check_cancelled()       # бросит Cancelled; или проверять cmd.cancelled
     handle(row)
+if cmd.wait(2):                 # пауза, которую прерывает отмена: True — срок истёк
+    raise Cancelled(cmd.id)
 ```
 
 ```go
@@ -177,6 +180,49 @@ await fetch(url, { signal: cmd.signal }); // или проверять cmd.cance
 ```
 
 **Результат.** `status: "failed"`, `error: {code: "TIMEOUT", …}`.
+
+## Отменить команду
+
+**Бэкенд.**
+
+```ts
+const cmd = await agents.cancelCommand(id); // или agents.by(user).cancelCommand(id)
+```
+
+```go
+cmd, err := agents.CancelCommand(id) // или agents.By(user).CancelCommand(id)
+```
+
+```python
+cmd = await agents.cancel_command(command_id)  # или agents.by(user).cancel_command(…)
+```
+
+Команда сразу получает `status: "cancelled"`, `error: {code: "CANCELLED", message: "Команду
+отменили"}`, `finishedAt`; ждущие `call` возвращают её. Ошибки: `COMMAND_NOT_FOUND` (нет такой
+команды), `COMMAND_NOT_ACTIVE` (уже завершена). Аудит `command.cancel`.
+
+**Что уходит по сети** ([§6.4](../spec/README.md#64-команды-capabilitiescommands)):
+
+- команда ещё ждёт отправки агенту — ничего, сервер отменяет её у себя;
+- уже отправлена или выполняется — `cmd.cancel {commandId}` агенту, если его сессия в этом
+  процессе.
+- Сессия агента в другом процессе бэкенда — `cmd.cancel` отправит тот процесс при `refresh`
+  ([connection.md](connection.md#несколько-процессов-бэкенда)), один раз. Процесс с сессией
+  отслеживает команды, которые отправил агенту в этой сессии, и команды, которые при подключении
+  агента уже выполнялись (`running`, в том числе принятые в прошлой сессии у другого процесса);
+  при `refresh` отменённым из них он шлёт `cmd.cancel`.
+- Агент без связи в момент отмены — `cmd.cancel` не уходит: выполнявшаяся команда доработает
+  на узле до конца или до срока, её итог сервер не учтёт.
+
+**Агент** прерывает команду (команде воркера передаёт `cmd.cancel`) и присылает итог `cmd.done`
+с ошибкой `CANCELLED`. Сервер его подтверждает, но итог не меняет: команда остаётся
+`cancelled`, как и при любом позднем итоге. Поздний `cmd.output` тоже не записывается. Поздний
+итог `agent.rotateKey` новый ключ не запоминает.
+
+**Воркер** узнаёт об отмене так же, как об истёкшем сроке ([выше](#срок-команды)):
+`cmd.cancelled`, `ctx.Done()`, `cmd.signal`.
+
+**Результат.** `status: "cancelled"`, событие `change` `{kind: "command"}`.
 
 ## Ошибки
 
@@ -197,22 +243,28 @@ throw new CommandError("RELOAD_FAILED", "шаблоны повреждены");
 ```
 
 Любая другая ошибка, исключение или паника — `COMMAND_FAILED` с текстом ошибки; воркер не
-падает.
+падает. Код не по правилу (`^[A-Z0-9_]{1,64}$`) SDK заменяет на `COMMAND_FAILED`, исходный
+дописывает в начало текста. Результат, который не превращается в JSON, — `COMMAND_FAILED`;
+итог больше 16 МБ (предел строки канала с агентом) — `RESULT_TOO_LARGE`.
 
 **Результат** — `cmd.status: "failed"`, `cmd.error: {code, message}`. Коды, которые бывают:
 
-| Код                    | Кто ставит | Когда                                                           |
-| ---------------------- | ---------- | --------------------------------------------------------------- |
-| свой (`RELOAD_FAILED`) | воркер     | `CommandFailed` / `worker.CommandError` / `CommandError`        |
-| `COMMAND_FAILED`       | SDK, агент | любая другая ошибка или паника обработчика                      |
-| `COMMAND_UNKNOWN`      | агент, SDK | команды нет в списке (выключена, воркер её больше не объявляет) |
-| `WORKER_UNAVAILABLE`   | агент      | воркер, объявивший команду, сейчас не запущен                   |
-| `TIMEOUT`              | агент, SDK | срок истёк ([выше](#срок-команды))                              |
-| коды встроенных команд | агент      | [таблица ниже](#встроенные-команды-агента)                      |
+| Код                    | Кто ставит | Когда                                                                  |
+| ---------------------- | ---------- | ---------------------------------------------------------------------- |
+| свой (`RELOAD_FAILED`) | воркер     | `CommandFailed` / `worker.CommandError` / `CommandError`               |
+| `COMMAND_FAILED`       | SDK, агент | любая другая ошибка или паника обработчика                             |
+| `RESULT_TOO_LARGE`     | SDK        | итог команды больше 16 МБ                                              |
+| `COMMAND_UNKNOWN`      | агент, SDK | команды нет в списке (выключена, воркер её больше не объявляет)        |
+| `WORKER_UNAVAILABLE`   | агент      | воркер, объявивший команду, сейчас не запущен                          |
+| `TIMEOUT`              | агент, SDK | срок истёк ([выше](#срок-команды))                                     |
+| `CANCELLED`            | сервер     | команду отменил бэкенд ([выше](#отменить-команду)); статус `cancelled` |
+| коды встроенных команд | агент      | [таблица ниже](#встроенные-команды-агента)                             |
 
 Ошибки самого вызова (`command`, `call`): `MESSAGE_INVALID`, `AGENT_NOT_FOUND`,
-`COMMAND_NOT_SUPPORTED`; в Node — `AgentsError` (`code`, `status`), в Python — `AgentsError`, в
-Go — `*message.Error` (`Code`, `Message`).
+`COMMAND_NOT_SUPPORTED`; `cancelCommand` — `COMMAND_NOT_FOUND` (HTTP 404), `COMMAND_NOT_ACTIVE`
+(409); любой изменяющий вызов — `STORE_CONFLICT` (409), если запись так и не удалось записать
+([store.md](store.md#правила)). В Node и Python — `AgentsError` (`code`, `message`, `status` —
+HTTP-статус для ответа), в Go — `*message.Error` (`Code`, `Message`).
 
 ## Встроенные команды агента
 
@@ -281,7 +333,7 @@ const running = await agents.listCommands({ status: ["pending", "running"], agen
 
 ```go
 cmd, err := agents.CommandByID(id) // server.ErrNotFound — нет
-all, err := agents.Commands()      // новые первыми
+running, err := agents.Commands(server.CommandFilter{Status: server.CommandRunning, AgentID: agentID}) // новые первыми
 ```
 
 ```python
@@ -289,6 +341,10 @@ cmd = await agents.get_command(command_id)
 cmds = await agents.list_commands(status="running", agent_id=agent_id)  # новые первыми
 ```
 
+Списки читаются страницами: `limit` и `after` — id последней команды прошлой страницы (Go —
+`CommandFilter{Limit, After}`, Python — `limit=`, `after=`); команды `after` нет — страница
+пустая ([store.md](store.md#методы-по-языкам)).
+
 Поля `Command`: `id`, `agentId`, `name`, `args`, `timeoutSec`, `status` (`pending` | `running` |
-`succeeded` | `failed`), `output`, `result`, `error`, `exitCode` (код выхода из `cmd.done`),
+`succeeded` | `failed` | `cancelled`), `output`, `result`, `error`, `exitCode` (код выхода из `cmd.done`),
 `createdAt`, `finishedAt`, `actor`.

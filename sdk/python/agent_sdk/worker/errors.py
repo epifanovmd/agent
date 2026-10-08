@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Tuple
 
 
 class Cancelled(Exception):
@@ -38,6 +39,10 @@ class StateFailed(Exception):
         self.report = report
 
 
+class MessageTooLarge(ValueError):
+    """Сообщение длиннее строки канала (16 МБ): не отправлено, канал цел."""
+
+
 class AgentError(Exception):
     """Агент или сервер отклонили запрос воркера (ответ ``error``)."""
 
@@ -46,3 +51,23 @@ class AgentError(Exception):
         self.code = code
         self.message = message
         self.retryable = retryable
+
+
+#: Коды, которые выставляет SDK.
+WORKER_ERROR = "WORKER_ERROR"
+WORKER_STOPPING = "WORKER_STOPPING"
+COMMAND_FAILED = "COMMAND_FAILED"
+COMMAND_UNKNOWN = "COMMAND_UNKNOWN"
+#: Итог (результат задачи, команды, отчёт состояния) не уместился в строку канала (16 МБ).
+RESULT_TOO_LARGE = "RESULT_TOO_LARGE"
+#: Подтверждение отмены задачи: job.fail после job.cancel, когда обработчик завершился.
+CANCELLED = "CANCELLED"
+
+_CODE = re.compile(r"^[A-Z0-9_]{1,64}$")
+
+
+def normalize_code(code: Any, message: str, fallback: str) -> Tuple[str, str]:
+    """Код по схеме спецификации; негодный заменяется общим ``fallback``, исходный уходит в текст."""
+    if isinstance(code, str) and _CODE.fullmatch(code):
+        return code, message
+    return fallback, f"{code}: {message}"

@@ -1,0 +1,31 @@
+# Обновления зависимостей: раз в неделю, по одному запросу на каталог.
+version: 2
+updates:
+  # Агент и Go-SDK (go.mod в корне).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+
+  # SDK Node, примеры на Node, Prettier репозитория.
+  - package-ecosystem: npm
+    directories:
+      - /
+      - /sdk/node
+      - /examples/server
+      - /examples/web
+      - /examples/workers/node
+    schedule:
+      interval: weekly
+
+  # SDK Python: зависимостей нет, только средства сборки пакета.
+  - package-ecosystem: pip
+    directory: /sdk/python
+    schedule:
+      interval: weekly
+
+  # Действия CI и выпуска.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

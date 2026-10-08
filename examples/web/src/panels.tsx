@@ -174,10 +174,11 @@ function AgentCard({ agent: a }: { agent: Agent }) {
           ) : (
             <Badge tone={a.online ? "ok" : "bad"}>{a.online ? `на связи · ${a.transport}` : "без связи"}</Badge>
           )}
-          {a.status && <Badge tone={tone(a.status.state)}>{a.status.state}</Badge>}
+          {/* Без связи последний status устарел — состояние не показываем. */}
+          {a.online && a.status && <Badge tone={tone(a.status.state)}>{a.status.state}</Badge>}
         </div>
       </header>
-      {a.status?.message && <div className="hint warn-text">{a.status.message}</div>}
+      {a.online && a.status?.message && <div className="hint warn-text">{a.status.message}</div>}
 
       <div className="stats">
         <Stat label="CPU" value={host?.cpuPercent != null ? `${host.cpuPercent.toFixed(0)}%` : "—"} />
@@ -642,7 +643,14 @@ export function Commands({ snapshot }: { snapshot: Snapshot }) {
                 {agents.get(c.agentId)} · {fmtTime(c.createdAt)}
               </span>
             </div>
-            <Badge tone={tone(c.status)}>{c.status}</Badge>
+            <div className="row">
+              <Badge tone={tone(c.status)}>{c.status}</Badge>
+              {(c.status === "pending" || c.status === "running") && (
+                <button className="ghost danger" onClick={() => run(() => api.cancelCommand(c.id))}>
+                  Отменить
+                </button>
+              )}
+            </div>
           </header>
           {c.output && <pre className="log">{c.output.slice(-4000)}</pre>}
           {c.result !== undefined && <pre>{json(c.result)}</pre>}

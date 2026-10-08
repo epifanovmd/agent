@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from .errors import Cancelled
 
@@ -39,6 +39,15 @@ class Command:
     @property
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        """Устанавливается, когда срок команды истёк (``cmd.cancel``) или канал закрыт."""
+        return self._cancelled
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        """Подождать ``timeout`` секунд (``None`` — до отмены); ``True`` — команду отменили."""
+        return self._cancelled.wait(timeout)
 
     def check_cancelled(self) -> None:
         """Бросить ``Cancelled``, если срок команды истёк."""

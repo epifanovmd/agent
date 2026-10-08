@@ -517,11 +517,19 @@ func (r *Runtime) Run(ctx context.Context, link func(ctx context.Context) error,
 	r.Drain()
 	stopCtx, cancel := context.WithTimeout(context.Background(), stopTimeout)
 	defer cancel()
+	// Все этапы остановки — одновременно: воркеры получают SIGTERM сразу, а
+	// не после ожидания задач, и у каждого свой срок до SIGKILL.
+	var stops sync.WaitGroup
 	r.each(func(c Capability) {
 		if s, ok := c.(Stopper); ok {
-			s.Stop(stopCtx)
+			stops.Add(1)
+			go func() {
+				defer stops.Done()
+				s.Stop(stopCtx)
+			}()
 		}
 	})
+	stops.Wait()
 	wg.Wait()
 	// Последний status и досылка итогов, пока связь есть.
 	r.sendStatus()

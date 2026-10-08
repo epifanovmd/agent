@@ -11,7 +11,10 @@
 //	defer agents.Close()
 //	http.ListenAndServe(":8080", agents.Handler())
 //
-// Agents работает в одном процессе: сессии агентов живут в нём.
+// Сессии агентов живут в процессе, где агент подключён; записи (агенты,
+// задачи, команды) — в Store, общем для процессов бэкенда: каждое изменение —
+// условная запись по версии (Store), так процессы не затирают изменения друг
+// друга.
 package server
 
 import (
@@ -30,6 +33,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/epifanovmd/agent/sdk/go/message"
 )
@@ -38,9 +42,9 @@ import (
 type Options struct {
 	// EnrollToken — токен регистрации агентов (если не задан Enroll).
 	EnrollToken string
-	// Enroll — своя проверка токена регистрации: ok == false — отказ; labels
-	// добавляются к меткам агента.
-	Enroll func(token string) (labels map[string]string, ok bool)
+	// Enroll — своя проверка регистрации: токен и что агент сообщил о себе
+	// (EnrollInfo); ok == false — отказ; labels добавляются к меткам агента.
+	Enroll func(token string, info EnrollInfo) (labels map[string]string, ok bool)
 	// Store — хранилище (по умолчанию MemoryStore).
 	Store Store
 	// Files — провайдер файлов задач (по умолчанию MemoryFiles).
@@ -73,10 +77,12 @@ type Options struct {
 	// PublicKey — ключ проверки релизов (base64); подставляется в install.sh.
 	PublicKey string
 	// PublicURL — адрес сервера для ссылок на файлы и install.sh; пусто — из
-	// запроса (Host, X-Forwarded-Proto).
+	// запроса (Host и TLS; при TrustProxy — X-Forwarded-Host и X-Forwarded-Proto).
 	PublicURL string
-	// TrustProxy — сервер за доверенным прокси: адрес агента (Agent.Address) —
-	// первый из X-Forwarded-For; иначе заголовок не учитывается.
+	// TrustProxy — сервер за доверенным прокси: адрес клиента (Agent.Address,
+	// счёт неудачных регистраций) — первый из X-Forwarded-For, адрес сервера из
+	// запроса — по X-Forwarded-Host и X-Forwarded-Proto; иначе эти заголовки
+	// не учитываются.
 	TrustProxy bool
 	// Log — лог (по умолчанию slog.Default()).
 	Log *slog.Logger
@@ -107,7 +113,8 @@ type Options struct {
 	// каждое начало и конец — одно событие. Вызывается вне блокировки Agents
 	// (не блокировать), можно вызывать методы Agents.
 	OnAlert func(Alert)
-	// EnrollFailureLimit — неудачных регистраций с одного адреса за
+	// EnrollFailureLimit — неудачных регистраций с одного адреса (как
+	// Agent.Address: при TrustProxy — из X-Forwarded-For) за
 	// EnrollFailureWindow, после которых регистрация с него отклоняется (429
 	// ENROLL_RATE_LIMITED, Retry-After), пока окно не пройдёт. 0 — по
 	// умолчанию 10, отрицательное — без ограничения.
@@ -148,21 +155,19 @@ type Agents struct {
 	mu        sync.Mutex
 	publicURL string
 	sessions  map[string]*session // agentId → текущая сессия
-	streams   map[string]*stream  // agentId → поток (bootId, последний seq)
 	seen      map[string]bool     // id принятых event (повтор — идемпотентно)
 	seenOrder []string
 	waiters   map[string][]chan struct{} // commandId → ждущие Call
 	kick      chan struct{}              // закрывается Refresh: ждущие Call перечитывают Store
-	offline   map[string]*time.Timer     // agentId → отложенный переход в offline
+	offline   map[string]*offlineTimer   // agentId → отложенный переход в offline
 	stored    map[string]int64           // agentId → At последней сохранённой точки метрик
 	lastPrune time.Time                  // последняя чистка истории метрик
 	changes   []Change
-	points    []agentPoint       // сохранённые точки метрик для OnMetrics
-	deleted   []stateKey         // удалённые снимки для OnStateDeleted
-	audits    []AuditEntry       // записи аудита для OnAudit
-	alerts    map[alertKey]Alert // активные уведомления о проблемах
-	alertQ    []Alert            // начала и концы проблем для OnAlert
-	logs      []agentLog         // пачки записей лога для OnLog
+	points    []agentPoint // сохранённые точки метрик для OnMetrics
+	deleted   []stateKey   // удалённые снимки для OnStateDeleted
+	audits    []AuditEntry // записи аудита для OnAudit
+	alertQ    []Alert      // начала и концы проблем для OnAlert
+	logs      []agentLog   // пачки записей лога для OnLog
 	closed    bool
 
 	// enrollFails — адрес клиента → времена неудачных регистраций в окне.
@@ -171,12 +176,6 @@ type Agents struct {
 
 	stop      chan struct{}
 	closeOnce sync.Once
-}
-
-// stream — поток агента в пределах запуска (§4): повтор seq ≤ последнего — только ack.
-type stream struct {
-	bootID  string
-	lastSeq int64
 }
 
 // New — сервер агентов (Agents); фоновая работа (аренды, сроки команд, HTTP-сессии) — до Close.
@@ -220,13 +219,11 @@ func New(opts Options) *Agents {
 		offlineGrace: opts.OfflineGrace, pruneInterval: pruneInterval,
 		publicURL:   opts.PublicURL,
 		sessions:    map[string]*session{},
-		streams:     map[string]*stream{},
 		seen:        map[string]bool{},
 		waiters:     map[string][]chan struct{}{},
 		kick:        make(chan struct{}),
-		offline:     map[string]*time.Timer{},
+		offline:     map[string]*offlineTimer{},
 		stored:      map[string]int64{},
-		alerts:      map[alertKey]Alert{},
 		enrollFails: map[string][]time.Time{},
 		stop:        make(chan struct{}),
 	}
@@ -262,7 +259,7 @@ func (a *Agents) Close() {
 		}
 		// Отложенные переходы в offline — сразу: Agents больше ничего не ждёт.
 		for agentID := range a.offline {
-			a.setOffline(agentID)
+			a.setOffline(agentID, now())
 		}
 		a.unlock()
 	})
@@ -359,24 +356,64 @@ func marshalAny(v any) (json.RawMessage, error) {
 
 // ─── регистрация и учётные данные (§5) ─────────────────────────────────
 
+// Пределы регистрации (POST enroll).
+const (
+	enrollBodyLimit = 64 << 10 // тело запроса, байт
+	enrollNameMax   = 128      // символов в name
+	enrollLabelsMax = 64       // меток
+	enrollLabelMax  = 256      // символов в ключе и значении метки
+)
+
+// EnrollInfo — что агент сообщил о себе при регистрации: имя, метки и
+// сведения об узле (host из запроса регистрации, как есть).
+type EnrollInfo struct {
+	Name   string
+	Labels map[string]string
+	Host   json.RawMessage
+}
+
+// validEnroll — проверка запроса регистрации: token и name — непустые, name
+// не длиннее 128 символов, меток не больше 64, ключ метки — непустой, ключ и
+// значение — не длиннее 256 символов.
+func validEnroll(token string, info EnrollInfo) error {
+	if token == "" || info.Name == "" {
+		return protoErr("MESSAGE_INVALID", "Нужны token и name")
+	}
+	if utf8.RuneCountInString(info.Name) > enrollNameMax {
+		return protoErr("MESSAGE_INVALID", fmt.Sprintf("name длиннее %d символов", enrollNameMax))
+	}
+	if len(info.Labels) > enrollLabelsMax {
+		return protoErr("MESSAGE_INVALID", fmt.Sprintf("Меток больше %d", enrollLabelsMax))
+	}
+	for k, v := range info.Labels {
+		if k == "" || utf8.RuneCountInString(k) > enrollLabelMax || utf8.RuneCountInString(v) > enrollLabelMax {
+			return protoErr("MESSAGE_INVALID",
+				fmt.Sprintf("Ключ метки — непустой, ключ и значение — не длиннее %d символов", enrollLabelMax))
+		}
+	}
+	return nil
+}
+
 // Enroll — регистрация агента по токену: учётные данные (в хранилище —
-// sha256 секрета).
-func (a *Agents) Enroll(token, name string, labels map[string]string) (agentID, secret string, err error) {
-	if name == "" {
-		return "", "", protoErr("MESSAGE_INVALID", "Нужны token и name")
+// sha256 секрета). Запрос не по правилам (validEnroll) — MESSAGE_INVALID,
+// токен неверен — AGENT_ENROLLMENT_TOKEN_INVALID.
+func (a *Agents) Enroll(token string, info EnrollInfo) (agentID, secret string, err error) {
+	if err := validEnroll(token, info); err != nil {
+		return "", "", err
 	}
 	var extra map[string]string
 	switch {
 	case a.opts.Enroll != nil:
 		var ok bool
-		if extra, ok = a.opts.Enroll(token); !ok {
+		hook := EnrollInfo{Name: info.Name, Labels: maps.Clone(info.Labels), Host: slices.Clone(info.Host)}
+		if extra, ok = a.opts.Enroll(token, hook); !ok {
 			return "", "", protoErr("AGENT_ENROLLMENT_TOKEN_INVALID", "Токен регистрации неверен")
 		}
 	case a.opts.EnrollToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(a.opts.EnrollToken)) == 1:
 	default:
 		return "", "", protoErr("AGENT_ENROLLMENT_TOKEN_INVALID", "Токен регистрации неверен")
 	}
-	merged := maps.Clone(labels)
+	merged := maps.Clone(info.Labels)
 	if merged == nil {
 		merged = map[string]string{}
 	}
@@ -389,23 +426,21 @@ func (a *Agents) Enroll(token, name string, labels map[string]string) (agentID, 
 	_, _ = rand.Read(raw[:])
 	secret = hex.EncodeToString(raw[:])
 	agent := &Agent{
-		ID: newID(), Name: name, Labels: merged, GrantedLabels: granted, EnrolledAt: now(),
+		ID: newID(), Name: info.Name, Labels: merged, GrantedLabels: granted, EnrolledAt: now(),
 		StateApplied: map[string]message.StateApplied{}, SecretHash: hashSecret(secret),
 	}
-	a.mu.Lock()
-	err = a.store.CreateAgent(agent)
-	if err == nil {
-		a.emit(ChangeAgent, agent.ID)
-	}
-	a.unlock()
-	if err != nil {
+	if err := a.store.CreateAgent(agent); err != nil {
 		return "", "", err
 	}
-	a.log.Info("агент зарегистрирован", "agent", name, "id", agent.ID)
+	a.mu.Lock()
+	a.emit(ChangeAgent, agent.ID)
+	a.unlock()
+	a.log.Info("агент зарегистрирован", "agent", info.Name, "id", agent.ID)
 	return agent.ID, secret, nil
 }
 
-// authenticate — агент по `Authorization: Agent <id>.<secret>`.
+// authenticate — агент по `Authorization: Agent <id>.<secret>`. Без a.mu:
+// только Store.
 func (a *Agents) authenticate(header string) (string, bool) {
 	raw, ok := strings.CutPrefix(header, "Agent ")
 	if !ok {
@@ -416,8 +451,6 @@ func (a *Agents) authenticate(header string) (string, bool) {
 		return "", false
 	}
 	hash := []byte(hashSecret(secret))
-	a.mu.Lock()
-	defer a.unlock()
 	agent, err := a.store.GetAgent(id)
 	if err != nil || agent.SecretHash == "" || agent.Revoked {
 		return "", false
@@ -426,12 +459,31 @@ func (a *Agents) authenticate(header string) (string, bool) {
 		return id, true
 	}
 	// Новый секрет после RotateKey: агент подключился с ним — он основной.
-	if agent.PendingSecretHash == "" || subtle.ConstantTimeCompare(hash, []byte(agent.PendingSecretHash)) != 1 {
+	pending := func(ag *Agent) bool {
+		return !ag.Revoked && ag.PendingSecretHash != "" && subtle.ConstantTimeCompare(hash, []byte(ag.PendingSecretHash)) == 1
+	}
+	if !pending(agent) {
 		return "", false
 	}
-	agent.SecretHash, agent.PendingSecretHash = agent.PendingSecretHash, ""
-	if err := a.store.UpdateAgent(agent); err != nil {
+	var current bool // секрет уже стал основным (другой запрос успел раньше)
+	agent, written, err := a.mutateAgent(id, func(ag *Agent) bool {
+		if current = !ag.Revoked && subtle.ConstantTimeCompare(hash, []byte(ag.SecretHash)) == 1; current {
+			return false
+		}
+		if !pending(ag) {
+			return false
+		}
+		ag.SecretHash, ag.PendingSecretHash = ag.PendingSecretHash, ""
+		return true
+	})
+	if err != nil {
 		a.log.Error("новый секрет агента не сохранён", "agent", id, "err", err)
+		return "", false
+	}
+	if current {
+		return id, true
+	}
+	if !written {
 		return "", false
 	}
 	a.log.Info("агент перешёл на новый секрет", "agent", agent.Name)
@@ -505,31 +557,36 @@ func (a *Agents) StopJob(id string) error { return a.signalJob("", id, true) }
 func (a *Agents) signalJob(actor, id string, stop bool) error {
 	a.mu.Lock()
 	defer a.unlock()
-	job, err := a.store.GetJob(id)
+	var active bool
+	var wasRunning bool
+	job, _, err := a.mutateJob(id, func(j *Job) bool {
+		if active = j.Status == JobQueued || j.Status == JobRunning; !active {
+			return false
+		}
+		wasRunning = j.Status == JobRunning
+		if stop && wasRunning {
+			j.StopRequested = true
+		} else {
+			j.Status, j.FinishedAt = JobCancelled, now()
+		}
+		return true
+	})
 	if errors.Is(err, ErrNotFound) {
 		return protoErr("JOB_NOT_FOUND", "Задача не найдена")
 	}
 	if err != nil {
 		return err
 	}
-	if job.Status != JobQueued && job.Status != JobRunning {
+	if !active {
 		return protoErr("JOB_NOT_ACTIVE", "Задача уже завершена")
 	}
-	ss := a.sessions[job.AgentID]
-	if stop && job.Status == JobRunning {
-		job.StopRequested = true
-		if ss != nil {
+	if ss := a.sessions[job.AgentID]; ss != nil && wasRunning {
+		if stop {
 			ss.send(message.TypeJobStop, job.Ref(), "")
-		}
-	} else {
-		if ss != nil && job.Status == JobRunning {
+		} else {
 			delete(ss.pending, job.ID)
 			ss.send(message.TypeJobCancel, job.Ref(), "")
 		}
-		job.Status, job.FinishedAt = JobCancelled, now()
-	}
-	if err := a.store.UpdateJob(job); err != nil {
-		return err
 	}
 	a.emit(ChangeJob, job.ID)
 	action := AuditJobCancel
@@ -541,18 +598,11 @@ func (a *Agents) signalJob(actor, id string, stop bool) error {
 }
 
 // Job — задача по id (ErrNotFound — нет).
-func (a *Agents) Job(id string) (*Job, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.store.GetJob(id)
-}
+func (a *Agents) Job(id string) (*Job, error) { return a.store.GetJob(id) }
 
-// Jobs — задачи, новые первыми.
-func (a *Agents) Jobs() ([]*Job, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.store.ListJobs(JobFilter{})
-}
+// Jobs — задачи по фильтру (пустой — все), новые первыми; Limit и After —
+// постранично (JobFilter).
+func (a *Agents) Jobs(f JobFilter) ([]*Job, error) { return a.store.ListJobs(f) }
 
 // Command — поручить команду агенту (пусто — агенту на связи, объявившему
 // её; нет такого — COMMAND_NOT_SUPPORTED). Доставка — когда агент на связи и
@@ -588,7 +638,7 @@ func (a *Agents) newCommand(actor string, req CommandRequest, audit func(*Comman
 		}
 		var capable []*Agent
 		for _, agent := range list {
-			if declaresCommand(agent.Capabilities, req.Name) {
+			if !agent.Revoked && declaresCommand(agent.Capabilities, req.Name) {
 				capable = append(capable, agent)
 			}
 		}
@@ -684,17 +734,49 @@ func (a *Agents) callKick() <-chan struct{} {
 }
 
 // CommandByID — команда по id (ErrNotFound — нет).
-func (a *Agents) CommandByID(id string) (*Command, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.store.GetCommand(id)
-}
+func (a *Agents) CommandByID(id string) (*Command, error) { return a.store.GetCommand(id) }
 
-// Commands — команды, новые первыми.
-func (a *Agents) Commands() ([]*Command, error) {
+// Commands — команды по фильтру (пустой — все), новые первыми; Limit и After
+// — постранично (CommandFilter).
+func (a *Agents) Commands(f CommandFilter) ([]*Command, error) { return a.store.ListCommands(f) }
+
+// CancelCommand — отменить незавершённую команду: статус cancelled, ошибка
+// CANCELLED. Команду уже отправили агенту или она выполняется — агенту
+// cmd.cancel (если его сессия в этом процессе; иначе — процессу с сессией
+// при Refresh); ждущую, ещё не отправленную — без сообщения. Итог агента после
+// отмены не учитывается. Нет команды — COMMAND_NOT_FOUND, завершена —
+// COMMAND_NOT_ACTIVE.
+func (a *Agents) CancelCommand(id string) (*Command, error) { return a.cancelCommand("", id) }
+
+func (a *Agents) cancelCommand(actor, id string) (*Command, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.store.ListCommands(CommandFilter{})
+	defer a.unlock()
+	var finished, wasRunning bool
+	cmd, _, err := a.mutateCommand(id, func(c *Command) bool {
+		if finished = c.Finished(); finished {
+			return false
+		}
+		wasRunning = c.Status == CommandRunning
+		c.Status, c.FinishedAt = CommandCancelled, now()
+		c.Error = &message.CommandError{Code: "CANCELLED", Message: "Команду отменили"}
+		return true
+	})
+	if errors.Is(err, ErrNotFound) {
+		return nil, protoErr("COMMAND_NOT_FOUND", "Команда не найдена")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if finished {
+		return nil, protoErr("COMMAND_NOT_ACTIVE", "Команда уже завершена")
+	}
+	if ss := a.sessions[cmd.AgentID]; ss != nil && (ss.sent[id] || wasRunning) {
+		delete(ss.sent, id)
+		ss.send(message.TypeCmdCancel, message.CommandRef{CommandID: id}, "")
+	}
+	a.commandSaved(cmd)
+	a.audit(actor, AuditCommandCancel, cmd.AgentID, id, nil)
+	return cmd.Clone(), nil
 }
 
 // SetState — новый снимок домена: общий (agentID == "") или для агента
@@ -820,8 +902,6 @@ func (a *Agents) StateHistory(domain, agentID string, limit int) ([]*DesiredStat
 	if limit <= 0 {
 		limit = 20
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	h, err := a.store.ListStateHistory(domain, agentID, limit)
 	if h == nil && err == nil {
 		h = []*DesiredState{}
@@ -864,32 +944,16 @@ func (a *Agents) rollbackState(actor, domain string, version int64, agentID stri
 }
 
 // States — снимки доменов.
-func (a *Agents) States() ([]*DesiredState, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.store.ListStates()
-}
+func (a *Agents) States() ([]*DesiredState, error) { return a.store.ListStates() }
 
 // List — агенты в порядке регистрации.
-func (a *Agents) List() ([]*Agent, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.store.ListAgents()
-}
+func (a *Agents) List() ([]*Agent, error) { return a.store.ListAgents() }
 
 // Agent — агент по id (ErrNotFound — нет).
-func (a *Agents) Agent(id string) (*Agent, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.store.GetAgent(id)
-}
+func (a *Agents) Agent(id string) (*Agent, error) { return a.store.GetAgent(id) }
 
 // Events — последние n событий агентов и воркеров (n ≤ 0 — все), новые первыми.
-func (a *Agents) Events(n int) ([]AgentEvent, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.store.ListEvents(n)
-}
+func (a *Agents) Events(n int) ([]AgentEvent, error) { return a.store.ListEvents(n) }
 
 // ─── фоновая работа ────────────────────────────────────────────────────
 
@@ -939,13 +1003,18 @@ func (a *Agents) sweep() {
 	if err != nil {
 		a.log.Error("задачи не прочитаны", "err", err)
 	}
+	requeued := false
 	for _, job := range jobs {
-		if ts > job.LeaseUntil {
-			// Агент на связи, но задачу не перечисляет: её заберут — прервать.
-			if ss := a.sessions[job.AgentID]; ss != nil {
-				ss.send(message.TypeJobCancel, job.Ref(), "")
-			}
-			a.failAttempt(job, "LEASE_EXPIRED", "Агент перестал отвечать: аренда истекла", true)
+		if ts <= job.LeaseUntil {
+			continue
+		}
+		// Условие — по свежей записи: аренду мог продлить другой процесс.
+		_, failed, again, _ := a.failAttempt(job.AgentID, job.Ref(), "LEASE_EXPIRED", "Агент перестал отвечать: аренда истекла", true,
+			func(j *Job) bool { return ts > j.LeaseUntil })
+		requeued = requeued || again
+		// Агент на связи, но задачу не перечисляет: её забрали — прервать.
+		if ss := a.sessions[job.AgentID]; ss != nil && failed {
+			ss.send(message.TypeJobCancel, job.Ref(), "")
 		}
 	}
 	for _, status := range []string{CommandPending, CommandRunning} {
@@ -955,10 +1024,22 @@ func (a *Agents) sweep() {
 		}
 		for _, cmd := range cmds {
 			// Запас 15 с: итог агента с TIMEOUT приходит сам, здесь — если агент пропал.
-			if ts > cmd.CreatedAt+int64(cmd.TimeoutSec)*1000+commandGrace.Milliseconds() {
-				cmd.Status, cmd.FinishedAt = CommandFailed, ts
-				cmd.Error = &message.CommandError{Code: "TIMEOUT", Message: "Нет итога от агента"}
-				a.saveCommand(cmd)
+			deadline := func(c *Command) int64 {
+				return c.CreatedAt + int64(c.TimeoutSec)*1000 + commandGrace.Milliseconds()
+			}
+			if ts <= deadline(cmd) {
+				continue
+			}
+			fresh, written, _ := a.mutateCommand(cmd.ID, func(c *Command) bool {
+				if c.Finished() || ts <= deadline(c) {
+					return false
+				}
+				c.Status, c.FinishedAt = CommandFailed, ts
+				c.Error = &message.CommandError{Code: "TIMEOUT", Message: "Нет итога от агента"}
+				return true
+			})
+			if written {
+				a.commandSaved(fresh)
 			}
 		}
 	}
@@ -970,14 +1051,13 @@ func (a *Agents) sweep() {
 		a.expireSubscriptions(ss, ts)
 	}
 	a.sweepOffline(ts)
+	if requeued {
+		a.dispatchJobs()
+	}
 }
 
-// saveCommand — сохранить команду; завершённая будит Call.
-func (a *Agents) saveCommand(cmd *Command) {
-	if err := a.store.UpdateCommand(cmd); err != nil {
-		a.log.Error("команда не сохранена", "command", cmd.ID, "err", err)
-		return
-	}
+// commandSaved — команда записана: уведомление; завершённая будит Call. Под a.mu.
+func (a *Agents) commandSaved(cmd *Command) {
 	a.emit(ChangeCommand, cmd.ID)
 	if cmd.Finished() {
 		for _, c := range a.waiters[cmd.ID] {

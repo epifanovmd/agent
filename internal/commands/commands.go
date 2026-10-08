@@ -1,6 +1,8 @@
 // Package commands — возможность `commands`: белый список команд агента.
 // Команда принимается (cmd.accept), её вывод уходит потоком (cmd.output),
 // итог — надёжно (cmd.done). Повторная доставка той же команды не выполняется.
+// Одновременно выполняется не больше MaxConcurrent команд; cmd.cancel
+// прерывает команду (итог CANCELLED).
 package commands
 
 import (
@@ -13,6 +15,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/epifanovmd/agent/sdk/go/message"
 )
@@ -48,6 +51,16 @@ const outputFlush = 250 * time.Millisecond
 
 const chunkMax = 64 * 1024
 
+// DefaultMaxConcurrent — команд одновременно по умолчанию.
+const DefaultMaxConcurrent = 8
+
+// lateGrace — сколько после срока или отмены ждать, пока обработчик вернётся,
+// прежде чем отправить итог без него.
+var lateGrace = 5 * time.Second
+
+// errCancelled — причина отмены контекста команды по cmd.cancel.
+var errCancelled = errors.New("команда отменена сервером")
+
 // Registry — команды агента.
 type Registry struct {
 	sender   Sender
@@ -55,11 +68,30 @@ type Registry struct {
 	mu       sync.Mutex
 	handlers map[string]Handler
 	seen     map[string]time.Time
+	// running — выполняющиеся и ждущие очереди команды: commandId → отмена.
+	running map[string]context.CancelCauseFunc
+	// slots — места для одновременных команд; limit — их число.
+	slots chan struct{}
+	limit int
 }
 
 // New — пустой реестр.
 func New(sender Sender, log *slog.Logger) *Registry {
-	return &Registry{sender: sender, log: log, handlers: map[string]Handler{}, seen: map[string]time.Time{}}
+	return &Registry{sender: sender, log: log, handlers: map[string]Handler{}, seen: map[string]time.Time{},
+		running: map[string]context.CancelCauseFunc{}, slots: make(chan struct{}, DefaultMaxConcurrent), limit: DefaultMaxConcurrent}
+}
+
+// SetMaxConcurrent — команд одновременно не больше n (остальные ждут); для
+// команд, принятых после вызова.
+func (r *Registry) SetMaxConcurrent(n int) {
+	if n <= 0 {
+		n = DefaultMaxConcurrent
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n != r.limit {
+		r.slots, r.limit = make(chan struct{}, n), n
+	}
 }
 
 // Register — добавить команду.
@@ -109,9 +141,23 @@ func (r *Registry) Declare(caps *message.Capabilities) {
 	caps.Commands = &message.CommandsCapability{Names: r.Names()}
 }
 
-func (r *Registry) Handles() []string { return []string{message.TypeCmdRun} }
+func (r *Registry) Handles() []string { return []string{message.TypeCmdRun, message.TypeCmdCancel} }
 
 func (r *Registry) Handle(_ context.Context, env message.Envelope) error {
+	if env.Type == message.TypeCmdCancel {
+		var ref message.CommandRef
+		if err := env.Decode(&ref); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		cancel := r.running[ref.CommandID]
+		r.mu.Unlock()
+		if cancel != nil {
+			r.log.Info("команда отменена сервером", "commandId", ref.CommandID)
+			cancel(errCancelled)
+		}
+		return nil
+	}
 	var run message.CommandRun
 	if err := env.Decode(&run); err != nil {
 		return err
@@ -129,30 +175,75 @@ func (r *Registry) Handle(_ context.Context, env message.Envelope) error {
 	}
 	r.seen[run.CommandID] = now
 	h := r.handlers[run.Name]
-	r.mu.Unlock()
-
-	r.sender.Stream(message.TypeCmdAccept, message.CommandRef{CommandID: run.CommandID})
-	go r.execute(run, h)
-	return nil
-}
-
-func (r *Registry) execute(run message.CommandRun, h Handler) {
 	timeout := time.Duration(run.TimeoutSec) * time.Second
 	if timeout <= 0 {
 		timeout = time.Minute
 	}
-	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), idKey{}, run.CommandID), timeout)
-	defer cancel()
+	base, cancel := context.WithCancelCause(context.WithValue(context.Background(), idKey{}, run.CommandID))
+	ctx, stop := context.WithTimeout(base, timeout)
+	r.running[run.CommandID] = cancel
+	slots := r.slots
+	r.mu.Unlock()
 
+	r.sender.Stream(message.TypeCmdAccept, message.CommandRef{CommandID: run.CommandID})
+	go func() {
+		defer func() {
+			stop()
+			cancel(nil)
+			r.mu.Lock()
+			delete(r.running, run.CommandID)
+			r.mu.Unlock()
+		}()
+		r.execute(ctx, slots, run, h)
+	}()
+	return nil
+}
+
+// execute — дождаться места, выполнить и отправить итог. Срок или отмена —
+// итог TIMEOUT или CANCELLED, даже если обработчик не вернулся за lateGrace.
+func (r *Registry) execute(ctx context.Context, slots chan struct{}, run message.CommandRun, h Handler) {
 	out := newOutput(r.sender, run.CommandID)
 	var result any
 	var err error
-	if h == nil {
-		err = Errorf("COMMAND_UNKNOWN", "Команда %s не поддерживается", run.Name)
-	} else {
-		result, err = safe(ctx, h, run.Args, out)
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+		if h == nil {
+			err = Errorf("COMMAND_UNKNOWN", "Команда %s не поддерживается", run.Name)
+			break
+		}
+		type ret struct {
+			result any
+			err    error
+		}
+		done := make(chan ret, 1)
+		go func() {
+			res, err := safe(ctx, h, run.Args, out)
+			done <- ret{res, err}
+		}()
+		select {
+		case res := <-done:
+			result, err = res.result, res.err
+		case <-ctx.Done():
+			select {
+			case res := <-done:
+				result, err = res.result, res.err
+			case <-time.After(lateGrace):
+				r.log.Warn("команда не вернулась после срока или отмены — итог без неё", "name", run.Name)
+			}
+		}
+	case <-ctx.Done():
+		// Не дождалась места.
 	}
 	out.Close()
+	if ctx.Err() != nil {
+		if errors.Is(context.Cause(ctx), errCancelled) {
+			err = Errorf(message.ErrCancelled, "Команда отменена")
+		} else if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			err = context.DeadlineExceeded
+		}
+		result = nil
+	}
 
 	done := message.CommandDone{CommandID: run.CommandID, OK: err == nil}
 	if err != nil {
@@ -203,7 +294,7 @@ func (o *output) Write(p []byte) (int, error) {
 	}
 	o.buf = append(o.buf, p...)
 	for len(o.buf) >= chunkMax {
-		o.flushLocked(chunkMax)
+		o.flushLocked(runeBoundary(o.buf, chunkMax))
 	}
 	if len(o.buf) > 0 && o.timer == nil {
 		o.timer = time.AfterFunc(outputFlush, func() {
@@ -214,6 +305,19 @@ func (o *output) Write(p []byte) (int, error) {
 		})
 	}
 	return len(p), nil
+}
+
+// runeBoundary — не больше n байт b без разрыва символа UTF-8.
+func runeBoundary(b []byte, n int) int {
+	if n >= len(b) {
+		return len(b)
+	}
+	for k := n; k > n-utf8.UTFMax && k > 0; k-- {
+		if utf8.RuneStart(b[k]) {
+			return k
+		}
+	}
+	return n
 }
 
 func (o *output) flushLocked(n int) {
