@@ -1,0 +1,44 @@
+[project]
+name = "agent-sdk"
+version = "1.1.0"
+description = "SDK агента на Python: воркер на узле (agent_sdk.worker) и сервер для агентов (agent_sdk.server), без зависимостей"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "epifanovmd"}]
+keywords = ["agent", "worker", "websocket", "fleet", "sdk"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Адаптер agent_sdk.server.websockets_adapter (необязательно: Agents работает с любым WebSocket).
+websockets = ["websockets>=13"]
+# agents.seal — запечатывание секретов состояния (X25519 + HKDF + AES-GCM); без пакета seal бросает AgentsError.
+crypto = ["cryptography>=42"]
+
+[project.urls]
+Homepage = "https://github.com/epifanovmd/agent"
+Repository = "https://github.com/epifanovmd/agent"
+Issues = "https://github.com/epifanovmd/agent/issues"
+
+[build-system]
+# license как SPDX-выражение и license-files (PEP 639) — setuptools ≥ 77.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agent_sdk*"]

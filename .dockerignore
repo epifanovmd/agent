@@ -1,0 +1,13 @@
+.git
+.dev
+.idea
+.claude
+CLAUDE.md
+.venv
+**/.venv
+**/.DS_Store
+**/dist
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/*.egg-info

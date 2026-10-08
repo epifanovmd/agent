@@ -1,0 +1,49 @@
+{
+  "event@agent": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "event",
+      "id": "5d1f0c1e-3b0a-4c7e-9a51-2f4b8f0c9e11",
+      "ts": 1791380000600,
+      "data": {
+        "source": "report",
+        "type": "listener.changed",
+        "data": {
+          "listener": "http",
+          "status": "up"
+        }
+      }
+    }
+  },
+  "event@worker": {
+    "from": "worker",
+    "to": "agent",
+    "message": {
+      "type": "event",
+      "ts": 1791380000600,
+      "data": {
+        "type": "listener.changed",
+        "data": {
+          "listener": "http",
+          "status": "up"
+        }
+      }
+    }
+  },
+  "telemetry": {
+    "from": "worker",
+    "to": "agent",
+    "message": {
+      "type": "telemetry",
+      "ts": 1791380000700,
+      "data": {
+        "channel": "example.app",
+        "data": {
+          "connections": 3,
+          "rxBytes": 1024
+        }
+      }
+    }
+  }
+}

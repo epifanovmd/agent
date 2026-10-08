@@ -1,0 +1,94 @@
+{
+  "_comment": "ТЕСТОВАЯ пара ключей агента (не использовать вне тестов) и значения, запечатанные её открытым ключом. samples[].sealed раскрывается в samples[].value; snapshot.spec — в snapshot.unsealed; wrongKey запечатан другим ключом и не раскрывается.",
+  "agentKey": {
+    "privateKey": "YDQdC17E/AWklrXnKtQVCOHyWnkJQADkXoWrlp2vQQQ=",
+    "publicKey": "StNcZMfyPuPFV8lWznuO4l79fStVpUhS6BZHn0OKlD0="
+  },
+  "samples": [
+    {
+      "sealed": {
+        "$sealed": "v1.IVsTmmQWNkqNoYdbj3qZGCV2GijJ0vcbUpbnj0r02DI.Ls_-pXMgF8U1-p5r.VLZZqwRh2aSDmvmGJX19hD-3v0upN_UU"
+      },
+      "value": "s3cr3t"
+    },
+    {
+      "sealed": {
+        "$sealed": "v1.UQFC6Hm3ejUyr8IqH9Os_ouHHHdyXxxj0FDjuQF_Ji0.7E3wNvA9gs4rXlKo.awx9BT48FJyBaep3q0j-2sFaKnO_WOHhBMJpPXqJkFHGYxjggixe87YUQltVvqmIcjaU1VElhgk3yGcNLQm-OjqnMyQ"
+      },
+      "value": {
+        "password": "p@ss<&>",
+        "user": "admin"
+      }
+    },
+    {
+      "sealed": {
+        "$sealed": "v1.r61Pza_XeFB9WJDGEbfk-J6GG3AVOEKS3MucufG1eGg.iFFgNYBI6Z0Q-LJT.iYwzqfOXApx2VbRSUoT5CMmz"
+      },
+      "value": 42
+    },
+    {
+      "sealed": {
+        "$sealed": "v1.kPx2CzFz_OQ0je4lC5KMvi3BLEtjKYHo6VZKG_mPlTA.f0MRNzCNYiFlrf11.DgGF36HKgdreUezkJPLMj_PwfKK8DKXDW2-NwMJDvbPL"
+      },
+      "value": [1, "два", null]
+    },
+    {
+      "sealed": {
+        "$sealed": "v1.ZYr0EAv-KcyawDiHNKzczsuq9sVOgqHabL-LZlUe7mg.dsuVQdxvQy_a_q2q.R_T2vSQID5DCK-pkPnfuaIgdU_Q"
+      },
+      "value": null
+    },
+    {
+      "sealed": {
+        "$sealed": "v1.cLnlz9C-juX8ueBkaCZ5DSrbhWZPbWcbKxfEGWnXeUI.Pl1LMsd5oN0VGNid.gxCvNIlF3vj4J8i_SU1e8T-uFeY"
+      },
+      "value": true
+    }
+  ],
+  "snapshot": {
+    "spec": {
+      "db": {
+        "$sealed": "v1.y-FEsQWEeWglvQuUrM3M8kjGK7rYftdTVVYHWDO8VUY.A9EFIc_SDhvNp3TQ.oJ1rzOFQMqWGlZMTQkcenodoG6YfkUceYgHE3xKBwxBx6cc7sfHuBgBL335K9w"
+      },
+      "peers": [
+        {
+          "name": "a",
+          "port": 8080,
+          "privateKey": {
+            "$sealed": "v1._oDJPY-mNuWVgx37KUMDk1gcZxumfp0ZPvw5rOQe0Ao.fuLKW0PkGARoPp7a.G6LLnGFZMCm4apgKVyGCyTBf5dniayE"
+          }
+        },
+        {
+          "name": "b",
+          "port": 8081,
+          "privateKey": {
+            "$sealed": "v1.h-APmSLetMhTPh703PhQ6K3ip4W36_FSLo25Ft53NEU.e_58fja9fWmT5yqu.L3rf-rm7s25ptnKLd5WJ6pyQw57OtQY"
+          }
+        }
+      ],
+      "public": "открыто"
+    },
+    "unsealed": {
+      "db": {
+        "password": "pw",
+        "user": "app"
+      },
+      "peers": [
+        {
+          "name": "a",
+          "port": 8080,
+          "privateKey": "key-a"
+        },
+        {
+          "name": "b",
+          "port": 8081,
+          "privateKey": "key-b"
+        }
+      ],
+      "public": "открыто"
+    }
+  },
+  "wrongKey": {
+    "$sealed": "v1.n5EwXXDtKg93W6IT5EW1vroNLDMGaUTx66egi4JRXHk.PMmobo7Y-_O_Slda.gWyfkmtlthMMYDzos0R8_iQmhZ0BwpC36PxM5A"
+  }
+}

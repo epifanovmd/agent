@@ -1,0 +1,8 @@
+# Сборки, зависимости, файлы, которые генерируют инструменты
+node_modules/
+dist/
+**/dist/
+package-lock.json
+go.sum
+.idea/
+.dev/

@@ -1,0 +1,21 @@
+# Пример целиком в Docker: сервер на Node.js (agent-sdk/server) + интерфейс и агент с
+# воркерами на Python, Go и Node.js.
+#   docker compose -f examples/docker-compose.yml up --build            # http://localhost:8080
+#   docker compose -f examples/docker-compose.yml up --build --scale agent=3
+#   DEMO_PORT=8081 docker compose -f examples/docker-compose.yml up --build   # другой порт на машине
+# Агенты без тома: каждый запуск — новая регистрация (для примера так проще).
+services:
+  server:
+    build: { context: .., dockerfile: examples/docker/server.Dockerfile }
+    environment:
+      ENROLL_TOKEN: demo-token
+    # Порт на машине — DEMO_PORT (8080 занят локальным make demo-server и т. п.).
+    ports: ["${DEMO_PORT:-8080}:8080"]
+
+  agent:
+    build: { context: .., dockerfile: examples/docker/agent.Dockerfile }
+    environment:
+      AGENT_SERVER_URL: http://server:8080
+      AGENT_ENROLL_TOKEN: demo-token
+    depends_on: [server]
+    stop_grace_period: 40s

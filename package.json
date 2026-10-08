@@ -1,0 +1,13 @@
+{
+  "name": "agent-repo",
+  "private": true,
+  "description": "Инструменты репозитория: форматирование (Prettier) для всего проекта",
+  "license": "MIT",
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "example-node-worker",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Пример воркера на Node.js (agent-sdk/worker): хеш файла, команда, желаемое состояние, телеметрия, события",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node --import tsx main.ts",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "agent-sdk": "file:../../../sdk/node",
+    "tsx": "^4.23.15"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "typescript": "^5.9.2"
+  }
+}

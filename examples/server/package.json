@@ -1,0 +1,26 @@
+{
+  "name": "example-server",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Пример сервера на Node.js: Agents из agent-sdk/server + API для веб-интерфейса",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "dev": "tsx watch src/main.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "agent-sdk": "file:../../sdk/node",
+    "tsx": "^4.23.15",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.2"
+  }
+}

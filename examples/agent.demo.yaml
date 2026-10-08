@@ -1,0 +1,47 @@
+# Агент для примера: сервер на Node.js (examples/server) и пять воркеров.
+# ${…} подставляет scripts/demo.sh. Второй агент — DEMO_AGENT=2 (свой каталог данных).
+server:
+  url: ${AGENT_SERVER_URL}
+dataDir: ${DEMO_ROOT}/.dev/demo-agent-${DEMO_AGENT}
+name: demo-${DEMO_AGENT}
+labels:
+  env: demo
+enroll:
+  token: ${AGENT_ENROLL_TOKEN}
+update:
+  mode: disabled
+workers:
+  # Python: задачи очереди example.echo (текст, файлы, повторы).
+  - name: echo
+    command: ["python3", "examples/workers/echo_worker.py"]
+    dir: ${DEMO_ROOT}
+    env:
+      PYTHONPATH: ${DEMO_ROOT}/sdk/python
+    stopTimeout: 30s
+  # Python: пакетная обработка example.batch — этапы, события, остановка, выходной файл.
+  - name: batch
+    command: ["python3", "examples/workers/batch_worker.py"]
+    dir: ${DEMO_ROOT}
+    env:
+      PYTHONPATH: ${DEMO_ROOT}/sdk/python
+      BATCH_TELEMETRY_INTERVAL: "2"
+    stopTimeout: 30s
+  # Python: сервис — желаемое состояние example.kv, команда, телеметрия, события.
+  - name: kv
+    command: ["python3", "examples/workers/kv_worker.py"]
+    dir: ${DEMO_ROOT}
+    env:
+      PYTHONPATH: ${DEMO_ROOT}/sdk/python
+      KV_DIR: ${DEMO_ROOT}/.dev/demo-kv-${DEMO_AGENT}
+  # Go (sdk/go/worker): команды, раздел состояния example.sys.banner, показатели, событие.
+  - name: sysinfo
+    command: ["${SYSINFO_BIN}"]
+  # Node.js: agent-sdk/worker — задачи example.hash, команды, домен example.node.config,
+  # телеметрия, события. TypeScript — через tsx из node_modules воркера (--import
+  # ищет его от рабочего каталога; sdk/node собран и зависимости стоят: demo.sh build).
+  - name: node
+    command: ["node", "--import", "tsx", "main.ts"]
+    dir: ${DEMO_ROOT}/examples/workers/node
+    env:
+      NODE_TELEMETRY_INTERVAL_MS: "2000"
+    stopTimeout: 30s

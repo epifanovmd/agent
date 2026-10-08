@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Агент, Go-SDK, эталоны сообщений, integration, conformance (серверы на Go, Node, Python).
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Node — для test/conformance (сервер examples/server на agent-sdk).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm ci && npm run build
+        working-directory: sdk/node
+      - run: npm ci
+        working-directory: examples/server
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "gofmt: не отформатированы:"; echo "$out"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  # SDK Python и бэкенд-пример на нём: младшая и старшая поддерживаемые версии.
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # Необязательные зависимости SDK: адаптер websockets, agents.seal.
+      - run: pip install websockets cryptography
+      - run: python -m unittest discover -s tests -t .
+        working-directory: sdk/python
+      - run: python -m unittest discover -s examples/server-python/tests -t examples/server-python
+
+  # SDK Node, примеры на Node, версия, форматирование.
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Версия везде одинаковая
+        run: scripts/version.sh check
+      - name: Prettier
+        run: npm ci && npx prettier --check .
+      - run: npm ci && npm run lint && npm run typecheck && npm test && npm run build
+        working-directory: sdk/node
+      - run: npm ci && npm run typecheck && npm test
+        working-directory: examples/server
+      - run: npm ci && npm run typecheck
+        working-directory: examples/workers/node
+      - run: npm ci && npm run build
+        working-directory: examples/web
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck deploy/install/install.sh scripts/*.sh
+
+  images:
+    runs-on: ubuntu-latest
+    needs: go
+    strategy:
+      matrix:
+        include:
+          - name: python
+            file: deploy/Dockerfile
+          - name: dist
+            file: deploy/Dockerfile.dist
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
