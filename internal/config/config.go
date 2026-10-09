@@ -3,8 +3,10 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -195,6 +197,21 @@ type Update struct {
 	Mode string `yaml:"mode"`
 	// PublicKey — ключ проверки подписи выпусков Ed25519, base64.
 	PublicKey string `yaml:"publicKey"`
+	// PublicKeys — ещё ключи проверки (base64): подпись сборки принимается,
+	// если сходится с любым из ключей — вшитым при сборке, PublicKey и этими.
+	PublicKeys []string `yaml:"publicKeys"`
+}
+
+// Keys — ключи проверки выпусков из настроек: publicKey и publicKeys без
+// пустых и повторов (вшитый при сборке ключ сюда не входит).
+func (u Update) Keys() []string {
+	var out []string
+	for _, k := range append([]string{u.PublicKey}, u.PublicKeys...) {
+		if k = strings.TrimSpace(k); k != "" && !slices.Contains(out, k) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // SysmetricsWorker — имя встроенного воркера метрик узла; в workers это имя занято.
@@ -553,6 +570,7 @@ func applyEnv(cfg *Config) {
 		}
 	}
 	list(&cfg.Server.URLs, "AGENT_SERVER_URLS")
+	list(&cfg.Update.PublicKeys, "AGENT_UPDATE_PUBLIC_KEYS")
 	list(&cfg.Telemetry.ExcludeInterfaces, "AGENT_TELEMETRY_EXCLUDE_INTERFACES")
 	list(&cfg.Telemetry.Metrics, "AGENT_TELEMETRY_METRICS")
 	list(&cfg.Telemetry.Disks, "AGENT_TELEMETRY_DISKS")
@@ -603,6 +621,11 @@ func (c *Config) Validate() error {
 	}
 	if !slices.Contains([]string{UpdateSelf, UpdateExternal, UpdateDisabled}, c.Update.Mode) {
 		errs = append(errs, fmt.Errorf("update.mode (AGENT_UPDATE_MODE): self | external | disabled, а не %q", c.Update.Mode))
+	}
+	for _, k := range c.Update.Keys() {
+		if raw, err := base64.StdEncoding.DecodeString(k); err != nil || len(raw) != ed25519.PublicKeySize {
+			errs = append(errs, fmt.Errorf("update.publicKey / update.publicKeys (AGENT_UPDATE_PUBLIC_KEY, AGENT_UPDATE_PUBLIC_KEYS): %q — нужен base64 32 байт Ed25519", k))
+		}
 	}
 	for _, g := range c.Telemetry.Metrics {
 		if !slices.Contains(message.MetricGroups, g) {

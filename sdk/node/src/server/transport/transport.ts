@@ -15,7 +15,6 @@ import {
   type Envelope,
   LINK_PATH,
   MAX_MESSAGE_BYTES,
-  type ReleaseManifest,
   WS_CHANNEL,
 } from "../protocol/messages";
 import { envelopeSchema } from "../protocol/schemas";
@@ -37,8 +36,6 @@ export interface TransportHost extends ReleaseSource {
   /** Регистрация: функция чтения тела и адрес клиента → ключ агента. */
   enroll(body: () => Promise<unknown>, remote: string): Promise<unknown>;
   authenticate(header: string | undefined): Promise<AgentRecord | undefined>;
-  /** manifest.json каталога выпуска или null — для раздачи выпуска. */
-  manifest(): Promise<ReleaseManifest | null>;
   open(ss: Session, env: Envelope): Promise<void>;
   process(ss: Session, env: Envelope): Promise<void>;
   closed(ss: Session): Promise<void>;

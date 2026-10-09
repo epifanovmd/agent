@@ -12,7 +12,7 @@ cd "$ROOT"
 PLACES=(
   "VERSION|^()([0-9][0-9A-Za-z.+-]*)()$"
   "sdk/node/package.json|^(  \"version\": \")([^\"]+)(\",)$"
-  "sdk/node/src/index.ts|^(export const SDK_VERSION = \")([^\"]+)(\";)$"
+  "sdk/node/src/server/lib/sdk-version.ts|^(export const SDK_VERSION = \")([^\"]+)(\";)$"
   "examples/server/package.json|^(  \"version\": \")([^\"]+)(\",)$"
 )
 

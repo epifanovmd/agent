@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 )
@@ -87,11 +88,48 @@ func Verify(pub ed25519.PublicKey, b Build, signature string) error {
 
 // ParsePublicKey — ключ проверки из base64.
 func ParsePublicKey(b64 string) (ed25519.PublicKey, error) {
-	raw, err := base64.StdEncoding.DecodeString(b64)
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
 	if err != nil || len(raw) != ed25519.PublicKeySize {
-		return nil, errors.New("update: publicKey — base64 32 байт Ed25519")
+		return nil, errors.New("update: ключ проверки — base64 32 байт Ed25519")
 	}
 	return ed25519.PublicKey(raw), nil
+}
+
+// Keys — ключи проверки выпусков: подпись сборки принимается, если сходится
+// с любым из них (автор агента подписывает агента и его воркеры, проект —
+// свои воркеры).
+type Keys []ed25519.PublicKey
+
+// ParseKeys — ключи из base64; пустые строки и повторы пропускаются.
+func ParseKeys(list ...string) (Keys, error) {
+	var out Keys
+	for _, s := range list {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		k, err := ParsePublicKey(s)
+		if err != nil {
+			return nil, err
+		}
+		if !slices.ContainsFunc(out, func(x ed25519.PublicKey) bool { return x.Equal(k) }) {
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}
+
+// Verify — подпись сборки сходится хотя бы с одним ключом; ключей нет —
+// ErrNotVerified.
+func (k Keys) Verify(b Build, signature string) error {
+	if len(k) == 0 {
+		return ErrNotVerified
+	}
+	for _, pub := range k {
+		if Verify(pub, b, signature) == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("update: подпись сборки %s %s (%s/%s) не сходится ни с одним ключом проверки", b.Name, b.Version, b.OS, b.Arch)
 }
 
 // FileHash — sha256 файла, hex.
@@ -109,11 +147,8 @@ func FileHash(path string) (string, error) {
 }
 
 // Install — скачать, проверить и подменить исполняемый файл (без перезапуска).
-func Install(ctx context.Context, client *http.Client, auth string, p Paths, pub ed25519.PublicKey, rel Release) error {
-	if pub == nil {
-		return ErrNotVerified
-	}
-	if err := Verify(pub, Local(AgentName, rel.Version, rel.SHA256), rel.Signature); err != nil {
+func Install(ctx context.Context, client *http.Client, auth string, p Paths, keys Keys, rel Release) error {
+	if err := keys.Verify(Local(AgentName, rel.Version, rel.SHA256), rel.Signature); err != nil {
 		return err
 	}
 	if current, err := FileHash(p.Binary); err == nil && SameHash(current, rel.SHA256) {
@@ -134,17 +169,14 @@ func Install(ctx context.Context, client *http.Client, auth string, p Paths, pub
 	return os.Rename(next, p.Binary)
 }
 
-// ErrNotVerified — ключа проверки подписи (update.publicKey) нет: сборку
-// нельзя проверить, ставить её агент не будет.
-var ErrNotVerified = errors.New("update: не задан ключ проверки релизов (update.publicKey)")
+// ErrNotVerified — ни одного ключа проверки подписи нет: сборку нельзя
+// проверить, ставить её агент не будет.
+var ErrNotVerified = errors.New("update: не задан ключ проверки выпусков (update.publicKey, update.publicKeys)")
 
-// Fetch — проверить подпись сборки b ключом выпуска и скачать файл в dst
-// (0755) со сверкой sha256. Ключа нет — ErrNotVerified.
-func Fetch(ctx context.Context, client *http.Client, auth string, pub ed25519.PublicKey, b Build, url, signature, dst string) error {
-	if pub == nil {
-		return ErrNotVerified
-	}
-	if err := Verify(pub, b, signature); err != nil {
+// Fetch — проверить подпись сборки b ключами выпуска и скачать файл в dst
+// (0755) со сверкой sha256. Ключей нет — ErrNotVerified.
+func Fetch(ctx context.Context, client *http.Client, auth string, keys Keys, b Build, url, signature, dst string) error {
+	if err := keys.Verify(b, signature); err != nil {
 		return err
 	}
 	return Download(ctx, client, auth, url, dst, b.SHA256)
@@ -152,9 +184,9 @@ func Fetch(ctx context.Context, client *http.Client, auth string, pub ed25519.Pu
 
 // FetchArchive — как Fetch, но сборка — архив .tar.gz: после проверки он
 // распаковывается в новый каталог dst (Extract), сам архив удаляется.
-func FetchArchive(ctx context.Context, client *http.Client, auth string, pub ed25519.PublicKey, b Build, url, signature, dst string) error {
+func FetchArchive(ctx context.Context, client *http.Client, auth string, keys Keys, b Build, url, signature, dst string) error {
 	archive := dst + ".tar.gz"
-	if err := Fetch(ctx, client, auth, pub, b, url, signature, archive); err != nil {
+	if err := Fetch(ctx, client, auth, keys, b, url, signature, archive); err != nil {
 		return err
 	}
 	defer os.Remove(archive)

@@ -588,3 +588,26 @@ log: {buffer: 1000}
 		t.Fatalf("прежние до перезапуска: %+v", kept)
 	}
 }
+
+// Ключи проверки выпусков: publicKey и publicKeys вместе, без повторов;
+// AGENT_UPDATE_PUBLIC_KEYS — через запятую; неверный ключ — ошибка настроек.
+func TestUpdateKeys(t *testing.T) {
+	const a, b = "MCowBQYDK2VwAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "Q0hBTkdFTUVDSEFOR0VNRUNIQU5HRU1FQ0hBTkdFTUU="
+	dir := t.TempDir()
+	path := writeConfig(t, "server: {url: https://api.example.com}\ndataDir: "+dir+"\nupdate: {publicKey: "+b+", publicKeys: ["+b+"]}\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Update.Keys(); !slices.Equal(got, []string{b}) {
+		t.Fatalf("ключи: %v", got)
+	}
+	t.Setenv("AGENT_UPDATE_PUBLIC_KEYS", " "+b+", ,"+b)
+	if cfg, err = Load(path); err != nil || !slices.Equal(cfg.Update.PublicKeys, []string{b, b}) {
+		t.Fatalf("из окружения: %v %v", cfg.Update.PublicKeys, err)
+	}
+	t.Setenv("AGENT_UPDATE_PUBLIC_KEYS", a+",a2V5")
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "update.publicKeys") {
+		t.Fatalf("неверный ключ: %v", err)
+	}
+}

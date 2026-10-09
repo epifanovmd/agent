@@ -205,14 +205,14 @@ func TestInstallUninstall(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte(f.read(t, ConfigFile)+"# своё\n"), 0o644)
 	_ = os.WriteFile(filepath.Join(f.root, EnvFile), []byte(f.read(t, EnvFile)+"EXAMPLE_KEY=1\n"), 0o600)
 	f.cmds = nil
-	again := Options{Binary: binary(t, "v2"), Version: "1.3.0", KillMode: "mixed", PublicKey: "a2V5"}
+	again := Options{Binary: binary(t, "v2"), Version: "1.3.0", KillMode: "mixed", PublicKeys: []string{testKeyA, testKeyB, testKeyA}}
 	if err := Install(ctx, s, again); err != nil {
 		t.Fatal(err)
 	}
 	if f.read(t, Binary) != "v2" || !strings.HasSuffix(f.read(t, ConfigFile), "# своё\n") {
 		t.Fatal("повторная установка: программа или agent.yaml")
 	}
-	if env := f.read(t, EnvFile); env != "AGENT_ENROLL_TOKEN=tok\nEXAMPLE_KEY=1\nAGENT_UPDATE_PUBLIC_KEY=a2V5\n" {
+	if env := f.read(t, EnvFile); env != "AGENT_ENROLL_TOKEN=tok\nEXAMPLE_KEY=1\nAGENT_UPDATE_PUBLIC_KEYS="+testKeyA+","+testKeyB+"\n" {
 		t.Fatalf("agent.env: %q", env)
 	}
 	again.KillMode = ""
@@ -495,7 +495,7 @@ func TestInstallWorkers(t *testing.T) {
 
 	f, s := newFake(t, "systemctl", "useradd")
 	key := base64.StdEncoding.EncodeToString(pub)
-	o := Options{Binary: binary(t, "v1"), Server: srv.URL, Token: "t", PublicKey: key, Workers: []string{"collector", "report"}}
+	o := Options{Binary: binary(t, "v1"), Server: srv.URL, Token: "t", PublicKeys: []string{key}, Workers: []string{"collector", "report"}}
 	if err := Install(ctx, s, o); err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +516,7 @@ func TestInstallWorkers(t *testing.T) {
 	// Готовый agent.yaml не меняется — подсказка; чужая подпись — ошибка.
 	f.out.Reset()
 	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n"), 0o644)
-	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKey: key, Workers: []string{"collector"}, Server: srv.URL}); err != nil {
+	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKeys: []string{key}, Workers: []string{"collector"}, Server: srv.URL}); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(f.out.String(), "server.url") {
@@ -526,18 +526,18 @@ func TestInstallWorkers(t *testing.T) {
 		t.Fatalf("подсказка:\n%s", f.out.String())
 	}
 	// Повторная установка без --server: адрес — из agent.yaml, затем из agent.env.
-	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKey: key, Workers: []string{"collector"}}); err != nil {
+	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKeys: []string{key}, Workers: []string{"collector"}}); err != nil {
 		t.Fatalf("адрес из agent.yaml: %v", err)
 	}
 	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: https://wrong.example.com\n"), 0o644)
 	_ = os.WriteFile(filepath.Join(f.root, EnvFile), []byte("AGENT_SERVER_URL="+srv.URL+"/\n"), 0o600)
-	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKey: key, Workers: []string{"collector"}}); err != nil {
+	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKeys: []string{key}, Workers: []string{"collector"}}); err != nil {
 		t.Fatalf("адрес из agent.env: %v", err)
 	}
 	_ = os.Remove(filepath.Join(f.root, EnvFile))
 	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n"), 0o644)
 	other, _, _ := ed25519.GenerateKey(rand.Reader)
-	err = Install(ctx, s, Options{Binary: o.Binary, Server: srv.URL, PublicKey: base64.StdEncoding.EncodeToString(other), Workers: []string{"collector"}})
+	err = Install(ctx, s, Options{Binary: o.Binary, Server: srv.URL, PublicKeys: []string{base64.StdEncoding.EncodeToString(other)}, Workers: []string{"collector"}})
 	if err == nil || !strings.Contains(err.Error(), "подпись") {
 		t.Fatalf("чужая подпись: %v", err)
 	}
@@ -599,13 +599,82 @@ func TestParseFlagsInstallCommand(t *testing.T) {
 		"--kill-mode", "process", "--packages", "jq curl", "--packages-apk", "bind-tools",
 		"--sysctl", "net.core.somaxconn=1024", "--sysctl", "vm.max_map_count=262144",
 		"--rw-path", "/etc/example", "--rw-path", "/var/lib/it's", "--ca-file", "/etc/agent/ca.pem", "--worker", "report",
-		"--stop-timeout", "15min", "--token-file", "/root/agent.token", "--public-key", "a2V5", "--server", "https://api.example.com",
+		"--stop-timeout", "15min", "--token-file", "/root/agent.token", "--public-key", "a2V5", "--update-key", "b2V5", "--server", "https://api.example.com",
 	}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if o.Token != "tok'en" || o.User != "root" || o.Config != "/etc/agent/node.yaml" || o.CAFile != "/etc/agent/ca.pem" ||
-		o.StopTimeout != "15min" || o.TokenFile != "/root/agent.token" || o.PublicKey != "a2V5" || o.Instance != "web-2" {
+		o.StopTimeout != "15min" || o.TokenFile != "/root/agent.token" || !slices.Equal(o.PublicKeys, []string{"a2V5", "b2V5"}) || o.Instance != "web-2" {
 		t.Fatalf("%+v", o)
+	}
+}
+
+// Ключи проверки выпусков для тестов (base64 32 байт).
+const (
+	testKeyA = "MCowBQYDK2VwAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	testKeyB = "Q0hBTkdFTUVDSEFOR0VNRUNIQU5HRU1FQ0hBTkdFTUU="
+)
+
+// Сборка воркера по абсолютной ссылке на другом хосте, подпись — вторым из
+// ключей (--update-key несколько раз).
+func TestInstallWorkersAbsoluteURL(t *testing.T) {
+	ctx := context.Background()
+	authorPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	projectPub, project, _ := ed25519.GenerateKey(rand.Reader)
+	body := []byte("probe")
+	sum := sha256.Sum256(body)
+	hexSum := hex.EncodeToString(sum[:])
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Error("на другой хост — без Authorization")
+		}
+		_, _ = w.Write(body)
+	}))
+	defer cdn.Close()
+	manifest := message.Manifest{Version: "1.0.0", Workers: []message.WorkerArtifact{{
+		Name: "probe", Version: "2.0.0", OS: "linux", Arch: "amd64", File: cdn.URL + "/download/v2.0.0/probe-2.0.0-linux-amd64", SHA256: hexSum,
+		Signature: update.Sign(project, update.Build{Name: "probe", Version: "2.0.0", OS: "linux", Arch: "amd64", SHA256: hexSum}),
+	}}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(manifest) }))
+	defer srv.Close()
+	f, s := newFake(t, "systemctl", "useradd")
+	enc := base64.StdEncoding.EncodeToString
+	o := Options{Binary: binary(t, "v1"), Server: srv.URL, Token: "t", PublicKeys: []string{enc(authorPub), enc(projectPub)}, Workers: []string{"probe"}}
+	if err := Install(ctx, s, o); err != nil {
+		t.Fatal(err)
+	}
+	if f.read(t, filepath.Join(DataDir, "workers/probe/current")) != "probe" {
+		t.Fatal("сборка по абсолютной ссылке")
+	}
+	if !strings.Contains(f.read(t, EnvFile), "AGENT_UPDATE_PUBLIC_KEYS="+enc(authorPub)+","+enc(projectPub)+"\n") {
+		t.Fatalf("agent.env: %q", f.read(t, EnvFile))
+	}
+	o.PublicKeys = []string{enc(authorPub)}
+	if err := Install(ctx, s, o); err == nil || !strings.Contains(err.Error(), "подпись") {
+		t.Fatalf("подпись ключом, которого нет: %v", err)
+	}
+	o.PublicKeys = []string{"a2V5"}
+	if err := Install(ctx, s, o); err == nil || !strings.Contains(err.Error(), "--update-key") {
+		t.Fatalf("неверный ключ: %v", err)
+	}
+}
+
+// Где скачать сборку: имя файла — в каталоге выпуска; https:// — как есть;
+// http:// — только при http-каталоге.
+func TestBuildURL(t *testing.T) {
+	for _, tc := range []struct{ releases, file, want string }{
+		{"https://api.example.com/r", "report-1.0.0-linux-amd64", "https://api.example.com/r/report-1.0.0-linux-amd64"},
+		{"https://api.example.com/r", "https://github.com/example/agent/releases/download/v1.1.0/netprobe-1.1.0-linux-amd64", "https://github.com/example/agent/releases/download/v1.1.0/netprobe-1.1.0-linux-amd64"},
+		{"http://127.0.0.1:8080/r", "http://127.0.0.1:9000/x", "http://127.0.0.1:9000/x"},
+		{"https://api.example.com/r", "http://cdn.example.com/x", ""},
+		{"https://api.example.com/r", "../x", ""},
+		{"https://api.example.com/r", "ftp://cdn.example.com/x", ""},
+		{"https://api.example.com/r", "", ""},
+	} {
+		got, err := buildURL(tc.releases, tc.file)
+		if got != tc.want || (err != nil) != (tc.want == "") {
+			t.Errorf("%s %s: %q %v", tc.releases, tc.file, got, err)
+		}
 	}
 }

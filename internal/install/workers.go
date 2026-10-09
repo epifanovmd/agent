@@ -3,6 +3,7 @@ package install
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -46,13 +47,9 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 	if err != nil {
 		return nil, err
 	}
-	var pub []byte
-	if key := cmpOr(o.PublicKey, o.BuiltinKey); key != "" {
-		k, err := update.ParsePublicKey(key)
-		if err != nil {
-			return nil, fmt.Errorf("--public-key: %w", err)
-		}
-		pub = k
+	keys, err := update.ParseKeys(append([]string{o.BuiltinKey}, o.PublicKeys...)...)
+	if err != nil {
+		return nil, fmt.Errorf("--update-key: %w", err)
 	}
 	root := s.p(config.ReleasesDir(l.DataDir))
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -67,10 +64,14 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 		if a == nil {
 			return nil, fmt.Errorf("--worker %s: в выпуске %s нет сборки воркера под linux/%s", name, releases, s.Arch)
 		}
-		if a.File == "" || a.SHA256 == "" || a.File != path.Base(a.File) {
+		if a.SHA256 == "" {
 			return nil, fmt.Errorf("--worker %s: запись выпуска неполная", name)
 		}
-		archive := strings.HasSuffix(a.File, ".tar.gz")
+		fileURL, err := buildURL(releases, a.File)
+		if err != nil {
+			return nil, fmt.Errorf("--worker %s: %w", name, err)
+		}
+		archive := isArchive(fileURL)
 		if a.Command != "" && (!archive || !reCommand.MatchString(a.Command) || strings.HasPrefix(a.Command, "/") ||
 			slices.Contains(strings.Split(a.Command, "/"), "..")) {
 			return nil, fmt.Errorf("--worker %s: command в выпуске — не путь внутри архива: %q", name, a.Command)
@@ -82,14 +83,13 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 		next := filepath.Join(dir, config.ReleaseCurrent+".new")
 		_ = os.RemoveAll(next)
 		build := update.Build{Name: name, Version: a.Version, OS: "linux", Arch: s.Arch, SHA256: a.SHA256}
-		if pub != nil && a.Signature != "" {
-			if err := update.Verify(pub, build, a.Signature); err != nil {
+		if len(keys) > 0 && a.Signature != "" {
+			if err := keys.Verify(build, a.Signature); err != nil {
 				return nil, fmt.Errorf("--worker %s: %w", name, err)
 			}
-		} else if pub != nil {
+		} else if len(keys) > 0 {
 			s.warn("воркер %s: в выпуске нет подписи сборки — сверена только контрольная сумма", name)
 		}
-		fileURL := releases + "/" + url.PathEscape(a.File)
 		if archive {
 			tmp := next + ".tar.gz"
 			if err := update.Download(ctx, client, "", fileURL, tmp, a.SHA256); err != nil {
@@ -124,6 +124,35 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 		out = append(out, w)
 	}
 	return out, nil
+}
+
+// buildURL — где скачать сборку из записи выпуска (§11): имя файла — в
+// каталоге выпуска releases; абсолютная ссылка https:// — как есть; http:// —
+// только если и каталог выпуска http://.
+func buildURL(releases, file string) (string, error) {
+	if file == "" {
+		return "", errors.New("запись выпуска неполная")
+	}
+	if file == path.Base(file) && !strings.Contains(file, ":") {
+		return releases + "/" + url.PathEscape(file), nil
+	}
+	u, err := url.Parse(file)
+	if err != nil || u.Host == "" || u.User != nil {
+		return "", fmt.Errorf("файл выпуска %q: нужно имя файла или ссылка https://", file)
+	}
+	base, _ := url.Parse(releases)
+	if !strings.EqualFold(u.Scheme, "https") && (!strings.EqualFold(u.Scheme, "http") || base == nil || !strings.EqualFold(base.Scheme, "http")) {
+		return "", fmt.Errorf("файл выпуска %q: нужна ссылка https:// (http:// — только если и каталог выпуска http://)", file)
+	}
+	return u.String(), nil
+}
+
+// isArchive — сборка — архив .tar.gz (по пути ссылки).
+func isArchive(rawURL string) bool {
+	if u, err := url.Parse(rawURL); err == nil {
+		return strings.HasSuffix(u.Path, ".tar.gz")
+	}
+	return strings.HasSuffix(rawURL, ".tar.gz")
 }
 
 func caIfSet(s *System, l Paths, o Options) string {

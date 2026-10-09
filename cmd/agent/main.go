@@ -25,7 +25,7 @@
 // Ключи подписи и манифест выпуска — отдельная программа cmd/agent-release.
 //
 // Ключ проверки обновлений вшивается при сборке: -ldflags "-X main.updateKey=<base64>";
-// настройка update.publicKey важнее.
+// ключи из настроек (update.publicKey, update.publicKeys) действуют вместе с ним.
 package main
 
 import (
@@ -49,7 +49,7 @@ import (
 var version = "dev"
 
 // updateKey — открытый ключ проверки сборок (base64 Ed25519), вшитый при
-// сборке: -ldflags "-X main.updateKey=…". Настройка update.publicKey важнее.
+// сборке: -ldflags "-X main.updateKey=…". Ключи из настроек действуют вместе с ним.
 var updateKey = ""
 
 // errQuiet — команда уже всё сказала сама: только код выхода 1.

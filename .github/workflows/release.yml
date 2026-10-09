@@ -1,5 +1,6 @@
-# Выпуск по тегу v*: проверки → подписанные сборки агента (scripts/release.sh) и архив
-# серверного SDK (npm pack) → один GitHub Release; образы в GHCR: agent:<версия> (минимальный),
+# Выпуск по тегу v*: проверки → подписанные сборки агента и стандартного воркера выпуска netprobe
+# (scripts/release.sh) и архив серверного SDK (npm pack) → один GitHub Release; бэкенды с опцией
+# agentReleases находят его через API GitHub сами. Образы в GHCR: agent:<версия> (минимальный),
 # agent:<версия>-python (с python3 для воркеров), agent-dist:<версия>. Всё ставится с GitHub —
 # без npm. Тег с «-» (v1.2.0-rc.1) — предварительный выпуск.
 # Нужны в настройках репозитория (agent-release keygen выдаёт пару):
@@ -45,7 +46,9 @@ jobs:
       - name: Сквозные тесты стенда
         run: scripts/e2e.sh
 
-  # Выпуск агента: сборки linux/darwin × amd64/arm64, manifest.json с подписями, install.sh.
+  # Выпуск агента: сборки агента linux/darwin × amd64/arm64 (agent-<os>-<arch>), воркер netprobe под
+  # те же платформы (netprobe-<версия>-<os>-<arch>, в манифесте — --worker netprobe=<версия>),
+  # manifest.json с подписями тем же ключом и его publicKey, install.sh.
   build:
     runs-on: ubuntu-latest
     needs: test
@@ -63,6 +66,7 @@ jobs:
           test -n "$AGENT_UPDATE_PUBLIC_KEY" || { echo "нет переменной AGENT_UPDATE_PUBLIC_KEY: открытый ключ вшивается в сборки" >&2; exit 1; }
           v=$(cat VERSION)
           scripts/release.sh "dist/$v" "$v"
+          grep -q '"name": "netprobe"' "dist/$v/manifest.json" || { echo "в manifest.json нет netprobe" >&2; exit 1; }
           mkdir -p out && cp "dist/$v"/* out/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

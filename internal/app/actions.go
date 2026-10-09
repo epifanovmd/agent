@@ -218,12 +218,30 @@ func (a *App) logs(args message.AgentLogsArgs) (message.LogsResult, error) {
 	return message.LogsResult{Entries: entries}, nil
 }
 
-// resolveURL — url от корня (/api/…) дополняется адресом сервера (§10).
-func (a *App) resolveURL(u string) string {
-	if strings.HasPrefix(u, "/") {
-		return strings.TrimRight(a.link.ServerURL(), "/") + u
+// source — откуда скачать сборку по url из agent.update или worker.update
+// (§10): от корня (/api/…) — с сервера, с которым сейчас связь, с ключом
+// агента; абсолютная https:// — с любого хоста без ключа агента; http:// —
+// только если и сервер http://. auth — заголовок Authorization ("" — без).
+func (a *App) source(raw string) (src, auth string, err error) {
+	server := strings.TrimRight(a.link.ServerURL(), "/")
+	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") {
+		return server + raw, a.auth.Session(), nil
 	}
-	return u
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil {
+		return "", "", message.NewError(message.CodeUpdateFailed, fmt.Sprintf("адрес сборки %q: нужен путь от корня (/api/…) или ссылка https://", raw))
+	}
+	s, _ := url.Parse(server)
+	switch {
+	case strings.EqualFold(u.Scheme, "https"):
+	case strings.EqualFold(u.Scheme, "http") && s != nil && strings.EqualFold(s.Scheme, "http"):
+	default:
+		return "", "", message.NewError(message.CodeUpdateFailed, fmt.Sprintf("адрес сборки %q: нужна ссылка https:// (http:// — только если и сервер http://)", raw))
+	}
+	if s != nil && strings.EqualFold(u.Scheme, s.Scheme) && strings.EqualFold(u.Host, s.Host) {
+		return u.String(), a.auth.Session(), nil
+	}
+	return u.String(), "", nil
 }
 
 // isArchive — сборка воркера — архив .tar.gz (по имени файла в url).
@@ -244,19 +262,19 @@ func (a *App) workerUpdate(ctx context.Context, args message.WorkerUpdateArgs) (
 	if a.config().Update.Mode == config.UpdateDisabled {
 		return nil, message.NewError(message.CodeUpdateNotSupported, "обновления выключены настройкой update.mode: disabled")
 	}
-	src := a.resolveURL(args.URL)
+	src, auth, err := a.source(args.URL)
+	if err != nil {
+		return nil, err
+	}
 	build := update.Local(args.Name, args.Version, args.SHA256)
 	fetch := func(dst string) error {
-		if a.pubKey == nil {
-			return message.NewError(message.CodeUpdateNotVerified, "не задан ключ проверки сборок (update.publicKey)")
+		if len(a.keys) == 0 {
+			return message.NewError(message.CodeUpdateNotVerified, update.ErrNotVerified.Error())
 		}
-		var err error
 		if isArchive(src) {
-			err = update.FetchArchive(ctx, a.client, a.auth.Session(), a.pubKey, build, src, args.Signature, dst)
-		} else {
-			err = update.Fetch(ctx, a.client, a.auth.Session(), a.pubKey, build, src, args.Signature, dst)
+			return update.FetchArchive(ctx, a.client, auth, a.keys, build, src, args.Signature, dst)
 		}
-		return err
+		return update.Fetch(ctx, a.client, auth, a.keys, build, src, args.Signature, dst)
 	}
 	return a.workers.Update(ctx, args.Name, args.Version, args.Force, fetch)
 }
@@ -279,20 +297,24 @@ func (a *App) agentUpdate(ctx context.Context, id string, args message.AgentUpda
 	case config.UpdateDisabled:
 		return nil, message.NewError(message.CodeUpdateNotSupported, "обновления выключены настройкой update.mode: disabled")
 	}
-	if a.pubKey == nil {
-		return nil, message.NewError(message.CodeUpdateNotVerified, "не задан ключ проверки сборок (update.publicKey)")
+	if len(a.keys) == 0 {
+		return nil, message.NewError(message.CodeUpdateNotVerified, update.ErrNotVerified.Error())
 	}
 	if args.Version == a.version {
 		return message.UpdateResult{Version: a.version, Previous: a.version}, nil
 	}
-	rel := update.Release{Version: args.Version, URL: a.resolveURL(args.URL), SHA256: args.SHA256, Signature: args.Signature}
+	src, auth, err := a.source(args.URL)
+	if err != nil {
+		return nil, err
+	}
+	rel := update.Release{Version: args.Version, URL: src, SHA256: args.SHA256, Signature: args.Signature}
 	pending := pendingUpdate{ID: id, Version: args.Version, Previous: a.version}
 	raw, _ := json.Marshal(pending)
 	path := filepath.Join(a.config().DataDir, pendingUpdateFile)
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		return nil, err
 	}
-	if err := update.Install(ctx, a.client, a.auth.Session(), a.update, a.pubKey, rel); err != nil {
+	if err := update.Install(ctx, a.client, auth, a.update, a.keys, rel); err != nil {
 		_ = os.Remove(path)
 		if errors.Is(err, update.ErrNotVerified) {
 			return nil, message.NewError(message.CodeUpdateNotVerified, err.Error())

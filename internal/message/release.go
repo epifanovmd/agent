@@ -9,9 +9,13 @@ import (
 // ─── Выпуск (manifest.json, §11) ───────────────────────────────────────
 
 // Manifest — manifest.json каталога выпуска (`agent-release manifest`):
-// сборки агента и (необязательно) сборки воркеров из выпуска.
+// сборки агента и (необязательно) сборки воркеров из выпуска. PublicKey —
+// открытый ключ, которым подписан выпуск (справочно: агент проверяет подписи
+// своими ключами). Artifacts пуст — выпуск только воркеров. File сборки —
+// имя файла в каталоге выпуска или абсолютная ссылка https://.
 type Manifest struct {
 	Version   string           `json:"version"`
+	PublicKey string           `json:"publicKey,omitempty"`
 	Artifacts []Artifact       `json:"artifacts"`
 	Workers   []WorkerArtifact `json:"workers,omitempty"`
 }

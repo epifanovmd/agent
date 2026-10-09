@@ -69,8 +69,10 @@ server.listen(8080);
 | `offlineAfterMs`         | max(3 × statusIntervalMs, 30 с) + grace | без вестей дольше — `offline` (копия с соединением упала)                                                                                                  |
 | `actionTimeoutMs`        | 60 000                                  | срок итога действия                                                                                                                                        |
 | `updateTimeoutMs`        | 300 000                                 | срок итога `updateAgent`, `updateWorker`                                                                                                                   |
-| `releasesDir`            | —                                       | каталог выпуска: manifest.json, сборки, install.sh                                                                                                         |
+| `releasesDir`            | —                                       | каталог выпуска: manifest.json, сборки, install.sh; с `agentReleases` — воркеры проекта ([releases](docs/releases.md#откуда-бэкенд-берёт-агента))          |
+| `agentReleases`          | —                                       | откуда брать агента и netprobe: `{ github: "owner/repo", range?, token?, checkIntervalMs?, proxy? }` или `{ url }`; SDK сам следит за новыми версиями      |
 | `publicKey`              | —                                       | ключ проверки выпуска для install.sh                                                                                                                       |
+| `updatePublicKeys`       | `[]`                                    | ещё ключи проверки (ключи проекта) для install.sh                                                                                                          |
 | `baseUrl`                | из запроса                              | публичный адрес бэкенда для install.sh и `installCommand`                                                                                                  |
 | `enrollFailureLimit`     | 10                                      | неудачных регистраций с адреса за окно, дальше — 429 (`0` — без предела)                                                                                   |
 | `enrollFailureWindowMs`  | 60 000                                  | окно подсчёта неудачных регистраций                                                                                                                        |
@@ -110,7 +112,8 @@ server.listen(8080);
 | `restartWorker(id, name, { force?, wait?, timeoutMs? })`                            | `{ deferred: false }` или `{ deferred: true, pending, actionId }` | [workers](docs/workers.md#замена-занятого-воркера)                        |
 | `updateWorker(id, name, { force?, wait?, timeoutMs? })`                             | `{ version, previous?, deferred: false }` или как выше            | [releases](docs/releases.md)                                              |
 | `updateAgent(id, { timeoutMs? })`                                                   | `{ version, previous? }`                                          | там же                                                                    |
-| `release()`, `updateCandidates()`, `workerUpdateCandidates()`                       | манифест и кандидаты на обновление                                | [releases](docs/releases.md)                                              |
+| `release()`, `updateCandidates()`, `workerUpdateCandidates()`                       | итоговый выпуск (у сборок — `source`, `url`) и кандидаты          | [releases](docs/releases.md)                                              |
+| `checkRelease()`                                                                    | проверить удалённый источник сейчас → итоговый выпуск             | [releases](docs/releases.md#откуда-бэкенд-берёт-агента)                   |
 | `installCommand(opts)`                                                              | строка `curl … \| sudo sh -s -- …`                                | [releases](docs/releases.md#установка-одной-командой)                     |
 
 `fetch`, задачи, действия (`restartWorker`, `updateWorker`, `updateAgent`, `rotateKey`, `logs`)
@@ -178,6 +181,7 @@ agents.on("alert", (a: AlertEvent) => {}); // проблема началась 
 agents.on("action", (a: ActionRecord) => {}); // итог действия (и отложенной замены — deferred: true)
 agents.on("audit", (e: AuditEntry) => {}); // кто что сделал
 agents.on("change", ({ agentId, reason }: ChangeEvent) => {}); // другим копиям — refresh(agentId)
+agents.on("release", ({ version, previous, from }: ReleaseEvent) => {}); // новая версия агента в agentReleases
 ```
 
 Ошибка в подписчике не мешает работе `Agents`: она попадает в журнал.

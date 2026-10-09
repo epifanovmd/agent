@@ -1,10 +1,12 @@
 #!/bin/sh
-# Выпуск агента в каталог DIR: сборки linux/darwin × amd64/arm64 (agent-<os>-<arch>),
-# manifest.json (подпись — AGENT_SIGNING_KEY, base64 seed Ed25519 из agent-release keygen;
-# без него — без подписей, самообновление на такой выпуск не встанет) и install.sh.
+# Выпуск агента в каталог DIR: сборки linux/darwin × amd64/arm64 (agent-<os>-<arch>), стандартный
+# воркер выпуска netprobe (examples/workers/netprobe → netprobe-<VERSION>-<os>-<arch>, в манифесте —
+# --worker netprobe=<VERSION>), manifest.json (подпись — AGENT_SIGNING_KEY, base64 seed Ed25519 из
+# agent-release keygen; без него — без подписей, самообновление на такой выпуск не встанет) и
+# install.sh.
 # Нужен Go: на машине без него — scripts/go.sh release (контейнер golang).
 #   scripts/release.sh DIR VERSION [--worker NAME=VERSION[,stopTimeout=…][,command=…]]…
-# --worker — воркеры из выпуска: их сборки кладутся в DIR заранее — файл
+# --worker — ещё воркеры в выпуске: их сборки кладутся в DIR заранее — файл
 # DIR/<name>-<version>-<os>-<arch> или архив DIR/<name>-<version>-<os>-<arch>.tar.gz.
 # AGENT_UPDATE_PUBLIC_KEY (base64 открытого ключа из agent-release keygen) вшивается в сборки агента:
 # они проверяют обновления без настройки update.publicKey.
@@ -23,8 +25,10 @@ for os in linux darwin; do
   for arch in amd64 arm64; do
     CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false \
       -ldflags "$LDFLAGS" -o "$DIR/agent-$os-$arch" ./cmd/agent
+    CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false \
+      -ldflags "-s -w -X main.version=$VERSION" -o "$DIR/netprobe-$VERSION-$os-$arch" ./examples/workers/netprobe
   done
 done
-go run ./cmd/agent-release manifest "$DIR" "$VERSION" "$@"
+go run ./cmd/agent-release manifest "$DIR" "$VERSION" --worker "netprobe=$VERSION" "$@"
 cp deploy/install/install.sh "$DIR/install.sh"
 echo "выпуск $VERSION: $DIR"

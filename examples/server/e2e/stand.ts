@@ -6,7 +6,14 @@
 // Сборки агента и Go-воркеров — в E2E_BIN (по умолчанию .dev/e2e; их собирает scripts/e2e.sh).
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { createWriteStream, existsSync, readFileSync } from "node:fs";
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { arch, platform, tmpdir } from "node:os";
@@ -93,8 +100,12 @@ export interface StandOptions {
   name: string;
   /** Каталог выпуска для Agents. */
   releasesDir?: string;
-  /** Ключ проверки выпуска агенту (update.publicKey); без него — update.mode: disabled. */
+  /** Ключ проверки выпуска агенту (update.publicKey); без него и updateKeys — update.mode: disabled. */
   updateKey?: string;
+  /** Ключи проверки выпуска агенту (update.publicKeys): подпись принимается, если сходится с любым. */
+  updateKeys?: string[];
+  /** netprobe — воркер из выпуска (release: true): сборка в <dataDir>/workers/netprobe/current. */
+  releaseNetprobe?: boolean;
   /** Свои настройки Agents сервера стенда. */
   server?: Partial<AgentsOptions>;
   /** Ещё воркеры в agent.yaml (кроме воркеров-примеров). */
@@ -333,7 +344,7 @@ export class Stand {
     JSON.parse(await readFile(join(this.dataDir, "credentials.json"), "utf8"));
 
   writeConfig = async (): Promise<void> => {
-    const { name, updateKey } = this.opts;
+    const { name, updateKey, updateKeys, releaseNetprobe } = this.opts;
     const echoEnv = (worker: string) => ({
       ECHO_STATE_FILE: this.stateFile(worker),
     });
@@ -344,9 +355,10 @@ export class Stand {
       dataDir: this.dataDir,
       name,
       enroll: { token: TOKEN },
-      update: updateKey
-        ? { mode: "self", publicKey: updateKey }
-        : { mode: "disabled" },
+      update:
+        updateKey || updateKeys
+          ? { mode: "self", publicKey: updateKey, publicKeys: updateKeys }
+          : { mode: "disabled" },
       log: { level: "debug", forward: "warn" },
       telemetry: { metrics: ["cpu", "load", "memory", "network", "uptime"] },
       workers: [
@@ -374,12 +386,22 @@ export class Stand {
           lifecycle,
         },
         { name: "sysinfo", command: [bin("sysinfo")], lifecycle },
-        { name: "netprobe", command: [bin("netprobe")], lifecycle },
+        releaseNetprobe
+          ? { name: "netprobe", release: true, lifecycle }
+          : { name: "netprobe", command: [bin("netprobe")], lifecycle },
         ...(this.opts.workers ?? []),
       ],
     };
 
     await writeFile(this.configPath, JSON.stringify(config, null, 2));
+    if (releaseNetprobe) {
+      // Воркер из выпуска, как после agent install --worker netprobe.
+      const dir = join(this.dataDir, "workers", "netprobe");
+
+      await mkdir(dir, { recursive: true });
+      await copyFile(bin("netprobe"), join(dir, "current"));
+      await writeFile(join(dir, "version"), "1.0.0\n");
+    }
   };
 
   /**

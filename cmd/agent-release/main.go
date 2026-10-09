@@ -3,7 +3,8 @@
 //
 //	agent-release keygen                ключи подписи выпуска (Ed25519)
 //	agent-release manifest DIR VERSION [--worker NAME=VERSION[,stopTimeout=…][,command=…]]…
-//	                                    manifest.json сборок агента и воркеров в DIR (подпись — AGENT_SIGNING_KEY)
+//	                                    manifest.json сборок агента и воркеров в DIR (подпись — AGENT_SIGNING_KEY);
+//	                                    без сборок агента — выпуск только воркеров (воркеры проекта)
 package main
 
 import (
@@ -72,7 +73,8 @@ func keygen() error {
 // воркеров из выпуска: `--worker NAME=VERSION[,stopTimeout=…]`
 // (повторяемый) берёт файлы DIR/<name>-<version>-<os>-<arch> или архивы
 // DIR/<name>-<version>-<os>-<arch>.tar.gz. Подпись — AGENT_SIGNING_KEY над
-// строкой сборки (§11: имя, версия, os, arch, sha256).
+// строкой сборки (§11: имя, версия, os, arch, sha256), publicKey — её
+// открытый ключ. Сборок агента нет, но есть --worker — выпуск только воркеров.
 func manifest(args []string) error {
 	usage := errors.New("manifest DIR VERSION [--worker NAME=VERSION[,stopTimeout=30s][,command=bin/report]]…")
 	var positional []string
@@ -115,7 +117,10 @@ func manifest(args []string) error {
 		return update.Sign(priv, b)
 	}
 	files, _ := filepath.Glob(filepath.Join(dir, "agent-*-*"))
-	m := message.Manifest{Version: ver}
+	m := message.Manifest{Version: ver, Artifacts: []message.Artifact{}}
+	if priv != nil {
+		m.PublicKey = base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey))
+	}
 	for _, file := range files {
 		parts := strings.Split(filepath.Base(file), "-")
 		if len(parts) != 3 {
@@ -128,8 +133,8 @@ func manifest(args []string) error {
 		b := update.Build{Name: update.AgentName, Version: ver, OS: parts[1], Arch: parts[2], SHA256: hash}
 		m.Artifacts = append(m.Artifacts, message.Artifact{OS: parts[1], Arch: parts[2], File: filepath.Base(file), SHA256: hash, Signature: sign(b)})
 	}
-	if len(m.Artifacts) == 0 {
-		return fmt.Errorf("в %s нет сборок agent-<os>-<arch>", dir)
+	if len(m.Artifacts) == 0 && len(workers) == 0 {
+		return fmt.Errorf("в %s нет сборок agent-<os>-<arch> (и не задан --worker)", dir)
 	}
 	for _, w := range workers {
 		prefix := w.Name + "-" + w.Version + "-"

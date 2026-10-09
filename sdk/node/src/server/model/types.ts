@@ -11,7 +11,10 @@ import type {
   ManifestRequest,
   ManifestRoute,
   Metrics,
+  ReleaseArtifact,
+  ReleaseManifest,
   Status,
+  WorkerArtifact,
   WorkerStatus,
 } from "../protocol/messages";
 
@@ -247,6 +250,35 @@ export interface ActionRecord {
   finishedAt: number;
   /** Итог отложенной замены воркера (пришёл в action.done). */
   deferred?: true;
+}
+
+/** Откуда сборка выпуска: remote — удалённый источник (agentReleases), local — releasesDir. */
+export type ReleaseOrigin = "remote" | "local";
+
+/** Где лежит сборка: источник и ссылка (у local — путь от корня сервера). */
+export interface ReleaseLocation {
+  source: ReleaseOrigin;
+  url: string;
+}
+
+/**
+ * Выпуск, который раздаёт Agents: manifest.json (file — имя файла для
+ * `…/releases/<file>`) с источником каждой сборки; с agentReleases — агент и его воркеры из
+ * удалённого источника плюс воркеры проекта из releasesDir.
+ */
+export interface ReleaseView extends ReleaseManifest {
+  artifacts: (ReleaseArtifact & ReleaseLocation)[];
+  workers?: (WorkerArtifact & ReleaseLocation)[];
+  /**
+   * Удалённый выпуск: версия, источник (`github:owner/repo` или url), когда проверен (мс), ключ
+   * его подписи (publicKey из его manifest.json).
+   */
+  remote?: {
+    version: string;
+    from: string;
+    checkedAt: number;
+    publicKey?: string;
+  };
 }
 
 /** Агент, которого можно обновить до версии выпуска. */

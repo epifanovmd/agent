@@ -51,7 +51,7 @@ check: vet fmt-check format-check version-check race sdk-test examples-test e2e 
 
 build: ## агент под эту машину → dist/<VERSION>/
 	scripts/go.sh build
-release: ## выпуск: сборки linux/darwin × amd64/arm64, manifest.json, install.sh → dist/<VERSION>/ (подпись — AGENT_SIGNING_KEY, ключ проверки — AGENT_UPDATE_PUBLIC_KEY)
+release: ## выпуск: сборки агента и netprobe linux/darwin × amd64/arm64, manifest.json, install.sh → dist/<VERSION>/ (подпись — AGENT_SIGNING_KEY, ключ проверки — AGENT_UPDATE_PUBLIC_KEY)
 	scripts/go.sh release
 images: ## образы: агент (agent:dev), агент с python3 для воркеров (agent:dev-python), каталог выпуска (agent-dist:dev)
 	docker build -f deploy/Dockerfile --target agent -t agent:dev .

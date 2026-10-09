@@ -1,5 +1,6 @@
-// Выпуск (§11): manifest.json каталога выпуска, сборки для обновления агентов и воркеров,
-// кандидаты на обновление. Раздачу файлов выпуска делает транспорт.
+// Выпуск (§11): итоговый выпуск — удалённый источник агента (agentReleases) и воркеры проекта из
+// releasesDir; сборки для обновления агентов и воркеров, кандидаты на обновление, install.sh.
+// Раздачу файлов выпуска делает транспорт.
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -9,6 +10,8 @@ import { newerVersion, sameVersion } from "../lib/version";
 import { publicAgent } from "../model/public-agent";
 import type {
   AgentRecord,
+  ReleaseLocation,
+  ReleaseView,
   UpdateCandidate,
   WorkerUpdateCandidate,
 } from "../model/types";
@@ -19,6 +22,7 @@ import {
   RELEASES_PATH,
   type WorkerArtifact,
 } from "../protocol/messages";
+import { AgentReleases, isAbsolute } from "./agent-releases";
 
 /** Аргументы действия обновления: версия и где взять сборку. */
 export interface UpdateArgs extends Record<string, unknown> {
@@ -28,15 +32,47 @@ export interface UpdateArgs extends Record<string, unknown> {
   signature: string;
 }
 
+/** Где взять файл выпуска: в releasesDir или по ссылке удалённого источника. */
+export type ReleaseFile = { path: string } | { url: string; proxy: boolean };
+
+/** install.sh для раздачи и ключи проверки, которые в него подставить. */
+export interface InstallScript {
+  script: string;
+  keys: string[];
+}
+
 export class Release {
   private readonly ctx: Context;
+  private readonly remote?: AgentReleases;
 
   constructor(ctx: Context) {
     this.ctx = ctx;
+    const opts = ctx.settings.agentReleases;
+
+    if (opts) {
+      this.remote = new AgentReleases(ctx, opts);
+      this.remote.start();
+    }
   }
 
-  /** manifest.json каталога выпуска или null. */
-  async manifest(): Promise<ReleaseManifest | null> {
+  close(): void {
+    this.remote?.close();
+  }
+
+  /** Раздавать ли выпуск: есть releasesDir или удалённый источник. */
+  enabled(): boolean {
+    return Boolean(this.ctx.settings.releasesDir || this.remote);
+  }
+
+  /** Проверить удалённый источник сейчас и вернуть итоговый выпуск. */
+  async check(): Promise<ReleaseView | null> {
+    await this.remote?.check();
+
+    return this.manifest();
+  }
+
+  /** manifest.json каталога releasesDir или null. */
+  private async local(): Promise<ReleaseManifest | null> {
     const dir = this.ctx.settings.releasesDir;
 
     if (!dir) return null;
@@ -56,6 +92,128 @@ export class Release {
     }
 
     return m.value;
+  }
+
+  /**
+   * Итоговый выпуск: агент и его воркеры — из удалённого источника (пока он не получен — из
+   * releasesDir), воркеры проекта — из releasesDir (при совпадении имён важнее). Нет ни того, ни
+   * другого — null.
+   */
+  async manifest(): Promise<ReleaseView | null> {
+    const [local, remote] = await Promise.all([
+      this.local(),
+      this.remote?.release() ?? null,
+    ]);
+    const here = <T extends ReleaseArtifact>(a: T): T & ReleaseLocation => ({
+      ...a,
+      source: "local",
+      url: `${RELEASES_PATH}/${encodeURIComponent(a.file)}`,
+    });
+
+    if (!remote) {
+      if (!local) return null;
+      const { workers: own, artifacts, ...rest } = local;
+
+      return {
+        ...rest,
+        artifacts: artifacts.map(here),
+        ...(own ? { workers: own.map(here) } : {}),
+      };
+    }
+    const away = <T extends ReleaseArtifact>(a: T): T & ReleaseLocation => ({
+      ...a,
+      file: fileName(a.file),
+      source: "remote",
+      url: a.file,
+    });
+    const project = new Set((local?.workers ?? []).map(w => w.name));
+    const workers = [
+      ...(remote.manifest.workers ?? [])
+        .filter(w => !project.has(w.name))
+        .map(away),
+      ...(local?.workers ?? []).map(here),
+    ];
+
+    return {
+      version: remote.manifest.version,
+      artifacts: remote.manifest.artifacts.map(away),
+      ...(workers.length ? { workers } : {}),
+      remote: {
+        version: remote.version,
+        from: remote.from,
+        checkedAt: remote.checkedAt,
+        ...(remote.manifest.publicKey
+          ? { publicKey: remote.manifest.publicKey }
+          : {}),
+      },
+    };
+  }
+
+  /** manifest.json для узлов: итоговый выпуск без источников (file — имя для …/releases/<file>). */
+  async served(): Promise<ReleaseManifest | null> {
+    const view = await this.manifest();
+
+    if (!view) return null;
+    const strip = <T extends ReleaseArtifact>({
+      source: _s,
+      url: _u,
+      ...a
+    }: T & ReleaseLocation): T => a as unknown as T;
+    const { remote: _r, artifacts, workers, ...rest } = view;
+
+    return {
+      ...rest,
+      artifacts: artifacts.map(strip),
+      ...(workers ? { workers: workers.map(strip) } : {}),
+    };
+  }
+
+  /** Файл выпуска по имени: только сборки из итогового выпуска. */
+  async file(name: string): Promise<ReleaseFile | null> {
+    const view = await this.manifest();
+    const art = [...(view?.artifacts ?? []), ...(view?.workers ?? [])].find(
+      a => a.file === name,
+    );
+
+    if (!art || name.includes("/") || name.includes("\\")) return null;
+    if (art.source === "remote")
+      return {
+        url: art.url,
+        proxy: Boolean(this.ctx.settings.agentReleases?.proxy),
+      };
+
+    return { path: join(this.ctx.settings.releasesDir!, art.file) };
+  }
+
+  /** Скачать сборку удалённого источника (раздача потоком). */
+  download(url: string, signal?: AbortSignal): Promise<Response> {
+    return this.remote
+      ? this.remote.download(url, signal)
+      : Promise.reject(new Error("нет удалённого источника"));
+  }
+
+  /**
+   * install.sh: из удалённого выпуска (если он получен и в нём есть install.sh), иначе — из
+   * releasesDir. Ключи: publicKey, updatePublicKeys (проект) и ключ автора агента
+   * (agentReleases.publicKey или publicKey удалённого manifest.json).
+   */
+  async installScript(): Promise<InstallScript | null> {
+    const { releasesDir, publicKey, updatePublicKeys, agentReleases } =
+      this.ctx.settings;
+    const remote = await this.remote?.release();
+    let script = remote?.installScript;
+
+    if (script === undefined && releasesDir)
+      script = await readFile(join(releasesDir, "install.sh"), "utf8").catch(
+        () => undefined,
+      );
+    if (script === undefined) return null;
+    const author = agentReleases?.publicKey ?? remote?.manifest.publicKey;
+    const keys = [publicKey, ...updatePublicKeys, author].filter(
+      (k, i, all): k is string => Boolean(k) && all.indexOf(k) === i,
+    );
+
+    return { script, keys };
   }
 
   /** Аргументы agent.update для агента; сборки нет — UPDATE_NOT_AVAILABLE. */
@@ -163,7 +321,10 @@ export class Release {
     const m = await this.manifest();
 
     if (!m)
-      throw codeError("UPDATE_NOT_AVAILABLE", "нет выпуска (releasesDir)");
+      throw codeError(
+        "UPDATE_NOT_AVAILABLE",
+        "нет выпуска (releasesDir, agentReleases)",
+      );
 
     return m;
   }
@@ -195,6 +356,22 @@ const workerArtifact = (
   return best;
 };
 
+/** Имя файла сборки: у ссылки — последняя часть пути. */
+const fileName = (file: string): string => {
+  if (!isAbsolute(file)) return file;
+  const last = new URL(file).pathname.split("/").pop() ?? "";
+
+  try {
+    return decodeURIComponent(last);
+  } catch {
+    return last;
+  }
+};
+
+/**
+ * Аргументы обновления: url — всегда от корня сервера. Сборку удалённого источника сервер отдаёт
+ * перенаправлением или потоком: ключ агента не уходит на чужой хост и у агентов прежних версий.
+ */
 const updateArgs = (version: string, art: ReleaseArtifact): UpdateArgs => {
   return {
     version,

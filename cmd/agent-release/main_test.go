@@ -33,7 +33,7 @@ func TestReleaseManifestWorkers(t *testing.T) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.Version != "1.0.0" || len(m.Artifacts) != 1 || len(m.Workers) != 4 {
+	if m.Version != "1.0.0" || len(m.Artifacts) != 1 || len(m.Workers) != 4 || m.PublicKey != base64.StdEncoding.EncodeToString(pub) {
 		t.Fatalf("манифест: %s", raw)
 	}
 	w := m.Worker("sysinfo", "linux", "amd64")
@@ -66,6 +66,24 @@ func TestReleaseManifestWorkers(t *testing.T) {
 		if err := manifest(bad); err == nil {
 			t.Errorf("%v: ожидалась ошибка", bad)
 		}
+	}
+}
+
+// Выпуск только воркеров (воркеры проекта): сборок агента нет — artifacts
+// пустой; без сборок агента и без --worker — ошибка.
+func TestReleaseManifestWorkersOnly(t *testing.T) {
+	t.Setenv("AGENT_SIGNING_KEY", "")
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "report-1.0.0-linux-amd64"), []byte("r"), 0o755)
+	if err := manifest([]string{dir, "2.0.0"}); err == nil {
+		t.Fatal("без сборок агента и --worker — ошибка")
+	}
+	if err := manifest([]string{dir, "2.0.0", "--worker", "report=1.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if !strings.Contains(string(raw), `"artifacts": []`) || strings.Contains(string(raw), "publicKey") {
+		t.Fatalf("манифест: %s", raw)
 	}
 }
 

@@ -43,6 +43,16 @@ export interface ChangeEvent {
   reason: "session" | "config" | "revoke" | "delete";
 }
 
+/** Удалённый источник выпуска агента дал новую версию (опция agentReleases). */
+export interface ReleaseEvent {
+  /** Версия выпуска агента. */
+  version: string;
+  /** Прежняя версия; нет — выпуск получен впервые. */
+  previous?: string;
+  /** Источник: `github:owner/repo` или база выпуска (url). */
+  from: string;
+}
+
 export interface AgentsEvents {
   agent: [Agent];
   event: [AgentEvent];
@@ -54,6 +64,7 @@ export interface AgentsEvents {
   action: [ActionRecord];
   audit: [AuditEntry];
   change: [ChangeEvent];
+  release: [ReleaseEvent];
 }
 
 /** Начавшиеся и закончившиеся проблемы. */

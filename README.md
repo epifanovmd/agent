@@ -141,7 +141,7 @@ Go на машине не нужен: цели `make` запускают его 
 | `make version-check`   | проверить, что версия везде одинаковая                                                                      |
 | `make check`           | всё сразу: vet, fmt-check, format-check, version-check, race, sdk-test, examples-test, e2e — перед коммитом |
 | `make build`           | агент под эту машину → `dist/<VERSION>/`                                                                    |
-| `make release`         | выпуск: агент для linux/darwin × amd64/arm64, `manifest.json`, `install.sh` → `dist/<VERSION>/`             |
+| `make release`         | выпуск: агент и netprobe для linux/darwin × amd64/arm64, `manifest.json`, `install.sh` → `dist/<VERSION>/`  |
 | `make images`          | образы `agent:dev` (минимальный), `agent:dev-python` (с python3 для воркеров) и `agent-dist:dev` (выпуск)   |
 | `make demo-build`      | стенд: собрать агента и воркеры на Go (`.dev/bin`), выпуск (`dist/<VERSION>`), SDK, сервер                  |
 | `make demo-server`     | стенд: сервер на Node.js, API — http://localhost:8080/api                                                   |
@@ -157,7 +157,7 @@ Go на машине не нужен: цели `make` запускают его 
 Тег `v<VERSION>` → CI выкладывает в GitHub Release (тег с «-», например `v1.2.0-rc.1`, —
 предварительный выпуск):
 
-- подписанные сборки агента, `manifest.json`, `install.sh`;
+- подписанные сборки агента и стандартного воркера выпуска netprobe, `manifest.json`, `install.sh`;
 - SDK — архив для Node (`agent-sdk-<версия>.tgz`);
 
 и образы `ghcr.io/epifanovmd/agent:<версия>` (минимальный), `ghcr.io/epifanovmd/agent:<версия>-python`
@@ -165,12 +165,16 @@ Go на машине не нужен: цели `make` запускают его 
 GitHub, без npm — команда установки SDK в [sdk/README.md](sdk/README.md#установка).
 
 Воркеры из выпуска (`release: true` в настройках агента) входят в него, если их сборки положить в
-каталог выпуска заранее и передать `scripts/release.sh … --worker NAME=VERSION`.
+каталог выпуска заранее и передать `scripts/release.sh … --worker NAME=VERSION`; netprobe
+`scripts/release.sh` собирает и вносит сам. Бэкенд на SDK находит новые выпуски на GitHub сам
+(опция `agentReleases`, [sdk/docs/releases.md](sdk/docs/releases.md#откуда-бэкенд-берёт-агента)):
+новая версия агента не требует пересобирать бэкенд.
 
 Подпись: `agent-release keygen` (`go run ./cmd/agent-release keygen`) выдаёт пару ключей. Закрытый
 (`AGENT_SIGNING_KEY`) — секрет репозитория для CI. Открытый (`AGENT_UPDATE_PUBLIC_KEY`) —
 переменная репозитория: CI вшивает его в сборки агента, и они проверяют обновления без
-настройки; бэкенду он нужен в опции `publicKey`. Как поставить агента прямо из GitHub Release —
+настройки. Свои воркеры проект подписывает своим ключом: агенту его передают при установке
+(`--update-key`), подпись принимается, если сходится с любым из ключей агента. Как поставить агента прямо из GitHub Release —
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#установка).
 
 Об уязвимостях сообщайте не в открытых issue — см. [SECURITY.md](SECURITY.md).

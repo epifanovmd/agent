@@ -56,7 +56,7 @@ func TestTemplate(t *testing.T) {
 		cfg.Workers[0].Lifecycle.StopTimeout.Std().String() != "1m0s" || !slices.Equal(cfg.Workers[1].Command, []string{"./bin/report"}) {
 		t.Fatalf("воркеры: %+v", cfg.Workers)
 	}
-	if !reflect.DeepEqual(cfg.Telemetry, Defaults().Telemetry) || cfg.Update != Defaults().Update {
+	if !reflect.DeepEqual(cfg.Telemetry, Defaults().Telemetry) || !reflect.DeepEqual(cfg.Update, Defaults().Update) {
 		t.Fatalf("умолчания: %+v %+v", cfg.Telemetry, cfg.Update)
 	}
 

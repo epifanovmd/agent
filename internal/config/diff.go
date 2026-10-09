@@ -44,6 +44,7 @@ func Compare(old, next Config) Diff {
 	restart("dataDir", old.DataDir != next.DataDir)
 	restart("update.mode", old.Update.Mode != next.Update.Mode)
 	restart("update.publicKey", old.Update.PublicKey != next.Update.PublicKey)
+	restart("update.publicKeys", !slices.Equal(old.Update.PublicKeys, next.Update.PublicKeys))
 	restart("enroll.token", old.Enroll.Token != next.Enroll.Token)
 	restart("server.reconnect", old.Server.Reconnect != next.Server.Reconnect)
 	restart("server.streamBuffer", old.Server.StreamBuffer != next.Server.StreamBuffer)

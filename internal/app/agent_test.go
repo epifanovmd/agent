@@ -6,9 +6,12 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +26,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/identity"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/sysmetrics"
 )
@@ -571,5 +575,69 @@ func TestMetricsIntervalAndWatch(t *testing.T) {
 	a.setWatch(message.Watch{MetricsIntervalMs: 2000, UntilMs: time.Now().Add(-time.Second).UnixMilli()})
 	if d := a.obs.metricsInterval(); d != 30*time.Second {
 		t.Fatalf("истёкший watch не действует: %v", d)
+	}
+}
+
+// Адрес сборки (§10): от корня — сервер и ключ агента; https:// — любой хост
+// без ключа (тот же сервер — с ключом); http:// — только при http-сервере.
+func TestUpdateSource(t *testing.T) {
+	for _, tc := range []struct {
+		server, raw, want string
+		auth, fail        bool
+	}{
+		{"https://api.example.com/", "/api/v1/agent-link/releases/agent-linux-amd64", "https://api.example.com/api/v1/agent-link/releases/agent-linux-amd64", true, false},
+		{"https://api.example.com", "https://github.com/example/agent/releases/download/v1.1.0/agent-linux-amd64", "https://github.com/example/agent/releases/download/v1.1.0/agent-linux-amd64", false, false},
+		{"https://api.example.com", "https://api.example.com/files/agent", "https://api.example.com/files/agent", true, false},
+		{"https://api.example.com", "http://cdn.example.com/agent", "", false, true},
+		{"http://127.0.0.1:8080", "http://127.0.0.1:9090/agent", "http://127.0.0.1:9090/agent", false, false},
+		{"https://api.example.com", "//cdn.example.com/agent", "", false, true},
+		{"https://api.example.com", "ftp://cdn.example.com/agent", "", false, true},
+		{"https://api.example.com", "agent-linux-amd64", "", false, true},
+		{"https://api.example.com", "https://user:pw@cdn.example.com/agent", "", false, true},
+	} {
+		cfg := config.Defaults()
+		cfg.Server.URL = tc.server
+		cfg.DataDir = t.TempDir()
+		cfg.Log.Level = "error"
+		a, err := New(cfg, "1.0.0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.auth.keys.Store(identity.NewKeys(nil, identity.Credentials{AgentID: "a1", Secret: "s1"}))
+		src, auth, err := a.source(tc.raw)
+		a.Close()
+		if tc.fail {
+			var me *message.ErrorInfo
+			if !errors.As(err, &me) || me.Code != message.CodeUpdateFailed {
+				t.Fatalf("%s: ожидался UPDATE_FAILED, а не %v (%s)", tc.raw, err, src)
+			}
+			continue
+		}
+		if err != nil || src != tc.want || (auth != "") != tc.auth {
+			t.Fatalf("%s: %q %q %v", tc.raw, src, auth, err)
+		}
+	}
+}
+
+// Ключи проверки: вшитый при сборке и ключи из настроек действуют вместе.
+func TestUpdateKeysFromConfig(t *testing.T) {
+	enc := base64.StdEncoding.EncodeToString
+	builtin, _, _ := ed25519.GenerateKey(nil)
+	project, _, _ := ed25519.GenerateKey(nil)
+	prev := BuiltinUpdateKey
+	BuiltinUpdateKey = enc(builtin)
+	t.Cleanup(func() { BuiltinUpdateKey = prev })
+	cfg := config.Defaults()
+	cfg.Server.URL = "http://127.0.0.1:1"
+	cfg.DataDir = t.TempDir()
+	cfg.Log.Level = "error"
+	cfg.Update.PublicKeys = []string{enc(project), enc(builtin)}
+	a, err := New(cfg, "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if len(a.keys) != 2 || !a.keys[0].Equal(builtin) || !a.keys[1].Equal(project) {
+		t.Fatalf("ключи: %d", len(a.keys))
 	}
 }

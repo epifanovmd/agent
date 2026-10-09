@@ -127,7 +127,7 @@ func TestFetchArchive(t *testing.T) {
 	defer srv.Close()
 	b := Local("report", "1.0.0", hash)
 	dst := filepath.Join(dir, "current.new")
-	if err := FetchArchive(context.Background(), srv.Client(), "", pub, b, srv.URL, Sign(priv, b), dst); err != nil {
+	if err := FetchArchive(context.Background(), srv.Client(), "", Keys{pub}, b, srv.URL, Sign(priv, b), dst); err != nil {
 		t.Fatal(err)
 	}
 	if raw, _ := os.ReadFile(filepath.Join(dst, "main.py")); string(raw) != "print('report')\n" {

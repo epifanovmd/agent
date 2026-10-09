@@ -21,6 +21,7 @@ import (
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/internal/update"
 )
 
 // Пути установки экземпляра по умолчанию (остальные — Layout).
@@ -106,8 +107,10 @@ type Options struct {
 	Server    string
 	Token     string
 	TokenFile string
-	PublicKey string
-	Name      string
+	// PublicKeys — ключи проверки выпусков (--update-key, --public-key):
+	// вместе со вшитым ключом; в agent.env — AGENT_UPDATE_PUBLIC_KEYS.
+	PublicKeys []string
+	Name       string
 	// Config — свой agent.yaml вместо создаваемого.
 	Config string
 	CAFile string
@@ -185,6 +188,9 @@ func (o *Options) check() error {
 		if !rePkg.MatchString(p) {
 			errs = append(errs, fmt.Errorf("--packages: %q — не имя пакета", p))
 		}
+	}
+	if _, err := update.ParseKeys(o.PublicKeys...); err != nil {
+		errs = append(errs, fmt.Errorf("--update-key: %w", err))
 	}
 	for _, p := range o.RWPaths {
 		if !filepath.IsAbs(p) || strings.ContainsAny(p, " \t\n\"'") {
@@ -300,8 +306,8 @@ func Install(ctx context.Context, s *System, o Options) error {
 		return err
 	}
 	if err := writeEnv(s, l, user, map[string]string{
-		"AGENT_ENROLL_TOKEN":      o.Token,
-		"AGENT_UPDATE_PUBLIC_KEY": o.PublicKey,
+		"AGENT_ENROLL_TOKEN":       o.Token,
+		"AGENT_UPDATE_PUBLIC_KEYS": strings.Join(keyList(o.PublicKeys), ","),
 	}); err != nil {
 		return err
 	}
@@ -454,8 +460,20 @@ func savedServer(s *System, l Paths) string {
 	return strings.TrimRight(cfg.Server.URL, "/")
 }
 
+// keyList — ключи без пустых и повторов.
+func keyList(keys []string) []string {
+	var out []string
+	for _, k := range keys {
+		if k = strings.TrimSpace(k); k != "" && !slices.Contains(out, k) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // writeEnv — секреты в agent.env (0600): переданные заменяют прежние,
-// остальные строки сохраняются.
+// остальные строки сохраняются. Новые ключи проверки заменяют и прежний
+// одиночный AGENT_UPDATE_PUBLIC_KEY.
 func writeEnv(s *System, l Paths, user string, vars map[string]string) error {
 	path := s.p(l.EnvFile)
 	raw, err := os.ReadFile(path)
@@ -465,12 +483,13 @@ func writeEnv(s *System, l Paths, user string, vars map[string]string) error {
 	var lines []string
 	for _, l := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
 		k, _, _ := strings.Cut(l, "=")
-		if l == "" || vars[strings.TrimSpace(k)] != "" {
+		k = strings.TrimSpace(k)
+		if l == "" || vars[k] != "" || (k == "AGENT_UPDATE_PUBLIC_KEY" && vars["AGENT_UPDATE_PUBLIC_KEYS"] != "") {
 			continue
 		}
 		lines = append(lines, l)
 	}
-	for _, k := range []string{"AGENT_ENROLL_TOKEN", "AGENT_UPDATE_PUBLIC_KEY"} {
+	for _, k := range []string{"AGENT_ENROLL_TOKEN", "AGENT_UPDATE_PUBLIC_KEYS"} {
 		if v := vars[k]; v != "" {
 			lines = append(lines, k+"="+v)
 		}

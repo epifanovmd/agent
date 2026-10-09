@@ -2,8 +2,8 @@
 
 package main
 
-// version — версия воркера.
-const version = "1.0.0"
+// version — версия воркера; в выпуске агента — его версия (-ldflags "-X main.version=…").
+var version = "1.0.0"
 
 // jobRun — тип задачи «проверить сейчас».
 const jobRun = "netprobe.run"

@@ -47,16 +47,12 @@ import type {
   Alert,
   ConfigRecord,
   ConfigStatus,
+  ReleaseView,
   UpdateCandidate,
   WorkerCapabilities,
   WorkerUpdateCandidate,
 } from "./model/types";
-import {
-  type JobStatus,
-  type LogEntry,
-  newId,
-  type ReleaseManifest,
-} from "./protocol/messages";
+import { type JobStatus, type LogEntry, newId } from "./protocol/messages";
 import { MemoryStore } from "./store/memory";
 import type { Store } from "./store/store";
 import { Transport } from "./transport/transport";
@@ -207,7 +203,11 @@ export class Agents extends EventEmitter<AgentsEvents> {
     this.transport = new Transport({
       settings: this.settings,
       pingIntervalMs: this.settings.pingIntervalMs,
-      manifest: () => releases.manifest(),
+      releaseEnabled: () => releases.enabled(),
+      servedManifest: () => releases.served(),
+      releaseFile: name => releases.file(name),
+      downloadRelease: (url, signal) => releases.download(url, signal),
+      installScript: () => releases.installScript(),
       enroll: (body, remote) => enrollment.enroll(body, remote),
       authenticate: header => enrollment.authenticate(header),
       open: (ss, env) => links.open(ss, env),
@@ -282,6 +282,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
   /** Остановить: соединения закрываются кодом 1012 (агенты сразу подключатся снова). */
   async close(): Promise<void> {
     clearInterval(this.timer);
+    this.releases.close();
     this.actions.close();
     const offline = this.links.close();
 
@@ -515,9 +516,17 @@ export class Agents extends EventEmitter<AgentsEvents> {
 
   // ── выпуск ──
 
-  /** manifest.json каталога выпуска или null. */
-  release(): Promise<ReleaseManifest | null> {
+  /**
+   * Итоговый выпуск или null: агент и его воркеры — из удалённого источника (agentReleases), воркеры
+   * проекта — из releasesDir; у каждой сборки — источник (source) и ссылка (url).
+   */
+  release(): Promise<ReleaseView | null> {
     return this.releases.manifest();
+  }
+
+  /** Проверить удалённый источник выпуска сейчас (не дожидаясь checkIntervalMs) и вернуть выпуск. */
+  checkRelease(): Promise<ReleaseView | null> {
+    return this.releases.check();
   }
 
   /** Агенты, чья версия не как в выпуске и для чьих os/arch есть сборка. */

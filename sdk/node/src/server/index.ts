@@ -6,9 +6,11 @@ export type {
   ChangeEvent,
   LogEvent,
   MetricsEvent,
+  ReleaseEvent,
 } from "./core/context";
 export { AgentsError } from "./core/errors";
 export {
+  type AgentReleasesOptions,
   agentsDefaults,
   type AgentsOptions,
   type EnrollInfo,

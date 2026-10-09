@@ -67,6 +67,46 @@ export type RelayFunction = (
   request: RelayRequest,
 ) => Promise<Response>;
 
+/** Общее для удалённых источников выпуска агента. */
+interface AgentReleasesCommon {
+  /** Как часто проверять новый выпуск, мс (по умолчанию 3 600 000 — 1 ч); первая проверка — при старте. */
+  checkIntervalMs?: number;
+  /**
+   * Сборки из удалённого источника отдавать узлам через бэкенд потоком (узлам без доступа к
+   * GitHub). По умолчанию false: `GET …/releases/<file>` отвечает 302 на ссылку источника.
+   */
+  proxy?: boolean;
+  /**
+   * Ключ автора агента (base64) для install.sh; по умолчанию — publicKey из manifest.json
+   * удалённого выпуска.
+   */
+  publicKey?: string;
+  /** Своя функция fetch (тесты, прокси); по умолчанию — глобальная. */
+  fetch?: typeof globalThis.fetch;
+}
+
+/**
+ * Удалённый источник выпуска агента: выпуски GitHub (github) или постоянная база выпуска (url —
+ * каталог с manifest.json, например `https://github.com/<owner>/<repo>/releases/download/v1.1.0`).
+ */
+export type AgentReleasesOptions = AgentReleasesCommon &
+  (
+    | {
+        /** Репозиторий `owner/repo`: выпуски без prerelease и draft. */
+        github: string;
+        /** Диапазон версий semver (по умолчанию `^<мажорная версия SDK>`, например `^1`). */
+        range?: string;
+        /** Токен GitHub для API (лимиты запросов). */
+        token?: string;
+        /** Адрес API GitHub (по умолчанию https://api.github.com). */
+        apiUrl?: string;
+      }
+    | {
+        /** База выпуска: `<url>/manifest.json`, `<url>/<file>`, `<url>/install.sh`. */
+        url: string;
+      }
+  );
+
 export interface AgentsOptions {
   /** Токен регистрации агентов (или своя проверка — enroll). */
   enrollToken?: string;
@@ -124,10 +164,22 @@ export interface AgentsOptions {
   actionTimeoutMs?: number;
   /** Срок ответа на worker.update и agent.update, мс (по умолчанию 300 000). */
   updateTimeoutMs?: number;
-  /** Каталог выпуска (manifest.json, сборки, install.sh). */
+  /**
+   * Каталог выпуска (manifest.json, сборки, install.sh). С agentReleases — воркеры проекта:
+   * manifest.json от `agent-release manifest` и их сборки; сборки агента из него не берутся, пока
+   * получен удалённый выпуск.
+   */
   releasesDir?: string;
+  /**
+   * Откуда брать агента и его воркеры (netprobe): выпуски GitHub или база выпуска по ссылке. SDK
+   * сам следит за новыми версиями; итоговый выпуск — удалённый плюс воркеры проекта из
+   * releasesDir.
+   */
+  agentReleases?: AgentReleasesOptions;
   /** Ключ проверки выпуска (base64): подставляется в install.sh. */
   publicKey?: string;
+  /** Ещё ключи проверки (base64; ключи проекта): подставляются в install.sh вместе с publicKey. */
+  updatePublicKeys?: string[];
   /** Публичный адрес сервера для install.sh и installCommand (по умолчанию — из запроса). */
   baseUrl?: string;
   /** Неудачных регистраций с одного адреса за окно, после которых — 429 (по умолчанию 10; 0 — без предела). */
@@ -179,6 +231,7 @@ type Optional =
   | "onEvent"
   | "onWorkerRequest"
   | "releasesDir"
+  | "agentReleases"
   | "publicKey"
   | "baseUrl"
   | "relay"
@@ -218,7 +271,9 @@ export const resolveOptions = (opts: AgentsOptions): Settings => {
     actionTimeoutMs: opts.actionTimeoutMs ?? 60_000,
     updateTimeoutMs: opts.updateTimeoutMs ?? 300_000,
     releasesDir: opts.releasesDir,
+    agentReleases: opts.agentReleases,
     publicKey: opts.publicKey,
+    updatePublicKeys: opts.updatePublicKeys ?? [],
     baseUrl: opts.baseUrl,
     enrollFailureLimit: opts.enrollFailureLimit ?? 10,
     enrollFailureWindowMs: opts.enrollFailureWindowMs ?? 60_000,

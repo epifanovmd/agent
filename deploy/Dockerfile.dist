@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Выпуск агента (scripts/release.sh): сборки linux/darwin × amd64/arm64, manifest.json и install.sh в
+# Выпуск агента (scripts/release.sh): сборки агента и netprobe linux/darwin × amd64/arm64, manifest.json и install.sh в
 # /dist/<версия>/ — каталог выпуска, который раздаёт сервер (releases, install.sh; COPY --from в его образе).
 # Подпись — секрет BuildKit `agent_signing_key` (agent-release keygen); без него
 # manifest без подписей и агенты на такие сборки не обновляются. Открытый ключ

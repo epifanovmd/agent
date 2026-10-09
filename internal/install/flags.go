@@ -29,7 +29,7 @@ const Usage = `agent install — поставить агента службой 
   sudo agent install --server https://api.example.com --token <токен> [флаги]
 
 Повторный запуск обновляет программу и службу; ключ агента, agent.yaml и
-agent.env сохраняются (переданные --token и --public-key заменяют прежние).
+agent.env сохраняются (переданные --token и --update-key заменяют прежние).
 
 Несколько агентов на одном узле (для разных бэкендов) — экземпляры:
 --instance ИМЯ ставит или обновляет экземпляр ИМЯ со своими путями
@@ -44,7 +44,10 @@ agent.env сохраняются (переданные --token и --public-key �
   --name ИМЯ              имя агента (по умолчанию — имя машины)
   --config ФАЙЛ           свой agent.yaml вместо создаваемого
   --ca-file ПУТЬ          свой корневой сертификат сервера → ca.pem рядом с agent.yaml
-  --public-key КЛЮЧ       ключ проверки подписи выпусков (в сборки из выпуска вшит)
+  --update-key КЛЮЧ       ключ проверки подписи выпусков (можно несколько раз; подпись принимается,
+                          если сходится с любым; ключ автора агента в сборки из выпуска вшит,
+                          сюда — ключи проекта) → agent.env AGENT_UPDATE_PUBLIC_KEYS;
+                          --public-key — то же
   --worker ИМЯ            воркер из выпуска (можно несколько раз)
   --releases URL          откуда брать воркеры (по умолчанию <server>/api/v1/agent-link/releases)
   --user ИМЯ              пользователь службы (по умолчанию agent, у экземпляра — agent-ИМЯ;
@@ -72,7 +75,8 @@ func ParseFlags(args []string, errOut io.Writer) (Options, error) {
 	fs.StringVar(&o.Server, "server", "", "")
 	fs.StringVar(&o.Token, "token", "", "")
 	fs.StringVar(&o.TokenFile, "token-file", "", "")
-	fs.StringVar(&o.PublicKey, "public-key", "", "")
+	fs.Var(list{to: &o.PublicKeys}, "update-key", "")
+	fs.Var(list{to: &o.PublicKeys}, "public-key", "")
 	fs.StringVar(&o.Name, "name", "", "")
 	fs.StringVar(&o.Config, "config", "", "")
 	fs.StringVar(&o.CAFile, "ca-file", "", "")

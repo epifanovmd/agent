@@ -6,9 +6,7 @@
 package app
 
 import (
-	"cmp"
 	"context"
-	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,7 +38,8 @@ import (
 )
 
 // BuiltinUpdateKey — ключ проверки сборок, вшитый при сборке (cmd/agent,
-// -ldflags "-X main.updateKey=…"); настройка update.publicKey важнее.
+// -ldflags "-X main.updateKey=…"); ключи из настроек (update.publicKey,
+// update.publicKeys) действуют вместе с ним.
 var BuiltinUpdateKey string
 
 // ErrRestart — агент остановлен для перезапуска (обновление): процесс
@@ -71,7 +70,8 @@ type App struct {
 	asks    *requests.Broker
 	runDir  string
 	update  update.Paths
-	pubKey  ed25519.PublicKey
+	// keys — ключи проверки выпусков: вшитый при сборке и из настроек.
+	keys update.Keys
 	// sysmetricsCmd — запуск встроенного воркера sysmetrics.
 	sysmetricsCmd []string
 
@@ -123,10 +123,8 @@ func New(cfg config.Config, version string) (*App, error) {
 		sysmetricsCmd: SysmetricsCommand(),
 	}
 	a.obs.init()
-	if key := cmp.Or(cfg.Update.PublicKey, BuiltinUpdateKey); key != "" {
-		if a.pubKey, err = update.ParsePublicKey(key); err != nil {
-			return nil, err
-		}
+	if a.keys, err = update.ParseKeys(append([]string{BuiltinUpdateKey}, cfg.Update.Keys()...)...); err != nil {
+		return nil, err
 	}
 	if exe, err := os.Executable(); err == nil {
 		a.update = update.NewPaths(exe)

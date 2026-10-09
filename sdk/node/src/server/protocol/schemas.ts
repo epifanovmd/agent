@@ -429,9 +429,24 @@ export const workerArtifactSchema = releaseArtifactSchema.extend({
   command: z.string().optional(),
 });
 
-/** manifest.json выпуска (§11): неверные сборки пропускаются. */
+/** manifest.json выпуска (§11): неверные сборки пропускаются; artifacts пуст — выпуск только воркеров. */
 export const releaseManifestSchema = z.object({
   version: z.string(),
-  artifacts: validItems(releaseArtifactSchema),
+  /** Открытый ключ, которым подписан выпуск (base64), — справочно. */
+  publicKey: z.string().optional().catch(undefined),
+  artifacts: validItems(releaseArtifactSchema).catch([]),
   workers: validItems(workerArtifactSchema).optional().catch(undefined),
 });
+
+/** Выпуск GitHub (ответ `GET /repos/{owner}/{repo}/releases`): нужное SDK; неверные файлы пропускаются. */
+export const githubReleaseSchema = z.looseObject({
+  tag_name: z.string(),
+  draft: z.boolean().catch(false),
+  prerelease: z.boolean().catch(false),
+  assets: validItems(
+    z.looseObject({ name: z.string(), browser_download_url: z.string() }),
+  ).catch([]),
+});
+
+/** Список выпусков GitHub; неверные записи пропускаются. */
+export const githubReleasesSchema = validItems(githubReleaseSchema);

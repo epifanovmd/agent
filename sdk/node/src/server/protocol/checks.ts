@@ -12,6 +12,7 @@ import {
   eventSchema,
   eventTypeSchema,
   fetchReplySchemas,
+  githubReleasesSchema,
   helloSchema,
   jobEventSchema,
   jobReplySchema,
@@ -241,3 +242,9 @@ export const parseManifest = (
   data: unknown,
 ): Parsed<z.output<typeof releaseManifestSchema>> =>
   parse(releaseManifestSchema, data, "manifest.json");
+
+/** Список выпусков GitHub (удалённый источник выпуска агента). */
+export const parseGithubReleases = (
+  data: unknown,
+): Parsed<z.output<typeof githubReleasesSchema>> =>
+  parse(githubReleasesSchema, data, "выпуски GitHub");

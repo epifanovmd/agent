@@ -4,7 +4,7 @@
 # agent install как есть: --token, --name, --worker, --packages, --sysctl, --privileged и др.
 # (список — agent install -h и docs/ARCHITECTURE.md, раздел «Установка»).
 #
-# С сервера (он раздаёт этот скрипт со своим адресом и ключом проверки выпусков):
+# С сервера (он раздаёт этот скрипт со своим адресом и ключами проверки выпусков):
 #   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --token <токен> [флаги]
 #   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --uninstall [--purge]
 #
@@ -23,9 +23,10 @@
 #   sudo ./agent-linux-<arch> install --server URL --token <токен>
 set -eu
 
-# Сервер, раздающий скрипт, подставляет сюда свой адрес и ключ проверки выпусков.
+# Сервер, раздающий скрипт, подставляет сюда свой адрес и ключи проверки выпусков (base64 через
+# пробел: автор агента и проект) — они уходят agent install флагами --update-key.
 DEFAULT_SERVER=""
-DEFAULT_PUBLIC_KEY=""
+DEFAULT_UPDATE_KEYS=""
 
 die() {
   echo "install.sh: $*" >&2
@@ -111,7 +112,19 @@ fetch_agent() {
     FILE="$(printf '%s' "$ENTRY" | sed -n 's/.*"file":"\([^"]*\)".*/\1/p')"
     SUM="$(printf '%s' "$ENTRY" | sed -n 's/.*"sha256":"\([^"]*\)".*/\1/p')"
     if [ -z "$FILE" ] || [ -z "$SUM" ]; then die "в выпуске нет сборки агента linux/$ARCH"; fi
-    curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$RELEASES/$FILE" -o "$TMP/agent" || die "сборка $FILE не скачана"
+    # file — имя в каталоге выпуска или абсолютная ссылка https:// (http:// — при http-каталоге).
+    case "$FILE" in
+      https://*) URL=$FILE ;;
+      http://*)
+        case "$RELEASES" in
+          http://*) URL=$FILE ;;
+          *) die "сборка $FILE: нужна ссылка https://" ;;
+        esac
+        ;;
+      */* | *:*) die "сборка $FILE: нужно имя файла или ссылка https://" ;;
+      *) URL="$RELEASES/$FILE" ;;
+    esac
+    curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$URL" -o "$TMP/agent" || die "сборка $FILE не скачана"
     GOT="$(sha256sum "$TMP/agent" | cut -d' ' -f1)"
     [ "$GOT" = "$SUM" ] || die "sha256 сборки не сходится: $GOT"
   fi
@@ -142,5 +155,9 @@ fi
 
 fetch_agent
 
-# Значения сервера — первыми: такие же флаги в командной строке их заменяют.
-"$TMP/agent" install ${SERVER:+--server "$SERVER"} ${DEFAULT_PUBLIC_KEY:+--public-key "$DEFAULT_PUBLIC_KEY"} "$@"
+# Ключи сервера — флагами --update-key перед остальными (ключи — base64 без пробелов).
+for k in $DEFAULT_UPDATE_KEYS; do
+  set -- --update-key "$k" "$@"
+done
+# Адрес сервера — первым: такой же флаг в командной строке его заменяет.
+"$TMP/agent" install ${SERVER:+--server "$SERVER"} "$@"

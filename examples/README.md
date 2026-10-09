@@ -86,16 +86,21 @@ curl -X POST localhost:8080/api/agents/<id>/workers/echo/fetch/echo -d '{"text":
 curl -N 'localhost:8080/api/agents/<id>/watch?logLevel=info'             # метрики и журнал вживую
 ```
 
-| Переменная                                  | По умолчанию                            | Что                                                                 |
-| ------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------- |
-| `PORT`                                      | `8080`                                  | порт                                                                |
-| `ENROLL_TOKEN`                              | `demo-token`                            | токен регистрации агентов                                           |
-| `RELEASES_DIR`                              | `dist/<VERSION>` (в `make demo-server`) | каталог выпуска; без него нет обновлений и `install.sh`             |
-| `PUBLIC_KEY`                                | —                                       | открытый ключ проверки подписи (base64), вписывается в `install.sh` |
-| `PUBLIC_URL`                                | из запроса                              | адрес сервера для команды установки                                 |
-| `STATUS_INTERVAL_MS`, `METRICS_INTERVAL_MS` | `5000`                                  | как часто агенты шлют статус и метрики                              |
-| `METRICS_HISTORY_INTERVAL_MS`               | `5000`                                  | как часто точка метрик попадает в историю (`0` — каждая)            |
-| `VALIDATE_CONFIGS`                          | —                                       | `1` — проверять настройки по схеме из манифеста воркера             |
+| Переменная                                     | По умолчанию                            | Что                                                                      |
+| ---------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------ |
+| `PORT`                                         | `8080`                                  | порт                                                                     |
+| `ENROLL_TOKEN`                                 | `demo-token`                            | токен регистрации агентов                                                |
+| `RELEASES_DIR`                                 | `dist/<VERSION>` (в `make demo-server`) | каталог выпуска; с `AGENT_RELEASES_*` — воркеры проекта                  |
+| `AGENT_RELEASES_GITHUB`                        | —                                       | `owner/repo`: агент и netprobe из выпусков GitHub (`agentReleases`)      |
+| `AGENT_RELEASES_RANGE`, `AGENT_RELEASES_TOKEN` | `^<мажор SDK>`, —                       | диапазон версий и токен API GitHub                                       |
+| `AGENT_RELEASES_URL`                           | —                                       | вместо GitHub: база выпуска (каталог с `manifest.json`)                  |
+| `AGENT_RELEASES_PROXY`                         | —                                       | `1` — сборки из источника узлам через сервер потоком, а не 302           |
+| `AGENT_RELEASES_CHECK_INTERVAL_MS`             | `3600000`                               | как часто проверять новый выпуск                                         |
+| `PUBLIC_KEY`, `UPDATE_PUBLIC_KEYS`             | —                                       | ключи проверки подписи (base64; второй — через запятую) для `install.sh` |
+| `PUBLIC_URL`                                   | из запроса                              | адрес сервера для команды установки                                      |
+| `STATUS_INTERVAL_MS`, `METRICS_INTERVAL_MS`    | `5000`                                  | как часто агенты шлют статус и метрики                                   |
+| `METRICS_HISTORY_INTERVAL_MS`                  | `5000`                                  | как часто точка метрик попадает в историю (`0` — каждая)                 |
+| `VALIDATE_CONFIGS`                             | —                                       | `1` — проверять настройки по схеме из манифеста воркера                  |
 
 Это переменные сервера (`server/src/main.ts`). `scripts/demo.sh` задаёт `ENROLL_TOKEN` сам — из
 `DEMO_TOKEN` (по умолчанию `demo-token`), один и тот же для сервера и агента; адрес сервера для
@@ -111,7 +116,7 @@ curl -N 'localhost:8080/api/agents/<id>/watch?logLevel=info'             # ме�
 
 ```bash
 make e2e                 # сборки → .dev/e2e, затем тесты (около минуты)
-scripts/e2e.sh build     # только сборки: агент, агент следующей версии, agent-release, sysinfo, netprobe
+scripts/e2e.sh build     # только сборки: агент, агент и netprobe следующей версии, agent-release, sysinfo, netprobe
 scripts/e2e.sh test      # только тесты (сборки и sdk/node уже собраны: make node-sdk)
 E2E_KEEP=1 scripts/e2e.sh test   # не удалять временные каталоги стендов (журналы agent.log, server.log)
 ```
@@ -130,4 +135,5 @@ echo, node-echo, sysinfo и netprobe (у `registration.test.ts` — ещё `bare
 | `longwork.test.ts`     | долгая задача `echo.long` переживает перезапуск агента (SIGTERM и запуск): тот же процесс, все шаги и итог дошли; `worker.restart` во время задачи — сразу `deferred` (`pending: restart`), замена и событие `action` — после её окончания; `force` — сразу, а `echo` продолжает задачу с сохранённого шага                                                                                                   |
 | `detect.test.ts`       | обнаружение потери связи с настройками по умолчанию: упавший процесс воркера — новый `state` не позже 2 с; убитый агент (SIGKILL) — `offline` не позже 8 с, `lastSeenAt` — последняя весть                                                                                                                                                                                                                    |
 | `actions.test.ts`      | выпуск, подписанный тестовым ключом (`agent-release keygen`, `manifest`): кандидаты обновления, чужая подпись — отказ, обновление агента с перезапуском (тест перезапускает процесс, как служба) — работа `echo` при этом не прерывается; `worker.restart`; перезапуск зависшего воркера; смена ключа; отзыв и новая регистрация по токену                                                                    |
+| `releases.test.ts`     | удалённый источник выпуска агента (`agentReleases.url` — каталог на отдельном HTTP-сервере, как GitHub Release; подпись ключом автора агента) и воркер проекта netprobe в `releasesDir` (подпись ключом проекта): итоговый выпуск с источниками, `install.sh` с ключами проекта и автора, сборка — `302`; агент с двумя ключами (`update.publicKeys`) обновляет netprobe из `releasesDir` и себя из источника |
 | `strict.test.ts`       | строгие возможности: маршрут не из манифеста — `ROUTE_UNDECLARED`, тип задачи — `JOB_UNKNOWN` (от агента), тело не по схеме маршрута — `REQUEST_INVALID` (`validateRequests`); запрос воркера к бэкенду `echo.lookup` в задаче `echo.quick`; `waitEvent` — `echo.started` после перезапуска, `data` по схеме (`validateEvents: reject`); `capabilities`                                                       |

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"net/http"
@@ -36,20 +37,20 @@ func TestInstallVerifiesAndBootCounts(t *testing.T) {
 
 	forged := rel
 	forged.Signature = Sign(priv, Local(AgentName, "3", hash)) // подпись другой версии
-	if err := Install(context.Background(), srv.Client(), "Agent a.s", p, pub, forged); err == nil {
+	if err := Install(context.Background(), srv.Client(), "Agent a.s", p, Keys{pub}, forged); err == nil {
 		t.Fatal("подпись другой версии должна отвергаться")
 	}
 	bad := rel
 	bad.SHA256 = hex.EncodeToString(make([]byte, 32))
 	bad.Signature = Sign(priv, Local(AgentName, "2", bad.SHA256))
-	if err := Install(context.Background(), srv.Client(), "Agent a.s", p, pub, bad); err == nil {
+	if err := Install(context.Background(), srv.Client(), "Agent a.s", p, Keys{pub}, bad); err == nil {
 		t.Fatal("несовпадение sha256 должно отвергаться")
 	}
 	if got, _ := os.ReadFile(bin); string(got) != "#!old" {
 		t.Fatal("после отказа файл не должен меняться")
 	}
 
-	if err := Install(context.Background(), srv.Client(), "Agent a.s", p, pub, rel); err != nil {
+	if err := Install(context.Background(), srv.Client(), "Agent a.s", p, Keys{pub}, rel); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := os.ReadFile(bin); string(got) != string(newBin) {
@@ -106,7 +107,7 @@ func TestInstallUpperCaseHash(t *testing.T) {
 	p := NewPaths(bin)
 	rel := Release{Version: "2", URL: srv.URL, SHA256: hash, Signature: Sign(priv, Local(AgentName, "2", hash))}
 	for range 2 {
-		if err := Install(context.Background(), srv.Client(), "", p, pub, rel); err != nil {
+		if err := Install(context.Background(), srv.Client(), "", p, Keys{pub}, rel); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -139,17 +140,17 @@ func TestFetch(t *testing.T) {
 	}
 	other := b
 	other.Name = "other" // подпись сборки другого воркера
-	if err := Fetch(ctx, srv.Client(), "", pub, b, srv.URL, Sign(priv, other), dst); err == nil {
+	if err := Fetch(ctx, srv.Client(), "", Keys{pub}, b, srv.URL, Sign(priv, other), dst); err == nil {
 		t.Fatal("подпись другого воркера")
 	}
 	wrong := Local("report", "1.0.0", hex.EncodeToString(make([]byte, 32)))
-	if err := Fetch(ctx, srv.Client(), "", pub, wrong, srv.URL, Sign(priv, wrong), dst); err == nil {
+	if err := Fetch(ctx, srv.Client(), "", Keys{pub}, wrong, srv.URL, Sign(priv, wrong), dst); err == nil {
 		t.Fatal("sha256 не сходится")
 	}
 	if _, err := os.Stat(dst); !os.IsNotExist(err) {
 		t.Fatal("после отказа файла быть не должно")
 	}
-	if err := Fetch(ctx, srv.Client(), "", pub, b, srv.URL, Sign(priv, b), dst); err != nil {
+	if err := Fetch(ctx, srv.Client(), "", Keys{pub}, b, srv.URL, Sign(priv, b), dst); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := os.ReadFile(dst); string(got) != string(body) {
@@ -157,7 +158,7 @@ func TestFetch(t *testing.T) {
 	}
 	// sha256 прописными: подпись и проверка файла сходятся одинаково.
 	upper := Local("report", "1.0.0", strings.ToUpper(hash))
-	if err := Fetch(ctx, srv.Client(), "", pub, upper, srv.URL, Sign(priv, upper), dst); err != nil {
+	if err := Fetch(ctx, srv.Client(), "", Keys{pub}, upper, srv.URL, Sign(priv, upper), dst); err != nil {
 		t.Fatalf("sha256 прописными: %v", err)
 	}
 }
@@ -178,5 +179,34 @@ func TestBuildPayload(t *testing.T) {
 	arm.Arch = "arm64"
 	if Verify(pub, arm, sig) == nil {
 		t.Fatal("подпись другой платформы")
+	}
+}
+
+// Несколько ключей: подпись принимается, если сходится с любым; повторы и
+// пустые строки пропускаются; неверный ключ — ошибка.
+func TestKeys(t *testing.T) {
+	authorPub, author, _ := ed25519.GenerateKey(nil)
+	projectPub, project, _ := ed25519.GenerateKey(nil)
+	_, stranger, _ := ed25519.GenerateKey(nil)
+	enc := base64.StdEncoding.EncodeToString
+	keys, err := ParseKeys(enc(authorPub), "", enc(projectPub), " "+enc(authorPub)+" ")
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("ключи: %d, %v", len(keys), err)
+	}
+	b := Local("report", "1.0.0", "ab")
+	if err := keys.Verify(b, Sign(author, b)); err != nil {
+		t.Fatalf("подпись автора: %v", err)
+	}
+	if err := keys.Verify(b, Sign(project, b)); err != nil {
+		t.Fatalf("подпись проекта: %v", err)
+	}
+	if err := keys.Verify(b, Sign(stranger, b)); err == nil {
+		t.Fatal("чужая подпись принята")
+	}
+	if err := (Keys{}).Verify(b, Sign(author, b)); !errors.Is(err, ErrNotVerified) {
+		t.Fatalf("без ключей: %v", err)
+	}
+	if _, err := ParseKeys(enc(authorPub), "a2V5"); err == nil {
+		t.Fatal("неверный ключ принят")
 	}
 }
