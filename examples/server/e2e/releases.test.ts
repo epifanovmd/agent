@@ -182,10 +182,18 @@ describe("удалённый источник выпуска агента", () =
     );
 
     assert.equal(w.version, NEXT_VERSION);
+    await s.waitAgent("netprobe новой версии работает", a =>
+      Boolean(
+        a.status?.workers.some(
+          x =>
+            x.name === "netprobe" &&
+            x.state === "running" &&
+            x.version === NEXT_VERSION &&
+            x.health?.ok,
+        ),
+      ),
+    );
     await s.waitWorkers();
-    const probe = await s.worker("netprobe");
-
-    assert.equal(probe?.version, NEXT_VERSION);
     const a = await s.api("POST", `/api/agents/${s.agentId}/update`);
 
     assert.deepEqual(a, { version: NEXT_VERSION, previous: VERSION });
