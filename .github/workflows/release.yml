@@ -94,10 +94,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Только артефакты выпуска: build-push-action добавляет свои (.dockerbuild).
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          name: agent
           path: out
-          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdk
+          path: out
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: out/*
