@@ -1,3 +1,3 @@
 // Версия SDK (одна на агента, SDK и примеры — scripts/version.sh).
 /** Версия SDK. */
-export const SDK_VERSION = "1.1.0";
+export const SDK_VERSION = "1.1.1";
