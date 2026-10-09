@@ -64,6 +64,8 @@ type result struct {
 	OK      bool   `json:"ok"`
 	Code    string `json:"code,omitempty"`
 	Message string `json:"message,omitempty"`
+	// Detail — тело ответа воркера 2xx (config.applied.result); на диск не пишется.
+	Detail json.RawMessage `json:"-"`
 }
 
 type entry struct {
@@ -253,7 +255,7 @@ func (s *Store) Delete(d message.ConfigDelete) {
 		resp.Body.Close()
 		if resp.StatusCode/100 != 2 && resp.StatusCode != http.StatusNotFound {
 			s.log.Warn("config.delete: воркер ответил ошибкой", "worker", d.Worker, "key", d.Key,
-				"status", resp.StatusCode, "err", worker.ErrorText(body))
+				"status", resp.StatusCode, "bytes", len(body))
 		}
 	}()
 }
@@ -400,15 +402,42 @@ func (s *Store) apply(ctx context.Context, name, key string, f file) result {
 		return result{Code: message.CodeWorkerUnavailable, Message: err.Error()}
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, message.MaxConfigResultBytes+1))
 	if resp.StatusCode/100 != 2 {
+		if len(raw) > message.MaxConfigResultBytes {
+			raw = raw[:message.MaxConfigResultBytes]
+		}
 		text := worker.ErrorText(raw)
 		if text == "" {
 			text = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		}
 		return result{Code: message.CodeConfigRejected, Message: text}
 	}
-	return result{OK: true}
+	return result{OK: true, Detail: s.detail(name, key, raw)}
+}
+
+// detail — тело ответа 2xx как итог применения: JSON до
+// MaxConfigResultBytes; пусто, null, больше предела или не JSON — без итога
+// (последние два — с предупреждением; содержимое в лог не пишется).
+func (s *Store) detail(name, key string, raw []byte) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	switch {
+	case len(trimmed) == 0 || string(trimmed) == "null":
+		return nil
+	case len(raw) > message.MaxConfigResultBytes:
+		s.log.Warn("PUT /config: тело ответа воркера больше предела — итог не передан",
+			"worker", name, "key", key, "limit", message.MaxConfigResultBytes)
+		return nil
+	case !json.Valid(trimmed):
+		s.log.Warn("PUT /config: тело ответа воркера не JSON — итог не передан",
+			"worker", name, "key", key, "bytes", len(raw))
+		return nil
+	}
+	var out bytes.Buffer
+	if json.Compact(&out, trimmed) != nil {
+		return nil
+	}
+	return out.Bytes()
 }
 
 // done — итог применения версии f.Version: статус, повтор при ошибке,
@@ -434,13 +463,18 @@ func (s *Store) done(name, key string, f file, res result) {
 	}
 	s.mu.Unlock()
 	log := s.log.With("worker", name, "key", key, "version", f.Version)
-	if res.OK {
-		log.Info("настройки применены воркером")
-	} else {
+	// Текст ошибки воркера и итог применения могут повторять значения
+	// настроек: в лог — только код, сам текст уходит серверу в config.applied.
+	switch {
+	case res.OK:
+		log.Info("настройки применены воркером", "resultBytes", len(res.Detail))
+	case res.Code == message.CodeConfigRejected:
+		log.Warn("настройки не применены", "code", res.Code)
+	default:
 		log.Warn("настройки не применены", "code", res.Code, "err", res.Message)
 	}
 	if send {
-		applied := message.ConfigApplied{Worker: name, Key: key, Version: f.Version, OK: res.OK}
+		applied := message.ConfigApplied{Worker: name, Key: key, Version: f.Version, OK: res.OK, Result: res.Detail}
 		if !res.OK {
 			applied.Error = message.NewError(res.Code, res.Message)
 		}

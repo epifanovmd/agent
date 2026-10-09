@@ -297,6 +297,8 @@ export const configAppliedSchema = z.object({
   key: nameSchema,
   version: z.number().int(),
   ok: z.boolean(),
+  /** Подробный итог применения — тело ответа воркера 2xx на PUT /config (§8); только при ok. */
+  result: z.unknown().optional(),
   error: errorInfoSchema.optional(),
 });
 

@@ -187,11 +187,14 @@ type Event struct {
 }
 
 type ConfigApplied struct {
-	Worker  string     `json:"worker"`
-	Key     string     `json:"key"`
-	Version int64      `json:"version"`
-	OK      bool       `json:"ok"`
-	Error   *ErrorInfo `json:"error,omitempty"`
+	Worker  string `json:"worker"`
+	Key     string `json:"key"`
+	Version int64  `json:"version"`
+	OK      bool   `json:"ok"`
+	// Result — тело ответа воркера 2xx на PUT /config/{key} как есть (JSON
+	// до MaxConfigResultBytes); только при OK.
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *ErrorInfo      `json:"error,omitempty"`
 }
 
 type FetchHead struct {

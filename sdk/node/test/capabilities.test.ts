@@ -325,12 +325,15 @@ describe("запросы воркера к серверу", () => {
         ),
     });
 
-    fa.send({
-      type: "request",
-      id: "slow",
-      data: { worker: "report", type: "report.recipients", timeoutMs: 30 },
+    // Обработчик завершился уже после срока — воркер получает TIMEOUT, а не его итог.
+    const slow = await ask(fa, "slow", {
+      type: "report.recipients",
+      timeoutMs: 30,
     });
-    await until(() => aborted.includes("slow"));
+
+    assert.equal(slow.ok, false);
+    assert.equal(slow.error?.code, "TIMEOUT");
+    assert.ok(aborted.includes("slow"));
     fa.send({
       type: "request",
       id: "gone",

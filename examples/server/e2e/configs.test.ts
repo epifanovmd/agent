@@ -39,6 +39,8 @@ describe("настройки и доставка", () => {
     const c = await waitState("applied", rec.version);
 
     assert.equal(c.applied, rec.version);
+    // Подробный итог применения — тело ответа воркера на PUT /config.
+    assert.deepEqual(c.result, { applied: { prefix: "> ", upper: true } });
     assert.equal(await s.echo("echo", "a"), "> A");
   });
 
@@ -47,6 +49,7 @@ describe("настройки и доставка", () => {
     const c = await waitState("failed", rec.version);
 
     assert.match(c.error?.message ?? "", /prefix/);
+    assert.equal(c.result, undefined);
     const alerts = await s.api<{ type: string }[]>(
       "GET",
       `/api/alerts?agentId=${s.agentId}`,

@@ -79,7 +79,7 @@ server.listen(8080);
 | `validateJobs`           | `false`                                 | `runJob` проверяет `data` по схеме типа задачи из манифеста воркера ([workers](docs/workers.md#задачи))                                                    |
 | `validateRequests`       | `false`                                 | тело `fetch` — по `routes[].request` ([fetch](docs/fetch.md#проверка-тела-по-схеме)), `data` запроса воркера — по `requests[].schema`                      |
 | `validateEvents`         | `"off"`                                 | `data` события — по `events[].schema`: `log` — журнал и `invalidEvent`, `reject` — ещё и не передавать ([observe](docs/observe.md#проверка-data-по-схеме)) |
-| `log(msg, extra)`        | строки `agents: …` в stdout             | журнал SDK                                                                                                                                                 |
+| `log(msg, extra)`        | строки `agents: …` в stdout             | журнал SDK: в `extra` — имена, id, коды и причины отказа, без значений настроек, тел запросов, `data` событий и токенов                                    |
 
 ### Методы
 
@@ -258,6 +258,7 @@ interface ConfigStatus {
   applied?;
   state: "pending" | "applying" | "applied" | "failed" | "deleting" | "deleted"; // deleted — только в событии config
   error?;
+  result?; // подробный итог от воркера (тело ответа на PUT /config) — только в state applied
   updatedAt?;
 }
 interface AgentEvent {

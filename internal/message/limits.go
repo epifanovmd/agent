@@ -4,9 +4,11 @@ import "time"
 
 // Пределы и сроки (§16).
 const (
-	MaxMessageBytes      = 8 << 20
-	MaxEnrollBytes       = 64 << 10
-	MaxConfigBytes       = 4 << 20
+	MaxMessageBytes = 8 << 20
+	MaxEnrollBytes  = 64 << 10
+	MaxConfigBytes  = 4 << 20
+	// MaxConfigResultBytes — тело ответа 2xx на PUT /config (config.applied.result).
+	MaxConfigResultBytes = 64 << 10
 	MaxEventDataBytes    = 64 << 10
 	MaxMetricsBytes      = 1 << 20
 	MaxHealthBytes       = 64 << 10

@@ -57,6 +57,12 @@ func TestEnroll(t *testing.T) {
 			_, _ = w.Write([]byte(`{"code":"RATE_LIMITED","message":"подождите"}`))
 		case req.Token == "down":
 			w.WriteHeader(http.StatusBadGateway)
+		case req.Token == "proxy-SECRET-CANARY":
+			// Ответ не от сервера агентов, повторяющий запрос с токеном.
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("<html>" + req.Token + "</html>"))
+		case req.Token == "half-SECRET-CANARY":
+			_, _ = w.Write([]byte(`{"secret":"SECRET-CANARY-agent"}`))
 		case req.Token != "good" || req.Host.OS == "":
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"code":"ENROLL_DENIED","message":"токен не принят"}`))
@@ -81,6 +87,13 @@ func TestEnroll(t *testing.T) {
 	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: "down", Host: host}); err == nil ||
 		errors.Is(err, ErrTokenRejected) || errors.As(err, &rl) {
 		t.Fatalf("5xx — обычная ошибка: %v", err)
+	}
+	// Тело ответа в текст ошибки не попадает: в нём может быть токен или секрет.
+	for _, tok := range []string{"proxy-SECRET-CANARY", "half-SECRET-CANARY"} {
+		_, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: tok, Host: host})
+		if err == nil || strings.Contains(err.Error(), "SECRET-CANARY") {
+			t.Fatalf("%s: %v", tok, err)
+		}
 	}
 }
 

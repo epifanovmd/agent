@@ -232,7 +232,8 @@ async function route(req, res) {
     settings = { ...DEFAULTS, ...body.data };
     settingsVersion = body.version ?? 0;
     saveState();
-    console.log(`настройки применены: версия ${settingsVersion}`, settings);
+    // Только версия: значения настроек в вывод не пишем — агент передаёт его в журнал как есть.
+    console.log(`настройки применены: версия ${settingsVersion}`);
     return json(res, 204);
   }
 

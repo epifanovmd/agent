@@ -127,7 +127,8 @@ func Enroll(ctx context.Context, client *http.Client, baseURL string, req messag
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
 		var r message.EnrollResult
 		if err := json.Unmarshal(raw, &r); err != nil || r.AgentID == "" || r.Secret == "" {
-			return Credentials{}, fmt.Errorf("identity: неожиданный ответ регистрации: %.200s", raw)
+			// Тело не выводится: в нём может быть секрет агента.
+			return Credentials{}, fmt.Errorf("identity: неожиданный ответ регистрации (HTTP %d, %d байт)", resp.StatusCode, len(raw))
 		}
 		return Credentials{AgentID: r.AgentID, Secret: r.Secret}, nil
 	case resp.StatusCode == http.StatusTooManyRequests:
@@ -139,8 +140,11 @@ func Enroll(ctx context.Context, client *http.Client, baseURL string, req messag
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusBadRequest ||
 		resp.StatusCode == http.StatusRequestEntityTooLarge:
 		return Credentials{}, fmt.Errorf("%w: HTTP %d %s %s", ErrTokenRejected, resp.StatusCode, e.Code, e.Message)
+	case e.Code != "":
+		return Credentials{}, fmt.Errorf("identity: регистрация: HTTP %d %s %s", resp.StatusCode, e.Code, e.Message)
 	default:
-		return Credentials{}, fmt.Errorf("identity: регистрация: HTTP %d: %.200s", resp.StatusCode, raw)
+		// Тело не выводится: ответ не от сервера агентов (прокси) может повторять запрос с токеном.
+		return Credentials{}, fmt.Errorf("identity: регистрация: HTTP %d (%d байт)", resp.StatusCode, len(raw))
 	}
 }
 

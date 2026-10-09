@@ -91,6 +91,8 @@ type ConfigStatus struct {
 	Applied   int64              `json:"applied"`
 	State     string             `json:"state"`
 	Error     *message.ErrorInfo `json:"error,omitempty"`
+	// Result — подробный итог применения от воркера (state applied).
+	Result json.RawMessage `json:"result,omitempty"`
 }
 
 // FetchInit — параметры запроса к воркеру.

@@ -267,6 +267,12 @@ func TestExamplesMessages(t *testing.T) {
 					seenResults[act] = true
 					decodeResult(t, act, r.Result)
 				}
+			case TypeConfigApplied:
+				var c ConfigApplied
+				_ = env.Decode(&c)
+				if c.OK == (c.Error != nil) || (!c.OK && len(c.Result) > 0) {
+					t.Fatalf("ok, result и error противоречат друг другу")
+				}
 			case TypeRequestResult:
 				var r RequestResult
 				_ = env.Decode(&r)
@@ -355,7 +361,7 @@ type route struct {
 
 var routes = []route{
 	{"agent", "server", "POST", EnrollPath, func() any { return &Enroll{} }, func() any { return &EnrollResult{} }, errorInfo},
-	{"agent", "worker", "PUT", ConfigPathPrefix, func() any { return &ConfigValue{} }, nil, workerError},
+	{"agent", "worker", "PUT", ConfigPathPrefix, func() any { return &ConfigValue{} }, func() any { return new(json.RawMessage) }, workerError},
 	{"agent", "worker", "DELETE", ConfigPathPrefix, nil, nil, workerError},
 	{"agent", "worker", "GET", MetricsPath, nil, func() any { return new(json.RawMessage) }, workerError},
 	{"agent", "worker", "GET", HealthPath, nil, func() any { return &Health{} }, workerError},
@@ -433,7 +439,10 @@ func TestExamplesHTTP(t *testing.T) {
 				if strings.HasSuffix(name, "@"+BuiltinSysmetrics) {
 					factory = func() any { return &HostMetrics{} }
 				}
-				decodeOptional(t, "тело ответа", body, factory)
+				// Ответ на PUT /config — JSON-итог применения или пусто (§8).
+				if r.method != "PUT" || r.path != ConfigPathPrefix || len(body) > 0 {
+					decodeOptional(t, "тело ответа", body, factory)
+				}
 				if r.path == WorkerManifestPath {
 					if _, err := ParseWorkerManifest(body); err != nil {
 						t.Fatalf("манифест не по §12, §16: %v", err)

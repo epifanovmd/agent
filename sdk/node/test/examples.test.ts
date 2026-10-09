@@ -6,7 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 
-import type { ActionRecord, AgentEvent, Envelope } from "../src/server/index";
+import type {
+  ActionRecord,
+  AgentEvent,
+  ConfigStatus,
+  Envelope,
+} from "../src/server/index";
 import {
   type Creds,
   enroll,
@@ -225,6 +230,50 @@ describe("образцы", () => {
     assert.equal(st.state, "failed");
     assert.equal(st.applied, 42);
     assert.deepEqual(st.error, bad.data.error);
+  });
+
+  it("config.applied.result — подробный итог в ConfigStatus.result и событии config", async () => {
+    const m = use("config.applied.result");
+    const events: unknown[] = [];
+    const onConfig = (c: ConfigStatus) => {
+      if (c.key === "main" && c.state === "applied") events.push(c.result);
+    };
+
+    s.agents.on("config", onConfig);
+
+    await s.agents.setConfig(creds.agentId, "report", "main", {
+      target: "https://example.com/report",
+      intervalSec: 60,
+    });
+    await fa.next("config.put", e => e.data.version === m.data.version);
+    fa.send(m);
+    await fa.ackOf(m.id!);
+    const find = async () =>
+      (await s.agents.configStatus(creds.agentId, "report")).find(
+        c => c.key === "main",
+      )!;
+    let st = await find();
+
+    assert.equal(st.state, "applied");
+    assert.deepEqual(st.result, m.data.result);
+    assert.deepEqual(events, [m.data.result]);
+    // status той же версии (без result) итог не стирает.
+    const seq = fa.stream("status", {
+      workers: [
+        {
+          name: "report",
+          state: "running",
+          restarts: 0,
+          configs: { main: { version: m.data.version, ok: true } },
+        },
+      ],
+      outbox: 0,
+    });
+
+    await fa.ackSeq(seq);
+    st = await find();
+    assert.deepEqual(st.result, m.data.result);
+    s.agents.off("config", onConfig);
   });
 
   it("config.applied.key-unknown — отказ с кодом CONFIG_KEY_UNKNOWN", async () => {

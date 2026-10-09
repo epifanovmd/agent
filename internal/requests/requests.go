@@ -99,7 +99,15 @@ func (b *Broker) Do(ctx context.Context, worker string, p message.RequestPost) (
 		if r.Error != nil && r.Error.Code != "" {
 			info = *r.Error
 		}
-		return nil, &Error{Status: http.StatusUnprocessableEntity, Info: info}
+		// Срок и обрыв, о которых сообщил сервер, — те же коды HTTP, что и замеченные агентом.
+		status := http.StatusUnprocessableEntity
+		switch info.Code {
+		case message.CodeTimeout:
+			status = http.StatusGatewayTimeout
+		case message.CodeDisconnected:
+			status = http.StatusServiceUnavailable
+		}
+		return nil, &Error{Status: status, Info: info}
 	case <-timer.C:
 		return nil, fail(http.StatusGatewayTimeout, message.CodeTimeout, fmt.Sprintf("сервер не ответил за %d мс", timeout.Milliseconds()))
 	case <-s.Context().Done():

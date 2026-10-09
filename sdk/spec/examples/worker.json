@@ -20,6 +20,37 @@
       "status": 204
     }
   },
+  "worker.config.put.result": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "PUT",
+      "path": "/config/main",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "version": 44,
+        "data": {
+          "target": "https://example.com/report",
+          "intervalSec": 60
+        }
+      }
+    },
+    "response": {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "applied": {
+          "target": "ok",
+          "intervalSec": "ok"
+        },
+        "skipped": []
+      }
+    }
+  },
   "worker.config.put.rejected": {
     "from": "agent",
     "to": "worker",

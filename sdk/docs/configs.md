@@ -66,8 +66,9 @@ await agents.setConfig(agentId, "echo", "settings", { prefix: 5, extra: 1 });
   подключении.
 
 Агент сохраняет значение и вызывает у воркера `PUT /config/{key}` с телом `{ version, data }`
-([workers.md](workers.md#что-воркер-обслуживает)). `2xx` — применено; иначе — отказ с текстом
-ответа воркера (`CONFIG_REJECTED`), агент повторит через 25 с и после перезапуска воркера.
+([workers.md](workers.md#что-воркер-обслуживает)). `2xx` — применено, тело ответа (JSON до
+64 КБ) — подробный итог в `result` ([ниже](#статус-применения)); иначе — отказ с текстом ответа
+воркера (`CONFIG_REJECTED`), агент повторит через 25 с и после перезапуска воркера.
 Версия, пришедшая во время применения, ждёт его конца; промежуточные пропускаются.
 
 Перед вызовом агент сверяется с воркером:
@@ -82,7 +83,7 @@ await agents.setConfig(agentId, "echo", "settings", { prefix: 5, extra: 1 });
 
 ```ts
 const list = await agents.configStatus(agentId); // или (agentId, "report") — только его ключи
-// [{ agentId, worker, key, version, delivered, applied, state, error?, updatedAt }]
+// [{ agentId, worker, key, version, delivered, applied, state, error?, result?, updatedAt }]
 ```
 
 | Поле        | Что это                                                    |
@@ -91,6 +92,7 @@ const list = await agents.configStatus(agentId); // или (agentId, "report") �
 | `delivered` | версия на диске агента                                     |
 | `applied`   | последняя версия, которую воркер применил                  |
 | `error`     | `{ code, message }` — почему желаемая версия не применена  |
+| `result`    | подробный итог применения желаемой версии от воркера       |
 
 | `state`    | Значит                                                        |
 | ---------- | ------------------------------------------------------------- |
@@ -111,6 +113,16 @@ const list = await agents.configStatus(agentId); // или (agentId, "report") �
 | `WORKER_UNAVAILABLE` | воркер не запущен или не отвечает                             |
 | `WORKER_UNKNOWN`     | воркера нет в настройках агента                               |
 | `TIMEOUT`            | воркер не ответил за 30 с                                     |
+
+`result` — то, что воркер вернул в теле ответа `2xx` на `PUT /config/{key}` (JSON до 64 КБ,
+агент передаёт как есть в `config.applied.result`): например, какие части настроек применены.
+Есть только при `state: applied` и если воркер его вернул; тело больше 64 КБ или не JSON агент не
+передаёт.
+
+```ts
+const [s] = await agents.configStatus(agentId, "echo");
+// { key: "settings", state: "applied", result: { applied: { prefix: "> ", upper: true } }, … }
+```
 
 Статус собирается из `config.applied` (итог каждой версии) и `status.workers[].configs` (что
 у агента на диске и чем кончилось применение). Желаемое значение хранится в Store как запись

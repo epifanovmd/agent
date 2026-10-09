@@ -13,19 +13,29 @@ type Reported = AgentRecord["configs"];
 /** Итог ключа из сообщения агента поверх прежнего: appliedVersion помнит последнюю удачную версию. */
 export const report = (
   prev: ConfigReported | undefined,
-  r: ConfigReport,
+  r: ConfigReport & { result?: unknown },
   at: number,
 ): ConfigReported => {
   const next: ConfigReported = { version: r.version, at };
+  const same = prev?.version === r.version;
 
   if (r.ok !== undefined) next.ok = r.ok;
+  // result приходит только в config.applied: status и hello той же версии его не стирают.
+  if (r.ok === true && r.result !== undefined) next.result = r.result;
+  else if (
+    same &&
+    r.result === undefined &&
+    (r.ok === undefined || r.ok === prev.ok) &&
+    prev.result !== undefined
+  )
+    next.result = prev.result;
   if (r.ok === false && r.error)
     next.error = { code: r.error.code, message: r.error.message };
   if (r.ok === true) next.appliedVersion = r.version;
   else if (prev?.appliedVersion !== undefined)
     next.appliedVersion = prev.appliedVersion;
   // Та же версия без итога (hello, status во время применения) — прежний итог остаётся.
-  if (prev && prev.version === r.version && r.ok === undefined) {
+  if (same && r.ok === undefined) {
     if (prev.ok !== undefined) next.ok = prev.ok;
     if (prev.error) next.error = prev.error;
     if (prev.appliedVersion !== undefined)
@@ -106,6 +116,7 @@ export const configStatus = (
   else if (r.ok === undefined) s.state = "applying";
   else s.state = r.ok ? "applied" : "failed";
   if (r?.ok === false && r.error && s.state === "failed") s.error = r.error;
+  if (r?.result !== undefined && s.state === "applied") s.result = r.result;
 
   return s;
 };

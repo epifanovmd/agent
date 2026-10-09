@@ -81,10 +81,25 @@ export class Requests {
       MAX_REQUEST_TIMEOUT_MS,
     );
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    let expired = false;
+    const timer = setTimeout(() => {
+      expired = true;
+      ctl.abort();
+    }, timeoutMs);
     const stop = ss.onWake(() => {
       if (ss.closed) ctl.abort();
     });
+    // Срок истёк или связь оборвалась, пока работал обработчик: его итог уже не нужен —
+    // воркер получает TIMEOUT (или ответа нет вовсе), а не успех.
+    const interrupted = (): Outcome | undefined =>
+      ctl.signal.aborted
+        ? refuse(
+            expired ? "TIMEOUT" : "DISCONNECTED",
+            expired
+              ? "срок запроса воркера истёк"
+              : "связь с агентом оборвалась",
+          )
+        : undefined;
 
     try {
       const result = await handler({
@@ -98,8 +113,11 @@ export class Requests {
         signal: ctl.signal,
       });
 
-      return this.result(result);
+      return interrupted() ?? this.result(result);
     } catch (e) {
+      const cut = interrupted();
+
+      if (cut) return cut;
       if (e instanceof AgentsError) return refuse(e.code, e.message);
       this.ctx.log("обработчик запроса воркера упал", {
         agentId: ss.agentId,

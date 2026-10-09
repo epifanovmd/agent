@@ -60,7 +60,9 @@ func buildTag() string {
 	return strings.TrimSpace(string(buf[i+len(tailMark):]))
 }
 
-// testWorker — воркер для тестов: HTTP на unix-сокете AGENT_WORKER_SOCKET без SDK. Каталог
+// testWorker — воркер для тестов: HTTP на unix-сокете AGENT_WORKER_SOCKET без SDK. PUT
+// /config/{key} отвечает 200 {"applied": data} — подробный итог применения, отказ — 422 с
+// data в тексте. Каталог
 // IT_STATE хранит то, что переживает перезапуск: журнал настроек (configs.log), отказ в
 // настройках (файл reject), отметку уборки (cleanup), отменённые запросы (cancelled.log),
 // pid дочернего процесса (child.pid).
@@ -109,11 +111,12 @@ func testWorker() {
 		if _, err := os.Stat(filepath.Join(state, "reject")); err == nil {
 			record("configs.log", fmt.Sprintf("reject %s %d", key, v.Version))
 			w.WriteHeader(http.StatusUnprocessableEntity)
-			fmt.Fprint(w, `{"message":"значение не подходит"}`)
+			_ = json.NewEncoder(w).Encode(map[string]string{"message": "значение не подходит: " + string(v.Data)})
 			return
 		}
 		record("configs.log", fmt.Sprintf("put %s %d %s", key, v.Version, v.Data))
-		w.WriteHeader(http.StatusNoContent)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"applied":%s}`, cmp.Or(string(v.Data), "null"))
 	})
 	mux.HandleFunc("DELETE /config/{key}", func(w http.ResponseWriter, r *http.Request) {
 		record("configs.log", "delete "+r.PathValue("key"))
@@ -183,13 +186,15 @@ func testWorker() {
 			fmt.Fprint(w, "проснулся")
 		}
 	})
-	// /emit?type=…&n=… — n событий через сокет агента; ответ — коды ответов агента.
+	// /emit?type=…&n=…&data=… — n событий через сокет агента (data — JSON, по умолчанию
+	// {"i": номер}); ответ — коды ответов агента.
 	mux.HandleFunc("POST /emit", func(w http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(r.URL.Query().Get("n"))
 		from, _ := strconv.Atoi(r.URL.Query().Get("from"))
 		var codes []string
 		for i := from; i < from+max(n, 1); i++ {
-			body, _ := json.Marshal(message.EventPost{Type: r.URL.Query().Get("type"), Data: json.RawMessage(fmt.Sprintf(`{"i":%d}`, i))})
+			data := cmp.Or(r.URL.Query().Get("data"), fmt.Sprintf(`{"i":%d}`, i))
+			body, _ := json.Marshal(message.EventPost{Type: r.URL.Query().Get("type"), Data: json.RawMessage(data)})
 			code, _, err := agent(http.MethodPost, message.EventsPath, body)
 			if err != nil {
 				codes = append(codes, err.Error())
@@ -266,11 +271,12 @@ func testWorker() {
 			fmt.Fprintf(w, `{"message":"нет задачи %s"}`, req.Type)
 		}
 	})
-	// /ask?type=…&timeoutMs=… — запрос к серверу через сокет агента: статус ответа агента —
-	// в X-Agent-Status, тело — как есть.
+	// /ask?type=…&timeoutMs=…&data=… — запрос к серверу через сокет агента (data — JSON, по
+	// умолчанию {"n": 1}): статус ответа агента — в X-Agent-Status, тело — как есть.
 	mux.HandleFunc("POST /ask", func(w http.ResponseWriter, r *http.Request) {
 		ms, _ := strconv.Atoi(r.URL.Query().Get("timeoutMs"))
-		body, _ := json.Marshal(message.RequestPost{Type: r.URL.Query().Get("type"), Data: json.RawMessage(`{"n":1}`), TimeoutMs: int64(ms)})
+		data := cmp.Or(r.URL.Query().Get("data"), `{"n":1}`)
+		body, _ := json.Marshal(message.RequestPost{Type: r.URL.Query().Get("type"), Data: json.RawMessage(data), TimeoutMs: int64(ms)})
 		code, raw, err := agent(http.MethodPost, message.RequestsPath, body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)

@@ -15,7 +15,9 @@ HTTP-сервис на unix-сокете AGENT_WORKER_SOCKET (sdk/spec §12):
                           заменяет воркер до её окончания)
   GET  /jobs/{id}       состояние: {id, state, progress, result?}; state — running | done | cancelled
   POST /jobs/{id}/cancel  прервать задачу (событие job.cancelled)
-  PUT  /config/settings {version, data: {"prefix": "…", "upper": true}}; неверное — 400 {message}
+  PUT  /config/settings {version, data: {"prefix": "…", "upper": true}} → 200 {"applied": {"prefix",
+                        "upper"}} — подробный итог: значения, которые теперь действуют (бэкенд видит
+                        его в ConfigStatus.result); неверное — 400 {message}
   DELETE /config/settings  вернуть значения по умолчанию
   GET  /metrics         счётчики
   GET  /health          {ok, message, info}
@@ -524,8 +526,10 @@ class Handler(BaseHTTPRequestHandler):
             settings = {**DEFAULTS, **data}
             settings_version = int(body.get("version") or 0)
         save_state()
-        print(f"настройки применены: версия {settings_version}, {settings}", flush=True)
-        self.reply(204)
+        # В вывод — только версия: значения настроек могут быть секретными, а вывод воркера агент
+        # передаёт в журнал как есть.
+        print(f"настройки применены: версия {settings_version}", flush=True)
+        self.reply(200, {"applied": {"prefix": settings["prefix"], "upper": settings["upper"]}})
 
     def do_DELETE(self):
         global settings, settings_version

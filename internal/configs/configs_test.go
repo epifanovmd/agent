@@ -1,6 +1,7 @@
 package configs
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -47,6 +48,8 @@ func newFakeWorker(t *testing.T) *fakeWorker {
 			Data    struct {
 				Reject string `json:"reject"`
 				Text   bool   `json:"text"`
+				// Reply — тело ответа 200 как есть.
+				Reply string `json:"reply"`
 			} `json:"data"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&v)
@@ -58,6 +61,8 @@ func newFakeWorker(t *testing.T) *fakeWorker {
 			<-hold
 		}
 		switch {
+		case v.Data.Reply != "":
+			_, _ = io.WriteString(w, v.Data.Reply)
 		case v.Data.Text:
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, "текстом")
@@ -189,6 +194,69 @@ func TestPutApplyReport(t *testing.T) {
 	if v := s.Versions(); v["report"]["main"] != 41 || len(v) != 1 {
 		t.Fatalf("hello.configs: %v", v)
 	}
+}
+
+// Тело ответа 2xx — config.applied.result как есть (JSON до 64 КБ); не JSON
+// или больше предела — без result, предупреждение в лог без содержимого.
+// Ни значение настроек, ни ответ воркера, ни текст его отказа в лог не
+// попадают.
+func TestApplyResult(t *testing.T) {
+	const secret = "SECRET-CANARY-configs"
+	var logBuf bytes.Buffer
+	var mu sync.Mutex
+	log, _ := logx.New(lockedWriter{&mu, &logBuf}, nil, logx.Options{Level: "debug"})
+	w, r := newFakeWorker(t), &reports{}
+	s, err := Open(t.TempDir(), w, r.add, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.Run(ctx)
+	reply := func(body string) string {
+		raw, _ := json.Marshal(map[string]string{"reply": body, "token": secret})
+		return string(raw)
+	}
+	s.Put(put("a", 1, reply(`{"applied": {"token": "`+secret+`"}}`)))
+	s.Put(put("b", 1, reply("не JSON "+secret)))
+	s.Put(put("c", 1, reply(`"`+strings.Repeat("x", message.MaxConfigResultBytes)+`"`)))
+	s.Put(put("d", 1, `{"reject":"плохой token `+secret+`"}`))
+	eventually(t, "четыре итога", func() bool { return len(r.list()) == 4 })
+	got := map[string]message.ConfigApplied{}
+	for _, c := range r.list() {
+		got[c.Key] = c
+	}
+	if c := got["a"]; !c.OK || string(c.Result) != `{"applied":{"token":"`+secret+`"}}` {
+		t.Fatalf("result: %+v %s", c, c.Result)
+	}
+	for _, key := range []string{"b", "c"} {
+		if c := got[key]; !c.OK || c.Result != nil {
+			t.Fatalf("%s: без result: %+v", key, c)
+		}
+	}
+	if c := got["d"]; c.OK || c.Error == nil || !strings.Contains(c.Error.Message, secret) {
+		t.Fatalf("отказ — с текстом воркера серверу: %+v", c)
+	}
+	mu.Lock()
+	text := logBuf.String()
+	mu.Unlock()
+	if strings.Contains(text, secret) {
+		t.Fatalf("секрет в логе:\n%s", text)
+	}
+	if !strings.Contains(text, "не JSON") || !strings.Contains(text, "больше предела") {
+		t.Fatalf("нет предупреждений:\n%s", text)
+	}
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // Отказ воркера — CONFIG_REJECTED с его текстом (JSON message или текст);

@@ -45,6 +45,8 @@ type Config struct {
 type Server struct {
 	t    testing.TB
 	base *url.URL // адрес процесса node
+	// log — журнал сервера: вывод опции log Agents (stderr процесса node).
+	log func() string
 
 	mu    sync.Mutex
 	conns map[net.Conn]struct{} // соединения прокси с сервером
@@ -134,7 +136,12 @@ func Start(t testing.TB, cfg Config) *Server {
 		t.Fatalf("сервер не запустился: %q\n%s", line, logs.String())
 	}
 	base, _ := url.Parse(ready.URL)
-	return &Server{t: t, base: base, conns: map[net.Conn]struct{}{}}
+	log := func() string {
+		logsMu.Lock()
+		defer logsMu.Unlock()
+		return logs.String()
+	}
+	return &Server{t: t, base: base, log: log, conns: map[net.Conn]struct{}{}}
 }
 
 // need — путь к node; без node или без собранного sdk/node тест пропускается (в CI — падает).
@@ -156,6 +163,9 @@ func need(t testing.TB) string {
 	}
 	return node
 }
+
+// Log — журнал сервера: всё, что Agents передал опции log.
+func (s *Server) Log() string { return s.log() }
 
 // Proxy — HTTP-обработчик для агента: всё — серверу (WebSocket тоже), с X-Forwarded-Host
 // и X-Forwarded-Proto (install.sh — с адресом прокси).

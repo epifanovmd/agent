@@ -25,6 +25,8 @@ export interface Watcher {
 
 /** Что агент сообщил о ключе настроек: версия на диске и итог её применения. */
 export interface ConfigReported extends ConfigReport {
+  /** Подробный итог применения version (config.applied.result); только при ok. */
+  result?: unknown;
   /** Последняя версия, применённая успешно. */
   appliedVersion?: number;
   /** Когда пришло, мс. */
@@ -160,6 +162,11 @@ export interface ConfigStatus {
    */
   state: ConfigState;
   error?: ErrorInfo;
+  /**
+   * Подробный итог применения желаемой версии — что ответил воркер (например, что из настроек
+   * применено); только в state applied и если воркер его вернул.
+   */
+  result?: unknown;
   updatedAt?: number;
 }
 
