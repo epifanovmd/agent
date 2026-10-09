@@ -99,7 +99,7 @@ fetch_agent() {
     ENTRY="$(printf '%s' "$MANIFEST" | tr -d '\n\r\t ' | sed 's/{/\n{/g' | grep '"os":"linux"' | grep "\"arch\":\"$ARCH\"" | grep -v '"name":' | head -n 1)" || true
     FILE="$(printf '%s' "$ENTRY" | sed -n 's/.*"file":"\([^"]*\)".*/\1/p')"
     SUM="$(printf '%s' "$ENTRY" | sed -n 's/.*"sha256":"\([^"]*\)".*/\1/p')"
-    [ -n "$FILE" ] && [ -n "$SUM" ] || die "в выпуске нет сборки агента linux/$ARCH"
+    if [ -z "$FILE" ] || [ -z "$SUM" ]; then die "в выпуске нет сборки агента linux/$ARCH"; fi
     curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$RELEASES/$FILE" -o "$TMP/agent" || die "сборка $FILE не скачана"
     GOT="$(sha256sum "$TMP/agent" | cut -d' ' -f1)"
     [ "$GOT" = "$SUM" ] || die "sha256 сборки не сходится: $GOT"
