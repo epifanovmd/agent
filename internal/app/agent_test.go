@@ -442,7 +442,7 @@ func TestAgent(t *testing.T) {
 	}
 	if res := s.action("x6", "worker.update", message.WorkerUpdateArgs{Name: "echo", Version: "1", URL: "/x", SHA256: "00"}); res.Error == nil ||
 		res.Error.Code != message.CodeWorkerNotReleased {
-		t.Fatalf("не из выпуска: %+v", res)
+		t.Fatalf("без release: true: %+v", res)
 	}
 	if res := s.action("x7", "agent.update", message.AgentUpdateArgs{Version: "9", URL: "/x", SHA256: "00"}); res.Error == nil ||
 		res.Error.Code != message.CodeUpdateNotVerified {

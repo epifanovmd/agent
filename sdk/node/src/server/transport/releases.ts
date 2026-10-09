@@ -1,4 +1,4 @@
-// Раздача выпуска (§11) по HTTP: manifest.json, сборки из манифеста (из releasesDir — файлом,
+// Раздача сборок (§11) по HTTP: manifest.json, сборки из манифеста (из releasesDir — файлом,
 // из удалённого источника — перенаправлением 302 или потоком), install.sh с адресом сервера и
 // ключами проверки. Публично: сборки подписаны.
 import { createReadStream } from "node:fs";
@@ -15,17 +15,17 @@ import {
 } from "../protocol/messages";
 import { baseUrl, sendJSON } from "./http";
 
-/** Файл выпуска: в каталоге или по ссылке удалённого источника (proxy — отдавать потоком). */
+/** Файл сборок: в каталоге или по ссылке удалённого источника (proxy — отдавать потоком). */
 export type ReleaseFileRef = { path: string } | { url: string; proxy: boolean };
 
-/** Что нужно раздаче выпуска. */
+/** Что нужно раздаче сборок. */
 export interface ReleaseSource {
   readonly settings: Pick<Settings, "baseUrl" | "trustProxy" | "log">;
   /** Раздача включена (releasesDir или agentReleases). */
   releaseEnabled(): boolean;
   /** manifest.json для узлов или null. */
   servedManifest(): Promise<ReleaseManifest | null>;
-  /** Файл выпуска по имени; не из манифеста — null. */
+  /** Файл сборок по имени; не из манифеста — null. */
   releaseFile(name: string): Promise<ReleaseFileRef | null>;
   /** Скачать сборку удалённого источника (раздача потоком). */
   downloadRelease(url: string, signal: AbortSignal): Promise<Response>;
@@ -35,7 +35,7 @@ export interface ReleaseSource {
 
 const SAFE_KEY = /^[A-Za-z0-9+/=]+$/;
 
-/** GET и HEAD install.sh и файлов выпуска; не наш маршрут — false. */
+/** GET и HEAD install.sh и файлов сборок; не наш маршрут — false. */
 export const serveRelease = async (
   src: ReleaseSource,
   req: IncomingMessage,
@@ -116,26 +116,26 @@ const proxyFile = async (
   try {
     upstream = await src.downloadRelease(url, abort.signal);
   } catch (e) {
-    src.settings.log("сборка выпуска не получена из источника", {
+    src.settings.log("сборка не получена из источника", {
       url,
       err: String(e),
     });
     sendJSON(res, 502, {
       code: "UPSTREAM_FAILED",
-      message: "Сборка выпуска не получена из источника",
+      message: "Сборка не получена из источника",
     });
 
     return true;
   }
   if (!upstream.ok || !upstream.body) {
     await upstream.body?.cancel();
-    src.settings.log("сборка выпуска не получена из источника", {
+    src.settings.log("сборка не получена из источника", {
       url,
       status: upstream.status,
     });
     sendJSON(res, 502, {
       code: "UPSTREAM_FAILED",
-      message: `Источник выпуска ответил ${upstream.status}`,
+      message: `Источник сборок ответил ${upstream.status}`,
     });
 
     return true;
@@ -214,7 +214,7 @@ const install = async (
 const fileNotFound = (res: ServerResponse): true => {
   sendJSON(res, 404, {
     code: "NOT_FOUND",
-    message: "Нет такого файла выпуска",
+    message: "Нет такого файла сборок",
   });
 
   return true;

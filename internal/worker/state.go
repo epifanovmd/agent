@@ -32,7 +32,7 @@ type procState struct {
 	Start  string `json:"start"`
 	Socket string `json:"socket"`
 	Token  string `json:"token"`
-	// Version — версия сборки воркера из выпуска.
+	// Version — версия сборки воркера с сервера.
 	Version string `json:"version,omitempty"`
 	// Spec — отпечаток настроек, с которыми процесс запущен (specHash).
 	Spec      string `json:"spec"`

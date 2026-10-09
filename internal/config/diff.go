@@ -69,7 +69,7 @@ func KeepRestartOnly(old, next Config) Config {
 	next.Enroll = old.Enroll
 	next.Outbox = old.Outbox
 	next.Log.Buffer = old.Log.Buffer
-	// Каталоги воркеров из выпуска — в прежнем dataDir.
+	// Каталоги сборок воркеров — в прежнем dataDir.
 	next.Workers = slices.Clone(next.Workers)
 	for i := range next.Workers {
 		if w := &next.Workers[i]; w.Release {

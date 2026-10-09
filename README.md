@@ -48,7 +48,7 @@
 | **занят (`busy`)**      | воркер ведёт долгую работу (`GET /health` → `busy: true`): плановая замена откладывается до её окончания, итог замены приходит отдельно                                                                 |
 | **подхват**             | новый запуск агента находит живой процесс воркера, запущенный прежним, и следит за ним дальше, не перезапуская                                                                                          |
 | **действие**            | встроенная операция агента по просьбе бэкенда: перезапустить или обновить воркер, обновить агента, сменить ключ, показать журнал                                                                        |
-| **выпуск**              | подписанные сборки агента (и при желании воркеров) с `manifest.json`; бэкенд раздаёт их для установки и обновления                                                                                      |
+| **сборки агента**       | подписанные файлы агента под каждую систему (и при желании сборки воркеров) с `manifest.json`; бэкенд раздаёт их для установки и обновления                                                             |
 | **Agents**              | главный объект SDK — «все подключённые агенты»: принимает агентов, отправляет запросы воркерам, доставляет настройки, хранит события и метрики                                                          |
 | **копия бэкенда**       | один из процессов бэкенда с общим Store; соединение агента — в одной копии, вызовы из других копий SDK пересылает туда (`relay`)                                                                        |
 
@@ -56,7 +56,7 @@
 
 ```
 cmd/agent/            программа агента: run | install | uninstall | init | config | status | logs | restart | stop-workers | cleanup | version
-cmd/agent-release/    утилита выпуска: keygen | manifest (на узлы не ставится)
+cmd/agent-release/    утилита подписи сборок: keygen | manifest (на узлы не ставится)
 internal/             устройство агента (message/ — типы сообщений, install/ — установка службой) — docs/ARCHITECTURE.md
 └── sysmetrics/       встроенный воркер агента: метрики узла (тот же файл, режим agent sysmetrics)
 sdk/                  серверный SDK — обзор: sdk/README.md
@@ -66,15 +66,15 @@ sdk/                  серверный SDK — обзор: sdk/README.md
 examples/             готовый стенд: сервер на SDK, воркеры-примеры, сквозные тесты — examples/README.md
 deploy/
 ├── Dockerfile        образы агента: минимальный и с python3 для воркеров
-├── Dockerfile.dist   образ с каталогом выпуска
+├── Dockerfile.dist   образ с каталогом сборок агента
 └── install/install.sh  установка с бэкенда одной командой (скачивает агента и вызывает agent install)
-scripts/              go.sh (Go в контейнере), release.sh (выпуск), demo.sh (стенд), e2e.sh (сквозные тесты), version.sh (версия)
+scripts/              go.sh (Go в контейнере), release.sh (сборки агента), demo.sh (стенд), e2e.sh (сквозные тесты), version.sh (версия)
 test/integration/     настоящий агент против сервера на agent-sdk, воркеры — HTTP-серверы на Go
 test/testserver/      этот сервер (процесс node) и его клиент для Go-тестов
 docs/ARCHITECTURE.md  как устроен агент, настройки, установка, работа на узле, обновление
 CONTRIBUTING.md       правила разработки
 SECURITY.md           как сообщить об уязвимости
-.github/              CI, выпуск по тегу, обновления зависимостей (dependabot)
+.github/              CI, публикация версии по тегу, обновления зависимостей (dependabot)
 VERSION               версия агента, SDK и примеров
 ```
 
@@ -84,7 +84,7 @@ VERSION               версия агента, SDK и примеров
 не нужно, он запускается в контейнере):
 
 ```bash
-make demo-build     # собрать агента, воркеры на Go, выпуск агента, SDK
+make demo-build     # собрать агента, воркеры на Go, сборки агента для узлов, SDK
 make demo-server    # терминал 1 — API на http://localhost:8080/api
 make demo-agent     # терминал 2 — агент с воркерами-примерами
 make e2e            # сквозные тесты: свой сервер и настоящий агент на каждый сценарий
@@ -141,32 +141,32 @@ Go на машине не нужен: цели `make` запускают его 
 | `make version-check`   | проверить, что версия везде одинаковая                                                                      |
 | `make check`           | всё сразу: vet, fmt-check, format-check, version-check, race, sdk-test, examples-test, e2e — перед коммитом |
 | `make build`           | агент под эту машину → `dist/<VERSION>/`                                                                    |
-| `make release`         | выпуск: агент и netprobe для linux/darwin × amd64/arm64, `manifest.json`, `install.sh` → `dist/<VERSION>/`  |
-| `make images`          | образы `agent:dev` (минимальный), `agent:dev-python` (с python3 для воркеров) и `agent-dist:dev` (выпуск)   |
-| `make demo-build`      | стенд: собрать агента и воркеры на Go (`.dev/bin`), выпуск (`dist/<VERSION>`), SDK, сервер                  |
+| `make release`         | сборки агента и netprobe для linux/darwin × amd64/arm64, `manifest.json`, `install.sh` → `dist/<VERSION>/`  |
+| `make images`          | образы `agent:dev` (минимальный), `agent:dev-python` (с python3 для воркеров) и `agent-dist:dev` (сборки)   |
+| `make demo-build`      | стенд: собрать агента и воркеры на Go (`.dev/bin`), сборки агента (`dist/<VERSION>`), SDK, сервер           |
 | `make demo-server`     | стенд: сервер на Node.js, API — http://localhost:8080/api                                                   |
 | `make demo-agent`      | стенд: агент с воркерами-примерами                                                                          |
 | `make help`            | список целей                                                                                                |
 | `scripts/go.sh …`      | любая команда Go в контейнере, например `scripts/go.sh build linux arm64` или `scripts/go.sh go list ./...` |
 
-## Выпуск
+## Публикация версии
 
 Версия одна на агента, SDK и примеры: файл `VERSION`. Записать новую везде — `make version V=1.2.0`;
 `make check` (и CI) проверяет, что она совпадает во всех местах.
 
 Тег `v<VERSION>` → CI выкладывает в GitHub Release (тег с «-», например `v1.2.0-rc.1`, —
-предварительный выпуск):
+предварительная версия):
 
-- подписанные сборки агента и стандартного воркера выпуска netprobe, `manifest.json`, `install.sh`;
+- подписанные сборки агента и стандартного воркера netprobe, `manifest.json`, `install.sh`;
 - SDK — архив для Node (`agent-sdk-<версия>.tgz`);
 
 и образы `ghcr.io/epifanovmd/agent:<версия>` (минимальный), `ghcr.io/epifanovmd/agent:<версия>-python`
 (с python3 для воркеров на Python) и `ghcr.io/epifanovmd/agent-dist:<версия>`. Всё ставится с
 GitHub, без npm — команда установки SDK в [sdk/README.md](sdk/README.md#установка).
 
-Воркеры из выпуска (`release: true` в настройках агента) входят в него, если их сборки положить в
-каталог выпуска заранее и передать `scripts/release.sh … --worker NAME=VERSION`; netprobe
-`scripts/release.sh` собирает и вносит сам. Бэкенд на SDK находит новые выпуски на GitHub сам
+Сборки воркеров (`release: true` в настройках агента) попадают в `manifest.json`, если положить их в
+каталог сборок заранее и передать `scripts/release.sh … --worker NAME=VERSION`; netprobe
+`scripts/release.sh` собирает и вносит сам. Бэкенд на SDK находит новые версии на GitHub сам
 (опция `agentReleases`, [sdk/docs/releases.md](sdk/docs/releases.md#откуда-бэкенд-берёт-агента)):
 новая версия агента не требует пересобирать бэкенд.
 

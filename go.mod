@@ -1,7 +1,7 @@
 module github.com/epifanovmd/agent
 
 // go — младшая версия Go, с которой собирается модуль; toolchain — версия, которой собираются
-// агент и выпуски (scripts/go.sh, CI, образы).
+// агент и его сборки для узлов (scripts/go.sh, CI, образы).
 go 1.25.0
 
 toolchain go1.26.9

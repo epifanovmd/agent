@@ -22,7 +22,7 @@
 // иначе AGENT_CONFIG, иначе экземпляр, чья это программа (/opt/agent-ИМЯ/bin/agent),
 // иначе /etc/agent/agent.yaml (на macOS ~/.agent/agent.yaml), если он есть.
 //
-// Ключи подписи и манифест выпуска — отдельная программа cmd/agent-release.
+// Ключи подписи и манифест сборок — отдельная программа cmd/agent-release.
 //
 // Ключ проверки обновлений вшивается при сборке: -ldflags "-X main.updateKey=<base64>";
 // ключи из настроек (update.publicKey, update.publicKeys) действуют вместе с ним.

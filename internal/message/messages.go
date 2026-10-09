@@ -56,7 +56,7 @@ type Host struct {
 }
 
 // HelloWorker — воркер из настроек агента; Version — версия сборки у воркера
-// из выпуска, у остальных — из манифеста.
+// со сборкой с сервера, у остальных — из манифеста.
 type HelloWorker struct {
 	Name     string          `json:"name"`
 	Version  string          `json:"version,omitempty"`

@@ -46,13 +46,13 @@ const installOptionsSchema = z
     rwPaths: z.array(z.string()).optional(),
     /** Путь к сертификату CA на узле (--ca-file). */
     caFile: z.string().optional(),
-    /** Воркеры из выпуска (--worker NAME, повторяемый); имя — по правилу имён. */
+    /** Воркеры с сервера (--worker NAME, повторяемый); имя — по правилу имён. */
     workers: z.array(nameSchema).optional(),
     stopTimeout: z.string().optional(),
     user: z.string().optional(),
     /** Путь к agent.yaml на узле (--config). */
     config: z.string().optional(),
-    /** Откуда скачивать сборки (--releases); по умолчанию — выпуск на сервере. */
+    /** Откуда скачивать сборки (--releases); по умолчанию — с этого сервера. */
     releases: serverSchema.or(z.literal("")).optional(),
   })
   .refine(

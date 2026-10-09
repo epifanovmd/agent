@@ -1,5 +1,5 @@
 // Схемы zod входящих данных: сообщения агента, манифест воркера, тело регистрации, manifest.json
-// выпуска, имена и метки. Типы протокола выводятся из этих схем (messages.ts), проверка — checks.ts.
+// сборок, имена и метки. Типы протокола выводятся из этих схем (messages.ts), проверка — checks.ts.
 // Незнакомые поля получатель пропускает: объект, чей тип допускает любые поля, сохраняет их
 // (looseObject), остальные их отбрасывают.
 import { z } from "zod";
@@ -182,7 +182,7 @@ const manifestField = workerManifestSchema.optional().catch(undefined);
 /** Воркер из `hello.workers`. */
 export const helloWorkerSchema = z.object({
   name: z.string(),
-  /** Версия сборки у воркера из выпуска, у остальных — из манифеста. */
+  /** Версия сборки у воркера со сборкой с сервера, у остальных — из манифеста. */
   version: z.string().optional(),
   release: z.boolean().optional(),
   /** Манифест воркера (§12); нет — воркер себя не описывает. */
@@ -429,16 +429,16 @@ export const workerArtifactSchema = releaseArtifactSchema.extend({
   command: z.string().optional(),
 });
 
-/** manifest.json выпуска (§11): неверные сборки пропускаются; artifacts пуст — выпуск только воркеров. */
+/** manifest.json сборок (§11): неверные сборки пропускаются; artifacts пуст — только сборки воркеров. */
 export const releaseManifestSchema = z.object({
   version: z.string(),
-  /** Открытый ключ, которым подписан выпуск (base64), — справочно. */
+  /** Открытый ключ, которым подписаны сборки (base64), — справочно. */
   publicKey: z.string().optional().catch(undefined),
   artifacts: validItems(releaseArtifactSchema).catch([]),
   workers: validItems(workerArtifactSchema).optional().catch(undefined),
 });
 
-/** Выпуск GitHub (ответ `GET /repos/{owner}/{repo}/releases`): нужное SDK; неверные файлы пропускаются. */
+/** Релиз GitHub (ответ `GET /repos/{owner}/{repo}/releases`): нужное SDK; неверные файлы пропускаются. */
 export const githubReleaseSchema = z.looseObject({
   tag_name: z.string(),
   draft: z.boolean().catch(false),
@@ -448,5 +448,5 @@ export const githubReleaseSchema = z.looseObject({
   ).catch([]),
 });
 
-/** Список выпусков GitHub; неверные записи пропускаются. */
+/** Список релизов GitHub; неверные записи пропускаются. */
 export const githubReleasesSchema = validItems(githubReleaseSchema);

@@ -1,20 +1,20 @@
-# Выпуск, установка, обновление, удаление
+# Сборки, установка, обновление, удаление
 
-Выпуск — подписанные сборки агента и воркеров с `manifest.json`. Бэкенд берёт агента из
-GitHub Release (или своего каталога), раздаёт сборки, ставит агента на узел одной командой и
+Сборки — подписанные файлы агента и воркеров с `manifest.json`. Бэкенд берёт агента из
+релизов GitHub (GitHub Releases) или своего каталога, раздаёт сборки, ставит агента на узел одной командой и
 обновляет агентов и воркеры; узел проверяет подпись и
 возвращает прежнюю сборку, если новая не заработала. Формат —
-[sdk/spec §10–§11](../spec/README.md#11-выпуск-и-обновление), образцы —
+[sdk/spec §10–§11](../spec/README.md#11-сборки-и-обновление), образцы —
 [actions.json](../spec/examples/actions.json). Флаги установщика и настройки агента —
 [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).
 
 - [Откуда бэкенд берёт агента](#откуда-бэкенд-берёт-агента)
 - [Ключи подписи](#ключи-подписи)
-- [Собрать выпуск](#собрать-выпуск)
-- [Раздать выпуск](#раздать-выпуск)
+- [Собрать сборки](#собрать-сборки)
+- [Раздать сборки](#раздать-сборки)
 - [Установка одной командой](#установка-одной-командой)
 - [Обновление агента](#обновление-агента)
-- [Обновление воркеров из выпуска](#обновление-воркеров-из-выпуска)
+- [Обновление воркеров с сервера](#обновление-воркеров-с-сервера)
 - [Удаление агента с узла](#удаление-агента-с-узла)
 
 ## Откуда бэкенд берёт агента
@@ -27,7 +27,7 @@ GitHub Release (или своего каталога), раздаёт сборк
 ```ts
 const agents = new Agents({
   enrollToken,
-  // Агент и его стандартные воркеры (netprobe) — из выпусков GitHub.
+  // Агент и его стандартные воркеры (netprobe) — из релизов GitHub (GitHub Releases).
   agentReleases: {
     github: "epifanovmd/agent",
     range: "^1", // необязательно; по умолчанию — та же мажорная версия, что у SDK
@@ -47,30 +47,30 @@ await agents.checkRelease(); // проверить сейчас, не дожид
 **Удалённый источник** (`agentReleases`):
 
 - `{ github: "owner/repo" }` — SDK запрашивает API GitHub (`GET /repos/{owner}/{repo}/releases`),
-  берёт выпуски без `prerelease` и не `draft`, выбирает старшую версию в диапазоне `range` (semver;
+  берёт релизы без `prerelease` и не `draft`, выбирает старшую версию в диапазоне `range` (semver;
   по умолчанию `^<мажорная версия SDK>`, например `^1` — новая мажорная версия агента сама не
   подхватывается) и скачивает её `manifest.json` и `install.sh`. Нужен публичный репозиторий;
   `token` — только для лимитов запросов к API.
-- `{ url: "https://…/releases/download/v1.1.0" }` — база выпуска: `<url>/manifest.json`,
-  `<url>/<file>`, `<url>/install.sh`. Так закрепляют одну версию, берут выпуск со своего
+- `{ url: "https://…/releases/download/v1.1.0" }` — адрес, откуда берутся сборки: `<url>/manifest.json`,
+  `<url>/<file>`, `<url>/install.sh`. Так закрепляют одну версию, берут сборки со своего
   зеркала или из каталога `agent-dist` на своём сервере.
 
-Проверка — при старте и раз в `checkIntervalMs` (`checkRelease()` — сейчас). Полученный выпуск
+Проверка — при старте и раз в `checkIntervalMs` (`checkRelease()` — сейчас). Полученный манифест сборок
 хранится в памяти процесса; ошибка сети или источника — предупреждение в журнал, остаётся прежний
-выпуск. Новая версия — событие `release` (`{ version, previous?, from }`). Подписи сборок SDK не
+манифест. Новая версия — событие `release` (`{ version, previous?, from }`). Подписи сборок SDK не
 проверяет — это делает агент своими ключами.
 
-**Итоговый выпуск** — то, что бэкенд раздаёт и чем обновляет:
+**Итоговый набор сборок** — то, что бэкенд раздаёт и чем обновляет:
 
 - агент и его воркеры (netprobe) — из удалённого источника; пока он ни разу не получен — из
   `releasesDir` (если там есть сборки агента);
 - воркеры проекта — из `releasesDir`; при совпадении имён воркер проекта важнее (воркер с этим
   именем из удалённого источника не раздаётся).
 
-`release()` возвращает итоговый выпуск: у каждой сборки — `source` (`remote` или `local`) и `url`
-(ссылка источника или путь от корня бэкенда), у выпуска — `remote` (`{ version, from, checkedAt,
+`release()` возвращает итоговый набор сборок: у каждой сборки — `source` (`remote` или `local`) и `url`
+(ссылка источника или путь от корня бэкенда), у набора — `remote` (`{ version, from, checkedAt,
 publicKey? }`). `updateCandidates()`, `workerUpdateCandidates()`, `updateAgent()`,
-`updateWorker()` работают по нему. Узлам `…/releases/manifest.json` отдаёт тот же выпуск без
+`updateWorker()` работают по нему. Узлам `…/releases/manifest.json` отдаёт тот же набор сборок без
 источников: `file` — имя файла.
 
 **Сборки из удалённого источника.** `GET …/releases/<file>` отвечает перенаправлением `302` на
@@ -90,12 +90,12 @@ AGENT_SIGNING_KEY=<ключ проекта> agent-release manifest /srv/agent-re
 **Ключи.** У агента может быть несколько ключей проверки; подпись принимается, если сходится с
 любым:
 
-- **ключ автора агента** — им подписаны агент и netprobe в GitHub Release; он вшит в эти сборки, а
-  `manifest.json` выпуска называет его в поле `publicKey`;
+- **ключ автора агента** — им подписаны агент и netprobe в релизах GitHub; он вшит в эти сборки, а
+  `manifest.json` сборок называет его в поле `publicKey`;
 - **ключ проекта** — им проект подписывает свои воркеры; узлу его передаёт установщик
   (`--update-key`), в настройках агента — `update.publicKeys`.
 
-`install.sh` из удалённого выпуска SDK отдаёт с подставленными адресом бэкенда и ключами:
+`install.sh` из удалённого источника SDK отдаёт с подставленными адресом бэкенда и ключами:
 `publicKey`, `updatePublicKeys` и ключ автора агента (`agentReleases.publicKey` или `publicKey`
 из `manifest.json` источника). Нет `install.sh` в источнике — берётся из `releasesDir`.
 
@@ -103,7 +103,7 @@ AGENT_SIGNING_KEY=<ключ проекта> agent-release manifest /srv/agent-re
 
 ```bash
 scripts/go.sh go run ./cmd/agent-release keygen   # Go в контейнере; где Go есть — go run ./cmd/agent-release keygen
-# AGENT_SIGNING_KEY=…        закрытый: только для сборки выпуска (секреты CI), не на бэкенде
+# AGENT_SIGNING_KEY=…        закрытый: только для подписи сборок (секреты CI), не на бэкенде
 # AGENT_UPDATE_PUBLIC_KEY=…  открытый: вшивается в сборки агента при make release (или update.publicKeys
 #                            в настройках агента) и нужен бэкенду (опция publicKey или updatePublicKeys)
 ```
@@ -113,16 +113,16 @@ scripts/go.sh go run ./cmd/agent-release keygen   # Go в контейнере; 
 обновление агента, ни сборку воркера (`UPDATE_NOT_VERIFIED`). Ключей может быть несколько —
 [выше](#откуда-бэкенд-берёт-агента).
 
-## Собрать выпуск
+## Собрать сборки
 
 ```bash
 AGENT_SIGNING_KEY=… AGENT_UPDATE_PUBLIC_KEY=… make release   # → dist/<VERSION>/
 ```
 
 `scripts/release.sh` собирает агента под linux и darwin × amd64 и arm64 (`agent-<os>-<arch>`) и
-стандартный воркер выпуска netprobe (`netprobe-<версия>-<os>-<arch>`), пишет подписанный
+стандартный воркер netprobe (`netprobe-<версия>-<os>-<arch>`), пишет подписанный
 `manifest.json` утилитой `agent-release manifest` (с `--worker netprobe=<версия>` и `publicKey` —
-открытым ключом подписи) и кладёт `install.sh`. Так же собирается выпуск на GitHub (CI по тегу). Сборки
+открытым ключом подписи) и кладёт `install.sh`. Так же собираются сборки для релиза на GitHub (CI по тегу). Сборки
 своих воркеров (файл или архив `<имя>-<версия>-<os>-<arch>.tar.gz`) кладут в тот же каталог заранее и
 вносят в манифест флагом `--worker`:
 `scripts/go.sh release --worker report=1.5.0,command=bin/report,stopTimeout=30s`
@@ -149,7 +149,7 @@ AGENT_SIGNING_KEY=… AGENT_UPDATE_PUBLIC_KEY=… make release   # → dist/<VER
 }
 ```
 
-## Раздать выпуск
+## Раздать сборки
 
 ```ts
 const agents = new Agents({
@@ -158,14 +158,14 @@ const agents = new Agents({
   publicKey: process.env.AGENT_UPDATE_PUBLIC_KEY, // вписывается в install.sh
   baseUrl: "https://api.example.com", // публичный адрес (иначе — из запроса)
 });
-const manifest = await agents.release(); // ReleaseView | null — итоговый выпуск
+const manifest = await agents.release(); // ReleaseView | null — итоговый набор сборок
 ```
 
 `Agents` раздаёт без авторизации — сборки подписаны, секретов в них нет:
 
 | Ссылка                                          | Что отдаёт                                                                                                |
 | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `GET /api/v1/agent-link/releases/manifest.json` | манифест выпуска                                                                                          |
+| `GET /api/v1/agent-link/releases/manifest.json` | манифест сборок                                                                                           |
 | `GET /api/v1/agent-link/releases/<file>`        | сборки агента и воркеров — только файлы из манифеста; из удалённого источника — `302` или поток (`proxy`) |
 | `GET /api/v1/agent-link/install.sh`             | установщик, в который уже вписаны адрес сервера и ключи проверки (`DEFAULT_UPDATE_KEYS`)                  |
 
@@ -188,7 +188,7 @@ const cmd = agents.installCommand({
   sysctl: { "vm.max_map_count": "262144" },
   rwPaths: ["/srv/data"],
   caFile: "/etc/ssl/example-ca.pem",
-  workers: ["report"], // воркеры из выпуска (--worker)
+  workers: ["report"], // воркеры с сервера (--worker)
   stopTimeout: "15min",
   releases: "https://cdn.example.com/agent", // необязательно: другой источник сборок
   baseUrl: "https://api.example.com", // иначе — опция baseUrl
@@ -205,7 +205,7 @@ const cmd = agents.installCommand({
 `install.sh` скачивает с бэкенда сборку агента под машину, сверяет контрольную сумму и
 запускает `agent install` с этими флагами. Агент ставится службой systemd, при первом запуске
 регистрируется по токену ([connection.md](connection.md#регистрация-по-токену)) и появляется в
-`agents.listAgents()`. Воркер из выпуска (`--worker report`) ставится в
+`agents.listAgents()`. Воркер со сборкой с сервера (`--worker report`) ставится в
 `/var/lib/agent/workers/report/current` и прописывается в `agent.yaml` с `release: true`.
 
 **Если на узле уже есть агент другого бэкенда**, ставьте своего отдельным экземпляром:
@@ -222,8 +222,8 @@ const candidates = await agents.updateCandidates(); // [{ agentId, name, online,
 for (const c of candidates) await agents.updateAgent(c.agentId); // → { version, previous }
 ```
 
-Кандидаты — агенты, чья версия отличается от выпуска и для чьих ОС и процессора есть сборка.
-Нет выпуска или сборки — `UPDATE_NOT_AVAILABLE`. Аудит — `agent.update`.
+Кандидаты — агенты, чья версия отличается от версии в манифесте сборок и для чьих ОС и процессора есть сборка.
+Нет манифеста или сборки — `UPDATE_NOT_AVAILABLE`. Аудит — `agent.update`.
 
 **Что уходит по сети.** `action {name: "agent.update", args: {version, url, sha256, signature}}`
 (`url` — от корня бэкенда; сборку удалённого источника бэкенд отдаёт перенаправлением или потоком)
@@ -238,7 +238,7 @@ previous}}`. Итог приходит уже в новом соединении
 дальше, новая версия их подхватывает (`lifecycle.onAgentRestart: keep`), — долгая работа не
 прерывается и ждать её окончания не нужно.
 
-## Обновление воркеров из выпуска
+## Обновление воркеров с сервера
 
 ```ts
 const list = await agents.workerUpdateCandidates();
@@ -251,7 +251,7 @@ await agents.updateWorker(agentId, "report", { wait: true }); // ждать ит
 ```
 
 Кандидаты — воркеры с `release: true`, чья версия отличается от новейшей сборки этого воркера в
-манифесте под ОС и процессор агента. Переустановить ту же версию можно. Воркер не из выпуска —
+манифесте под ОС и процессор агента. Переустановить ту же версию можно. Воркер, прописанный командой, —
 `WORKER_NOT_RELEASED`, нет сборки — `UPDATE_NOT_AVAILABLE`. Аудит — `worker.update`.
 
 **Агент** скачивает и проверяет сборку; если воркер занят (`GET /health` → `busy: true`), сразу

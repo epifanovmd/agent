@@ -1,5 +1,5 @@
 // Сценарии серверной части с фейковым агентом: регистрация, связь, поток и важное, fetch,
-// настройки, watch, метрики, проблемы, смена ключа, выпуск.
+// настройки, watch, метрики, проблемы, смена ключа, сборки.
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
@@ -1022,7 +1022,7 @@ describe("смена ключа", () => {
   });
 });
 
-describe("выпуск", () => {
+describe("сборки", () => {
   it("manifest.json, сборки из манифеста, install.sh с адресом и ключом", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-release-"));
     const manifest = {
@@ -1053,7 +1053,7 @@ describe("выпуск", () => {
           file: "report-1.10.0.tar.gz",
           sha256: "cc",
         },
-        // Предварительная версия старше выпуска 1.10.0.
+        // Предварительная версия старше версии 1.10.0.
         {
           name: "report",
           version: "1.10.0-rc.1",
@@ -1131,7 +1131,7 @@ describe("выпуск", () => {
     });
   });
 
-  it("неверный путь к файлу выпуска — 404; сборка без file — не кандидат", async () => {
+  it("неверный путь к файлу сборок — 404; сборка без file — не кандидат", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-release-"));
     const manifest = {
       version: "1.1.0",
@@ -1154,7 +1154,7 @@ describe("выпуск", () => {
     });
   });
 
-  it("без каталога выпуска — UPDATE_NOT_AVAILABLE", async () => {
+  it("без каталога сборок — UPDATE_NOT_AVAILABLE", async () => {
     const s = await server();
     const c = await enroll(s.url);
 

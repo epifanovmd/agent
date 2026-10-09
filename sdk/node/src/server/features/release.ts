@@ -1,6 +1,6 @@
-// Выпуск (§11): итоговый выпуск — удалённый источник агента (agentReleases) и воркеры проекта из
+// Сборки (§11): итоговые сборки — удалённый источник агента (agentReleases) и воркеры проекта из
 // releasesDir; сборки для обновления агентов и воркеров, кандидаты на обновление, install.sh.
-// Раздачу файлов выпуска делает транспорт.
+// Раздачу файлов сборок делает транспорт.
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -32,7 +32,7 @@ export interface UpdateArgs extends Record<string, unknown> {
   signature: string;
 }
 
-/** Где взять файл выпуска: в releasesDir или по ссылке удалённого источника. */
+/** Где взять файл сборок: в releasesDir или по ссылке удалённого источника. */
 export type ReleaseFile = { path: string } | { url: string; proxy: boolean };
 
 /** install.sh для раздачи и ключи проверки, которые в него подставить. */
@@ -59,12 +59,12 @@ export class Release {
     this.remote?.close();
   }
 
-  /** Раздавать ли выпуск: есть releasesDir или удалённый источник. */
+  /** Раздавать ли сборки: есть releasesDir или удалённый источник. */
   enabled(): boolean {
     return Boolean(this.ctx.settings.releasesDir || this.remote);
   }
 
-  /** Проверить удалённый источник сейчас и вернуть итоговый выпуск. */
+  /** Проверить удалённый источник сейчас и вернуть итоговые сборки. */
   async check(): Promise<ReleaseView | null> {
     await this.remote?.check();
 
@@ -95,7 +95,7 @@ export class Release {
   }
 
   /**
-   * Итоговый выпуск: агент и его воркеры — из удалённого источника (пока он не получен — из
+   * Итоговые сборки: агент и его воркеры — из удалённого источника (пока он не получен — из
    * releasesDir), воркеры проекта — из releasesDir (при совпадении имён важнее). Нет ни того, ни
    * другого — null.
    */
@@ -149,7 +149,7 @@ export class Release {
     };
   }
 
-  /** manifest.json для узлов: итоговый выпуск без источников (file — имя для …/releases/<file>). */
+  /** manifest.json для узлов: итоговые сборки без источников (file — имя для …/releases/<file>). */
   async served(): Promise<ReleaseManifest | null> {
     const view = await this.manifest();
 
@@ -168,7 +168,7 @@ export class Release {
     };
   }
 
-  /** Файл выпуска по имени: только сборки из итогового выпуска. */
+  /** Файл сборок по имени: только из итоговых сборок. */
   async file(name: string): Promise<ReleaseFile | null> {
     const view = await this.manifest();
     const art = [...(view?.artifacts ?? []), ...(view?.workers ?? [])].find(
@@ -193,7 +193,7 @@ export class Release {
   }
 
   /**
-   * install.sh: из удалённого выпуска (если он получен и в нём есть install.sh), иначе — из
+   * install.sh: из удалённого источника (если сборки получены и в нём есть install.sh), иначе — из
    * releasesDir. Ключи: publicKey, updatePublicKeys (проект) и ключ автора агента
    * (agentReleases.publicKey или publicKey удалённого manifest.json).
    */
@@ -225,13 +225,13 @@ export class Release {
     if (!art)
       throw codeError(
         "UPDATE_NOT_AVAILABLE",
-        `нет сборки ${os}/${arch} в выпуске ${m.version}`,
+        `нет сборки ${os}/${arch} в версии ${m.version}`,
       );
 
     return updateArgs(m.version, art);
   }
 
-  /** Аргументы worker.update; воркер не из выпуска — WORKER_NOT_RELEASED, сборки нет — UPDATE_NOT_AVAILABLE. */
+  /** Аргументы worker.update; воркер без сборки с сервера — WORKER_NOT_RELEASED, сборки нет — UPDATE_NOT_AVAILABLE. */
   async workerUpdate(
     agent: AgentRecord,
     name: string,
@@ -244,20 +244,23 @@ export class Release {
       !fromRelease(agent.hello?.workers) &&
       !fromRelease(agent.status?.workers)
     )
-      throw codeError("WORKER_NOT_RELEASED", `воркер ${name} не из выпуска`);
+      throw codeError(
+        "WORKER_NOT_RELEASED",
+        `воркер ${name} не со сборкой с сервера`,
+      );
     const { os = "", arch = "" } = agent.hello?.host ?? {};
     const art = workerArtifact(m, name, os, arch);
 
     if (!art)
       throw codeError(
         "UPDATE_NOT_AVAILABLE",
-        `нет сборки воркера ${name} ${os}/${arch} в выпуске ${m.version}`,
+        `нет сборки воркера ${name} ${os}/${arch} в версии ${m.version}`,
       );
 
     return { name, ...updateArgs(art.version, art) };
   }
 
-  /** Агенты, чья версия не как в выпуске и для чьих os/arch есть сборка. */
+  /** Агенты, чья версия не как на сервере и для чьих os/arch есть сборка. */
   async updateCandidates(): Promise<UpdateCandidate[]> {
     const m = await this.manifest();
 
@@ -285,7 +288,7 @@ export class Release {
     return out;
   }
 
-  /** Воркеры из выпуска, чья версия не как у новейшей сборки в manifest.json. */
+  /** Воркеры со сборкой с сервера, чья версия не как у новейшей сборки в manifest.json. */
   async workerUpdateCandidates(): Promise<WorkerUpdateCandidate[]> {
     const m = await this.manifest();
 
@@ -323,7 +326,7 @@ export class Release {
     if (!m)
       throw codeError(
         "UPDATE_NOT_AVAILABLE",
-        "нет выпуска (releasesDir, agentReleases)",
+        "нет сборок (releasesDir, agentReleases)",
       );
 
     return m;

@@ -1,8 +1,8 @@
-# Выпуск по тегу v*: проверки → подписанные сборки агента и стандартного воркера выпуска netprobe
+# Публикация версии по тегу v*: проверки → подписанные сборки агента и стандартного воркера netprobe
 # (scripts/release.sh) и архив серверного SDK (npm pack) → один GitHub Release; бэкенды с опцией
 # agentReleases находят его через API GitHub сами. Образы в GHCR: agent:<версия> (минимальный),
 # agent:<версия>-python (с python3 для воркеров), agent-dist:<версия>. Всё ставится с GitHub —
-# без npm. Тег с «-» (v1.2.0-rc.1) — предварительный выпуск.
+# без npm. Тег с «-» (v1.2.0-rc.1) — предварительная версия.
 # Нужны в настройках репозитория (agent-release keygen выдаёт пару):
 #   секрет AGENT_SIGNING_KEY — закрытый ключ подписи (base64 seed Ed25519);
 #   переменная AGENT_UPDATE_PUBLIC_KEY — открытый ключ: вшивается в сборки агента,
@@ -46,7 +46,7 @@ jobs:
       - name: Сквозные тесты стенда
         run: scripts/e2e.sh
 
-  # Выпуск агента: сборки агента linux/darwin × amd64/arm64 (agent-<os>-<arch>), воркер netprobe под
+  # Сборки агента linux/darwin × amd64/arm64 (agent-<os>-<arch>), воркер netprobe под
   # те же платформы (netprobe-<версия>-<os>-<arch>, в манифесте — --worker netprobe=<версия>),
   # manifest.json с подписями тем же ключом и его publicKey, install.sh.
   build:
@@ -62,7 +62,7 @@ jobs:
           AGENT_SIGNING_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
           AGENT_UPDATE_PUBLIC_KEY: ${{ vars.AGENT_UPDATE_PUBLIC_KEY }}
         run: |
-          test -n "$AGENT_SIGNING_KEY" || { echo "нет секрета AGENT_SIGNING_KEY: выпуск без подписи не публикуется" >&2; exit 1; }
+          test -n "$AGENT_SIGNING_KEY" || { echo "нет секрета AGENT_SIGNING_KEY: сборки без подписи не публикуются" >&2; exit 1; }
           test -n "$AGENT_UPDATE_PUBLIC_KEY" || { echo "нет переменной AGENT_UPDATE_PUBLIC_KEY: открытый ключ вшивается в сборки" >&2; exit 1; }
           v=$(cat VERSION)
           scripts/release.sh "dist/$v" "$v"
@@ -100,7 +100,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      # Только артефакты выпуска: build-push-action добавляет свои (.dockerbuild).
+      # Только артефакты для публикации: build-push-action добавляет свои (.dockerbuild).
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agent

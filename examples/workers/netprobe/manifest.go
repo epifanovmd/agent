@@ -2,7 +2,7 @@
 
 package main
 
-// version — версия воркера; в выпуске агента — его версия (-ldflags "-X main.version=…").
+// version — версия воркера; в сборках агента — его версия (-ldflags "-X main.version=…").
 var version = "1.0.0"
 
 // jobRun — тип задачи «проверить сейчас».

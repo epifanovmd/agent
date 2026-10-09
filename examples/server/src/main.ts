@@ -2,12 +2,12 @@
 // небольшой HTTP API над ним (examples/API.md).
 //
 //   PORT=8080 ENROLL_TOKEN=demo-token npm start   (node --import tsx src/main.ts)
-//   RELEASES_DIR=dist/<VERSION> — каталог выпуска (обновления, install.sh); с AGENT_RELEASES_* —
+//   RELEASES_DIR=dist/<VERSION> — каталог сборок (обновления, install.sh); с AGENT_RELEASES_* —
 //     воркеры проекта;
-//   AGENT_RELEASES_GITHUB=owner/repo — агент и его воркеры из выпусков GitHub (AGENT_RELEASES_RANGE —
-//     диапазон версий, AGENT_RELEASES_TOKEN — токен API) или AGENT_RELEASES_URL — база выпуска;
+//   AGENT_RELEASES_GITHUB=owner/repo — агент и его воркеры из релизов GitHub (AGENT_RELEASES_RANGE —
+//     диапазон версий, AGENT_RELEASES_TOKEN — токен API) или AGENT_RELEASES_URL — адрес каталога сборок;
 //     AGENT_RELEASES_PROXY=1 — сборки узлам через сервер потоком;
-//   PUBLIC_KEY — ключ проверки выпуска (base64), вписывается в install.sh; UPDATE_PUBLIC_KEYS — ещё
+//   PUBLIC_KEY — ключ проверки подписи сборок (base64), вписывается в install.sh; UPDATE_PUBLIC_KEYS — ещё
 //     ключи через запятую;
 //   PUBLIC_URL — адрес сервера для команды установки (по умолчанию — из запроса);
 //   VALIDATE_CONFIGS=1 — проверять настройки по схеме из манифеста воркера до отправки агенту;
@@ -27,7 +27,7 @@ const port = Number(env.PORT ?? 8080);
 const enrollToken = env.ENROLL_TOKEN ?? "demo-token";
 const interval = (v: string | undefined) => Number(v ?? 5000);
 
-/** Удалённый источник выпуска агента из окружения; не задан — undefined. */
+/** Откуда берутся сборки агента (из окружения); не задано — undefined. */
 const agentReleases = (): AgentsOptions["agentReleases"] => {
   const common = {
     proxy: env.AGENT_RELEASES_PROXY === "1",

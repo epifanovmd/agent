@@ -312,7 +312,7 @@ func TestProxyFromEnvironment(t *testing.T) {
 	}
 }
 
-// testPKI — свой CA и клиентский сертификат агента, выпущенный им (PEM-файлы в dir).
+// testPKI — свой CA и клиентский сертификат агента, подписанный им (PEM-файлы в dir).
 func testPKI(t *testing.T, dir string) (certFile, keyFile string, pool *x509.CertPool) {
 	t.Helper()
 	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

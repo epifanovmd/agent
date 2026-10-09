@@ -16,7 +16,7 @@ updates:
     schedule:
       interval: weekly
 
-  # Действия CI и выпуска.
+  # Действия CI и публикации версий.
   - package-ecosystem: github-actions
     directory: /
     schedule:

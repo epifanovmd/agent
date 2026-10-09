@@ -324,7 +324,7 @@ func workerNote(w message.WorkerStatus) string {
 		parts = append(parts, "встроенный")
 	}
 	if w.Release {
-		parts = append(parts, "из выпуска")
+		parts = append(parts, "сборка с сервера")
 	}
 	if w.Restarts > 0 {
 		parts = append(parts, "перезапусков: "+strconv.Itoa(w.Restarts))

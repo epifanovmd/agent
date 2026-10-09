@@ -26,7 +26,7 @@ import (
 	"github.com/epifanovmd/agent/test/testserver"
 )
 
-// releaseKit — каталог выпуска сервера: сборки, подписанные своим ключом, и manifest.json.
+// releaseKit — каталог сборок на сервере: сборки, подписанные своим ключом, и manifest.json.
 type releaseKit struct {
 	t       *testing.T
 	dir     string
@@ -44,7 +44,7 @@ func newReleaseKit(t *testing.T) *releaseKit {
 	return &releaseKit{t: t, dir: t.TempDir(), priv: priv, pub: base64.StdEncoding.EncodeToString(pub)}
 }
 
-// build — сборка name версии version в каталоге выпуска; запись для manifest.json.
+// build — сборка name версии version в каталоге сборок; запись для manifest.json.
 func (k *releaseKit) build(name, version string, content []byte) map[string]any {
 	sum := sha256.Sum256(content)
 	hash := hex.EncodeToString(sum[:])
@@ -56,7 +56,7 @@ func (k *releaseKit) build(name, version string, content []byte) map[string]any 
 	return map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "file": file, "sha256": hash, "signature": sig}
 }
 
-// setAgent, setWorker — сборка агента или воркера в выпуске (заменяет прежнюю).
+// setAgent, setWorker — сборка агента или воркера в каталоге сборок (заменяет прежнюю).
 func (k *releaseKit) setAgent(version string, content []byte) {
 	k.agent = k.build(update.AgentName, version, content)
 	k.agent["version"] = version
@@ -99,9 +99,9 @@ func testBinary(t *testing.T, tag string) []byte {
 	return append(raw, []byte(tailMark+tag+"\n")...)
 }
 
-// Воркер из выпуска: первая установка по worker.update, обновление (previous — прежняя
+// Воркер со сборкой с сервера: первая установка по worker.update, обновление (previous — прежняя
 // версия), новая сборка не запускается — возвращается прежняя (UPDATE_FAILED), подпись
-// другой сборки — UPDATE_FAILED, воркер не из выпуска — WORKER_NOT_RELEASED.
+// другой сборки — UPDATE_FAILED, воркер без release: true — WORKER_NOT_RELEASED.
 func TestWorkerUpdate(t *testing.T) {
 	t.Parallel()
 	kit := newReleaseKit(t)
@@ -158,7 +158,7 @@ func TestWorkerUpdate(t *testing.T) {
 		t.Fatalf("после отклонённой сборки работает %q", got)
 	}
 	if err := s.server.Action("updateWorker", a.ID, nil, "w"); errorCode(err) != "WORKER_NOT_RELEASED" {
-		t.Fatalf("воркер не из выпуска: %v", err)
+		t.Fatalf("воркер без release: true: %v", err)
 	}
 }
 

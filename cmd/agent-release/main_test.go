@@ -13,7 +13,7 @@ import (
 	"github.com/epifanovmd/agent/internal/update"
 )
 
-// manifest: сборки агента и воркеров (--worker) с подписью ключом выпуска.
+// manifest: сборки агента и воркеров (--worker) с подписью ключом подписи сборок.
 func TestReleaseManifestWorkers(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(nil)
 	t.Setenv("AGENT_SIGNING_KEY", base64.StdEncoding.EncodeToString(priv.Seed()))
@@ -69,7 +69,7 @@ func TestReleaseManifestWorkers(t *testing.T) {
 	}
 }
 
-// Выпуск только воркеров (воркеры проекта): сборок агента нет — artifacts
+// Только сборки воркеров (воркеры проекта): сборок агента нет — artifacts
 // пустой; без сборок агента и без --worker — ошибка.
 func TestReleaseManifestWorkersOnly(t *testing.T) {
 	t.Setenv("AGENT_SIGNING_KEY", "")

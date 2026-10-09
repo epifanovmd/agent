@@ -98,13 +98,13 @@ export class ApiError extends Error {
 export interface StandOptions {
   /** Имя агента. */
   name: string;
-  /** Каталог выпуска для Agents. */
+  /** Каталог сборок для Agents. */
   releasesDir?: string;
-  /** Ключ проверки выпуска агенту (update.publicKey); без него и updateKeys — update.mode: disabled. */
+  /** Ключ проверки подписи сборок для агента (update.publicKey); без него и updateKeys — update.mode: disabled. */
   updateKey?: string;
-  /** Ключи проверки выпуска агенту (update.publicKeys): подпись принимается, если сходится с любым. */
+  /** Ключи проверки подписи сборок для агента (update.publicKeys): подпись принимается, если сходится с любым. */
   updateKeys?: string[];
-  /** netprobe — воркер из выпуска (release: true): сборка в <dataDir>/workers/netprobe/current. */
+  /** netprobe — воркер со сборкой с сервера (release: true): сборка в <dataDir>/workers/netprobe/current. */
   releaseNetprobe?: boolean;
   /** Свои настройки Agents сервера стенда. */
   server?: Partial<AgentsOptions>;
@@ -395,7 +395,7 @@ export class Stand {
 
     await writeFile(this.configPath, JSON.stringify(config, null, 2));
     if (releaseNetprobe) {
-      // Воркер из выпуска, как после agent install --worker netprobe.
+      // Воркер со сборкой с сервера, как после agent install --worker netprobe.
       const dir = join(this.dataDir, "workers", "netprobe");
 
       await mkdir(dir, { recursive: true });

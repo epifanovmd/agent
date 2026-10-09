@@ -1,4 +1,4 @@
-// Удалённый источник выпуска агента (agentReleases): фейковый API GitHub на node:http — выбор
+// Удалённый источник сборок агента (agentReleases): фейковый API GitHub на node:http — выбор
 // версии по диапазону, пропуск prerelease и draft, ошибка сети, объединение с воркерами проекта
 // из releasesDir, install.sh с ключами, перенаправление и раздача сборок потоком, событие release.
 import assert from "node:assert/strict";
@@ -16,7 +16,7 @@ const AUTHOR_KEY = "QVVUSE9SLUtFWS1FWEFNUExFLUFVVEhPUi1LRVktMDE=";
 const PROJECT_KEY = "UFJPSkVDVC1LRVktRVhBTVBMRS1QUk9KRUNULUtFWTA=";
 const EXTRA_KEY = "RVhUUkEtS0VZLUVYQU1QTEUtRVhUUkEtS0VZLUVYVFI=";
 
-/** Выпуск в фейковом GitHub: тег, флаги и файлы (имя → содержимое). */
+/** Релиз в фейковом GitHub: тег, флаги и файлы (имя → содержимое). */
 interface FakeRelease {
   tag: string;
   draft?: boolean;
@@ -24,7 +24,7 @@ interface FakeRelease {
   files: Record<string, string>;
 }
 
-/** Файлы выпуска версии v: manifest.json (агент и netprobe), сборки, install.sh. */
+/** Файлы релиза версии v: manifest.json (агент и netprobe), сборки, install.sh. */
 const releaseFiles = (v: string): Record<string, string> => ({
   "manifest.json": JSON.stringify({
     version: v,
@@ -55,7 +55,7 @@ const releaseFiles = (v: string): Record<string, string> => ({
   "install.sh": `#!/bin/sh\n# ${v}\nDEFAULT_SERVER=""\nDEFAULT_UPDATE_KEYS=""\n`,
 });
 
-/** Фейковый GitHub: API выпусков и файлы по browser_download_url. */
+/** Фейковый GitHub: API релизов и файлы по browser_download_url. */
 class FakeGithub {
   releases: FakeRelease[] = [];
   /** Отвечать 500 на всё. */
@@ -154,7 +154,7 @@ const fromGithub = (
   ...more,
 });
 
-describe("удалённый источник выпуска агента", () => {
+describe("удалённый источник сборок агента", () => {
   it("старшая версия в диапазоне: prerelease, draft и чужой мажор пропускаются", async () => {
     const g = await github();
 
@@ -201,7 +201,7 @@ describe("удалённый источник выпуска агента", () =
     assert.equal((await narrow.agents.release())?.version, "1.1.0");
   });
 
-  it("новая версия — событие release; ошибка сети — остаётся прежний выпуск", async () => {
+  it("новая версия — событие release; ошибка сети — остаются прежние сборки", async () => {
     const g = await github();
     const logged: string[] = [];
 
@@ -229,7 +229,7 @@ describe("удалённый источник выпуска агента", () =
     const view = await s.agents.checkRelease();
 
     assert.equal(view?.version, "1.2.0");
-    assert.ok(logged.some(m => m.includes("остаётся прежний")));
+    assert.ok(logged.some(m => m.includes("остаются прежние")));
     assert.equal(events.length, seen);
     // Та же версия — без события.
     g.down = false;
@@ -238,7 +238,7 @@ describe("удалённый источник выпуска агента", () =
     assert.equal(events.length, seen);
   });
 
-  it("источник недоступен с самого начала — выпуск из releasesDir, событие при появлении", async () => {
+  it("источник недоступен с самого начала — сборки из releasesDir, событие при появлении", async () => {
     const g = await github();
     const dir = mkdtempSync(join(tmpdir(), "agent-release-"));
 
@@ -331,7 +331,7 @@ describe("удалённый источник выпуска агента", () =
       "REPORT",
     );
 
-    // Кандидаты и действия — по итоговому выпуску; url — от корня сервера.
+    // Кандидаты и действия — по итоговым сборкам; url — от корня сервера.
     const c = await enroll(s.url);
     const fa = await FakeAgent.connect(s.ws, c);
 
@@ -403,7 +403,7 @@ describe("удалённый источник выпуска агента", () =
     assert.equal((await fetch(`${pbase}/agent-linux-amd64`)).status, 502);
   });
 
-  it("install.sh из удалённого выпуска: адрес сервера и ключи проекта и автора агента", async () => {
+  it("install.sh из удалённого источника: адрес сервера и ключи проекта и автора агента", async () => {
     const g = await github();
 
     g.add("v1.2.0");
@@ -436,7 +436,7 @@ describe("удалённый источник выпуска агента", () =
     assert.match(sh2, new RegExp(`^DEFAULT_UPDATE_KEYS="${EXTRA_KEY}"$`, "m"));
   });
 
-  it("база выпуска по ссылке (url): manifest.json, сборки и install.sh рядом", async () => {
+  it("база сборок по ссылке (url): manifest.json, сборки и install.sh рядом", async () => {
     const g = await github();
 
     g.add("v1.2.0");

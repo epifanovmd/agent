@@ -49,7 +49,7 @@ type process struct {
 	socket string
 	log    *slog.Logger
 	client *http.Client
-	// version — версия сборки воркера из выпуска на момент запуска.
+	// version — версия сборки воркера на момент запуска.
 	version string
 	pid     int
 	// start — время запуска процесса по данным системы (procStart).
@@ -68,8 +68,8 @@ type process struct {
 	reason string
 }
 
-// argv — команда запуска и рабочий каталог: command + args; у воркера из
-// выпуска — его сборка (файл или ./run архива), command — в каталоге сборки.
+// argv — команда запуска и рабочий каталог: command + args; у воркера со
+// сборкой с сервера — его сборка (файл или ./run архива), command — в каталоге сборки.
 func argv(spec config.Worker) ([]string, string, error) {
 	args := append(slices.Clone(spec.Command), spec.Args...)
 	dir := spec.Dir
@@ -101,7 +101,7 @@ func readVersion(path string) string {
 	return strings.TrimSpace(string(raw))
 }
 
-// releaseVersion — версия текущей сборки воркера из выпуска ("" — не из выпуска).
+// releaseVersion — версия текущей сборки воркера ("" — воркер без release: true).
 func releaseVersion(spec config.Worker) string {
 	if !spec.Release {
 		return ""

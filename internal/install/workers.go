@@ -23,7 +23,7 @@ import (
 // reCommand — command сборки-архива: путь внутри архива.
 var reCommand = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 
-// installWorkers — воркеры из выпуска (--worker): сборка под эту машину из
+// installWorkers — воркеры со сборкой с сервера (--worker): сборка под эту машину из
 // manifest.json (старшая версия; sha256 и, если есть ключ, подпись
 // сверяются) кладётся в <dataDir>/workers/<name>/current (+ version); архив
 // .tar.gz распаковывается в каталог current. Вернёт записи для agent.yaml.
@@ -62,10 +62,10 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 	for _, name := range o.Workers {
 		a := manifest.Worker(name, "linux", s.Arch)
 		if a == nil {
-			return nil, fmt.Errorf("--worker %s: в выпуске %s нет сборки воркера под linux/%s", name, releases, s.Arch)
+			return nil, fmt.Errorf("--worker %s: в каталоге сборок %s нет сборки воркера под linux/%s", name, releases, s.Arch)
 		}
 		if a.SHA256 == "" {
-			return nil, fmt.Errorf("--worker %s: запись выпуска неполная", name)
+			return nil, fmt.Errorf("--worker %s: запись о сборке в manifest.json неполная", name)
 		}
 		fileURL, err := buildURL(releases, a.File)
 		if err != nil {
@@ -74,7 +74,7 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 		archive := isArchive(fileURL)
 		if a.Command != "" && (!archive || !reCommand.MatchString(a.Command) || strings.HasPrefix(a.Command, "/") ||
 			slices.Contains(strings.Split(a.Command, "/"), "..")) {
-			return nil, fmt.Errorf("--worker %s: command в выпуске — не путь внутри архива: %q", name, a.Command)
+			return nil, fmt.Errorf("--worker %s: command в manifest.json — не путь внутри архива: %q", name, a.Command)
 		}
 		dir := filepath.Join(root, name)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -88,7 +88,7 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 				return nil, fmt.Errorf("--worker %s: %w", name, err)
 			}
 		} else if len(keys) > 0 {
-			s.warn("воркер %s: в выпуске нет подписи сборки — сверена только контрольная сумма", name)
+			s.warn("воркер %s: в manifest.json нет подписи сборки — сверена только контрольная сумма", name)
 		}
 		if archive {
 			tmp := next + ".tar.gz"
@@ -126,23 +126,23 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 	return out, nil
 }
 
-// buildURL — где скачать сборку из записи выпуска (§11): имя файла — в
-// каталоге выпуска releases; абсолютная ссылка https:// — как есть; http:// —
-// только если и каталог выпуска http://.
+// buildURL — где скачать сборку по записи manifest.json (§11): имя файла — в
+// каталоге сборок releases; абсолютная ссылка https:// — как есть; http:// —
+// только если и каталог сборок http://.
 func buildURL(releases, file string) (string, error) {
 	if file == "" {
-		return "", errors.New("запись выпуска неполная")
+		return "", errors.New("запись о сборке в manifest.json неполная")
 	}
 	if file == path.Base(file) && !strings.Contains(file, ":") {
 		return releases + "/" + url.PathEscape(file), nil
 	}
 	u, err := url.Parse(file)
 	if err != nil || u.Host == "" || u.User != nil {
-		return "", fmt.Errorf("файл выпуска %q: нужно имя файла или ссылка https://", file)
+		return "", fmt.Errorf("файл сборки %q: нужно имя файла или ссылка https://", file)
 	}
 	base, _ := url.Parse(releases)
 	if !strings.EqualFold(u.Scheme, "https") && (!strings.EqualFold(u.Scheme, "http") || base == nil || !strings.EqualFold(base.Scheme, "http")) {
-		return "", fmt.Errorf("файл выпуска %q: нужна ссылка https:// (http:// — только если и каталог выпуска http://)", file)
+		return "", fmt.Errorf("файл сборки %q: нужна ссылка https:// (http:// — только если и каталог сборок http://)", file)
 	}
 	return u.String(), nil
 }
@@ -169,15 +169,15 @@ func fetchManifest(ctx context.Context, client *http.Client, u string) (*message
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("манифест выпуска %s: %w", u, err)
+		return nil, fmt.Errorf("манифест сборок %s: %w", u, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("манифест выпуска %s: HTTP %d", u, resp.StatusCode)
+		return nil, fmt.Errorf("манифест сборок %s: HTTP %d", u, resp.StatusCode)
 	}
 	var m message.Manifest
 	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return nil, fmt.Errorf("манифест выпуска %s: %w", u, err)
+		return nil, fmt.Errorf("манифест сборок %s: %w", u, err)
 	}
 	return &m, nil
 }

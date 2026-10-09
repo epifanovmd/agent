@@ -1,10 +1,10 @@
-// Утилита выпуска агента: ключи подписи и манифест сборок. На узлы не ставится —
-// нужна там, где собирают выпуск (scripts/release.sh, CI).
+// Утилита подписи сборок агента: ключи подписи и манифест сборок. На узлы не ставится —
+// нужна там, где готовят публикацию (scripts/release.sh, CI).
 //
-//	agent-release keygen                ключи подписи выпуска (Ed25519)
+//	agent-release keygen                ключи подписи сборок (Ed25519)
 //	agent-release manifest DIR VERSION [--worker NAME=VERSION[,stopTimeout=…][,command=…]]…
 //	                                    manifest.json сборок агента и воркеров в DIR (подпись — AGENT_SIGNING_KEY);
-//	                                    без сборок агента — выпуск только воркеров (воркеры проекта)
+//	                                    без сборок агента — только сборки воркеров (воркеры проекта)
 package main
 
 import (
@@ -70,11 +70,11 @@ func keygen() error {
 }
 
 // manifest — manifest.json для сборок agent-<os>-<arch> в каталоге и
-// воркеров из выпуска: `--worker NAME=VERSION[,stopTimeout=…]`
+// сборок воркеров: `--worker NAME=VERSION[,stopTimeout=…]`
 // (повторяемый) берёт файлы DIR/<name>-<version>-<os>-<arch> или архивы
 // DIR/<name>-<version>-<os>-<arch>.tar.gz. Подпись — AGENT_SIGNING_KEY над
 // строкой сборки (§11: имя, версия, os, arch, sha256), publicKey — её
-// открытый ключ. Сборок агента нет, но есть --worker — выпуск только воркеров.
+// открытый ключ. Сборок агента нет, но есть --worker — только сборки воркеров.
 func manifest(args []string) error {
 	usage := errors.New("manifest DIR VERSION [--worker NAME=VERSION[,stopTimeout=30s][,command=bin/report]]…")
 	var positional []string

@@ -1,4 +1,4 @@
-// Действия и выпуск: обновление агента из каталога выпуска (подпись тестовым ключом),
+// Действия и обновления: обновление агента из каталога сборок (подпись тестовым ключом),
 // перезапуск зависшего воркера, смена ключа агента, отзыв.
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
@@ -27,7 +27,7 @@ import {
   waitFor,
 } from "./stand";
 
-/** Пара ключей подписи выпуска (agent-release keygen). */
+/** Пара ключей подписи сборок (agent-release keygen). */
 const keygen = async () => {
   const { stdout } = await run(bin("agent-release"), ["keygen"]);
   const value = (name: string) =>
@@ -39,7 +39,7 @@ const keygen = async () => {
   };
 };
 
-/** manifest.json каталога выпуска с подписью ключом signing. */
+/** manifest.json каталога сборок с подписью ключом signing. */
 const manifest = (dir: string, signing: string) =>
   run(bin("agent-release"), ["manifest", dir, NEXT_VERSION], {
     env: { ...process.env, AGENT_SIGNING_KEY: signing },
@@ -71,7 +71,7 @@ const linkStatus = (url: string, agentId: string, secret: string) =>
     req.end();
   });
 
-describe("действия и выпуск", () => {
+describe("действия и обновления", () => {
   let s: Stand;
   let releases: string;
   let keys: { signing: string; public: string };
@@ -81,7 +81,7 @@ describe("действия и выпуск", () => {
     releases = await mkdtemp(join(tmpdir(), "agent-e2e-release-"));
     keys = await keygen();
     await copyFile(bin("agent", join(BIN, "next")), bin("agent", releases));
-    // Сначала выпуск подписан чужим ключом.
+    // Сначала сборки подписаны чужим ключом.
     await manifest(releases, (await keygen()).signing);
     s = await Stand.start({
       name: "e2e-actions",
@@ -122,7 +122,7 @@ describe("действия и выпуск", () => {
       assert.equal(a.version, VERSION);
     });
 
-    it("подписанный выпуск: агент ставит новую версию и перезапускается, работа воркера не прерывается", async () => {
+    it("подписанные сборки: агент ставит новую версию и перезапускается, работа воркера не прерывается", async () => {
       await manifest(releases, keys.signing);
       const starts = s.agentStarts;
       const echoPid = async () =>

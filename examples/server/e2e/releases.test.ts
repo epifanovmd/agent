@@ -1,4 +1,4 @@
-// Удалённый источник выпуска агента: выпуск агента и netprobe (подпись ключом автора агента)
+// Сборки агента с другого сервера: агент и netprobe (подпись ключом автора агента)
 // лежит на отдельном HTTP-сервере, как на GitHub (agentReleases.url); воркер проекта — netprobe
 // следующей версии — в releasesDir (подпись ключом проекта). Агент знает оба ключа
 // (update.publicKeys): воркер обновляется из releasesDir, агент — из удалённого источника по
@@ -18,7 +18,7 @@ import { BIN, bin, NEXT_VERSION, run, Stand, VERSION } from "./stand";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
-/** Пара ключей подписи выпуска (agent-release keygen). */
+/** Пара ключей подписи сборок (agent-release keygen). */
 const keygen = async () => {
   const { stdout } = await run(bin("agent-release"), ["keygen"]);
   const value = (name: string) =>
@@ -36,7 +36,7 @@ const manifest = (dir: string, signing: string, ...args: string[]) =>
     env: { ...process.env, AGENT_SIGNING_KEY: signing },
   });
 
-/** Статический сервер каталога dir (как файлы выпуска GitHub); запросы — в журнал. */
+/** Статический сервер каталога dir (как файлы релиза GitHub); запросы — в журнал. */
 const serveDir = async (dir: string) => {
   const requests: string[] = [];
   const server: Server = createServer(async (req, res) => {
@@ -66,7 +66,7 @@ const serveDir = async (dir: string) => {
   };
 };
 
-describe("удалённый источник выпуска агента", () => {
+describe("сборки агента с другого сервера", () => {
   let s: Stand;
   let remoteDir: string;
   let projectDir: string;
@@ -82,7 +82,7 @@ describe("удалённый источник выпуска агента", () =
     projectDir = await mkdtemp(join(tmpdir(), "agent-e2e-project-"));
     const next = join(BIN, "next");
 
-    // Выпуск автора агента: агент, netprobe и install.sh (как scripts/release.sh).
+    // Сборки автора агента: агент, netprobe и install.sh (как scripts/release.sh).
     await copyFile(bin("agent", next), bin("agent", remoteDir));
     await copyFile(
       bin("netprobe", next),
@@ -128,7 +128,7 @@ describe("удалённый источник выпуска агента", () =
     await rm(projectDir, { recursive: true, force: true });
   });
 
-  it("итоговый выпуск: агент из источника, netprobe — из releasesDir", async () => {
+  it("итоговый список сборок: агент из источника, netprobe — из releasesDir", async () => {
     const r = await s.api<{
       release: ReleaseView;
       candidates: UpdateCandidate[];

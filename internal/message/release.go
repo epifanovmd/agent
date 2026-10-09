@@ -6,13 +6,13 @@ import (
 	"strings"
 )
 
-// ─── Выпуск (manifest.json, §11) ───────────────────────────────────────
+// ─── Сборки (manifest.json, §11) ───────────────────────────────────────
 
-// Manifest — manifest.json каталога выпуска (`agent-release manifest`):
-// сборки агента и (необязательно) сборки воркеров из выпуска. PublicKey —
-// открытый ключ, которым подписан выпуск (справочно: агент проверяет подписи
-// своими ключами). Artifacts пуст — выпуск только воркеров. File сборки —
-// имя файла в каталоге выпуска или абсолютная ссылка https://.
+// Manifest — manifest.json каталога сборок (`agent-release manifest`):
+// сборки агента и (необязательно) сборки воркеров. PublicKey —
+// открытый ключ, которым подписаны сборки (справочно: агент проверяет подписи
+// своими ключами). Artifacts пуст — только сборки воркеров. File сборки —
+// имя файла в каталоге сборок или абсолютная ссылка https://.
 type Manifest struct {
 	Version   string           `json:"version"`
 	PublicKey string           `json:"publicKey,omitempty"`
@@ -21,7 +21,7 @@ type Manifest struct {
 }
 
 // Artifact — сборка агента под ОС и архитектуру. Signature — Ed25519 ключом
-// выпуска над подписываемой строкой (§11), base64.
+// публикации над подписываемой строкой (§11), base64.
 type Artifact struct {
 	OS        string `json:"os"`
 	Arch      string `json:"arch"`
@@ -30,7 +30,7 @@ type Artifact struct {
 	Signature string `json:"signature,omitempty"`
 }
 
-// WorkerArtifact — сборка воркера из выпуска (файл `<name>-<version>-<os>-<arch>`).
+// WorkerArtifact — сборка воркера (файл `<name>-<version>-<os>-<arch>`).
 // StopTimeout — значение по умолчанию для записи воркера в agent.yaml при
 // установке (agent install --worker).
 type WorkerArtifact struct {

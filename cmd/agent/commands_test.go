@@ -34,7 +34,7 @@ func TestPrintStatus(t *testing.T) {
 		"Агент работает: pid 42, версия 1.0.0, запущен 2026-01-02 12:00:00 (3 ч 0 мин назад)",
 		"node-01 (id ag-1)", "Связь:      нет — подключается к https://api.example.com",
 		"ждут подтверждения сервера: 2", "sysmetrics     running   встроенный",
-		"report         backoff   версия 1.2.0, из выпуска, перезапусков: 3, нездоров нет связи, limits v2 ошибка CONFIG_REJECTED, main v4 применено",
+		"report         backoff   версия 1.2.0, сборка с сервера, перезапусков: 3, нездоров нет связи, limits v2 ошибка CONFIG_REJECTED, main v4 применено",
 		"Последняя ошибка связи или регистрации 2026-01-02 14:55:00 (5 мин назад):\n  dial: connection refused",
 	} {
 		if !strings.Contains(text, want) {

@@ -3,11 +3,11 @@
 Серверная часть связи с агентами для Node.js (≥ 24): регистрация агентов, WebSocket,
 запросы к воркерам на узлах (`fetch`), задачи воркеров (`runJob`), настройки воркеров с
 версиями, метрики, события, наблюдение, встроенные действия (перезапуск и обновление воркеров,
-обновление агента, смена ключа, журнал), пересылка вызовов между копиями бэкенда, раздача выпуска
+обновление агента, смена ключа, журнал), пересылка вызовов между копиями бэкенда, раздача сборок
 и команда установки. Пакет — ESM с типами TypeScript.
 
 Зависимости: `ws` — WebSocket, `zod` — проверка входящих данных, `semver` — сравнение версий
-выпуска, `lru-cache` — учёт неудачных регистраций и повторов, `@cfworker/json-schema` —
+сборок, `lru-cache` — учёт неудачных регистраций и повторов, `@cfworker/json-schema` —
 проверка значений настроек и данных задач по схеме из манифеста воркера.
 
 Воркерам SDK не нужен: воркер — обычный HTTP-сервис на unix-сокете на любом языке.
@@ -19,7 +19,7 @@
 
 ## Установка
 
-Готовый архив из GitHub Release (TypeScript уже собран; `<версия>` — номер выпуска):
+Готовый архив из релизов GitHub (GitHub Releases; TypeScript уже собран; `<версия>` — номер версии):
 
 ```bash
 npm install https://github.com/epifanovmd/agent/releases/download/v<версия>/agent-sdk-<версия>.tgz
@@ -34,7 +34,7 @@ import { Agents } from "agent-sdk/server";
 const agents = new Agents({ enrollToken: process.env.AGENT_ENROLL_TOKEN });
 
 const server = createServer(async (req, res) => {
-  if (await agents.handle(req, res)) return; // регистрация, выпуск, install.sh
+  if (await agents.handle(req, res)) return; // регистрация, сборки, install.sh
   res.writeHead(404).end();
 });
 agents.attach(server); // WebSocket агентов

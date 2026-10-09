@@ -1,5 +1,5 @@
 // Сервер стенда на agent-sdk/server: связь с агентами (регистрация, WebSocket, запросы к
-// воркерам, настройки, метрики, события, действия, выпуск) делает Agents; здесь — небольшой HTTP
+// воркерам, настройки, метрики, события, действия, сборки) делает Agents; здесь — небольшой HTTP
 // API над ним (examples/API.md) и история в памяти (history.ts). Без авторизации — пример для
 // запуска у себя.
 import { randomUUID } from "node:crypto";
@@ -114,7 +114,7 @@ const handle = async (
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> => {
-  if (await agents.handle(req, res)) return; // регистрация, выпуск, install.sh
+  if (await agents.handle(req, res)) return; // регистрация, сборки, install.sh
   const url = new URL(req.url ?? "/", "http://x");
 
   if (!url.pathname.startsWith("/api/")) return notFound(res);

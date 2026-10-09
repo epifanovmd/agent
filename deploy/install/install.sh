@@ -4,14 +4,14 @@
 # agent install как есть: --token, --name, --worker, --packages, --sysctl, --privileged и др.
 # (список — agent install -h и docs/ARCHITECTURE.md, раздел «Установка»).
 #
-# С сервера (он раздаёт этот скрипт со своим адресом и ключами проверки выпусков):
+# С сервера (он раздаёт этот скрипт со своим адресом и ключами проверки подписи сборок):
 #   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --token <токен> [флаги]
 #   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --uninstall [--purge]
 #
 # Свои флаги:
 #   --server URL      адрес сервера (в скрипт с сервера уже вписан)
 #   --releases URL    откуда скачать сборку (по умолчанию <server>/api/v1/agent-link/releases);
-#                     передаётся и agent install (оттуда же — воркеры из выпуска)
+#                     передаётся и agent install (оттуда же — сборки воркеров)
 #   --ca-file ПУТЬ    свой корневой сертификат сервера для загрузки; передаётся и agent install
 #   --binary ПУТЬ     не скачивать, а поставить сборку из файла
 #   --instance ИМЯ    экземпляр агента (несколько агентов на одном узле — для разных бэкендов);
@@ -23,7 +23,7 @@
 #   sudo ./agent-linux-<arch> install --server URL --token <токен>
 set -eu
 
-# Сервер, раздающий скрипт, подставляет сюда свой адрес и ключи проверки выпусков (base64 через
+# Сервер, раздающий скрипт, подставляет сюда свой адрес и ключи проверки подписи сборок (base64 через
 # пробел: автор агента и проект) — они уходят agent install флагами --update-key.
 DEFAULT_SERVER=""
 DEFAULT_UPDATE_KEYS=""
@@ -90,7 +90,7 @@ SERVER="${SERVER%/}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# fetch_agent — сборка агента в $TMP/agent: --binary или из manifest.json выпуска (sha256 сверяется).
+# fetch_agent — сборка агента в $TMP/agent: --binary или из manifest.json (sha256 сверяется).
 fetch_agent() {
   if [ -n "$BINARY" ]; then
     [ -f "$BINARY" ] || die "--binary: нет файла $BINARY"
@@ -105,14 +105,14 @@ fetch_agent() {
     esac
     RELEASES="${RELEASES:-$SERVER/api/v1/agent-link/releases}"
     RELEASES="${RELEASES%/}"
-    MANIFEST="$(curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$RELEASES/manifest.json")" || die "манифест выпуска не получен: $RELEASES/manifest.json"
+    MANIFEST="$(curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$RELEASES/manifest.json")" || die "манифест сборок не получен: $RELEASES/manifest.json"
     # Без jq: каждый объект манифеста (записи плоские) — отдельной строкой; сборки агента — записи
     # без "name" (у воркеров он есть).
     ENTRY="$(printf '%s' "$MANIFEST" | tr -d '\n\r\t ' | sed 's/{/\n{/g' | grep '"os":"linux"' | grep "\"arch\":\"$ARCH\"" | grep -v '"name":' | head -n 1)" || true
     FILE="$(printf '%s' "$ENTRY" | sed -n 's/.*"file":"\([^"]*\)".*/\1/p')"
     SUM="$(printf '%s' "$ENTRY" | sed -n 's/.*"sha256":"\([^"]*\)".*/\1/p')"
-    if [ -z "$FILE" ] || [ -z "$SUM" ]; then die "в выпуске нет сборки агента linux/$ARCH"; fi
-    # file — имя в каталоге выпуска или абсолютная ссылка https:// (http:// — при http-каталоге).
+    if [ -z "$FILE" ] || [ -z "$SUM" ]; then die "в manifest.json нет сборки агента linux/$ARCH"; fi
+    # file — имя в каталоге сборок или абсолютная ссылка https:// (http:// — при http-каталоге).
     case "$FILE" in
       https://*) URL=$FILE ;;
       http://*)

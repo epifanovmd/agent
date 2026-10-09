@@ -31,7 +31,7 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, force boo
 	switch {
 	case !spec.Release:
 		w.mu.Unlock()
-		return res, message.NewError(message.CodeWorkerNotReleased, fmt.Sprintf("воркер %q не из выпуска (release: true не задан)", name))
+		return res, message.NewError(message.CodeWorkerNotReleased, fmt.Sprintf("у воркера %q нет сборки с сервера (release: true не задан)", name))
 	case w.updating:
 		w.mu.Unlock()
 		return res, message.NewError(message.CodeBusy, fmt.Sprintf("воркер %q уже обновляется", name))

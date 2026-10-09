@@ -118,7 +118,7 @@ export type ReleaseArtifact = z.output<typeof releaseArtifactSchema>;
 /** Сборка воркера в manifest.json. */
 export type WorkerArtifact = z.output<typeof workerArtifactSchema>;
 
-/** manifest.json выпуска (§11). */
+/** manifest.json сборок (§11). */
 export type ReleaseManifest = z.output<typeof releaseManifestSchema>;
 
 /** Идентификатор сообщения: 32 шестнадцатеричных символа. */

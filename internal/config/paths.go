@@ -19,7 +19,7 @@ const (
 )
 
 // EnvFileName — файл переменных окружения рядом с файлом настроек (agent.env):
-// токен регистрации и ключ проверки выпусков. Его читает служба systemd, а
+// токен регистрации и ключ проверки подписи сборок. Его читает служба systemd, а
 // agent config check / status / cleanup — сами.
 const EnvFileName = "agent.env"
 

@@ -38,7 +38,7 @@ import { Agents } from "agent-sdk/server";
 const agents = new Agents({ enrollToken: "demo-token" }); // хранилище — в памяти (MemoryStore)
 
 const server = createServer(async (req, res) => {
-  if (await agents.handle(req, res)) return; // регистрация, выпуск, install.sh
+  if (await agents.handle(req, res)) return; // регистрация, сборки, install.sh
   res.writeHead(404).end(); // здесь — ваше API
 });
 agents.attach(server); // WebSocket агентов на том же порту
@@ -170,7 +170,7 @@ agents.installCommand({ token: "demo-token", name: "node-01", baseUrl: "https://
 // curl -fsSL 'https://api.example.com/api/v1/agent-link/install.sh' | sudo sh -s -- --token 'demo-token' --name 'node-01'
 ```
 
-Выпуск, установка и обновления — [releases.md](releases.md).
+Сборки, установка и обновления — [releases.md](releases.md).
 
 ## Разделы
 
@@ -181,5 +181,5 @@ agents.installCommand({ token: "demo-token", name: "node-01", baseUrl: "https://
 | [fetch.md](fetch.md)           | запросы к воркеру: поток, отмена, сроки, ошибки                                 |
 | [configs.md](configs.md)       | настройки воркеров: версии, доставка, статус применения                         |
 | [observe.md](observe.md)       | метрики, наблюдение (watch), журнал, события, проблемы                          |
-| [releases.md](releases.md)     | выпуск, установка, обновление агента и воркеров, удаление                       |
+| [releases.md](releases.md)     | сборки, установка, обновление агента и воркеров, удаление                       |
 | [store.md](store.md)           | хранилище: свой Store, пример на Postgres                                       |

@@ -67,9 +67,9 @@ export type RelayFunction = (
   request: RelayRequest,
 ) => Promise<Response>;
 
-/** Общее для удалённых источников выпуска агента. */
+/** Общее для удалённых источников сборок агента. */
 interface AgentReleasesCommon {
-  /** Как часто проверять новый выпуск, мс (по умолчанию 3 600 000 — 1 ч); первая проверка — при старте. */
+  /** Как часто проверять новую версию, мс (по умолчанию 3 600 000 — 1 ч); первая проверка — при старте. */
   checkIntervalMs?: number;
   /**
    * Сборки из удалённого источника отдавать узлам через бэкенд потоком (узлам без доступа к
@@ -78,7 +78,7 @@ interface AgentReleasesCommon {
   proxy?: boolean;
   /**
    * Ключ автора агента (base64) для install.sh; по умолчанию — publicKey из manifest.json
-   * удалённого выпуска.
+   * удалённого источника.
    */
   publicKey?: string;
   /** Своя функция fetch (тесты, прокси); по умолчанию — глобальная. */
@@ -86,13 +86,13 @@ interface AgentReleasesCommon {
 }
 
 /**
- * Удалённый источник выпуска агента: выпуски GitHub (github) или постоянная база выпуска (url —
+ * Удалённый источник сборок агента: релизы GitHub (github) или постоянная база сборок (url —
  * каталог с manifest.json, например `https://github.com/<owner>/<repo>/releases/download/v1.1.0`).
  */
 export type AgentReleasesOptions = AgentReleasesCommon &
   (
     | {
-        /** Репозиторий `owner/repo`: выпуски без prerelease и draft. */
+        /** Репозиторий `owner/repo`: релизы без prerelease и draft. */
         github: string;
         /** Диапазон версий semver (по умолчанию `^<мажорная версия SDK>`, например `^1`). */
         range?: string;
@@ -102,7 +102,7 @@ export type AgentReleasesOptions = AgentReleasesCommon &
         apiUrl?: string;
       }
     | {
-        /** База выпуска: `<url>/manifest.json`, `<url>/<file>`, `<url>/install.sh`. */
+        /** База сборок: `<url>/manifest.json`, `<url>/<file>`, `<url>/install.sh`. */
         url: string;
       }
   );
@@ -126,7 +126,7 @@ export interface AgentsOptions {
   /**
    * Событие воркера: Agents ждёт обработчик и только после успеха подтверждает событие агенту;
    * ошибка — без подтверждения, агент пришлёт событие снова (с тем же event.id). Без обработчика
-   * событие подтверждается сразу и выпускается только как событие event.
+   * событие подтверждается сразу и передаётся только как событие event.
    */
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   /**
@@ -165,18 +165,18 @@ export interface AgentsOptions {
   /** Срок ответа на worker.update и agent.update, мс (по умолчанию 300 000). */
   updateTimeoutMs?: number;
   /**
-   * Каталог выпуска (manifest.json, сборки, install.sh). С agentReleases — воркеры проекта:
+   * Каталог сборок (manifest.json, сборки, install.sh). С agentReleases — воркеры проекта:
    * manifest.json от `agent-release manifest` и их сборки; сборки агента из него не берутся, пока
-   * получен удалённый выпуск.
+   * получены удалённые сборки.
    */
   releasesDir?: string;
   /**
-   * Откуда брать агента и его воркеры (netprobe): выпуски GitHub или база выпуска по ссылке. SDK
-   * сам следит за новыми версиями; итоговый выпуск — удалённый плюс воркеры проекта из
+   * Откуда брать агента и его воркеры (netprobe): релизы GitHub (GitHub Releases) или база сборок по ссылке. SDK
+   * сам следит за новыми версиями; итоговые сборки — удалённые плюс воркеры проекта из
    * releasesDir.
    */
   agentReleases?: AgentReleasesOptions;
-  /** Ключ проверки выпуска (base64): подставляется в install.sh. */
+  /** Ключ проверки сборок (base64): подставляется в install.sh. */
   publicKey?: string;
   /** Ещё ключи проверки (base64; ключи проекта): подставляются в install.sh вместе с publicKey. */
   updatePublicKeys?: string[];

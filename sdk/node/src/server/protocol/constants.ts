@@ -5,7 +5,7 @@ export const LINK_PATH = "/api/v1/agent-link";
 export const ENROLL_PATH = "/api/v1/agent-link/enroll";
 /** Подпротокол WebSocket (§2). */
 export const WS_CHANNEL = "agent.v2";
-/** Раздача выпуска (§11): manifest.json и сборки. */
+/** Раздача сборок (§11): manifest.json и сборки. */
 export const RELEASES_PATH = "/api/v1/agent-link/releases";
 /** Установщик агента: адрес сервера и ключ проверки подставлены. */
 export const INSTALL_PATH = "/api/v1/agent-link/install.sh";

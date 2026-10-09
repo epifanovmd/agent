@@ -70,7 +70,7 @@ type App struct {
 	asks    *requests.Broker
 	runDir  string
 	update  update.Paths
-	// keys — ключи проверки выпусков: вшитый при сборке и из настроек.
+	// keys — ключи проверки подписи сборок: вшитый при сборке и из настроек.
 	keys update.Keys
 	// sysmetricsCmd — запуск встроенного воркера sysmetrics.
 	sysmetricsCmd []string

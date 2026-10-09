@@ -332,7 +332,7 @@ func TestApply(t *testing.T) {
 }
 
 // Манифест (§12): GET /manifest после запуска — в status, version — из
-// манифеста (у воркера из выпуска — версия сборки, манифест как есть); новый
+// манифеста (у воркера со сборкой с сервера — версия сборки, манифест как есть); новый
 // запуск — новый манифест.
 func TestManifest(t *testing.T) {
 	dir := t.TempDir()
@@ -349,7 +349,7 @@ func TestManifest(t *testing.T) {
 		st := h.status("described")
 		return st.Manifest != nil && st.Version == "3.1.0" && len(st.Manifest.Routes) == 1 && st.Manifest.Routes[0].Path == "/echo"
 	})
-	eventually(t, "у воркера из выпуска — версия сборки", func() bool {
+	eventually(t, "у воркера со сборкой с сервера — версия сборки", func() bool {
 		st := h.status("report")
 		return st.Version == "1.0.0" && st.Manifest != nil && st.Manifest.Version == "9.9.9"
 	})
@@ -459,7 +459,7 @@ func TestCleanup(t *testing.T) {
 	}
 }
 
-// release — тестовый воркер из выпуска: сборка — скрипт, запускающий
+// release — тестовый воркер со сборкой с сервера: сборка — скрипт, запускающий
 // тестовый файл в режиме mode с версией version.
 func releaseScript(mode, version, events string) string {
 	return fmt.Sprintf("#!/bin/sh\nTEST_WORKER=%s TEST_VERSION=%s TEST_EVENTS=%s exec %s\n", mode, version, events, os.Args[0])
@@ -474,7 +474,7 @@ func writeBuild(t *testing.T, path, script string) {
 
 // worker.update (§11): новая сборка здорова — она остаётся, итог {version,
 // previous}; не здорова за срок — возврат прежней, UPDATE_FAILED; уже
-// обновляется — BUSY; не из выпуска — WORKER_NOT_RELEASED.
+// обновляется — BUSY; без release: true — WORKER_NOT_RELEASED.
 func TestUpdateAndRollback(t *testing.T) {
 	dir := t.TempDir()
 	events := filepath.Join(dir, "events")
@@ -557,7 +557,7 @@ func TestUpdateAndRollback(t *testing.T) {
 		t.Fatalf("ошибка загрузки — как есть: %v", first)
 	}
 	if _, err := h.sup.Update(ctx, "plain", "1", false, nil); !errors.As(err, &ei) || ei.Code != message.CodeWorkerNotReleased {
-		t.Fatalf("не из выпуска: %v", err)
+		t.Fatalf("без release: true: %v", err)
 	}
 	if _, err := h.sup.Update(ctx, "nope", "1", false, nil); !errors.As(err, &ei) || ei.Code != message.CodeWorkerUnknown {
 		t.Fatalf("неизвестный: %v", err)

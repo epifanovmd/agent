@@ -1,4 +1,4 @@
-// Транспорт Agents: HTTP-маршруты (регистрация, выпуск — releases.ts) и WebSocket (§2). Логика
+// Транспорт Agents: HTTP-маршруты (регистрация, сборки — releases.ts) и WebSocket (§2). Логика
 // сессии — у хозяина транспорта; здесь только доставка конвертов.
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";

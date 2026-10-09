@@ -237,14 +237,14 @@ export const parseFetchReply = (env: Envelope): FetchReply | undefined => {
   return schema?.safeParse(env.data).data;
 };
 
-/** manifest.json выпуска (§11). */
+/** manifest.json сборок (§11). */
 export const parseManifest = (
   data: unknown,
 ): Parsed<z.output<typeof releaseManifestSchema>> =>
   parse(releaseManifestSchema, data, "manifest.json");
 
-/** Список выпусков GitHub (удалённый источник выпуска агента). */
+/** Список релизов GitHub (удалённый источник сборок агента). */
 export const parseGithubReleases = (
   data: unknown,
 ): Parsed<z.output<typeof githubReleasesSchema>> =>
-  parse(githubReleasesSchema, data, "выпуски GitHub");
+  parse(githubReleasesSchema, data, "релизы GitHub");

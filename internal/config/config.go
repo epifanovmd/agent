@@ -195,14 +195,14 @@ const (
 type Update struct {
 	// Mode: self (агент сам заменяет свой файл) | external (контейнер) | disabled.
 	Mode string `yaml:"mode"`
-	// PublicKey — ключ проверки подписи выпусков Ed25519, base64.
+	// PublicKey — ключ проверки подписи сборок Ed25519, base64.
 	PublicKey string `yaml:"publicKey"`
 	// PublicKeys — ещё ключи проверки (base64): подпись сборки принимается,
 	// если сходится с любым из ключей — вшитым при сборке, PublicKey и этими.
 	PublicKeys []string `yaml:"publicKeys"`
 }
 
-// Keys — ключи проверки выпусков из настроек: publicKey и publicKeys без
+// Keys — ключи проверки подписи сборок из настроек: publicKey и publicKeys без
 // пустых и повторов (вшитый при сборке ключ сюда не входит).
 func (u Update) Keys() []string {
 	var out []string
@@ -221,7 +221,7 @@ const SysmetricsWorker = message.BuiltinSysmetrics
 type Worker struct {
 	Name    string   `yaml:"name"`
 	Command []string `yaml:"command"`
-	// Args — аргументы, дописываемые к command (или к файлу выпуска).
+	// Args — аргументы, дописываемые к command (или к файлу сборки).
 	Args []string          `yaml:"args"`
 	Dir  string            `yaml:"dir"`
 	Env  map[string]string `yaml:"env"`
@@ -231,7 +231,7 @@ type Worker struct {
 	InheritEnv []string `yaml:"inheritEnv"`
 	// User — пользователь, от которого запускается воркер; агенту нужен root.
 	User string `yaml:"user"`
-	// Release — воркер из выпуска: сборку ведёт агент
+	// Release — воркер со сборкой с сервера: сборку ведёт агент
 	// (<dataDir>/workers/<name>/current), сервер обновляет её действием
 	// worker.update. Сборка — исполняемый файл или каталог из архива
 	// .tar.gz; command (если задан) выполняется в каталоге сборки, без
@@ -261,7 +261,7 @@ const (
 // OpenRoutes — агент не сверяет fetch с манифестом воркера (routes: open).
 func (w Worker) OpenRoutes() bool { return w.Routes == RoutesOpen }
 
-// Файлы воркера из выпуска в его каталоге ReleaseDir.
+// Файлы сборки воркера в его каталоге ReleaseDir.
 const (
 	ReleaseCurrent         = "current"
 	ReleaseVersion         = "version"
@@ -490,10 +490,10 @@ func (w *Worker) check(i int) []error {
 	return errs
 }
 
-// Current — сборка воркера из выпуска (<ReleaseDir>/current).
+// Current — текущая сборка воркера (<ReleaseDir>/current).
 func (w Worker) Current() string { return filepath.Join(w.ReleaseDir, ReleaseCurrent) }
 
-// ReleasesDir — каталог воркеров из выпуска в dataDir.
+// ReleasesDir — каталог сборок воркеров в dataDir.
 func ReleasesDir(dataDir string) string { return filepath.Join(dataDir, "workers") }
 
 // Defaults — значения по умолчанию.

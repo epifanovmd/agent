@@ -110,7 +110,7 @@ test("installCommand: флаги по порядку, кавычки POSIX, ош
         token: "t",
         name: "a\nb",
       },
-      "адрес выпуска": {
+      "адрес сборок": {
         baseUrl: "https://api.example.com",
         token: "t",
         releases: "file:///x",

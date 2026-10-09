@@ -1,5 +1,5 @@
-// Удалённый источник выпуска агента (опция agentReleases): выпуски GitHub или база выпуска по
-// ссылке. Проверка — при старте и раз в checkIntervalMs; последний полученный выпуск хранится в
+// Удалённый источник сборок агента (опция agentReleases): релизы GitHub или база сборок по
+// ссылке. Проверка — при старте и раз в checkIntervalMs; последние полученные сборки хранятся в
 // памяти, ошибка сети — предупреждение в журнал, остаётся прежний. Подписи сборок проверяет агент.
 import { major, rcompare, satisfies, valid, validRange } from "semver";
 
@@ -10,19 +10,19 @@ import { SDK_VERSION } from "../lib/sdk-version";
 import { parseGithubReleases, parseManifest } from "../protocol/checks";
 import type { ReleaseManifest } from "../protocol/messages";
 
-/** Полученный удалённый выпуск: file сборок — абсолютные ссылки. */
+/** Полученные удалённые сборки: file сборок — абсолютные ссылки. */
 export interface RemoteRelease {
   version: string;
-  /** Источник: `github:owner/repo` или база выпуска. */
+  /** Источник: `github:owner/repo` или база сборок. */
   from: string;
   manifest: ReleaseManifest;
-  /** install.sh выпуска; нет в выпуске — undefined. */
+  /** install.sh из источника; нет в источнике — undefined. */
   installScript?: string;
   /** Когда проверен источник, мс. */
   checkedAt: number;
 }
 
-/** Где взять manifest.json и файлы выпуска: ссылка на manifest, имя файла → ссылка. */
+/** Где взять manifest.json и файлы сборок: ссылка на manifest, имя файла → ссылка. */
 interface Located {
   version?: string;
   manifestUrl: string;
@@ -87,7 +87,7 @@ export class AgentReleases {
     clearInterval(this.timer);
   }
 
-  /** Последний полученный выпуск; первая проверка ещё идёт — дождаться её. */
+  /** Последние полученные сборки; первая проверка ещё идёт — дождаться её. */
   async release(): Promise<RemoteRelease | null> {
     await this.first;
 
@@ -108,7 +108,7 @@ export class AgentReleases {
       const where = await this.locate();
 
       if (!where) {
-        this.ctx.log("выпуск агента: в источнике нет подходящей версии", {
+        this.ctx.log("сборки агента: в источнике нет подходящей версии", {
           from: this.from,
           range: this.range,
         });
@@ -153,7 +153,7 @@ export class AgentReleases {
       return this.current;
     } catch (e) {
       if (!this.closed)
-        this.ctx.log("выпуск агента не получен — остаётся прежний", {
+        this.ctx.log("сборки агента не получены — остаются прежние", {
           from: this.from,
           err: String(e instanceof Error ? e.message : e),
           version: this.current?.version ?? null,
@@ -163,7 +163,7 @@ export class AgentReleases {
     }
   }
 
-  /** Где manifest.json и файлы: старший подходящий выпуск GitHub или база выпуска. */
+  /** Где manifest.json и файлы: старший подходящий релиз GitHub или база сборок. */
   private async locate(): Promise<Located | null> {
     const o = this.opts;
 

@@ -1,6 +1,6 @@
 // Agents — серверная часть связи с агентами. Фасад: собирает части из features/ (регистрация и
 // ключи, сессии, приём сообщений, настройки, fetch, задачи, наблюдение и подписки на события,
-// запросы воркеров, действия, выпуск, пересылка между процессами) и передаёт им вызовы. Общее для частей — core/, данные — store/, HTTP и WebSocket — transport/.
+// запросы воркеров, действия, раздача сборок, пересылка между процессами) и передаёт им вызовы. Общее для частей — core/, данные — store/, HTTP и WebSocket — transport/.
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
@@ -266,7 +266,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
     this.transport.attach(server);
   }
 
-  /** HTTP-маршруты агентов (регистрация, выпуск, install.sh); обработан — true. */
+  /** HTTP-маршруты агентов (регистрация, сборки, install.sh); обработан — true. */
   handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     return this.transport.handle(req, res);
   }
@@ -485,7 +485,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
   }
 
   /**
-   * Обновить воркер из выпуска до сборки в manifest.json; итог — { version, previous }. Занят
+   * Обновить воркер со сборкой с сервера до сборки в manifest.json; итог — { version, previous }. Занят
    * (health.busy) — как у restartWorker: { deferred: true, … } и событие action.
    */
   updateWorker(
@@ -496,7 +496,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return this.ops.updateWorker("", agentId, name, opts);
   }
 
-  /** Обновить агента до версии выпуска; итог — после запуска новой версии. */
+  /** Обновить агента до версии с сервера; итог — после запуска новой версии. */
   updateAgent(
     agentId: string,
     opts: ActionOptions = {},
@@ -514,27 +514,27 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return this.ops.logs("", agentId, opts);
   }
 
-  // ── выпуск ──
+  // ── сборки ──
 
   /**
-   * Итоговый выпуск или null: агент и его воркеры — из удалённого источника (agentReleases), воркеры
+   * Итоговые сборки или null: агент и его воркеры — из удалённого источника (agentReleases), воркеры
    * проекта — из releasesDir; у каждой сборки — источник (source) и ссылка (url).
    */
   release(): Promise<ReleaseView | null> {
     return this.releases.manifest();
   }
 
-  /** Проверить удалённый источник выпуска сейчас (не дожидаясь checkIntervalMs) и вернуть выпуск. */
+  /** Проверить удалённый источник сборок сейчас (не дожидаясь checkIntervalMs) и вернуть итоговые сборки. */
   checkRelease(): Promise<ReleaseView | null> {
     return this.releases.check();
   }
 
-  /** Агенты, чья версия не как в выпуске и для чьих os/arch есть сборка. */
+  /** Агенты, чья версия не как на сервере и для чьих os/arch есть сборка. */
   updateCandidates(): Promise<UpdateCandidate[]> {
     return this.releases.updateCandidates();
   }
 
-  /** Воркеры из выпуска, чья версия не как у новейшей сборки в manifest.json. */
+  /** Воркеры со сборкой с сервера, чья версия не как у новейшей сборки в manifest.json. */
   workerUpdateCandidates(): Promise<WorkerUpdateCandidate[]> {
     return this.releases.workerUpdateCandidates();
   }

@@ -542,7 +542,7 @@ func TestInstallWorkers(t *testing.T) {
 		t.Fatalf("чужая подпись: %v", err)
 	}
 	if err := Install(ctx, s, Options{Binary: o.Binary, Server: srv.URL, Workers: []string{"absent"}}); err == nil {
-		t.Fatal("нет воркера в выпуске — ошибка")
+		t.Fatal("нет сборки воркера на сервере — ошибка")
 	}
 	files["collector-1.2.0-linux-amd64"] = []byte("tampered")
 	if err := Install(ctx, s, Options{Binary: o.Binary, Server: srv.URL, Workers: []string{"collector"}}); err == nil {
@@ -610,7 +610,7 @@ func TestParseFlagsInstallCommand(t *testing.T) {
 	}
 }
 
-// Ключи проверки выпусков для тестов (base64 32 байт).
+// Ключи проверки подписи сборок для тестов (base64 32 байт).
 const (
 	testKeyA = "MCowBQYDK2VwAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 	testKeyB = "Q0hBTkdFTUVDSEFOR0VNRUNIQU5HRU1FQ0hBTkdFTUU="
@@ -660,7 +660,7 @@ func TestInstallWorkersAbsoluteURL(t *testing.T) {
 	}
 }
 
-// Где скачать сборку: имя файла — в каталоге выпуска; https:// — как есть;
+// Где скачать сборку: имя файла — в каталоге сборок; https:// — как есть;
 // http:// — только при http-каталоге.
 func TestBuildURL(t *testing.T) {
 	for _, tc := range []struct{ releases, file, want string }{

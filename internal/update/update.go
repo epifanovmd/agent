@@ -1,7 +1,7 @@
 // Package update — самообновление исполняемого файла агента: загрузка,
 // проверка sha256 и подписи Ed25519, замена с копией .prev, откат версии,
 // не дошедшей до связи с сервером за несколько запусков (boot guard); сборки
-// воркеров из выпуска — файлом или архивом .tar.gz.
+// воркеров с сервера — файлом или архивом .tar.gz.
 package update
 
 import (
@@ -76,7 +76,7 @@ func Sign(priv ed25519.PrivateKey, b Build) string {
 	return base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(b.Payload())))
 }
 
-// Verify — подпись сборки ключом выпуска: подпись другой сборки (версии,
+// Verify — подпись сборки ключом публикации: подпись другой сборки (версии,
 // платформы, имени) не подходит.
 func Verify(pub ed25519.PublicKey, b Build, signature string) error {
 	sig, err := base64.StdEncoding.DecodeString(signature)
@@ -95,7 +95,7 @@ func ParsePublicKey(b64 string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(raw), nil
 }
 
-// Keys — ключи проверки выпусков: подпись сборки принимается, если сходится
+// Keys — ключи проверки подписи сборок: подпись сборки принимается, если сходится
 // с любым из них (автор агента подписывает агента и его воркеры, проект —
 // свои воркеры).
 type Keys []ed25519.PublicKey
@@ -171,9 +171,9 @@ func Install(ctx context.Context, client *http.Client, auth string, p Paths, key
 
 // ErrNotVerified — ни одного ключа проверки подписи нет: сборку нельзя
 // проверить, ставить её агент не будет.
-var ErrNotVerified = errors.New("update: не задан ключ проверки выпусков (update.publicKey, update.publicKeys)")
+var ErrNotVerified = errors.New("update: не задан ключ проверки подписи сборок (update.publicKey, update.publicKeys)")
 
-// Fetch — проверить подпись сборки b ключами выпуска и скачать файл в dst
+// Fetch — проверить подпись сборки b ключами проверки и скачать файл в dst
 // (0755) со сверкой sha256. Ключей нет — ErrNotVerified.
 func Fetch(ctx context.Context, client *http.Client, auth string, keys Keys, b Build, url, signature, dst string) error {
 	if err := keys.Verify(b, signature); err != nil {

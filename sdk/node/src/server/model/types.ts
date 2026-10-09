@@ -252,7 +252,7 @@ export interface ActionRecord {
   deferred?: true;
 }
 
-/** Откуда сборка выпуска: remote — удалённый источник (agentReleases), local — releasesDir. */
+/** Откуда сборка: remote — удалённый источник (agentReleases), local — releasesDir. */
 export type ReleaseOrigin = "remote" | "local";
 
 /** Где лежит сборка: источник и ссылка (у local — путь от корня сервера). */
@@ -262,7 +262,7 @@ export interface ReleaseLocation {
 }
 
 /**
- * Выпуск, который раздаёт Agents: manifest.json (file — имя файла для
+ * Сборки, которые раздаёт Agents: manifest.json (file — имя файла для
  * `…/releases/<file>`) с источником каждой сборки; с agentReleases — агент и его воркеры из
  * удалённого источника плюс воркеры проекта из releasesDir.
  */
@@ -270,7 +270,7 @@ export interface ReleaseView extends ReleaseManifest {
   artifacts: (ReleaseArtifact & ReleaseLocation)[];
   workers?: (WorkerArtifact & ReleaseLocation)[];
   /**
-   * Удалённый выпуск: версия, источник (`github:owner/repo` или url), когда проверен (мс), ключ
+   * Удалённые сборки: версия, источник (`github:owner/repo` или url), когда проверен (мс), ключ
    * его подписи (publicKey из его manifest.json).
    */
   remote?: {
@@ -281,7 +281,7 @@ export interface ReleaseView extends ReleaseManifest {
   };
 }
 
-/** Агент, которого можно обновить до версии выпуска. */
+/** Агент, которого можно обновить до версии с сервера. */
 export interface UpdateCandidate {
   agentId: string;
   name: string;
@@ -292,7 +292,7 @@ export interface UpdateCandidate {
   arch: string;
 }
 
-/** Воркер из выпуска, которого можно обновить. */
+/** Воркер со сборкой с сервера, которого можно обновить. */
 export interface WorkerUpdateCandidate {
   agentId: string;
   agentName: string;

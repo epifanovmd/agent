@@ -43,13 +43,13 @@ export interface ChangeEvent {
   reason: "session" | "config" | "revoke" | "delete";
 }
 
-/** Удалённый источник выпуска агента дал новую версию (опция agentReleases). */
+/** Удалённый источник сборок агента дал новую версию (опция agentReleases). */
 export interface ReleaseEvent {
-  /** Версия выпуска агента. */
+  /** Новая версия агента. */
   version: string;
-  /** Прежняя версия; нет — выпуск получен впервые. */
+  /** Прежняя версия; нет — сборки получены впервые. */
   previous?: string;
-  /** Источник: `github:owner/repo` или база выпуска (url). */
+  /** Источник: `github:owner/repo` или база сборок (url). */
   from: string;
 }
 

@@ -51,16 +51,16 @@ check: vet fmt-check format-check version-check race sdk-test examples-test e2e 
 
 build: ## агент под эту машину → dist/<VERSION>/
 	scripts/go.sh build
-release: ## выпуск: сборки агента и netprobe linux/darwin × amd64/arm64, manifest.json, install.sh → dist/<VERSION>/ (подпись — AGENT_SIGNING_KEY, ключ проверки — AGENT_UPDATE_PUBLIC_KEY)
+release: ## сборки агента и netprobe linux/darwin × amd64/arm64, manifest.json, install.sh → dist/<VERSION>/ (подпись — AGENT_SIGNING_KEY, ключ проверки — AGENT_UPDATE_PUBLIC_KEY)
 	scripts/go.sh release
-images: ## образы: агент (agent:dev), агент с python3 для воркеров (agent:dev-python), каталог выпуска (agent-dist:dev)
+images: ## образы: агент (agent:dev), агент с python3 для воркеров (agent:dev-python), каталог сборок (agent-dist:dev)
 	docker build -f deploy/Dockerfile --target agent -t agent:dev .
 	docker build -f deploy/Dockerfile --target agent-python -t agent:dev-python .
 	docker build -f deploy/Dockerfile.dist -t agent-dist:dev .
 
 # --- Стенд (examples/)
 
-demo-build: ## стенд: агент, sysinfo и netprobe → .dev/bin, выпуск → dist/<VERSION>, agent-sdk, сервер
+demo-build: ## стенд: агент, sysinfo и netprobe → .dev/bin, сборки агента → dist/<VERSION>, agent-sdk, сервер
 	scripts/demo.sh build
 demo-server: ## стенд: сервер на Node.js, API — http://localhost:8080/api
 	scripts/demo.sh server

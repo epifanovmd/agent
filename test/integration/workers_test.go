@@ -47,7 +47,7 @@ func TestWorkerActions(t *testing.T) {
 		t.Fatalf("restart неизвестного воркера: %v", err)
 	}
 	if err := s.server.Action("updateWorker", a.ID, nil, "w"); errorCode(err) == "" {
-		t.Fatal("updateWorker без выпуска выполнен")
+		t.Fatal("updateWorker без сборок на сервере выполнен")
 	}
 
 	n.direct("w", http.MethodPost, "/print?text=строка-для-журнала")

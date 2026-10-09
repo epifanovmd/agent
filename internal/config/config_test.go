@@ -208,7 +208,7 @@ func TestTLSFiles(t *testing.T) {
 	}
 }
 
-// testCerts — CA и выпущенный им сертификат (PEM).
+// testCerts — CA и подписанный им сертификат (PEM).
 func testCerts(t *testing.T) (caPEM, certPEM, keyPEM []byte) {
 	t.Helper()
 	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -300,7 +300,7 @@ workers:
 	rel, plain := cfg.Workers[0], cfg.Workers[1]
 	wantDir := filepath.Join(dir, "workers", "report")
 	if !rel.Release || rel.ReleaseDir != wantDir || rel.Current() != filepath.Join(wantDir, "current") {
-		t.Fatalf("воркер из выпуска: %+v", rel)
+		t.Fatalf("воркер со сборкой с сервера: %+v", rel)
 	}
 	if l := plain.Lifecycle; !l.KeepChildren || l.MaxRestarts != 5 || l.StopTimeout.Std() != DefaultStopTimeout || plain.ReleaseDir != "" {
 		t.Fatalf("воркер: %+v", plain)
@@ -326,7 +326,7 @@ workers:
 	}
 }
 
-// Перечитывание: release/args — изменение воркеров; каталог выпуска — в
+// Перечитывание: release/args — изменение воркеров; каталог сборок — в
 // прежнем dataDir до перезапуска.
 func TestCompareRelease(t *testing.T) {
 	base := Defaults()
@@ -348,7 +348,7 @@ func TestCompareRelease(t *testing.T) {
 	}
 	kept := KeepRestartOnly(base, next)
 	if kept.Workers[0].ReleaseDir != filepath.Join("/old", "workers", "w") || next.Workers[0].ReleaseDir != filepath.Join("/new", "workers", "w") {
-		t.Fatalf("каталог выпуска: %q / %q", kept.Workers[0].ReleaseDir, next.Workers[0].ReleaseDir)
+		t.Fatalf("каталог сборок: %q / %q", kept.Workers[0].ReleaseDir, next.Workers[0].ReleaseDir)
 	}
 	args := next
 	args.Workers = []Worker{{Name: "w", Release: true, Args: []string{"-q"}}}
@@ -589,7 +589,7 @@ log: {buffer: 1000}
 	}
 }
 
-// Ключи проверки выпусков: publicKey и publicKeys вместе, без повторов;
+// Ключи проверки подписи сборок: publicKey и publicKeys вместе, без повторов;
 // AGENT_UPDATE_PUBLIC_KEYS — через запятую; неверный ключ — ошибка настроек.
 func TestUpdateKeys(t *testing.T) {
 	const a, b = "MCowBQYDK2VwAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "Q0hBTkdFTUVDSEFOR0VNRUNIQU5HRU1FQ0hBTkdFTUU="

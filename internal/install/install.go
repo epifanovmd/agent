@@ -1,7 +1,7 @@
 // Package install — установка агента службой systemd на Linux (agent install,
 // agent uninstall): пользователь службы, каталоги, файл настроек, токен
-// регистрации, системные пакеты и параметры ядра для воркеров, воркеры из
-// выпуска, служба. Что поставлено — записывается в журнал установки, чтобы
+// регистрации, системные пакеты и параметры ядра для воркеров, воркеры со
+// сборкой с сервера, служба. Что поставлено — записывается в журнал установки, чтобы
 // удаление вернуло узел как было. Повторная установка обновляет программу и
 // службу, не трогая учётные данные агента и готовый файл настроек.
 package install
@@ -41,7 +41,7 @@ const (
 	Link = "/usr/local/bin/agent"
 	// Service — имя службы systemd.
 	Service = "agent.service"
-	// ReleasesPath — каталог выпуска на сервере (от адреса сервера).
+	// ReleasesPath — каталог сборок на сервере (от адреса сервера).
 	ReleasesPath = "/api/v1/agent-link/releases"
 )
 
@@ -101,13 +101,13 @@ type Options struct {
 	// Binary — файл агента, который ставится (обычно запущенный); Version — его версия.
 	Binary  string
 	Version string
-	// BuiltinKey — ключ проверки выпусков, вшитый в сборку.
+	// BuiltinKey — ключ проверки подписи сборок, вшитый в сборку.
 	BuiltinKey string
 
 	Server    string
 	Token     string
 	TokenFile string
-	// PublicKeys — ключи проверки выпусков (--update-key, --public-key):
+	// PublicKeys — ключи проверки подписи сборок (--update-key, --public-key):
 	// вместе со вшитым ключом; в agent.env — AGENT_UPDATE_PUBLIC_KEYS.
 	PublicKeys []string
 	Name       string
@@ -126,7 +126,7 @@ type Options struct {
 	PackagesBy map[string][]string
 	Sysctls    []string
 	Workers    []string
-	// Releases — адрес каталога выпуска для --worker (по умолчанию
+	// Releases — адрес каталога сборок для --worker (по умолчанию
 	// <server>/api/v1/agent-link/releases).
 	Releases string
 	// Instance — экземпляр (несколько агентов на узле, см. Layout); "" — по умолчанию.

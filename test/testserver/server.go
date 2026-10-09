@@ -34,7 +34,7 @@ type Config struct {
 	// StatusInterval, MetricsInterval — интервалы, которые сервер задаёт агентам.
 	StatusInterval  time.Duration
 	MetricsInterval time.Duration
-	// ReleasesDir, PublicKey — раздача выпуска (manifest.json, сборки) и install.sh.
+	// ReleasesDir, PublicKey — раздача сборок (manifest.json, файлы сборок) и install.sh.
 	ReleasesDir string
 	PublicKey   string
 	// Options — другие опции Agents (offlineGraceMs, actionTimeoutMs…).
