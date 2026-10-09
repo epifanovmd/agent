@@ -1,101 +1,66 @@
-# API бэкендов стенда
+# API сервера стенда
 
-У обоих бэкендов стенда одно и то же API: [server](server) (Node, `agent-sdk/server`) и
-[server-python](server-python) (Python, `agent_sdk.server`). На нём работают веб-интерфейс
-[web](web) и самопроверка. Всё, что связано с агентами, делает `Agents` из SDK. Здесь — только то,
-что бэкенд отдаёт своему интерфейсу. Авторизации нет: это пример для запуска у себя.
+Небольшой HTTP API сервера стенда [server](server) (Node, `agent-sdk/server`) — для сквозных
+тестов и ручной работы (`curl`). Всё, что связано с агентами, делает `Agents` из SDK; здесь —
+только тонкий слой над ним. Авторизации нет: это пример для запуска у себя. Кто действует —
+заголовок `X-Actor` (по умолчанию `api`): он попадает в записи настроек, итоги действий и в аудит.
+История — события воркеров, точки метрик, итоги действий — хранится в памяти сервера стенда
+(последние 10 000 событий, 2000 точек и 200 действий на агента) и пропадает при его перезапуске.
 
-## REST
+Ошибки — `{ code, message }` со статусом из `AgentsError` ([sdk/README.md](../sdk/README.md#ошибки));
+нет агента — `404 AGENT_NOT_FOUND`, нет такого маршрута API — `404 NOT_FOUND`.
 
-| Метод  | Путь                                         | Ответ                                                                                                         |
-| ------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| GET    | `/api/snapshot`                              | всё сразу: `{serverTime, agents, jobs, commands, states, events}` (у задач — `files`)                         |
-| POST   | `/api/jobs`                                  | поставить задачу `{queue, data, maxAttempts, leaseSeconds, inputs, outputs, agentId}` → Job                   |
-| GET    | `/api/jobs/:id`                              | Job                                                                                                           |
-| POST   | `/api/jobs/:id/cancel`, `/api/jobs/:id/stop` | отменить / закончить пораньше → Job                                                                           |
-| POST   | `/api/commands`                              | команда `{name, args, timeoutSec, agentId}` → Command                                                         |
-| GET    | `/api/commands/:id`                          | Command                                                                                                       |
-| POST   | `/api/commands/:id/cancel`                   | отменить ждущую или выполняющуюся команду → Command (`cancelled`)                                             |
-| PUT    | `/api/state/:domain?agentId=`                | задать состояние (тело — снимок); без `agentId` — всем → DesiredState                                         |
-| DELETE | `/api/state/:domain?agentId=`                | с `agentId` — вернуть агента на общее состояние; без — удалить общий снимок → `{state: DesiredState \| null}` |
-| GET    | `/api/state/:domain/history?agentId=&limit=` | история версий раздела, от новых к старым → DesiredState[]                                                    |
-| POST   | `/api/state/:domain/rollback`                | откат: тело `{version, agentId?}` — тот же снимок под новой версией → DesiredState                            |
-| GET    | `/api/agents/:id/metrics?since=<мс>`         | история метрик MetricsPoint[] по времени; `since` — строго позже                                              |
-| POST   | `/api/agents/:id/subscriptions`              | подписка на агента (тело — как у `agents.subscribe`, ниже) → `{id, until}`                                    |
-| DELETE | `/api/agents/:id/subscriptions/:subId`       | снять подписку → `{}`                                                                                         |
-| POST   | `/api/agents/:id/revoke`                     | отозвать агента → Agent                                                                                       |
-| DELETE | `/api/agents/:id`                            | удалить отозванного агента (запись и историю метрик) → `{}`                                                   |
-| POST   | `/api/agents/:id/update`                     | обновить агента → Command (`agent.update`)                                                                    |
-| POST   | `/api/agents/:id/rotate-key`                 | сменить ключ агента → Command (`agent.rotateKey`)                                                             |
-| POST   | `/api/agents/:id/workers/:name/update`       | обновить воркер из выпуска → Command (`worker.update`)                                                        |
-| POST   | `/api/agents/:id/workers/:name/pause`        | пауза воркера с сервера, тело `{queues?}` (без `queues` — все очереди) → Command (`worker.pause`)             |
-| POST   | `/api/agents/:id/workers/:name/resume`       | снять паузу сервера, тело `{queues?}` → Command (`worker.resume`)                                             |
-| GET    | `/api/releases`                              | `{release, candidates, installCommand, workerCandidates}` — выпуск, кого можно обновить, команда установки    |
+| Метод  | Путь                                                | Что                                                                                                          |
+| ------ | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| GET    | `/api/agents`                                       | `Agent[]`                                                                                                    |
+| GET    | `/api/agents/:id`                                   | `Agent`; манифест воркера — `workers[].manifest`                                                             |
+| DELETE | `/api/agents/:id`                                   | удалить запись агента и всё его → `{}`                                                                       |
+| POST   | `/api/agents/:id/revoke`                            | отозвать → `Agent`                                                                                           |
+| POST   | `/api/agents/:id/rotate-key`                        | сменить ключ (`agent.rotateKey`) → `{}`                                                                      |
+| POST   | `/api/agents/:id/update`                            | обновить агента до версии выпуска (`agent.update`) → `{ version, previous }`                                 |
+| GET    | `/api/agents/:id/actions?limit=`                    | итоги встроенных действий агента, новые первыми (`limit` — по умолчанию 50) → `ActionRecord[]`               |
+| GET    | `/api/agents/:id/configs`                           | `{ configs: ConfigRecord[], status: ConfigStatus[] }` — значения и статус применения                         |
+| PUT    | `/api/agents/:id/configs/:worker/:key`              | задать: тело — значение (любой JSON) → `ConfigRecord` с новой `version`                                      |
+| DELETE | `/api/agents/:id/configs/:worker/:key`              | удалить ключ на сервере и у агента → `{ deleted }`                                                           |
+| GET    | `/api/agents/:id/metrics?since=&limit=`             | история метрик `MetricsPoint[]` по времени; `since` — строго позже, мс; `limit` — последние                  |
+| GET    | `/api/agents/:id/logs?worker=&lines=`               | последние строки журнала агента или воркера с узла (`agent.logs`) → `LogEntry[]`                             |
+| GET    | `/api/agents/:id/watch?logLevel=`                   | поток Server-Sent Events, см. ниже                                                                           |
+| \*     | `/api/agents/:id/workers/:worker/fetch/<путь>?<…>`  | запрос к воркеру, см. ниже                                                                                   |
+| POST   | `/api/agents/:id/workers/:worker/restart`           | перезапустить воркер (`worker.restart`) → `{}`; тело `{ force: true }` — не ждать, пока воркер занят         |
+| POST   | `/api/agents/:id/workers/:worker/update`            | обновить воркер из выпуска (`worker.update`) → `{ version, previous }`; тело `{ force: true }` — так же      |
+| GET    | `/api/agents/:id/workers/:worker/supports?…`        | есть ли в манифесте воркера маршрут (`method`, `path`), ключ (`config`), событие (`event`) → `{ supported }` |
+| GET    | `/api/events?agentId=&worker=&type=&before=&limit=` | события воркеров, новые первыми (`limit` — по умолчанию 100); `before` — `receivedAt` последнего на странице |
+| GET    | `/api/alerts?agentId=`                              | текущие проблемы `Alert[]`                                                                                   |
+| GET    | `/api/releases`                                     | `{ release, candidates, workerCandidates, installCommand }` — выпуск, кого можно обновить, команда установки |
 
-Кто делает изменение, бэкенд берёт из заголовка `X-Actor` (нет — `web`) и пишет в журнал аудита.
-В снимке `GET /api/snapshot` есть ещё `alerts` — активные проблемы агентов (среди них
-`workerDegraded` — воркер сообщил, что он не в порядке).
+**Манифест.** Воркеры-примеры описывают себя (`GET /manifest`): агент передаёт манифест в
+`status`, и он виден в `GET /api/agents/:id` — `workers[].manifest` с версией, ключами настроек
+и их схемами, маршрутами и событиями. С `VALIDATE_CONFIGS=1` сервер стенда проверяет значение
+`PUT …/configs/:worker/:key` по схеме ключа до отправки агенту: не подходит — `400
+CONFIG_INVALID` с замечаниями.
 
-**Подписка** — «присылай это, так часто, столько времени». Тело `POST …/subscriptions`:
-
-```jsonc
-{
-  "id": "my-panel", // нет — сервер создаст; тот же id — продлить срок и заменить содержимое
-  "ttlMs": 30000, // срок, по умолчанию 30 с; чтобы подписка жила дольше, её продлевают
-  "status": { "intervalMs": 1000 },
-  "metrics": { "intervalMs": 1000, "groups": ["diskio", "sockets"] }, // группы метрик узла сверх настройки агента
-  "logs": { "level": "debug" }, // debug | info | warn | error
-  "channels": { "example.app": { "intervalMs": 1000 } }, // показатели воркеров
-}
+```bash
+curl localhost:8080/api/agents/<id> | jq '.workers[] | {name, manifest}'
+curl 'localhost:8080/api/agents/<id>/workers/echo/supports?method=POST&path=/echo'
 ```
 
-Все части необязательные. Интервал меньше 200 мс, неверное имя группы или канала, неизвестный
-уровень — ошибка `MESSAGE_INVALID`. Подписки агента видны в его записи (`subscriptions`).
+**Запрос к воркеру** передаётся как есть: метод, `<путь>` с параметрами, тело и `Content-Type`;
+срок — заголовок `X-Timeout-Ms` (по умолчанию 30 с). Ответ воркера — статус, заголовки и тело —
+приходит потоком, по мере того как воркер его отдаёт; закрыли запрос — запрос к воркеру
+отменяется. Ошибка до ответа воркера — статус и код из [sdk/docs/fetch.md](../sdk/docs/fetch.md#ошибки):
+`PATH_FORBIDDEN` (служебный путь), `WORKER_UNKNOWN`, `WORKER_UNAVAILABLE`, `WORKER_INVALID`,
+`TIMEOUT`, `BODY_TOO_LARGE`, `BUSY`, `AGENT_OFFLINE`.
 
-Ошибки — `{code, message}` с HTTP-статусом: `404 *_NOT_FOUND`, `409 UPDATE_NOT_AVAILABLE`,
-`409 COMMAND_NOT_ACTIVE` (команда уже завершена), `409 AGENT_NOT_REVOKED` (удалить можно только
-отозванного), `409 STORE_CONFLICT` и т. д.
+```bash
+curl -X POST localhost:8080/api/agents/<id>/workers/echo/fetch/echo -d '{"text":"привет"}'
+curl -N localhost:8080/api/agents/<id>/workers/echo/fetch/stream?n=5
+```
 
-## Изменения вживую — WebSocket `/api/ws`
+**Поток `watch`** (`text/event-stream`): пока он открыт, сервер держит наблюдателя
+`agents.watch` — агент присылает метрики раз в секунду и журнал с уровня `logLevel` (по
+умолчанию `info`); закрыли поток — наблюдатель снимается, агент возвращается к обычной частоте.
+События: `metrics` (`MetricsEvent`), `log` (`LogEntry[]`), `event` (`AgentEvent`) этого агента.
 
-Сервер сам присылает изменения, а интерфейс подписывается на тех агентов, которых показывает
-подробно. Одно сообщение WebSocket — один JSON `{type, …}`.
-
-**Сервер → интерфейс:**
-
-| `type`         | Поля                              | Когда                                                                            |
-| -------------- | --------------------------------- | -------------------------------------------------------------------------------- |
-| `snapshot`     | `data` — как `GET /api/snapshot`  | сразу после подключения                                                          |
-| `agent`        | `data` — Agent                    | агент изменился: связь, статус, метрики, сведения об узле, состояние             |
-| `job`          | `data` — Job (с `files`)          | задача изменилась                                                                |
-| `command`      | `data` — Command                  | команда изменилась                                                               |
-| `state`        | `data` — DesiredState             | состояние изменилось                                                             |
-| `stateDeleted` | `domain`, `agentId` (нет — общий) | снимок состояния удалён                                                          |
-| `alert`        | `data` — Alert                    | проблема началась (`active: true`) или закончилась (`false`)                     |
-| `audit`        | `data` — AuditEntry               | кто-то что-то изменил                                                            |
-| `event`        | `data` — AgentEvent               | новое событие                                                                    |
-| `metrics`      | `agentId`, `point` — MetricsPoint | новая точка метрик — **только если вы подписаны на агента**                      |
-| `log`          | `agentId`, `entries`              | записи лога агента и воркеров — **только для подписанных**, от выбранного уровня |
-
-**Интерфейс → сервер:**
-
-| `type`        | Поля                   | Что делает                                                                                                                |
-| ------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `subscribe`   | `agentId`, `logLevel?` | присылать точки метрик и лог агента; `logLevel` — с какого уровня (`debug`, `info`, `warn`, `error`; по умолчанию `info`) |
-| `logLevel`    | `agentId`, `level`     | поменять уровень лога для подписки                                                                                        |
-| `unsubscribe` | `agentId`              | перестать присылать                                                                                                       |
-
-Пока клиент подписан на агента, бэкенд держит за него подписку `agents.subscribe` (id — соединение
-и агент) и продлевает её каждые 20 с:
-
-- метрики раз в секунду и группы `diskio`, `sockets`, `processes`, `temperatures` сверх настройки
-  агента;
-- показатели всех воркеров агента раз в секунду;
-- лог с уровня клиента.
-
-`unsubscribe` или закрытие соединения снимают подписку, и агент возвращается к своим настройкам.
-
-История для графика — `GET /api/agents/:id/metrics?since=` при открытии, дальше точки идут по
-WebSocket. Досланные точки помечены `backfill` и могут прийти не по порядку. Подписки живут,
-пока открыто соединение. После переподключения приходит новый `snapshot`, и подписываться нужно
-заново.
+```bash
+curl -N 'localhost:8080/api/agents/<id>/watch?logLevel=debug'
+```

@@ -1,12 +1,11 @@
-// Package identity — учётные данные агента: регистрация по токену,
-// хранение `agentId.secret` в файле с правами 0600 и смена секрета
-// (agent.rotateKey) через ожидающий секрет.
+// Package identity — ключ агента: регистрация по токену, хранение
+// `agentId.secret` в файле с правами 0600 и смена секрета (agent.rotateKey)
+// через ожидающий секрет.
 package identity
 
 import (
 	"bytes"
 	"context"
-	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,17 +16,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/epifanovmd/agent/sdk/go/message"
-	"github.com/epifanovmd/agent/sdk/go/sealed"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 const fileName = "credentials.json"
 
 // Credentials — учётные данные агента. PendingSecret — новый секрет после
-// agent.rotateKey, ещё не признанный сервером (§5).
+// agent.rotateKey, ещё не признанный сервером (§10).
 type Credentials struct {
 	AgentID       string `json:"agentId"`
 	Secret        string `json:"secret"`
@@ -97,25 +97,18 @@ func (s *Store) Forget() error {
 	return nil
 }
 
-// EnrollRequest — тело регистрации.
-type EnrollRequest struct {
-	Token  string            `json:"token"`
-	Name   string            `json:"name"`
-	Labels map[string]string `json:"labels,omitempty"`
-	Host   *EnrollHost       `json:"host,omitempty"`
-}
-
-type EnrollHost struct {
-	Hostname string `json:"hostname,omitempty"`
-	OS       string `json:"os,omitempty"`
-	Arch     string `json:"arch,omitempty"`
-}
-
 // ErrTokenRejected — токен регистрации не принят: повтор не поможет.
 var ErrTokenRejected = errors.New("identity: токен регистрации отклонён")
 
-// Enroll — обменять токен регистрации на учётные данные.
-func Enroll(ctx context.Context, client *http.Client, baseURL string, req EnrollRequest) (Credentials, error) {
+// RateLimited — сервер просит повторить регистрацию позже (429 с Retry-After).
+type RateLimited struct{ After time.Duration }
+
+func (e *RateLimited) Error() string {
+	return fmt.Sprintf("identity: регистрация: много попыток, повтор через %s", e.After)
+}
+
+// Enroll — обменять токен регистрации на ключ агента (§2).
+func Enroll(ctx context.Context, client *http.Client, baseURL string, req message.Enroll) (Credentials, error) {
 	body, _ := json.Marshal(req)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+message.EnrollPath, bytes.NewReader(body))
 	if err != nil {
@@ -128,17 +121,26 @@ func Enroll(ctx context.Context, client *http.Client, baseURL string, req Enroll
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var e message.ErrorInfo
+	_ = json.Unmarshal(raw, &e)
 	switch {
-	case resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK:
-		var c Credentials
-		if err := json.Unmarshal(raw, &c); err != nil || c.AgentID == "" || c.Secret == "" {
-			return Credentials{}, fmt.Errorf("identity: неожиданный ответ регистрации: %s", raw)
+	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
+		var r message.EnrollResult
+		if err := json.Unmarshal(raw, &r); err != nil || r.AgentID == "" || r.Secret == "" {
+			return Credentials{}, fmt.Errorf("identity: неожиданный ответ регистрации: %.200s", raw)
 		}
-		return c, nil
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusBadRequest:
-		return Credentials{}, fmt.Errorf("%w: %s", ErrTokenRejected, raw)
+		return Credentials{AgentID: r.AgentID, Secret: r.Secret}, nil
+	case resp.StatusCode == http.StatusTooManyRequests:
+		after := 30 * time.Second
+		if n, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && n > 0 {
+			after = time.Duration(n) * time.Second
+		}
+		return Credentials{}, &RateLimited{After: min(after, 10*time.Minute)}
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusBadRequest ||
+		resp.StatusCode == http.StatusRequestEntityTooLarge:
+		return Credentials{}, fmt.Errorf("%w: HTTP %d %s %s", ErrTokenRejected, resp.StatusCode, e.Code, e.Message)
 	default:
-		return Credentials{}, fmt.Errorf("identity: регистрация: HTTP %d: %s", resp.StatusCode, raw)
+		return Credentials{}, fmt.Errorf("identity: регистрация: HTTP %d: %.200s", resp.StatusCode, raw)
 	}
 }
 
@@ -260,42 +262,4 @@ func (k *Keys) Replace(c Credentials) error {
 	k.skipPending = false
 	k.accepted = ""
 	return nil
-}
-
-// encryptionKeyFile — закрытый ключ X25519 агента (base64) рядом с учётными данными.
-const encryptionKeyFile = "encryption.key"
-
-// EncryptionKey — пара ключей X25519 агента для запечатанных значений в
-// состоянии (sdk/go/sealed): при первом запуске создаётся и сохраняется в
-// dir/encryption.key (0600), дальше читается оттуда. Открытый ключ уходит в
-// hello.agent.encryptionKey. Повреждённый файл — ошибка: новый ключ сделал
-// бы нераскрываемыми все уже запечатанные значения молча.
-func EncryptionKey(dir string) (*ecdh.PrivateKey, error) {
-	path := filepath.Join(dir, encryptionKeyFile)
-	raw, err := os.ReadFile(path)
-	if err == nil {
-		key, perr := sealed.ParsePrivateKey(string(raw))
-		if perr != nil {
-			return nil, fmt.Errorf("identity: файл %s повреждён — удалите его, чтобы создать новый ключ (бэкенду придётся запечатать секреты заново)", path)
-		}
-		return key, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("identity: %w", err)
-	}
-	key, err := sealed.GenerateKey()
-	if err != nil {
-		return nil, fmt.Errorf("identity: %w", err)
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("identity: %w", err)
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(sealed.EncodeKey(key.Bytes())+"\n"), 0o600); err != nil {
-		return nil, fmt.Errorf("identity: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("identity: %w", err)
-	}
-	return key, nil
 }

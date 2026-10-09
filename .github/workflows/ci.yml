@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  # Агент, Go-SDK, эталоны сообщений, integration, conformance (серверы на Go, Node, Python).
+  # Агент, образцы сообщений, integration (сервер на agent-sdk/server). Без node или
+  # собранного sdk/node интеграционные тесты в CI падают.
   go:
     runs-on: ubuntu-latest
     steps:
@@ -18,17 +19,11 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.13"
-      # Node — для test/conformance (сервер examples/server на agent-sdk).
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
       - run: npm ci && npm run build
         working-directory: sdk/node
-      - run: npm ci
-        working-directory: examples/server
       - name: gofmt
         run: |
           out=$(gofmt -l .)
@@ -36,7 +31,7 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
 
-  # Младшая версия Go из строки go в go.mod: модуль и Go-SDK собираются ей.
+  # Младшая версия Go из строки go в go.mod: модуль собирается ей.
   go-min:
     runs-on: ubuntu-latest
     steps:
@@ -48,24 +43,7 @@ jobs:
         env:
           GOTOOLCHAIN: local
 
-  # SDK Python и бэкенд-пример на нём: младшая и старшая поддерживаемые версии.
-  python:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.10", "3.13"]
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: ${{ matrix.python }}
-      # Необязательные зависимости SDK: адаптер websockets, agents.seal.
-      - run: pip install websockets cryptography
-      - run: python -m unittest discover -s tests -t .
-        working-directory: sdk/python
-      - run: python -m unittest discover -s examples/server-python/tests -t examples/server-python
-
-  # SDK Node, примеры на Node, версия, форматирование.
+  # Серверный SDK, стенд, версия, форматирование.
   node:
     runs-on: ubuntu-latest
     steps:
@@ -79,12 +57,25 @@ jobs:
         run: npm ci && npx prettier --check .
       - run: npm ci && npm run lint && npm run typecheck && npm test && npm run build
         working-directory: sdk/node
-      - run: npm ci && npm run typecheck && npm test
+      - run: npm ci && npm run lint && npm run typecheck
         working-directory: examples/server
-      - run: npm ci && npm run typecheck
-        working-directory: examples/workers/node
+      - name: Синтаксис воркеров стенда на Node и Python
+        run: node --check examples/workers/node-echo/main.mjs && python3 -m py_compile examples/workers/echo/main.py
+
+  # Сквозные тесты стенда: сервер на agent-sdk/server, настоящий агент, воркеры-примеры.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
       - run: npm ci && npm run build
-        working-directory: examples/web
+        working-directory: sdk/node
+      - run: scripts/e2e.sh
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -98,10 +89,15 @@ jobs:
     strategy:
       matrix:
         include:
+          - name: agent
+            file: deploy/Dockerfile
+            target: agent
           - name: python
             file: deploy/Dockerfile
+            target: agent-python
           - name: dist
             file: deploy/Dockerfile.dist
+            target: ""
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -109,6 +105,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
           push: false
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}

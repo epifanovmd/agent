@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -87,6 +88,39 @@ func TestInstallVerifiesAndBootCounts(t *testing.T) {
 	}
 }
 
+// sha256 прописными в agent.update: подпись сходится, файл скачан и
+// заменён; повторная команда с тем же файлом ничего не скачивает.
+func TestInstallUpperCaseHash(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	newBin := []byte("#!new-binary")
+	sum := sha256.Sum256(newBin)
+	hash := strings.ToUpper(hex.EncodeToString(sum[:]))
+	downloads := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		downloads++
+		_, _ = w.Write(newBin)
+	}))
+	defer srv.Close()
+	bin := filepath.Join(t.TempDir(), "agent")
+	_ = os.WriteFile(bin, []byte("#!old"), 0o755)
+	p := NewPaths(bin)
+	rel := Release{Version: "2", URL: srv.URL, SHA256: hash, Signature: Sign(priv, Local(AgentName, "2", hash))}
+	for range 2 {
+		if err := Install(context.Background(), srv.Client(), "", p, pub, rel); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := os.ReadFile(bin); string(got) != string(newBin) {
+		t.Fatal("файл не заменён")
+	}
+	if downloads != 1 {
+		t.Fatalf("загрузок: %d, ожидалась одна", downloads)
+	}
+	if m, _ := readMarker(p.Marker); m == nil || m.SHA256 != strings.ToLower(hash) {
+		t.Fatalf("отметка: %+v", m)
+	}
+}
+
 // Fetch (сборка воркера): без ключа — ErrNotVerified; чужая подпись и
 // неверный sha256 — ошибка, файла нет; верная — файл скачан.
 func TestFetch(t *testing.T) {
@@ -121,13 +155,18 @@ func TestFetch(t *testing.T) {
 	if got, _ := os.ReadFile(dst); string(got) != string(body) {
 		t.Fatalf("файл: %q", got)
 	}
+	// sha256 прописными: подпись и проверка файла сходятся одинаково.
+	upper := Local("report", "1.0.0", strings.ToUpper(hash))
+	if err := Fetch(ctx, srv.Client(), "", pub, upper, srv.URL, Sign(priv, upper), dst); err != nil {
+		t.Fatalf("sha256 прописными: %v", err)
+	}
 }
 
-// Подписываемая строка — по §7: шесть строк через \n, sha256 строчными;
+// Подписываемая строка — по §11: шесть строк через \n, sha256 строчными;
 // подпись другой платформы не подходит.
 func TestBuildPayload(t *testing.T) {
-	b := Build{Name: "agent", Version: "1.2.0", OS: "linux", Arch: "amd64", SHA256: "AB01"}
-	if got := b.Payload(); got != "agent-release/1\nagent\n1.2.0\nlinux\namd64\nab01" {
+	b := Build{Name: "agent", Version: "1.0.0", OS: "linux", Arch: "amd64", SHA256: "AB01"}
+	if got := b.Payload(); got != "agent-release/1\nagent\n1.0.0\nlinux\namd64\nab01" {
 		t.Fatalf("строка: %q", got)
 	}
 	pub, priv, _ := ed25519.GenerateKey(nil)

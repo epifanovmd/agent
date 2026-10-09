@@ -1,45 +1,64 @@
-// Пример сервера на Node.js: Agents из agent-sdk/server (агенты подключаются сами —
-// WebSocket или HTTP sync) и API веб-интерфейса examples/web.
+// Сервер стенда: Agents из agent-sdk/server (агенты подключаются сами — по WebSocket) и
+// небольшой HTTP API над ним (examples/API.md).
 //
-//   PORT=8080 ENROLL_TOKEN=demo-token npm start   (tsx src/main.ts)
-//   RELEASES_DIR=dist/<VERSION> — каталог выпуска агента (обновления, install.sh);
-//   PUBLIC_KEY — ключ проверки релизов (base64), подставляется в install.sh.
-//   METRICS_STORE_INTERVAL_MS — как часто сохранять точку метрик в историю (5000; 0 — каждую).
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { Agents, MemoryFiles } from "agent-sdk/server";
+//   PORT=8080 ENROLL_TOKEN=demo-token npm start   (node --import tsx src/main.ts)
+//   RELEASES_DIR=dist/<VERSION> — каталог выпуска (обновления, install.sh);
+//   PUBLIC_KEY — ключ проверки выпуска (base64), вписывается в install.sh;
+//   PUBLIC_URL — адрес сервера для команды установки (по умолчанию — из запроса);
+//   VALIDATE_CONFIGS=1 — проверять настройки по схеме из манифеста воркера до отправки агенту.
+import { resolve } from "node:path";
+import { format } from "node:util";
+
+import { Agents } from "agent-sdk/server";
+
 import { createApp } from "./app";
+import { History } from "./history";
 
-const port = Number(process.env.PORT ?? 8080);
-const enrollToken = process.env.ENROLL_TOKEN ?? "demo-token";
-const webDir = resolve(process.env.WEB_DIR ?? resolve(dirname(fileURLToPath(import.meta.url)), "../../web/dist"));
+const env = process.env;
+const port = Number(env.PORT ?? 8080);
+const enrollToken = env.ENROLL_TOKEN ?? "demo-token";
+const interval = (v: string | undefined) => Number(v ?? 5000);
 
-const log = (msg: string, extra?: Record<string, unknown>) =>
-  console.log(new Date().toISOString(), msg, extra ? JSON.stringify(extra) : "");
+const log = (msg: string, extra?: Record<string, unknown>) => {
+  process.stdout.write(
+    `${format(new Date().toISOString(), msg, ...(extra ? [extra] : []))}\n`,
+  );
+};
 
-const files = new MemoryFiles();
+// Хранилище и история — в памяти: перезапуск сервера — агенты регистрируются заново.
+const history = new History({
+  metricsEveryMs: interval(env.METRICS_HISTORY_INTERVAL_MS),
+});
 const agents = new Agents({
   enrollToken,
-  files,
-  statusIntervalMs: Number(process.env.STATUS_INTERVAL_MS ?? 5000),
-  metricsIntervalMs: Number(process.env.METRICS_INTERVAL_MS ?? 5000),
-  // История — каждая точка обычного интервала (5 с): окно графика 15 мин — 180 точек, без
-  // ступенек на стыке с частыми точками подписки. По умолчанию SDK сохранял бы раз в 15 с.
-  metricsStoreIntervalMs: Number(process.env.METRICS_STORE_INTERVAL_MS ?? 5000),
-  releasesDir: process.env.RELEASES_DIR ? resolve(process.env.RELEASES_DIR) : undefined,
-  publicKey: process.env.PUBLIC_KEY || undefined,
+  onEvent: history.addEvent,
+  statusIntervalMs: interval(env.STATUS_INTERVAL_MS),
+  metricsIntervalMs: interval(env.METRICS_INTERVAL_MS),
+  releasesDir: env.RELEASES_DIR ? resolve(env.RELEASES_DIR) : undefined,
+  publicKey: env.PUBLIC_KEY || undefined,
+  baseUrl: env.PUBLIC_URL || undefined,
+  validateConfigs: env.VALIDATE_CONFIGS === "1",
   log,
 });
-const server = createApp(agents, files, webDir, { enrollToken, log });
+
+history.follow(agents);
+const server = createApp(agents, {
+  history,
+  enrollToken,
+  publicUrl: env.PUBLIC_URL || undefined,
+});
 
 server.listen(port, () =>
-  log(`сервер на :${port}`, { enrollToken, webDir, releasesDir: process.env.RELEASES_DIR ?? null }),
+  log(`сервер на :${port}`, {
+    enrollToken,
+    releasesDir: env.RELEASES_DIR ?? null,
+  }),
 );
 
-// Остановка: агенты переподключатся сразу (1012), их итоги ждут в outbox.
+// Остановка: агенты переподключатся сразу (1012), их важные сообщения ждут в outbox.
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
-    agents.close();
+    void agents.close();
     server.close();
     setTimeout(() => process.exit(0), 300).unref();
   });

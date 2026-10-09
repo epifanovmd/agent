@@ -2,7 +2,6 @@ package logx
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -10,12 +9,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 func TestSwitchable(t *testing.T) {
 	var out bytes.Buffer
-	log, ctl := NewSwitchable(&out, NewRing(10), Options{Level: "info", Format: "text"})
+	log, ctl := New(&out, nil, Options{Level: "info", Format: "text"})
 	sub := log.With("worker", "echo")
 	sub.Debug("скрыто")
 	sub.Info("текст")
@@ -28,38 +27,42 @@ func TestSwitchable(t *testing.T) {
 	}
 }
 
-func TestRingTail(t *testing.T) {
-	r := NewRing(3)
-	if got := r.Tail(10); len(got) != 0 {
-		t.Fatalf("пустой буфер: %v", got)
+// Журнал — по источникам: вывод воркера (OutputKey) — в журнал воркера,
+// остальное — в журнал агента; переполнение вытесняет старые записи своего
+// источника; info попадает в журнал и при уровне warn.
+func TestJournal(t *testing.T) {
+	j := NewJournal(3)
+	log, _ := New(&bytes.Buffer{}, j, Options{Level: "warn"})
+	out := log.With(OutputKey, "echo")
+	for i := range 5 {
+		out.Info(fmt.Sprint("строка ", i))
 	}
-	r.Add("a")
-	r.Add("b")
-	if got := r.Tail(10); !reflect.DeepEqual(got, []string{"a", "b"}) {
-		t.Fatalf("неполный: %v", got)
+	log.Info("агент", "worker", "echo")
+	log.Debug("мимо")
+	got := j.Tail("echo", 10)
+	if len(got) != 3 || got[0].Msg != "строка 2" || got[2].Msg != "строка 4" || got[0].Source != "echo" || got[0].Attrs != nil {
+		t.Fatalf("журнал воркера: %+v", got)
 	}
-	r.Add("c")
-	r.Add("d")
-	if got := r.Tail(10); !reflect.DeepEqual(got, []string{"b", "c", "d"}) {
-		t.Fatalf("переполненный: %v", got)
+	if got := j.Tail("echo", 1); len(got) != 1 || got[0].Msg != "строка 4" {
+		t.Fatalf("хвост: %+v", got)
 	}
-	if got := r.Tail(2); !reflect.DeepEqual(got, []string{"c", "d"}) {
-		t.Fatalf("хвост: %v", got)
+	agent := j.Tail(message.LogSourceAgent, 0)
+	if len(agent) != 1 || agent[0].Msg != "агент" || agent[0].Attrs["worker"] != "echo" {
+		t.Fatalf("журнал агента: %+v", agent)
 	}
-	_, _ = r.Write([]byte("e\nf\n"))
-	if got := r.Tail(2); !reflect.DeepEqual(got, []string{"e", "f"}) {
-		t.Fatalf("writer: %v", got)
+	if got := j.Tail("нет", 5); len(got) != 0 || got == nil {
+		t.Fatalf("нет источника — пустой список: %#v", got)
 	}
 }
 
-// Записи для сервера: порог свой (ниже локального тоже), источник — имя
-// воркера, атрибуты плоские; сервер меняет порог на ходу.
+// Записи для сервера: порог свой (ниже локального тоже), источник — вывод
+// воркера, атрибуты плоские; watch меняет порог на ходу.
 func TestForward(t *testing.T) {
 	var out bytes.Buffer
-	log, ctl := NewSwitchable(&out, NewRing(10), Options{Level: "error"})
+	log, ctl := New(&out, nil, Options{Level: "error"})
 	f := NewForwarder("warn")
 	ctl.SetForwarder(f)
-	wlog := log.With("worker", "report", "instance", 2)
+	wlog := log.With(OutputKey, "report", "instance", 2)
 	log.Info("не уйдёт")
 	log.Warn("связь потеряна", "err", errors.New("reset"), "retryIn", 2*time.Second)
 	wlog.WithGroup("g").Error("порт занят", "port", 8080)
@@ -79,7 +82,7 @@ func TestForward(t *testing.T) {
 		t.Fatalf("запись воркера: %+v", e)
 	}
 
-	// Подписка просит debug; "" — снова настройка агента; неверное — ошибка.
+	// watch просит debug; "" — снова настройка агента; неверное — ошибка.
 	if err := f.Override("debug"); err != nil {
 		t.Fatal(err)
 	}
@@ -94,29 +97,28 @@ func TestForward(t *testing.T) {
 	if got := f.Take(); len(got) != 1 || got[0].Msg != "подробно" || got[0].Level != "debug" {
 		t.Fatalf("после override: %+v", got)
 	}
+	// watch не ослабляет настройку агента.
+	_ = f.Override("error")
+	log.Warn("уйдёт")
+	if got := f.Take(); len(got) != 1 {
+		t.Fatalf("грубее настройки: %+v", got)
+	}
 	f.SetLevel("off")
+	_ = f.Override("")
 	log.Error("off")
 	if got := f.Take(); got != nil {
 		t.Fatalf("off: %+v", got)
 	}
 }
 
-// Буфер: без связи не копится; сверх ForwardBuffer — пометка «пропущено N»;
-// пачки не больше ForwardBatch.
+// Буфер: сверх ForwardBuffer — пометка «пропущено N»; пачки не больше 500.
 func TestForwardBuffer(t *testing.T) {
 	f := NewForwarder("info")
-	online := false
-	f.SetOnline(func() bool { return online })
-	f.Add(message.LogEntry{Msg: "без связи"})
-	if f.Take() != nil {
-		t.Fatal("без связи записи не копятся")
-	}
-	online = true
 	for i := range ForwardBuffer + 7 {
 		f.Add(message.LogEntry{Msg: fmt.Sprint(i)})
 	}
 	first := f.Take()
-	if len(first) != ForwardBatch || first[0].Msg != "0" {
+	if len(first) != message.MaxLogBatch || first[0].Msg != "0" {
 		t.Fatalf("первая пачка: %d", len(first))
 	}
 	last := first[len(first)-1]
@@ -124,47 +126,13 @@ func TestForwardBuffer(t *testing.T) {
 		t.Fatalf("пометка: %+v", last)
 	}
 	second := f.Take()
-	if len(second) != ForwardBatch || second[0].Msg != fmt.Sprint(ForwardBatch-1) {
+	if len(second) != message.MaxLogBatch || second[0].Msg != fmt.Sprint(message.MaxLogBatch-1) {
 		t.Fatalf("вторая пачка: %d %s", len(second), second[0].Msg)
 	}
 	if third := f.Take(); len(third) != 1 {
 		t.Fatalf("остаток: %d", len(third))
 	}
-
-	// Run шлёт пачки по таймеру.
-	sent := make(chan message.LogBatch, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go f.Run(ctx, 10*time.Millisecond, func(b message.LogBatch) { sent <- b })
-	f.Add(message.LogEntry{Msg: "x"})
-	select {
-	case b := <-sent:
-		if len(b.Entries) != 1 || b.Entries[0].Msg != "x" {
-			t.Fatalf("пачка: %+v", b)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("пачка не ушла")
-	}
-}
-
-// Level — действующий порог: более подробный из настройки агента и подписки.
-func TestForwardLevel(t *testing.T) {
-	f := NewForwarder("")
-	if f.Level() != "warn" {
-		t.Fatalf("по умолчанию: %s", f.Level())
-	}
-	_ = f.Override("debug")
-	if f.Level() != "debug" {
-		t.Fatalf("от сервера: %s", f.Level())
-	}
-	// Подписка не ослабляет настройку агента: error грубее warn.
-	_ = f.Override("error")
-	if f.Level() != "warn" {
-		t.Fatalf("грубее настройки: %s", f.Level())
-	}
-	_ = f.Override("")
-	f.SetLevel("error")
-	if f.Level() != "error" {
-		t.Fatalf("настройка: %s", f.Level())
+	if f.Take() != nil {
+		t.Fatal("пусто — nil")
 	}
 }

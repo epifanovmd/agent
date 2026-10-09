@@ -12,7 +12,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 // conn — транспорт сессии: поток конвертов в обе стороны.
@@ -21,7 +21,6 @@ type conn interface {
 	Recv(ctx context.Context) (message.Envelope, error)
 	Ping(ctx context.Context) error
 	Close(code int, reason string)
-	Mode() string
 }
 
 // DialError — сервер отказал в соединении HTTP-кодом.
@@ -57,7 +56,7 @@ func (e *DialError) Error() string {
 
 func (e *DialError) Unwrap() error { return e.Err }
 
-// CloseError — сервер закрыл сессию кодом закрытия.
+// CloseError — сервер закрыл соединение кодом закрытия.
 type CloseError struct {
 	Code   int
 	Reason string
@@ -67,8 +66,8 @@ func (e *CloseError) Error() string {
 	return fmt.Sprintf("link: закрыто %d %s", e.Code, e.Reason)
 }
 
-// readLimit — предел входящего сообщения (снимок состояния может быть большим).
-const readLimit = 16 << 20
+// readLimit — предел входящего сообщения (§16).
+const readLimit = message.MaxMessageBytes
 
 // writeTimeout — запись одного сообщения.
 const writeTimeout = 10 * time.Second
@@ -83,7 +82,7 @@ func dialWS(ctx context.Context, client *http.Client, serverURL, auth string) (c
 	c, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		HTTPClient:   client,
 		HTTPHeader:   header,
-		Subprotocols: []string{message.WSChannel},
+		Subprotocols: []string{message.Subprotocol},
 	})
 	if err != nil {
 		if resp != nil {
@@ -94,8 +93,6 @@ func dialWS(ctx context.Context, client *http.Client, serverURL, auth string) (c
 	c.SetReadLimit(readLimit)
 	return &wsConn{c: c}, nil
 }
-
-func (w *wsConn) Mode() string { return "ws" }
 
 func (w *wsConn) Send(ctx context.Context, env message.Envelope) error {
 	raw, err := json.Marshal(env)
@@ -129,6 +126,17 @@ func (w *wsConn) Recv(ctx context.Context) (message.Envelope, error) {
 
 func (w *wsConn) Ping(ctx context.Context) error { return w.c.Ping(ctx) }
 
+// Close — закрытие с кодом; ждёт не дольше секунды: сторона, которая не
+// отвечает на закрытие, не задерживает переподключение (закрытие
+// доделывается в фоне).
 func (w *wsConn) Close(code int, reason string) {
-	_ = w.c.Close(websocket.StatusCode(code), reason)
+	done := make(chan struct{})
+	go func() {
+		_ = w.c.Close(websocket.StatusCode(code), reason)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+	}
 }

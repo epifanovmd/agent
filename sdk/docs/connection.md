@@ -1,453 +1,216 @@
-# Регистрация и связь
+# Связь бэкенда с агентами
 
-Как агент попадает в бэкенд, как держит связь, как меняется и отзывается его ключ и как
-работать с несколькими процессами бэкенда. Справочник API — [sdk/README.md](../README.md),
-формат сообщений — [sdk/spec §2–§5](../spec/README.md#2-подключение), образцы —
+Как агент попадает на бэкенд, как держится связь, как отозвать агента и сменить ему ключ, как
+работать из нескольких процессов и как подключить `Agents` к своему HTTP-серверу. Формат —
+[sdk/spec §2–§4](../spec/README.md#2-регистрация-и-подключение), образцы —
 [connection.json](../spec/examples/connection.json).
 
-Во всех разделах одна схема: **Бэкенд** (вызов на Node, Go, Python) → **Что уходит по сети** →
-**Агент** (что делает на узле) → **Воркер** → **Результат** (что видно в бэкенде).
-
 - [Регистрация по токену](#регистрация-по-токену)
-- [Ограничение попыток регистрации](#ограничение-попыток-регистрации)
-- [Метки агента](#метки-агента)
-- [Связь: WebSocket и HTTP](#связь-websocket-и-http)
-- [На связи ли агент](#на-связи-ли-агент)
-- [Несколько адресов, прокси, TLS](#несколько-адресов-прокси-tls)
+- [Подключение и разговор](#подключение-и-разговор)
+- [Что приходит и как подтверждается](#что-приходит-и-как-подтверждается)
+- [Агенты: список, отзыв, удаление](#агенты-список-отзыв-удаление)
 - [Смена ключа](#смена-ключа)
-- [Отзыв агента](#отзыв-агента)
 - [Несколько процессов бэкенда](#несколько-процессов-бэкенда)
+- [Подключение к HTTP-серверу и фреймворкам](#подключение-к-http-серверу-и-фреймворкам)
 
 ## Регистрация по токену
 
-Агент приходит с **токеном регистрации** и получает постоянный ключ `agentId.secret`. Токен
-нужен только до первой регистрации. Как выпускать и проверять токены — решает бэкенд.
-
-**Бэкенд.** Один общий токен — `enrollToken`; своя проверка — `enroll`: вернуть `null` —
-отказ, вернуть `{ labels }` — принять и выдать агенту метки.
+Агент один раз отправляет `POST /api/v1/agent-link/enroll` с токеном регистрации, своим именем,
+метками и сведениями об узле и получает ключ — `agentId` и `secret`. Ключ агент хранит у себя;
+бэкенд — только хеш секрета.
 
 ```ts
+// Один общий токен:
+const agents = new Agents({ enrollToken: process.env.AGENT_ENROLL_TOKEN });
+
+// Или своя проверка: одноразовые токены, метки от сервера, своё имя агента.
 const agents = new Agents({
-  enroll: async (token, { name, labels, host }) => {
-    const t = await db.enrollTokens.find(token); // ваша таблица токенов
-    if (!t || t.expiresAt < Date.now()) return null; // отказ — 401
-    return { labels: { nodeId: t.nodeId } }; // выданные метки
+  enroll: async (token, { name, labels, host, address }) => {
+    const t = await db.enrollTokens.take(token); // ваша таблица токенов
+    if (!t) return false; // 401 ENROLL_DENIED
+    return { labels: { project: t.project }, name: t.nodeName ?? name };
   },
 });
 ```
 
-```go
-agents := server.New(server.Options{
-	Enroll: func(token string, info server.EnrollInfo) (map[string]string, bool) {
-		nodeID, ok := lookupToken(token) // info.Name, info.Labels, info.Host — из запроса
-		return map[string]string{"nodeId": nodeID}, ok
-	},
-})
-```
+Метки из ответа хука сильнее меток, которые агент присылает сам: агент не может их подменить.
 
-```python
-async def check(token: str, info: dict):   # функция или корутина
-    node_id = await lookup_token(token)      # info["name"], info["labels"], info["host"]
-    return {"labels": {"nodeId": node_id}} if node_id else None
+**Пределы и ошибки.** Тело — до 64 КБ (`413 BODY_TOO_LARGE`), имя — до 128 символов, меток — до
+64, ключ и значение метки — до 256 символов (`400 MESSAGE_INVALID`), токен не принят — `401
+ENROLL_DENIED`. С одного адреса — не больше `enrollFailureLimit` неудачных попыток за
+`enrollFailureWindowMs` (по умолчанию 10 за минуту), дальше — `429 RATE_LIMITED` с
+`Retry-After`.
 
-agents = Agents(enroll=check)
-```
+**Адрес клиента.** По умолчанию — адрес сокета. Если бэкенд стоит за своим прокси, включите
+`trustProxy: true`: адрес берётся из `X-Forwarded-For`, адрес сервера — из `X-Forwarded-Host`
+и `X-Forwarded-Proto`. Без доверенного прокси эту опцию не включайте: заголовки подделываются.
 
-`enroll` получает токен и то, что агент прислал о себе: имя, метки и сведения об узле
-(`host`).
+## Подключение и разговор
 
-Запрос проверяется **до** токена: тело — не больше 64 КБ (больше — `413`, тело дальше не
-читается), `token` и `name` — непустые строки, `name` — до 128 символов, `labels` — объект до 64
-меток, ключ — непустая строка до 256 символов, значение — строка до 256 символов; иначе — `400
-MESSAGE_INVALID`. Такие отказы считаются неудачными
-попытками ([ниже](#ограничение-попыток-регистрации)).
+Агент открывает WebSocket `GET /api/v1/agent-link` с подпротоколом `agent.v2` и заголовком
+`Authorization: Agent <agentId>.<secret>`. Ключ не принят — `401` ещё до WebSocket, нет
+подпротокола — `426`.
 
-**Что уходит по сети.** `POST /api/v1/agent-link/enroll` `{token, name, labels, host}` → `201
-{agentId, secret}`; неверный токен — `401 AGENT_ENROLLMENT_TOKEN_INVALID`
-([§5](../spec/README.md#5-регистрация-агента)). Дальше каждое подключение — с заголовком
-`Authorization: Agent <agentId>.<secret>`.
+1. Агент присылает `hello`: версия, запуск (`bootId`), узел, метки, воркеры и версии настроек
+   на диске. Нет `hello` за 10 с — соединение закрывается кодом `4400`.
+2. `Agents` отвечает `welcome` с интервалами `statusIntervalMs` и `metricsIntervalMs`, затем
+   досылает настройки, которых у агента нет или которые у него старее, удаляет лишние и
+   присылает текущий `watch`.
+3. Агент досылает накопленное без связи, потом шлёт свежий `status`.
 
-**Агент** (`internal/identity`, `internal/app`):
+Обе стороны шлют ping раз в 20 с; нет pong за 10 с — соединение закрывается, агент
+переподключается.
 
-- токен — из `enroll.token` (`AGENT_ENROLL_TOKEN`); имя — `name`, метки — `labels`;
-- ключ сохраняется в `<dataDir>/credentials.json` с правами `0600`; есть файл — токен больше не
-  нужен;
-- сервер недоступен (сеть, `5xx`, `429`) — агент повторяет регистрацию с растущей паузой,
-  перебирая адреса из `server.url`/`server.urls`; токен отклонён (`401`/`400`) — ошибка запуска;
-- рядом создаётся ключ шифрования `<dataDir>/encryption.key` для секретов в состоянии
-  ([state.md](state.md#секреты-в-снимке)).
+| Код закрытия | Когда `Agents` закрывает                                                     |
+| ------------ | ---------------------------------------------------------------------------- |
+| `1012`       | бэкенд останавливается (`agents.close()`) или сменил агенту ключ             |
+| `4400`       | неверное сообщение, первое сообщение — не `hello`, нет `hello` за 10 с       |
+| `4401`       | агент отозван или удалён                                                     |
+| `4409`       | подключился другой экземпляр того же агента, или агент ушёл в другой процесс |
 
-**Воркер** не участвует. Id агента он видит в контексте: `context.agent.id` (пусто, пока агент
-не зарегистрирован) — [workers.md](workers.md#контекст-воркера).
+Агент без связи остаётся `online` ещё `offlineGraceMs` (по умолчанию 20 с): короткий обрыв
+незаметен. Потом — `online: false`, событие `agent` и проблема `offline`
+([observe.md](observe.md#проблемы)).
 
-**Результат.** Новая запись `Agent` (`id`, `name`, `labels`, `enrolledAt`), событие `change`
-`{kind: "agent"}` (в Node — ещё `agent`). В хранилище — только sha256 секрета (`secretHash`),
-наружу он не отдаётся.
+## Что приходит и как подтверждается
 
-## Ограничение попыток регистрации
+Всё это делает `Agents`; знать нужно, чтобы понимать, что может прийти повторно.
 
-Чтобы токен нельзя было подбирать, неудачные регистрации с одного адреса ограничены.
+- **Важное** — события, итоги настроек и действий. Агент хранит их на диске, пока бэкенд не
+  подтвердит. `Agents` подтверждает, когда сообщение обработано: событие — после обработчика
+  `onEvent` ([observe.md](observe.md#события-воркеров)), итог настройки — после записи в Store,
+  итог действия — сразу после приёма. Повтор с тем же `id` не задваивает событие.
+  Обработка не удалась (Store не ответил, `onEvent` бросил ошибку) — подтверждения нет, агент
+  повторит позже.
+- **Поток** — `status`, `metrics`, `log`. Нумеруется подряд (`seq`) в пределах запуска агента;
+  без связи агент держит последние 600 (настройка агента `server.streamBuffer`) и досылает их. Номер последнего принятого хранится в
+  записи агента, поэтому повтор не обрабатывается дважды и после переподключения к другому
+  процессу.
+- **Ответы** на `fetch` — только в текущем соединении: оборвалось — запрос завершается ошибкой
+  `DISCONNECTED` ([fetch.md](fetch.md)).
 
-**Бэкенд.**
-
-```ts
-new Agents({ enrollToken, enrollFailureLimit: 10, enrollFailureWindowMs: 60_000 });
-```
-
-```go
-server.New(server.Options{EnrollToken: token, EnrollFailureLimit: 10, EnrollFailureWindow: time.Minute})
-```
-
-```python
-Agents(enroll_token=token, enroll_failure_limit=10, enroll_failure_window_ms=60000)
-```
-
-По умолчанию — 10 неудач за минуту. Выключить: в Node и Python — `0`, в Go — отрицательное
-значение (ноль в Go — значение по умолчанию).
-
-Адрес клиента — тот же, что попадает в `agent.address`: адрес сокета, а с `trustProxy` —
-первый адрес `X-Forwarded-For`. Без `trustProxy` за прокси все агенты приходят с адреса
-прокси и делят один лимит. В Python адрес передаёт адаптер (`AgentsApp` — сам) или бэкенд:
-`handle_enroll(body, remote=client_ip, forwarded_for=xff)`; без него все клиенты считаются
-одним.
-
-**Что уходит по сети.** После лимита — `429 ENROLL_RATE_LIMITED` с заголовком `Retry-After`
-(секунды до конца окна).
-
-**Агент** считает `429` временной ошибкой и повторяет регистрацию с растущей паузой.
-
-**Воркер** не участвует.
-
-**Результат.** В Node — `AgentsError` с `code: "ENROLL_RATE_LIMITED"`, `status: 429`,
-`retryAfterSec`; в Python — `HttpReply` с `reply.headers["Retry-After"]`.
-
-## Метки агента
-
-Метки — пары «ключ — значение» (`zone: eu`), по ним бэкенд выбирает агентов.
-
-**Бэкенд** ничего не вызывает: метки приходят сами. Выданные при регистрации (`enroll` →
-`{labels}`) **главнее**: агент не может их переписать, иначе узел смог бы выдать себя за другой.
-
-**Что уходит по сети.** `hello.labels` при каждом подключении
-([§6.1](../spec/README.md#61-подключение)).
-
-**Агент.** `labels` в `agent.yaml` или `AGENT_LABELS=k=v,…`. Правка `agent.yaml` и
-`systemctl reload agent` (SIGHUP) — агент переподключается с новым `hello`, очередь важных
-сообщений сохраняется.
-
-**Воркер** видит метки в `context.agent.labels`.
-
-**Результат.** `agent.labels` = метки из `hello` + выданные бэкендом поверх; изменение —
-событие `change` `{kind: "agent"}`.
-
-## Связь: WebSocket и HTTP
-
-**Бэкенд** подключает маршруты агентов к своему HTTP-серверу — дальше `Agents` всё делает сам:
+## Агенты: список, отзыв, удаление
 
 ```ts
-const server = createServer(async (req, res) => {
-  if (await agents.handle(req, res)) return; // POST enroll, POST sync, /files/…, releases, install.sh
-  yourApi(req, res);
-});
-agents.attach(server); // WebSocket GET /api/v1/agent-link
+const list = await agents.listAgents(); // Agent[]
+const a = await agents.getAgent(id); // Agent | undefined
+// a.online, a.lastSeenAt, a.address, a.version, a.host, a.labels,
+// a.workers — [{ name, state, message, version, release, restarts, health, configs }],
+// a.status, a.metrics (последняя точка), a.alerts, a.session
+
+await agents.by("admin@example.com").revoke(id); // ключ больше не принимается, соединение — 4401
+await agents.deleteAgent(id); // запись агента и его настройки в Store, соединение — 4401
 ```
 
-```go
-mux := http.NewServeMux()
-agents.Mount(mux) // или http.Handler: agents.Handler()
-mux.HandleFunc("/api/", yourAPI)
-```
-
-```python
-# ASGI-приложение маршрутов агентов (без зависимостей); остальное — в fallback (FastAPI и т. п.)
-from agent_sdk.server.asgi import AgentsApp
-app = AgentsApp(agents, fallback=api)  # или api.mount("/", AgentsApp(agents)) последним маршрутом
-```
-
-Подключение к фреймворкам:
-
-- **Express** — маршруты агентов **до** `express.json()` и других разборщиков тела: `Agents`
-  читает тело сам, с пределом.
-
-  ```ts
-  const app = express();
-  app.use(async (req, res, next) => ((await agents.handle(req, res)) ? undefined : next()));
-  app.use(express.json());
-  const server = app.listen(8080);
-  agents.attach(server); // WebSocket
-  ```
-
-- **Fastify** — отдать ответ `Agents` через `reply.hijack()`, тело не разбирать:
-
-  ```ts
-  fastify.addHook("onRequest", async (req, reply) => {
-    if (!req.url.startsWith("/api/v1/agent-link") && !req.url.startsWith("/files/")) return;
-    reply.hijack();
-    if (!(await agents.handle(req.raw, reply.raw))) reply.raw.writeHead(404).end();
-  });
-  await fastify.listen({ port: 8080 });
-  agents.attach(fastify.server);
-  ```
-
-- **NestJS** (Express внутри) — без глобального разбора тела, `Agents` — первым:
-
-  ```ts
-  const app = await NestFactory.create(AppModule, { bodyParser: false });
-  app.use(async (req, res, next) => ((await agents.handle(req, res)) ? undefined : next()));
-  app.use(express.json());
-  await app.listen(8080);
-  agents.attach(app.getHttpServer());
-  ```
-
-- **Python** без ASGI — по методу на маршрут; тело читайте не больше `agents.body_limit(path)`
-  (регистрация — 64 КБ, остальное — `max_body`, 32 МБ):
-
-  ```python
-  reply = await agents.handle_enroll(body, remote=ip, forwarded_for=xff)  # POST …/enroll
-  status, data = await agents.handle_sync(auth, body, request.is_disconnected,
-                                          remote=ip, forwarded_for=xff)   # POST …/sync
-  await agents.serve_websocket(auth, ws, remote=ip, forwarded_for=xff)   # WS …/agent-link
-  ```
-
-Интервалы, которые сервер задаёт агентам: `statusIntervalMs` (5000) и `metricsIntervalMs`
-(15000); в Go — `StatusInterval`, `MetricsInterval`.
-
-**Что уходит по сети** ([§2](../spec/README.md#2-подключение),
-[§3](../spec/README.md#3-начало-разговора), [§4](../spec/README.md#4-конверт-и-способы-доставки)):
-
-- WebSocket `GET /api/v1/agent-link`, канал `agent.v1`; ключ проверяется до открытия (`401`,
-  `403`, `426`);
-- первое сообщение агента — `hello` (версии, сведения об узле, метки, возможности, задачи),
-  ответ — `welcome` (`agentId`, `sessionId`, `serverTime`, `config`);
-- запасной путь — `POST /api/v1/agent-link/sync` пачками; сервер держит запрос до 25 с, пока
-  ему нечего отдать;
-- сообщения агента — трёх видов: обычные (с `seq`, подтверждает `ack{seq}`), важные (с `id`,
-  подтверждает `ack{ids}`), запросы (ответ с `re`).
-
-**Агент** (`internal/link`, `internal/outbox`, `internal/stream`):
-
-- `server.transport: auto` (по умолчанию) — WebSocket; если прокси не пропускает upgrade, —
-  HTTP, и раз в 10 минут снова пробует WebSocket; `ws` или `http` — только он;
-- ping/pong раз в 20 с, нет ответа 10 с — переподключение; нет `welcome` за 15 с — тоже;
-- переподключение с растущей паузой; по коду закрытия: `1012` (сервер перезапускается) — сразу,
-  `4410` (подключилась другая копия) — через 30 с, `4409` (нет общей версии) — с наибольшей
-  паузой, `4401` — см. [отзыв](#отзыв-агента);
-- **важные** сообщения (итоги задач и команд, события, отчёты о состоянии) лежат файлами в
-  `<dataDir>/outbox`, пока сервер не подтвердит, и переживают перезапуск агента; отклонённые с
-  `retryable: true` агент повторяет через 30 с;
-- **обычные** (статус, метрики, прогресс, вывод команд, лог) — в памяти, до 2000 штук, и
-  досылаются после переподключения;
-- без связи агент работает как обычно: задачи доделываются, итоги копятся на диске.
-
-**Воркер** связи с сервером не видит и не держит. Есть ли связь — `context.online`
-([workers.md](workers.md#контекст-воркера)).
-
-**Результат.** `agent.online`, `agent.transport` (`ws` | `http`), `agent.lastSeenAt`,
-`agent.hello`, `agent.capabilities`, `agent.status`; событие `change` `{kind: "agent"}`.
-
-## На связи ли агент
-
-**Бэкенд.**
+`by(actor)` — те же изменяющие методы от имени пользователя: он попадает в событие `audit` и в
+записи настроек и действий.
 
 ```ts
-new Agents({ enrollToken, offlineGraceMs: 20_000, trustProxy: true });
-agents.on("alert", (a) => a.type === "offline" && notify(a));
+agents.on("audit", (e) => db.audit.insert(e)); // { at, actor, action, agentId, details }
 ```
 
-```go
-server.New(server.Options{EnrollToken: token, OfflineGrace: 20 * time.Second, TrustProxy: true, OnAlert: notify})
-```
-
-```python
-agents = Agents(enroll_token=token, offline_grace_ms=20000, trust_proxy=True)
-agents.on("alert", notify)
-```
-
-- `offlineGraceMs` (20 с) — сколько агент после обрыва ещё считается на связи: успел
-  переподключиться — никто ничего не заметил;
-- `offlineAfterMs` — для нескольких процессов бэкенда: агент «на связи» по записи, но без
-  сессии в этом процессе и без вестей дольше этого срока (процесс с его сессией упал) — агент
-  без связи. По умолчанию `max(3 × statusIntervalMs, 30 с) + offlineGraceMs`;
-- `trustProxy` — бэкенд за доверенным прокси: адрес агента — первый из `X-Forwarded-For`, адрес
-  сервера для ссылок — из `X-Forwarded-Host` и `X-Forwarded-Proto` (иначе адрес сокета, `Host` и
-  TLS соединения; заголовки подделывает любой клиент).
-
-**Что уходит по сети.** `status` при каждом изменении и не реже `statusIntervalMs` — это и
-«я жив».
-
-**Агент** шлёт `status` и `metrics` по своим циклам (`internal/runtime`).
-
-**Воркер** не участвует.
-
-**Результат.** `agent.online`, `agent.lastSeenAt`, `agent.address` (IP последнего
-подключения, без порта); уведомление `alert` `offline` — начало при потере связи, конец при
-возвращении ([events.md](events.md#уведомления-о-проблемах)).
-
-## Несколько адресов, прокси, TLS
-
-Всё это — настройки агента; бэкенд в них не участвует.
-
-**Бэкенд.** Для своего сертификата и клиентских сертификатов (mTLS) — настройки вашего
-HTTPS-сервера или балансировщика. В команду установки можно передать файл корневого
-сертификата: `installCommand({ …, caFile: "/etc/ssl/example-ca.pem" })` →
-`--ca-file`.
-
-**Что уходит по сети** — то же самое, только к другому адресу или через прокси.
-
-**Агент** (`internal/link`, `internal/app/proxy.go`, `internal/config`):
-
-```yaml
-server:
-  urls: [https://a.example.com, https://b.example.com] # один бэкенд, несколько адресов
-  caFile: /etc/agent/ca.pem # свой корневой сертификат в дополнение к системным
-  certFile: /etc/agent/client.pem # клиентский сертификат — вместе с keyFile
-  keyFile: /etc/agent/client.key
-```
-
-- **несколько адресов** — агент подключается к первому доступному; при отказе (сеть, нет
-  ответа, `5xx`) сразу переходит к следующему, после полного круга — пауза. Закрытие кодом или
-  ответ `4xx` адрес не меняют: сервер жив. Ключ агента один на все адреса;
-- **прокси** — `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (и строчные), читаются при запуске;
-  localhost и петлевые адреса — всегда напрямую;
-- **TLS** — системные корни плюс `caFile`; воркеры получают путь в `AGENT_SERVER_CA_FILE` (Node —
-  ещё в `NODE_EXTRA_CA_CERTS`), чтобы скачивать файлы задач;
-- адрес `http://` не на эту машину — агент при старте предупреждает: ключ и состояние идут
-  открытым текстом.
-
-`server.*` меняются только перезапуском агента. Все ключи — в
-[docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#настройки).
-
-**Воркер.** SDK воркера сам берёт `AGENT_SERVER_CA_FILE` для загрузки файлов задач.
-
-**Результат** — `agent.online`, `agent.address`; адрес, через который агент пришёл, SDK
-использует в ссылках на файлы задач и в `install.sh`, если не задан `baseUrl`.
+Отозванный агент, у которого есть токен регистрации, зарегистрируется заново — уже другим
+агентом. Чтобы узел больше не подключался, удалите агента с узла
+([releases.md](releases.md#удаление-агента-с-узла)).
 
 ## Смена ключа
 
-Секрет агента меняется без новой регистрации, id остаётся прежним. Новый секрет придумывает
-сам агент и присылает только его хеш — секрет не попадает ни в БД, ни в историю команд.
-
-**Бэкенд.**
-
 ```ts
-const cmd = await agents.rotateKey(agentId); // команда agent.rotateKey, срок 60 с
+await agents.rotateKey(id);
 ```
 
-```go
-cmd, err := agents.RotateKey(agentID)
-```
-
-```python
-cmd = await agents.rotate_key(agent_id)
-```
-
-Ошибки: `AGENT_NOT_FOUND`, `AGENT_REVOKED`, `COMMAND_NOT_SUPPORTED` (агент не объявил команду —
-выключена в `commands.disabled`).
-
-**Что уходит по сети** ([§5](../spec/README.md#5-регистрация-агента)):
-`cmd.run {name: "agent.rotateKey"}` → `cmd.done {ok: true, result: {secretHash}}`; сервер
-запоминает хеш как ожидающий и закрывает соединение кодом `1012`.
-
-**Агент** (`internal/identity`): создаёт новый секрет, записывает его в `credentials.json` как
-ожидающий **до** ответа и возвращает sha256. Следующее подключение — с новым секретом: сервер
-его признаёт, агент делает его основным и стирает прежний. Новый не принят (`401`) — агент
-подключается с прежним, связь не теряется.
-
-**Воркер** не участвует.
-
-**Результат.** `Command` со `status: "succeeded"`, `result.secretHash`; у записи агента
-`pendingSecretHash` → `secretHash` при первом входе с новым секретом. Аудит `agent.rotateKey`.
-
-## Отзыв агента
-
-**Бэкенд.**
-
-```ts
-await agents.revoke(agentId); // → Agent с revoked: true
-```
-
-```go
-err := agents.Revoke(agentID)
-```
-
-```python
-agent = await agents.revoke(agent_id)
-```
-
-`Agents` закрывает сессию кодом `4401`, удаляет подписки и ожидающий ключ, заканчивает все
-уведомления о проблемах агента. Дальше WebSocket и HTTP отвечают `401`.
-
-**Что уходит по сети.** Закрытие `4401`; последующие подключения — `401`.
-
-**Агент** (`internal/link`, `internal/app`): получил `4401`/`401` — если есть ожидающий секрет,
-пробует прежний; иначе удаляет `credentials.json` и регистрируется заново, если в настройках
-есть `enroll.token`. Токена нет — ждёт с наибольшей паузой и пишет ошибку в лог.
-
-**Воркер** не участвует (агент продолжает его держать).
-
-**Результат.** `agent.revoked: true`, `online: false`; аудит `agent.revoke`. Повторная
-регистрация — **новый** агент с новым id.
-
-Отозванного агента можно удалить совсем — `deleteAgent(agentId)` (Go `DeleteAgent`, Python
-`delete_agent`): из `Store` уходят запись агента и его история метрик, задачи, команды, события
-и снимки состояния остаются. Не отозванного удалить нельзя — `AGENT_NOT_REVOKED`; аудит
-`agent.delete`.
+Агент создаёт новый секрет и присылает только его хеш; `Agents` запоминает хеш как ожидающий и
+закрывает соединение кодом `1012`. Агент подключается с новым секретом — тот становится
+основным, старый больше не принимается. Если агент не смог сохранить новый секрет, он
+подключится со старым — это тоже примут. Агент должен быть на связи с этим процессом
+([ниже](#несколько-процессов-бэкенда)).
 
 ## Несколько процессов бэкенда
 
-Агент подключён к одному процессу, и только этот процесс может ему что-то отправить. Все
-процессы работают с одним `Store` ([store.md](store.md)): записи меняются условно (по `rev`),
-поэтому задача не выдаётся двум агентам, а запись одного процесса не затирает отзыв, подписки
-или ключ, записанные другим.
+Несколько процессов работают с одним общим Store ([store.md](store.md)). Соединение агента
+живёт в одном процессе — в `agent.session.instance` записано, в каком (опция `instanceId`).
 
-**Балансировщик.** WebSocket — одно долгое соединение, с ним ничего настраивать не нужно.
-HTTP-канал (`POST …/sync`) — это сессия из многих запросов: они должны приходить в **тот же**
-процесс («липкие» сессии по заголовку `Authorization` или по адресу клиента). Без этого каждый
-запрос к другому процессу открывает новую сессию, и агент получает сообщения с задержкой и
-повторами.
+**Что делает любой процесс:** списки и записи агентов (с последним `status`, метриками и
+проблемами), `setConfig`, `deleteConfig`, `configStatus`, `revoke`, `deleteAgent`.
 
-**Бэкенд.** Процесс, изменивший данные (задача, команда, состояние, подписка, отзыв), сообщает
-остальным своим способом, и каждый вызывает `refresh`: отправит тот, к кому подключён агент,
-двойной отправки не будет.
+**Что делает только процесс с соединением:** `fetch` и действия (`restartWorker`,
+`updateWorker`, `updateAgent`, `rotateKey`, `logs`); там же действует `watch` — зрители живут в
+памяти процесса. Ожидание итога действия — тоже в памяти: итог, пришедший в другой процесс,
+вызвавшему не достанется (`TIMEOUT`). В другом процессе действия завершаются ошибкой
+`AGENT_ELSEWHERE` (HTTP-статус 421) — бэкенд направляет такие запросы в нужный процесс сам:
+липкой маршрутизацией по `agentId` или пересылкой по `session.instance`. Агент без связи —
+`AGENT_OFFLINE`.
+
+**Как изменения доходят до соединения.** Процесс, изменивший данные агента, выпускает событие
+`change` с `agentId`. Бэкенд передаёт его остальным процессам (например, Postgres
+`NOTIFY`/`LISTEN`, Redis pub/sub), а те вызывают `refresh(agentId)`: процесс с соединением
+досылает настройки, закрывает соединение отозванного агента (`4401`) или агента, ушедшего в
+другой процесс (`4409`).
 
 ```ts
-agents.on("change", (c) => pg.query("SELECT pg_notify('agents', $1)", [c.id]));
-pg.on("notification", () => void agents.refresh()); // или refresh(agentId)
+agents.on("change", ({ agentId }) => pg.query("SELECT pg_notify('agents', $1)", [agentId]));
+pgListener.on("notification", (n) => void agents.refresh(n.payload));
 ```
 
-```go
-agents := server.New(server.Options{Store: pgStore, OnChange: func(c server.Change) { notify(c) }})
-onNotify(func() { agents.Refresh("") }) // "" — все агенты этого процесса
+Без передачи `change` всё тоже сойдётся, но позже: настройки — при следующем подключении агента,
+лишнее соединение закроется при следующем сообщении агента.
+
+**События в нескольких процессах.** `onEvent` вызывает и `event`, `metrics`, `log`, `alert`,
+`config`, `agent`, `action` выпускает процесс, через который пришло сообщение агента. Текущее
+состояние (`getAgent`, `listAlerts`) читается из Store в любом процессе; общую историю каждый
+процесс пишет в общую БД сам, из своих событий.
+
+**Процесс упал.** Агент переподключится к другому процессу. Если запись осталась `online`, а
+вестей нет дольше `offlineAfterMs`, любой процесс отметит агента `offline`.
+
+## Подключение к HTTP-серверу и фреймворкам
+
+`Agents` нужны две вещи: обработчик HTTP-маршрутов `/api/v1/agent-link/…` (`handle`) и
+WebSocket на том же сервере (`attach`). `handle` возвращает `true`, если запрос был его.
+
+**node:http**
+
+```ts
+const server = createServer(async (req, res) => {
+  if (await agents.handle(req, res)) return;
+  myApi(req, res);
+});
+agents.attach(server);
+server.listen(8080);
 ```
 
-```python
-agents.on("change", lambda c: notify(c))
-await agents.refresh()          # или refresh(agent_id)
+**Express**
+
+```ts
+const app = express();
+app.use(async (req, res, next) => ((await agents.handle(req, res)) ? undefined : next()));
+app.use(express.json()); // после agents.handle: тело регистрации SDK читает сам
+const server = app.listen(8080);
+agents.attach(server);
 ```
 
-`refresh` делает в этом процессе:
+**Fastify**
 
-- доставляет ждущие команды и новые снимки состояния агентам этого процесса;
-- раздаёт задачи из очереди;
-- применяет подписки из записи агента (сводная — агенту, если изменилась);
-- закрывает сессию отозванного в другом процессе агента (`4401`);
-- будит ждущие `call`: итог команды мог сохранить другой процесс;
-- отправляет `cmd.cancel` агентам этого процесса по командам, отменённым в другом процессе, —
-  отправленным агенту в этой сессии или выполнявшимся, когда агент подключился (один раз,
-  [commands.md](commands.md#отменить-команду)).
+```ts
+const app = Fastify();
+app.addHook("onRequest", async (req, reply) => {
+  if (await agents.handle(req.raw, reply.raw)) reply.hijack();
+});
+await app.listen({ port: 8080 });
+agents.attach(app.server);
+```
 
-Сроки задач и команд каждый процесс проверяет по БД сам, раз в секунду. Номер последнего
-принятого сообщения агента (`lastSeq`) и активные уведомления о проблемах тоже лежат в записи
-агента: повтор после переподключения к другому процессу не обрабатывается второй раз, а
-`alerts()` в любом процессе отдаёт одно и то же.
+**NestJS**
 
-**Что уходит по сети** — то, что накопилось: `cmd.run`, `state.put`, `job.assign`, `config`.
+```ts
+const app = await NestFactory.create(AppModule);
+const agents = app.get(Agents); // провайдер: { provide: Agents, useFactory: () => new Agents({ … }) }
+app.use(async (req, res, next) => ((await agents.handle(req, res)) ? undefined : next()));
+await app.listen(8080);
+agents.attach(app.getHttpServer());
+app.enableShutdownHooks(); // в onApplicationShutdown — await agents.close()
+```
 
-**Агент** ничего не знает о процессах бэкенда.
-
-**Воркер** не участвует.
-
-**Результат.** `call` в любом процессе возвращает итог команды: он ждёт событие своего
-процесса, раз в секунду проверяет `Store` и перечитывает итог по каждому `refresh` — но не
-дольше срока команды + 20 с ([commands.md](commands.md#команда-с-ожиданием-итога)). Агент без
-сессии где-либо дольше `offlineAfterMs` становится `online: false`.
+Если на сервере есть свой обработчик WebSocket (`upgrade`), `attach` его не мешает: чужие пути
+`Agents` пропускает. При остановке бэкенда вызывайте `await agents.close()` — агенты получат
+`1012` и сразу подключатся к другому процессу или к новому запуску.

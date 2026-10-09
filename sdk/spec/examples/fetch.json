@@ -1,0 +1,121 @@
+{
+  "fetch": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "fetch",
+      "id": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+      "data": {
+        "worker": "echo",
+        "method": "POST",
+        "path": "/echo?upper=1",
+        "headers": {
+          "content-type": "application/json"
+        },
+        "body": "{\"text\":\"привет\"}",
+        "timeoutMs": 5000
+      }
+    }
+  },
+  "fetch.binary": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "fetch",
+      "id": "0718293a4b5c6d7e8f90a1b2c3d4e5f6",
+      "data": {
+        "worker": "echo",
+        "method": "PUT",
+        "path": "/files/example.bin",
+        "headers": {
+          "content-type": "application/octet-stream"
+        },
+        "body": "AAECAwQF",
+        "encoding": "base64"
+      }
+    }
+  },
+  "fetch.cancel": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "fetch.cancel",
+      "re": "0718293a4b5c6d7e8f90a1b2c3d4e5f6"
+    }
+  },
+  "fetch.head": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "fetch.head",
+      "re": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+      "data": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        }
+      }
+    }
+  },
+  "fetch.chunk": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "fetch.chunk",
+      "re": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+      "data": {
+        "data": "{\"text\":\"ПРИВЕТ\"}",
+        "encoding": "utf8"
+      }
+    }
+  },
+  "fetch.chunk.base64": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "fetch.chunk",
+      "re": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+      "data": {
+        "data": "/9j/4AAQSkZJRg==",
+        "encoding": "base64"
+      }
+    }
+  },
+  "fetch.end": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "fetch.end",
+      "re": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+      "data": {}
+    }
+  },
+  "fetch.end.error": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "fetch.end",
+      "re": "0718293a4b5c6d7e8f90a1b2c3d4e5f6",
+      "data": {
+        "error": {
+          "code": "WORKER_UNAVAILABLE",
+          "message": "воркер echo не запущен"
+        }
+      }
+    }
+  },
+  "fetch.end.invalid": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "fetch.end",
+      "re": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+      "data": {
+        "error": {
+          "code": "WORKER_INVALID",
+          "message": "воркер legacy не зарегистрирован: GET /manifest: HTTP 404"
+        }
+      }
+    }
+  }
+}

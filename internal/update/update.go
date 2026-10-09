@@ -64,7 +64,7 @@ func Local(name, version, sha256hex string) Build {
 	return Build{Name: name, Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH, SHA256: sha256hex}
 }
 
-// Payload — подписываемая строка (§7): agent-release/1, имя, версия, os,
+// Payload — подписываемая строка (§11): agent-release/1, имя, версия, os,
 // arch, sha256 строчными — через \n.
 func (b Build) Payload() string {
 	return strings.Join([]string{"agent-release/1", b.Name, b.Version, b.OS, b.Arch, strings.ToLower(b.SHA256)}, "\n")
@@ -116,7 +116,7 @@ func Install(ctx context.Context, client *http.Client, auth string, p Paths, pub
 	if err := Verify(pub, Local(AgentName, rel.Version, rel.SHA256), rel.Signature); err != nil {
 		return err
 	}
-	if current, err := FileHash(p.Binary); err == nil && current == rel.SHA256 {
+	if current, err := FileHash(p.Binary); err == nil && SameHash(current, rel.SHA256) {
 		return nil
 	}
 	next := p.Binary + ".new"
@@ -127,7 +127,7 @@ func Install(ctx context.Context, client *http.Client, auth string, p Paths, pub
 		os.Remove(next)
 		return fmt.Errorf("update: копия текущей версии: %w", err)
 	}
-	if err := writeMarker(p.Marker, marker{Version: rel.Version, SHA256: rel.SHA256}); err != nil {
+	if err := writeMarker(p.Marker, marker{Version: rel.Version, SHA256: strings.ToLower(rel.SHA256)}); err != nil {
 		os.Remove(next)
 		return err
 	}
@@ -161,6 +161,11 @@ func FetchArchive(ctx context.Context, client *http.Client, auth string, pub ed2
 	return Extract(archive, dst)
 }
 
+// SameHash — одна ли сумма sha256 (hex): регистр букв не важен (§11).
+func SameHash(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
 // Download — скачать url в dst (0755) и сверить sha256; при ошибке dst удаляется.
 func Download(ctx context.Context, client *http.Client, auth, url, dst, sha256hex string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -192,7 +197,7 @@ func Download(ctx context.Context, client *http.Client, auth, url, dst, sha256he
 		os.Remove(dst)
 		return err
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != sha256hex {
+	if got := hex.EncodeToString(h.Sum(nil)); !SameHash(got, sha256hex) {
 		os.Remove(dst)
 		return fmt.Errorf("update: sha256 не сходится: %s", got)
 	}

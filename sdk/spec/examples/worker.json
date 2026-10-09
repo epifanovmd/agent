@@ -1,0 +1,436 @@
+{
+  "worker.config.put": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "PUT",
+      "path": "/config/main",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "version": 42,
+        "data": {
+          "target": "https://example.com/report",
+          "intervalSec": 60
+        }
+      }
+    },
+    "response": {
+      "status": 204
+    }
+  },
+  "worker.config.put.rejected": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "PUT",
+      "path": "/config/main",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "version": 43,
+        "data": {
+          "target": "https://example.com/report",
+          "intervalSec": 0
+        }
+      }
+    },
+    "response": {
+      "status": 422,
+      "body": {
+        "message": "intervalSec: должно быть больше 0"
+      }
+    }
+  },
+  "worker.config.put.text": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "PUT",
+      "path": "/config/limits",
+      "body": {
+        "version": 7,
+        "data": {
+          "maxItems": "много"
+        }
+      }
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "text/plain"
+      },
+      "body": "maxItems: должно быть числом"
+    }
+  },
+  "worker.config.delete": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "DELETE",
+      "path": "/config/limits"
+    },
+    "response": {
+      "status": 204
+    }
+  },
+  "worker.metrics": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "GET",
+      "path": "/metrics"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "sent": 1200,
+        "failed": 3,
+        "queue": 0
+      }
+    }
+  },
+  "worker.metrics@sysmetrics": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "GET",
+      "path": "/metrics"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "cpuPercent": 12.5,
+        "cpuCores": [10.1, 14.9],
+        "load1": 0.4,
+        "load5": 0.35,
+        "load15": 0.3,
+        "memUsedBytes": 1073741824,
+        "memTotalBytes": 8589934592,
+        "memAvailableBytes": 7516192768,
+        "swapUsedBytes": 0,
+        "swapTotalBytes": 2147483648,
+        "diskUsedBytes": 21474836480,
+        "diskTotalBytes": 107374182400,
+        "disks": [
+          {
+            "mount": "/",
+            "usedBytes": 21474836480,
+            "totalBytes": 107374182400,
+            "inodesUsed": 120000,
+            "inodesTotal": 6553600
+          }
+        ],
+        "diskReadBps": 40960,
+        "diskWriteBps": 81920,
+        "diskReadIops": 10,
+        "diskWriteIops": 20,
+        "netRxBps": 125000,
+        "netTxBps": 64000,
+        "netErrors": 0,
+        "netDrops": 1,
+        "interfaces": [
+          {
+            "name": "eth0",
+            "rxBps": 125000,
+            "txBps": 64000,
+            "drops": 1
+          }
+        ],
+        "conntrack": 512,
+        "conntrackMax": 262144,
+        "tcp": {
+          "established": 24,
+          "timeWait": 3,
+          "closeWait": 0,
+          "listen": 5
+        },
+        "processes": 180,
+        "threads": 620,
+        "fdsOpen": 2048,
+        "fdsMax": 1048576,
+        "uptimeSec": 86400,
+        "temperatures": {
+          "maxC": 58,
+          "sensors": [
+            {
+              "name": "cpu",
+              "c": 58
+            }
+          ]
+        },
+        "gpus": [
+          {
+            "index": 0,
+            "name": "Example GPU",
+            "utilPercent": 35,
+            "memUsedBytes": 1073741824,
+            "memTotalBytes": 8589934592,
+            "temperatureC": 61
+          }
+        ]
+      }
+    }
+  },
+  "worker.health": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "GET",
+      "path": "/health"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "message": "отчёты уходят",
+        "info": {
+          "version": "1.4.0",
+          "port": 8443
+        }
+      }
+    }
+  },
+  "worker.health.busy": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "GET",
+      "path": "/health"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "busy": true,
+        "message": "идёт работа 3f2a: шаг 40 из 100"
+      }
+    }
+  },
+  "worker.manifest": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "GET",
+      "path": "/manifest"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "version": "1.4.0",
+        "description": "Отправка отчётов",
+        "configs": [
+          {
+            "key": "main",
+            "description": "Куда и как часто отправлять",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "target": {
+                  "type": "string"
+                },
+                "intervalSec": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": ["target"],
+              "additionalProperties": false
+            }
+          },
+          {
+            "key": "limits",
+            "description": "Пределы очереди"
+          }
+        ],
+        "routes": [
+          {
+            "method": "GET",
+            "path": "/reports",
+            "description": "Список отчётов"
+          },
+          {
+            "method": "POST",
+            "path": "/reports/{id}/send",
+            "description": "Отправить отчёт сейчас"
+          }
+        ],
+        "events": [
+          {
+            "type": "report.sent",
+            "description": "Отчёт отправлен"
+          }
+        ]
+      }
+    }
+  },
+  "worker.manifest.missing": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "GET",
+      "path": "/manifest"
+    },
+    "response": {
+      "status": 404,
+      "body": {
+        "message": "нет маршрута"
+      }
+    }
+  },
+  "worker.manifest.minimal": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "GET",
+      "path": "/manifest"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "version": "1.0.0"
+      }
+    }
+  },
+  "worker.cleanup": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "POST",
+      "path": "/cleanup"
+    },
+    "response": {
+      "status": 204
+    }
+  },
+  "agent.events": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "POST",
+      "path": "/events",
+      "headers": {
+        "authorization": "Bearer worker-token-example",
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "report.sent",
+        "data": {
+          "target": "https://example.com/report",
+          "items": 12
+        }
+      }
+    },
+    "response": {
+      "status": 202
+    }
+  },
+  "agent.events.full": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "POST",
+      "path": "/events",
+      "headers": {
+        "authorization": "Bearer worker-token-example"
+      },
+      "body": {
+        "type": "report.sent"
+      }
+    },
+    "response": {
+      "status": 503,
+      "body": {
+        "code": "OUTBOX_FULL",
+        "message": "outbox агента полон"
+      }
+    }
+  },
+  "agent.events.undeclared": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "POST",
+      "path": "/events",
+      "headers": {
+        "authorization": "Bearer worker-token-example"
+      },
+      "body": {
+        "type": "report.lost"
+      }
+    },
+    "response": {
+      "status": 400,
+      "body": {
+        "code": "EVENT_UNDECLARED",
+        "message": "события report.lost нет в манифесте воркера (events)"
+      }
+    }
+  },
+  "agent.config": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "GET",
+      "path": "/config/main",
+      "headers": {
+        "authorization": "Bearer worker-token-example"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "version": 42,
+        "data": {
+          "target": "https://example.com/report",
+          "intervalSec": 60
+        }
+      }
+    }
+  },
+  "agent.config.missing": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "GET",
+      "path": "/config/limits",
+      "headers": {
+        "authorization": "Bearer worker-token-example"
+      }
+    },
+    "response": {
+      "status": 404,
+      "body": {
+        "code": "NOT_FOUND",
+        "message": "нет ключа limits"
+      }
+    }
+  },
+  "agent.context": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "GET",
+      "path": "/context",
+      "headers": {
+        "authorization": "Bearer worker-token-example"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "agent": {
+          "id": "6f1c2a9e-3b7d-4c55-9a10-2d8e4f6b7c01",
+          "name": "node-01",
+          "version": "1.0.0",
+          "labels": {
+            "zone": "eu"
+          }
+        },
+        "online": true
+      }
+    }
+  }
+}

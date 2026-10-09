@@ -6,74 +6,45 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
 
-	"github.com/epifanovmd/agent/internal/commands"
 	"github.com/epifanovmd/agent/internal/config"
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
-// updateWait — не меньше стольки ждать регистрации новой сборки
-// (max(stopTimeout, updateWait)); переменная — для тестов.
-var updateWait = 60 * time.Second
-
-// Released — воркер name из выпуска (release: true).
-func (s *Supervisor) Released(name string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	w, ok := s.workers[name]
-	return ok && w.spec.Release
-}
-
-// AnyReleased — есть хотя бы один воркер из выпуска.
-func (s *Supervisor) AnyReleased() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, w := range s.workers {
-		if w.spec.Release {
-			return true
-		}
+// Update — worker.update (§11): fetch кладёт проверенную сборку в dst
+// (файл или каталог распакованного архива); воркер заменяется (сначала
+// уходит прежний процесс), текущая сборка откладывается как previous, новая
+// становится current. Новая не ответила ok: true на GET /health за lifecycle.updateHealthyTimeout —
+// previous возвращается, воркер перезапускается с ней, итог —
+// UPDATE_FAILED. Без force замена ждёт, пока воркер занят (§13). Ошибки —
+// *message.ErrorInfo.
+func (s *Supervisor) Update(ctx context.Context, name, version string, force bool, fetch func(dst string) error) (message.UpdateResult, error) {
+	var res message.UpdateResult
+	w := s.get(name)
+	if w == nil {
+		return res, message.NewError(message.CodeWorkerUnknown, fmt.Sprintf("воркера %q нет в настройках агента", name))
 	}
-	return false
-}
-
-// Update — worker.update: fetch кладёт проверенную сборку в dst (рядом с
-// current) — файл или каталог распакованного архива; текущая откладывается
-// как previous, новая становится current (файл — атомарно, каталог —
-// переименованием), воркер заменяется своим способом (rolling | stop-first) и
-// должен зарегистрироваться с версией version не позже max(stopTimeout,
-// updateWait). Иначе previous возвращается на место, воркер перезапускается
-// с ней, итог — ошибка WORKER_UPDATE_FAILED. Ошибка fetch типа
-// *commands.Error возвращается как есть.
-func (s *Supervisor) Update(ctx context.Context, name, version string, fetch func(dst string) error, out io.Writer) (message.WorkerUpdateResult, error) {
-	res := message.WorkerUpdateResult{Name: name, Version: version}
-	s.mu.Lock()
-	w, ok := s.workers[name]
+	w.mu.Lock()
+	spec := w.spec
 	switch {
-	case !ok || !w.spec.Release:
-		s.mu.Unlock()
-		return res, commands.Errorf(message.ErrWorkerNotReleased, "воркер %q не из выпуска (нет в настройках или release: true не задан)", name)
-	case s.stopping:
-		s.mu.Unlock()
-		return res, commands.Errorf(message.ErrWorkerUpdateFailed, "агент останавливается")
+	case !spec.Release:
+		w.mu.Unlock()
+		return res, message.NewError(message.CodeWorkerNotReleased, fmt.Sprintf("воркер %q не из выпуска (release: true не задан)", name))
 	case w.updating:
-		s.mu.Unlock()
-		return res, commands.Errorf(message.ErrWorkerUpdateInProgress, "воркер %q уже обновляется", name)
+		w.mu.Unlock()
+		return res, message.NewError(message.CodeBusy, fmt.Sprintf("воркер %q уже обновляется", name))
 	}
 	w.updating = true
-	spec := w.spec
-	s.mu.Unlock()
+	w.mu.Unlock()
 	defer func() {
-		s.mu.Lock()
+		w.mu.Lock()
 		w.updating = false
-		s.mu.Unlock()
+		w.mu.Unlock()
 	}()
 	failed := func(format string, args ...any) error {
-		return commands.Errorf(message.ErrWorkerUpdateFailed, format, args...)
+		return message.NewError(message.CodeUpdateFailed, fmt.Sprintf(format, args...))
 	}
 
 	dir := spec.ReleaseDir
@@ -82,240 +53,93 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, fetch fun
 	}
 	current := filepath.Join(dir, config.ReleaseCurrent)
 	next := current + ".new"
-	_ = os.RemoveAll(next) // остаток прерванного обновления
-	fmt.Fprintf(out, "загрузка %s %s…\n", name, version)
+	_ = os.RemoveAll(next)
 	if err := fetch(next); err != nil {
 		_ = os.RemoveAll(next)
-		var ce *commands.Error
-		if errors.As(err, &ce) {
+		var ei *message.ErrorInfo
+		if errors.As(err, &ei) {
 			return res, err
 		}
 		return res, failed("%v", err)
 	}
-
-	res.Previous = readVersion(filepath.Join(dir, config.ReleaseVersion))
+	res.Version = version
+	res.Previous = releaseVersion(spec)
 	_, statErr := os.Stat(current)
 	hadCurrent := statErr == nil
-	previous := filepath.Join(dir, config.ReleasePrevious)
-	dirs := isDir(current) || isDir(next)
-	if hadCurrent {
-		var err error
-		if dirs {
-			// Каталог: текущая сборка переезжает в previous целиком.
-			if err = os.RemoveAll(previous); err == nil {
-				err = os.Rename(current, previous)
+	log := s.opts.Log.With("worker", name)
+
+	install := func() error {
+		if hadCurrent {
+			previous := filepath.Join(dir, config.ReleasePrevious)
+			if err := os.RemoveAll(previous); err != nil {
+				return err
 			}
-		} else {
-			err = keepAside(current, previous)
+			if err := os.Rename(current, previous); err != nil {
+				return err
+			}
+			if err := writeFileAtomic(filepath.Join(dir, config.ReleasePreviousVersion), res.Previous); err != nil {
+				return err
+			}
 		}
-		if err != nil {
-			_ = os.RemoveAll(next)
-			return res, failed("копия текущей сборки: %v", err)
+		if err := os.Rename(next, current); err != nil {
+			return err
 		}
-		if err := writeFileAtomic(filepath.Join(dir, config.ReleasePreviousVersion), res.Previous); err != nil {
-			_ = os.RemoveAll(next)
-			return res, failed("%v", err)
-		}
+		return writeFileAtomic(filepath.Join(dir, config.ReleaseVersion), version)
 	}
-	if err := os.Rename(next, current); err != nil {
+	rollback := func() error {
+		if !hadCurrent {
+			_ = os.RemoveAll(current)
+			_ = os.Remove(filepath.Join(dir, config.ReleaseVersion))
+			return nil
+		}
+		if err := os.RemoveAll(current); err != nil {
+			return err
+		}
+		if err := os.Rename(filepath.Join(dir, config.ReleasePrevious), current); err != nil {
+			return err
+		}
+		return writeFileAtomic(filepath.Join(dir, config.ReleaseVersion), res.Previous)
+	}
+
+	log.Info("воркер: замена на новую сборку", "version", version, "previous", res.Previous)
+	var installErr error
+	startErr := w.replace(ctx, func() error {
+		installErr = install()
+		return installErr
+	}, message.PendingUpdate, force)
+	if installErr != nil {
 		_ = os.RemoveAll(next)
-		if dirs && hadCurrent {
-			_ = os.Rename(previous, current)
-		}
-		return res, failed("замена сборки: %v", err)
+		return res, failed("замена сборки: %v", installErr)
 	}
-	if err := writeFileAtomic(filepath.Join(dir, config.ReleaseVersion), version); err != nil {
-		return res, s.rollback(w, spec, hadCurrent, res.Previous, fmt.Errorf("версия: %w", err), nil, 0)
+	cause := startErr
+	if cause == nil {
+		life := w.life()
+		cause = s.waitHealthy(ctx, name, life.UpdateHealthyTimeout.Std(), life.Health.Timeout.Std())
 	}
-	s.mu.Lock()
-	w.build++
-	build := w.build
-	slots := append([]*slot(nil), w.slots...)
-	s.mu.Unlock()
-	s.log.Info("воркер: новая сборка установлена — замена", "worker", name, "version", version, "previous", res.Previous)
-	fmt.Fprintf(out, "сборка %s установлена, замена воркера (%s)…\n", version, restartMode(spec))
-
-	if err := s.rollout(ctx, w, slots, spec, version); err != nil {
-		fmt.Fprintf(out, "новая сборка не заработала: %v — возврат прежней\n", err)
-		return res, s.rollback(w, spec, hadCurrent, res.Previous, err, slots, build)
-	}
-	fmt.Fprintf(out, "воркер %s работает на версии %s\n", name, version)
-	s.changed()
-	return res, nil
-}
-
-func restartMode(spec config.Worker) string {
-	if spec.Restart == config.RestartStopFirst {
-		return config.RestartStopFirst
-	}
-	return config.RestartRolling
-}
-
-// rollout — заменить экземпляры мест на новую сборку и проверить, что каждый
-// зарегистрировался с версией version.
-func (s *Supervisor) rollout(ctx context.Context, w *worker, slots []*slot, spec config.Worker, version string) error {
-	wait := max(spec.StopTimeout.Std(), updateWait)
-	if spec.Restart == config.RestartStopFirst {
-		wait += spec.StopTimeout.Std() // старый сначала дорабатывает
-	}
-	rctx, cancel := context.WithTimeout(ctx, wait)
-	defer cancel()
-	if err := s.replace(rctx, w, slots); err != nil {
-		if rctx.Err() != nil && ctx.Err() == nil {
-			return fmt.Errorf("новая сборка не зарегистрировалась за %s", wait)
-		}
-		return err
-	}
-	for _, sl := range slots {
-		s.mu.Lock()
-		inst, removed := sl.current, sl.removed
-		s.mu.Unlock()
-		if removed {
-			continue
-		}
-		if inst == nil || !inst.registered() {
-			return errors.New("новая сборка не зарегистрировалась")
-		}
-		inst.mu.Lock()
-		got := inst.version
-		inst.mu.Unlock()
-		if got != version {
-			return fmt.Errorf("новая сборка зарегистрировалась с версией %q, а не %q", got, version)
-		}
-	}
-	return nil
-}
-
-// rollback — вернуть прежнюю сборку (previous) и перезапустить экземпляры
-// мест slots с новой (поколение failedBuild и новее). Итог —
-// WORKER_UPDATE_FAILED с причиной.
-func (s *Supervisor) rollback(w *worker, spec config.Worker, hadCurrent bool, previous string, cause error, slots []*slot, failedBuild int) error {
-	dir := spec.ReleaseDir
-	current := filepath.Join(dir, config.ReleaseCurrent)
-	var errs []string
-	if hadCurrent {
-		prevBuild := filepath.Join(dir, config.ReleasePrevious)
-		var err error
-		if isDir(prevBuild) || isDir(current) {
-			if err = os.RemoveAll(current); err == nil {
-				err = os.Rename(prevBuild, current)
-			}
-		} else {
-			err = keepAside(prevBuild, current)
-		}
-		if err != nil {
-			errs = append(errs, "возврат сборки: "+err.Error())
-		}
-		if err := writeFileAtomic(filepath.Join(dir, config.ReleaseVersion), previous); err != nil {
-			errs = append(errs, err.Error())
-		}
-	} else {
-		_ = os.RemoveAll(current)
-		_ = os.Remove(filepath.Join(dir, config.ReleaseVersion))
-	}
-	s.mu.Lock()
-	w.build++
-	s.mu.Unlock()
-	if len(slots) > 0 {
-		s.restore(w, spec, slots, failedBuild)
+	if cause == nil {
+		log.Info("воркер работает на новой сборке", "version", version)
+		s.opts.OnChange()
+		return res, nil
 	}
 	msg := cause.Error()
+	var rbErr error
+	if err := w.replace(context.WithoutCancel(ctx), func() error {
+		rbErr = rollback()
+		return rbErr
+	}, message.PendingUpdate, true); err != nil && rbErr == nil {
+		log.Error("воркер: прежняя сборка не запустилась", "err", err)
+	}
 	switch {
-	case len(errs) > 0:
-		msg += "; прежняя сборка не возвращена: " + strings.Join(errs, "; ")
+	case rbErr != nil:
+		msg += "; прежняя сборка не возвращена: " + rbErr.Error()
 	case hadCurrent:
-		msg += "; возвращена прежняя сборка " + previous
+		msg += "; возвращена прежняя сборка " + res.Previous
 	default:
 		msg += "; прежней сборки не было"
 	}
-	s.log.Error("воркер: обновление не удалось", "worker", spec.Name, "err", msg)
-	s.changed()
-	return commands.Errorf(message.ErrWorkerUpdateFailed, "%s", msg)
-}
-
-// restore — после отката: зарегистрированные экземпляры новой сборки
-// заменяются (прежней), незарегистрированные останавливаются, и цикл места
-// сразу поднимает прежнюю сборку.
-func (s *Supervisor) restore(w *worker, spec config.Worker, slots []*slot, failedBuild int) {
-	var replace []*slot
-	for _, sl := range slots {
-		s.mu.Lock()
-		inst, removed := sl.current, sl.removed
-		if !removed {
-			sl.failures = 0
-		}
-		s.mu.Unlock()
-		switch {
-		case removed:
-		case inst == nil:
-		case inst.build < failedBuild:
-			continue // прежняя сборка так и работает (rolling: замена не дошла)
-		case inst.registered():
-			replace = append(replace, sl)
-			continue
-		default:
-			inst.retired.Store(true)
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				inst.terminate(ctx)
-			}()
-		}
-		select {
-		case sl.wake <- struct{}{}:
-		default:
-		}
-	}
-	if len(replace) == 0 {
-		return
-	}
-	s.mu.Lock()
-	ctx := s.ctx
-	s.mu.Unlock()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(ctx, max(spec.StopTimeout.Std(), updateWait))
-	defer cancel()
-	if err := s.replace(ctx, w, replace); err != nil {
-		s.log.Error("воркер: прежняя сборка не запустилась", "worker", spec.Name, "err", err)
-	}
-}
-
-// isDir — путь есть и это каталог.
-func isDir(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
-}
-
-// keepAside — dst становится копией src атомарно: жёсткая ссылка (или копия)
-// во временный файл и rename.
-func keepAside(src, dst string) error {
-	tmp := dst + ".tmp"
-	_ = os.Remove(tmp)
-	if err := os.Link(src, tmp); err != nil {
-		if err := copyFile(src, tmp); err != nil {
-			return err
-		}
-	}
-	return os.Rename(tmp, dst)
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
+	log.Error("воркер: обновление не удалось", "err", msg)
+	s.opts.OnChange()
+	return res, failed("%s", msg)
 }
 
 func writeFileAtomic(path, text string) error {
@@ -324,13 +148,4 @@ func writeFileAtomic(path, text string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
-}
-
-// readVersion — версия сборки из файла version ("" — нет).
-func readVersion(path string) string {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(raw))
 }

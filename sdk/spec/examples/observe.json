@@ -4,111 +4,126 @@
     "to": "server",
     "message": {
       "type": "status",
-      "seq": 3,
-      "ts": 1791380000000,
+      "seq": 15,
       "data": {
-        "state": "busy",
-        "slots": {
-          "example.echo": 1
-        },
-        "jobs": [
-          {
-            "jobId": "11111111-1111-4111-8111-111111111111",
-            "attempt": 0,
-            "queue": "example.echo",
-            "startedAt": 1791380000000
-          }
-        ],
-        "workers": [
-          {
-            "name": "echo",
-            "state": "running",
-            "instances": 1,
-            "version": "2.0.0"
-          }
-        ],
-        "outbox": 0,
-        "capacity": {
-          "example.echo": 2
-        }
-      }
-    }
-  },
-  "status.degraded": {
-    "from": "agent",
-    "to": "server",
-    "message": {
-      "type": "status",
-      "seq": 4,
-      "data": {
-        "state": "degraded",
-        "message": "воркер echo перезапускается",
-        "slots": {},
-        "jobs": [],
-        "workers": [
-          {
-            "name": "echo",
-            "state": "backoff",
-            "instances": 0
-          }
-        ],
-        "outbox": 2
-      }
-    }
-  },
-  "status.release": {
-    "from": "agent",
-    "to": "server",
-    "message": {
-      "type": "status",
-      "seq": 4,
-      "ts": 1791380000000,
-      "data": {
-        "state": "idle",
-        "slots": {},
-        "jobs": [],
-        "workers": [
-          {
-            "name": "example-sysinfo",
-            "state": "running",
-            "instances": 1,
-            "version": "1.3.0",
-            "release": true
-          }
-        ],
-        "outbox": 0
-      }
-    }
-  },
-  "status.workers": {
-    "from": "agent",
-    "to": "server",
-    "message": {
-      "type": "status",
-      "seq": 4,
-      "ts": 1791380000000,
-      "data": {
-        "state": "degraded",
-        "message": "воркер report: example.db недоступна",
-        "slots": {
-          "example.echo": 0
-        },
-        "jobs": [],
         "workers": [
           {
             "name": "report",
             "state": "running",
-            "instances": 1,
+            "version": "1.4.0",
+            "release": true,
+            "restarts": 0,
+            "health": {
+              "ok": true,
+              "message": "отчёты уходят",
+              "info": {
+                "version": "1.4.0",
+                "port": 8443
+              }
+            },
+            "manifest": {
+              "version": "1.4.0",
+              "description": "Отправка отчётов",
+              "configs": [
+                {
+                  "key": "main",
+                  "description": "Куда и как часто отправлять",
+                  "schema": {
+                    "type": "object",
+                    "required": ["target"]
+                  }
+                },
+                {
+                  "key": "limits"
+                }
+              ],
+              "routes": [
+                {
+                  "method": "POST",
+                  "path": "/reports/{id}/send",
+                  "description": "Отправить отчёт сейчас"
+                }
+              ],
+              "events": [
+                {
+                  "type": "report.sent",
+                  "description": "Отчёт отправлен"
+                }
+              ]
+            },
+            "configs": {
+              "main": {
+                "version": 42,
+                "ok": true
+              },
+              "limits": {
+                "version": 7,
+                "ok": false,
+                "error": {
+                  "code": "CONFIG_REJECTED",
+                  "message": "maxItems: должно быть числом"
+                }
+              }
+            }
+          },
+          {
+            "name": "train",
+            "state": "running",
             "version": "2.0.0",
-            "health": "degraded",
-            "message": "example.db недоступна",
-            "paused": true
+            "restarts": 0,
+            "health": {
+              "ok": true,
+              "busy": true,
+              "message": "обучение: шаг 40 из 100"
+            },
+            "pending": "restart"
+          },
+          {
+            "name": "echo",
+            "state": "backoff",
+            "version": "1.0.0",
+            "restarts": 3,
+            "health": {
+              "ok": false,
+              "message": "нет ответа"
+            },
+            "configs": {
+              "main": {
+                "version": 3
+              }
+            },
+            "manifest": {
+              "version": "1.0.0",
+              "routes": [
+                {
+                  "method": "POST",
+                  "path": "/echo"
+                }
+              ]
+            }
+          },
+          {
+            "name": "legacy",
+            "state": "invalid",
+            "restarts": 0,
+            "message": "GET /manifest: HTTP 404 — нужен манифест с version",
+            "health": {
+              "ok": true
+            }
+          },
+          {
+            "name": "sysmetrics",
+            "state": "running",
+            "builtin": true,
+            "restarts": 0,
+            "version": "1.0.0",
+            "manifest": {
+              "version": "1.0.0",
+              "description": "Метрики узла"
+            }
           }
         ],
-        "outbox": 0,
-        "capacity": {
-          "example.echo": 2
-        }
+        "outbox": 2
       }
     }
   },
@@ -117,171 +132,41 @@
     "to": "server",
     "message": {
       "type": "metrics",
-      "seq": 5,
-      "ts": 1791380000000,
+      "seq": 16,
       "data": {
-        "collectedAt": 1791380000000,
+        "collectedAt": 1791380010000,
         "host": {
           "cpuPercent": 12.5,
-          "cpuCores": [10.5, 14.5],
+          "cpuCores": [10.1, 14.9],
           "load1": 0.4,
-          "load5": 0.6,
-          "load15": 0.8,
+          "load5": 0.35,
+          "load15": 0.3,
           "memUsedBytes": 1073741824,
-          "memTotalBytes": 68719476736,
-          "memAvailableBytes": 60129542144,
-          "swapUsedBytes": 0,
-          "swapTotalBytes": 2147483648,
-          "diskUsedBytes": 1000,
-          "diskTotalBytes": 2000,
-          "disks": [
+          "memTotalBytes": 8589934592,
+          "memAvailableBytes": 7516192768,
+          "diskUsedBytes": 21474836480,
+          "diskTotalBytes": 107374182400,
+          "netRxBps": 125000,
+          "netTxBps": 64000,
+          "uptimeSec": 86400,
+          "gpus": [
             {
-              "mount": "/",
-              "usedBytes": 1000,
-              "totalBytes": 2000,
-              "inodesUsed": 10,
-              "inodesTotal": 100
-            },
-            {
-              "mount": "/var/lib/example",
-              "usedBytes": 500,
-              "totalBytes": 4000
-            }
-          ],
-          "diskReadBps": 4096,
-          "diskWriteBps": 8192,
-          "diskReadIops": 1,
-          "diskWriteIops": 2,
-          "netRxBps": 100,
-          "netTxBps": 200,
-          "netErrors": 0,
-          "netDrops": 3,
-          "uptimeSec": 3600,
-          "conntrack": 1234,
-          "conntrackMax": 262144,
-          "tcp": {
-            "established": 12,
-            "timeWait": 3,
-            "closeWait": 0,
-            "listen": 5
-          },
-          "processes": 210,
-          "threads": 640,
-          "fdsOpen": 3200,
-          "fdsMax": 1048576,
-          "temperatures": {
-            "maxC": 64,
-            "sensors": [
-              {
-                "name": "coretemp_package_id_0",
-                "c": 64
-              },
-              {
-                "name": "nvme_composite",
-                "c": 41.5
-              }
-            ]
-          },
-          "interfaces": [
-            {
-              "name": "eth0",
-              "rxBps": 100,
-              "txBps": 50,
-              "drops": 3
-            },
-            {
-              "name": "tun0",
-              "rxBps": 0,
-              "txBps": 150
+              "index": 0,
+              "name": "Example GPU",
+              "utilPercent": 35,
+              "temperatureC": 61
             }
           ]
         },
-        "gpus": [
-          {
-            "index": 0,
-            "name": "NVIDIA RTX 4090",
-            "utilPercent": 97,
-            "memUsedBytes": 1,
-            "memTotalBytes": 2,
-            "temperatureC": 71
+        "workers": {
+          "report": {
+            "sent": 1200,
+            "failed": 3,
+            "queue": 0
+          },
+          "echo": {
+            "requests": 42
           }
-        ],
-        "channels": {
-          "example.app": {
-            "connections": 3
-          }
-        },
-        "clockOffsetMs": -120
-      }
-    }
-  },
-  "metrics.backfill": {
-    "from": "agent",
-    "to": "server",
-    "message": {
-      "type": "metrics",
-      "seq": 6,
-      "ts": 1791380090000,
-      "data": {
-        "collectedAt": 1791380030000,
-        "backfill": true,
-        "host": {
-          "cpuPercent": 3.5,
-          "memUsedBytes": 1073741824,
-          "memTotalBytes": 68719476736,
-          "netRxBps": 10,
-          "netTxBps": 20
-        },
-        "clockOffsetMs": 0
-      }
-    }
-  },
-  "inventory": {
-    "from": "agent",
-    "to": "server",
-    "message": {
-      "type": "inventory",
-      "seq": 2,
-      "ts": 1791380000200,
-      "data": {
-        "collectedAt": 1791380000200,
-        "os": {
-          "hostname": "node-01",
-          "platform": "ubuntu 24.04",
-          "kernel": "6.8.0",
-          "arch": "amd64",
-          "virtualization": "kvm"
-        },
-        "cpu": {
-          "model": "AMD EPYC 7543",
-          "cores": 16,
-          "threads": 32
-        },
-        "memoryBytes": 68719476736,
-        "disks": [
-          {
-            "mount": "/",
-            "fs": "ext4",
-            "totalBytes": 512000000000
-          }
-        ],
-        "interfaces": [
-          {
-            "name": "eth0",
-            "mac": "52:54:00:12:34:56",
-            "addresses": ["10.0.0.5/24", "fe80::1/64"]
-          }
-        ],
-        "gpus": [
-          {
-            "index": 0,
-            "name": "NVIDIA RTX 4090",
-            "memoryBytes": 25769803776
-          }
-        ],
-        "ports": {
-          "tcp": [22, 443],
-          "udp": [53]
         }
       }
     }
@@ -291,37 +176,47 @@
     "to": "server",
     "message": {
       "type": "log",
-      "seq": 7,
-      "ts": 1791380001000,
+      "seq": 17,
       "data": {
         "entries": [
           {
-            "at": 1791380000100,
+            "at": 1791380011000,
             "level": "warn",
             "source": "agent",
-            "msg": "link: связь потеряна",
+            "msg": "воркер перезапущен",
             "attrs": {
-              "err": "connection reset",
-              "retryIn": "2s"
+              "worker": "echo",
+              "restarts": 3
             }
           },
           {
-            "at": 1791380000200,
-            "level": "info",
-            "source": "report",
-            "msg": "интерфейс tun0 поднят",
-            "attrs": {
-              "instance": 1
-            }
-          },
-          {
-            "at": 1791380000300,
-            "level": "error",
-            "source": "report",
-            "msg": "порт 8080 занят"
+            "at": 1791380011200,
+            "level": "warn",
+            "source": "echo",
+            "msg": "listen: address already in use"
           }
         ]
       }
+    }
+  },
+  "watch": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "watch",
+      "data": {
+        "metricsIntervalMs": 1000,
+        "logLevel": "debug",
+        "untilMs": 1791380310000
+      }
+    }
+  },
+  "watch.off": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "watch",
+      "data": {}
     }
   }
 }

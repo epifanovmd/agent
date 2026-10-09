@@ -1,5 +1,6 @@
-// Package outbox — журнал надёжных сообщений агента на диске: сообщение
-// хранится до подтверждения сервером и переживает обрыв связи и рестарт.
+// Package outbox — очередь важных сообщений агента на диске (event,
+// config.applied, action.result): сообщение хранится до подтверждения
+// сервером (ack {ids}) и переживает обрыв связи и перезапуск.
 // Список сообщений держится в памяти (читается с диска один раз при
 // открытии); сами сообщения читаются с диска только при отправке.
 package outbox
@@ -8,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,27 +18,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 const suffix = ".json"
 
-// DefaultLimit — сообщений в журнале не больше, если предел не задан.
-const DefaultLimit = 10000
-
-// ErrFull — журнал полон и отбросить нечего: все сообщения в нём — итоги
-// задач и команд.
+// ErrFull — в очереди уже message.MaxOutbox сообщений: событие воркера не
+// принимается (итоги настроек и действий записываются всегда).
 var ErrFull = errors.New("outbox: очередь важных сообщений переполнена")
-
-// droppable — сообщения, которые при переполнении можно потерять: события
-// (сервер их только показывает) и state.applied (сервер пришлёт снимок снова,
-// агент применит и сообщит заново). Итоги задач и команд не отбрасываются.
-var droppable = map[string]bool{message.TypeEvent: true, message.TypeJobEvent: true, message.TypeStateApplied: true}
 
 // item — запись журнала в памяти: файл, id и то, что нужно без чтения файла.
 type item struct {
 	name, id, typ string
-	ref           *message.JobRef
 }
 
 // Outbox — каталог: файл на сообщение, имя — порядок записи и id.
@@ -49,7 +40,6 @@ type Outbox struct {
 	notify  chan struct{}
 	items   []item
 	limit   int
-	log     *slog.Logger
 }
 
 // Open — журнал в каталоге dir (создаётся).
@@ -62,7 +52,7 @@ func Open(dir string) (*Outbox, error) {
 	for _, f := range tmp {
 		_ = os.Remove(f)
 	}
-	o := &Outbox{dir: dir, notify: make(chan struct{}, 1), limit: DefaultLimit, log: slog.New(slog.DiscardHandler)}
+	o := &Outbox{dir: dir, notify: make(chan struct{}, 1), limit: message.MaxOutbox}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("outbox: %w", err)
@@ -87,42 +77,25 @@ func Open(dir string) (*Outbox, error) {
 	return o, nil
 }
 
-// SetLimit — сообщений не больше limit (0 и меньше — DefaultLimit); log —
-// куда писать об отброшенных.
-func (o *Outbox) SetLimit(limit int, log *slog.Logger) {
+// SetLimit — предел для событий (тесты).
+func (o *Outbox) SetLimit(limit int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if limit <= 0 {
-		limit = DefaultLimit
-	}
 	o.limit = limit
-	if log != nil {
-		o.log = log
-	}
 }
 
 func newItem(name string, env message.Envelope) item {
-	it := item{name: name, id: env.ID, typ: env.Type}
-	switch env.Type {
-	case message.TypeJobComplete, message.TypeJobFail, message.TypeJobReject:
-		var ref message.JobRef
-		if env.Decode(&ref) == nil && ref.JobID != "" {
-			it.ref = &ref
-		}
-	}
-	return it
+	return item{name: name, id: env.ID, typ: env.Type}
 }
 
 // Notify — сигнал «появилось новое сообщение».
 func (o *Outbox) Notify() <-chan struct{} { return o.notify }
 
 // Append — сохранить сообщение (атомарно, с fsync файла и каталога). У
-// конверта должен быть id. Журнал полон — отбрасываются самые старые из
-// сообщений, которые можно потерять (событие, state.applied); таких нет —
-// ErrFull.
+// конверта должен быть id. Событие при полной очереди — ErrFull.
 func (o *Outbox) Append(env message.Envelope) error {
 	if env.ID == "" {
-		return errors.New("outbox: у надёжного сообщения нет id")
+		return errors.New("outbox: у важного сообщения нет id")
 	}
 	raw, err := json.Marshal(env)
 	if err != nil {
@@ -132,16 +105,8 @@ func (o *Outbox) Append(env message.Envelope) error {
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if len(o.items) >= o.limit {
-		idx := slices.IndexFunc(o.items, func(it item) bool { return droppable[it.typ] })
-		if idx < 0 {
-			o.log.Error("outbox: очередь важных сообщений переполнена — сообщение не записано", "type", env.Type, "limit", o.limit)
-			return ErrFull
-		}
-		old := o.items[idx]
-		_ = os.Remove(filepath.Join(o.dir, old.name))
-		o.items = slices.Delete(o.items, idx, idx+1)
-		o.log.Warn("outbox: очередь переполнена — отброшено самое старое необязательное сообщение", "type", old.typ, "id", old.id, "limit", o.limit)
+	if env.Type == message.TypeEvent && len(o.items) >= o.limit {
+		return ErrFull
 	}
 	if err := writeAtomic(filepath.Join(o.dir, name), raw); err != nil {
 		return err
@@ -254,18 +219,4 @@ func syncDir(dir string) {
 		_ = d.Sync()
 		_ = d.Close()
 	}
-}
-
-// JobRefs — задачи, чей итог (job.complete, job.fail, job.reject) ещё не
-// подтверждён сервером: агент их по-прежнему держит.
-func (o *Outbox) JobRefs() []message.JobRef {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	var refs []message.JobRef
-	for _, it := range o.items {
-		if it.ref != nil {
-			refs = append(refs, *it.ref)
-		}
-	}
-	return refs
 }

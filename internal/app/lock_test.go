@@ -16,6 +16,7 @@ import (
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/identity"
 	"github.com/epifanovmd/agent/internal/logx"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 // Один агент на dataDir: второй New (или agent cleanup) — ErrLocked; после
@@ -24,7 +25,6 @@ func TestDataDirLock(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Server.URL = "http://127.0.0.1:1"
 	cfg.DataDir = t.TempDir()
-	cfg.Telemetry.GPU = "off"
 	cfg.Log.Level = "error"
 	first, err := New(cfg, "test")
 	if err != nil {
@@ -59,10 +59,17 @@ func TestStatus(t *testing.T) {
 	if _, err := Status(dir); err == nil {
 		t.Fatal("без отметки — ошибка")
 	}
+	// Ошибка завершения видна, пока агент снова не отметился.
+	RecordExit(dir, errors.New("токен отклонён"))
+	if e := LastExit(dir); e == nil || e.Error != "токен отклонён" || e.At == 0 {
+		t.Fatalf("ошибка завершения: %+v", e)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		_ = heartbeat{path: filepath.Join(dir, StatusFile), online: func() bool { return true }}.Start(ctx)
+		_ = heartbeat{path: filepath.Join(dir, StatusFile), snapshot: func() AgentStatus {
+			return AgentStatus{Online: true, Version: "test", Workers: []message.WorkerStatus{{Name: "echo", State: message.WorkerRunning}}}
+		}}.run(ctx)
 		close(done)
 	}()
 	var st AgentStatus
@@ -70,8 +77,11 @@ func TestStatus(t *testing.T) {
 	for st, err = Status(dir); err != nil && time.Now().Before(deadline); st, err = Status(dir) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err != nil || !st.Online || st.PID != os.Getpid() {
+	if err != nil || !st.Online || st.PID != os.Getpid() || st.Version != "test" || len(st.Workers) != 1 {
 		t.Fatalf("работает: %+v %v", st, err)
+	}
+	if LastExit(dir) != nil {
+		t.Fatal("агент работает — ошибки завершения нет")
 	}
 	cancel()
 	<-done
@@ -82,7 +92,7 @@ func TestStatus(t *testing.T) {
 	}
 }
 
-// Renew: регистрация не удалась — прежние учётные данные остаются на диске.
+// Renew: регистрация не удалась — прежний ключ остаётся на диске.
 func TestRenewKeepsCredentialsOnFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)

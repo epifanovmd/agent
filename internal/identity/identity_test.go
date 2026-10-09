@@ -8,9 +8,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 func TestStoreRoundTripAndPermissions(t *testing.T) {
@@ -40,25 +42,45 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 	}
 }
 
+// Регистрация (§2): 200 — ключ; 401 — токен не принят (повтор не нужен);
+// 429 — подождать Retry-After; 5xx — обычный повтор.
 func TestEnroll(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req EnrollRequest
+		var req message.Enroll
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		if r.URL.Path != message.EnrollPath || req.Token != "good" {
+		switch {
+		case r.URL.Path != message.EnrollPath:
+			w.WriteHeader(http.StatusNotFound)
+		case req.Token == "busy":
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":"RATE_LIMITED","message":"подождите"}`))
+		case req.Token == "down":
+			w.WriteHeader(http.StatusBadGateway)
+		case req.Token != "good" || req.Host.OS == "":
 			w.WriteHeader(http.StatusUnauthorized)
-			return
+			_, _ = w.Write([]byte(`{"code":"ENROLL_DENIED","message":"токен не принят"}`))
+		default:
+			_, _ = w.Write([]byte(`{"agentId":"id-1","secret":"sec"}`))
 		}
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"agentId":"id-1","secret":"sec"}`))
 	}))
 	defer srv.Close()
-
-	c, err := Enroll(context.Background(), srv.Client(), srv.URL, EnrollRequest{Token: "good", Name: "n"})
-	if err != nil || c.AgentID != "id-1" {
+	host := message.Host{OS: "linux", Arch: "amd64", Hostname: "node-01"}
+	c, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: "good", Name: "n", Host: host})
+	if err != nil || c.AgentID != "id-1" || c.Secret != "sec" {
 		t.Fatalf("%v %v", c, err)
 	}
-	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, EnrollRequest{Token: "bad"}); !errors.Is(err, ErrTokenRejected) {
+	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: "bad", Host: host}); !errors.Is(err, ErrTokenRejected) ||
+		!strings.Contains(err.Error(), "ENROLL_DENIED") {
 		t.Fatalf("плохой токен: %v", err)
+	}
+	var rl *RateLimited
+	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: "busy", Host: host}); !errors.As(err, &rl) || rl.After != 7*time.Second {
+		t.Fatalf("429: %v", err)
+	}
+	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: "down", Host: host}); err == nil ||
+		errors.Is(err, ErrTokenRejected) || errors.As(err, &rl) {
+		t.Fatalf("5xx — обычная ошибка: %v", err)
 	}
 }
 
@@ -127,29 +149,5 @@ func TestKeysRotateFallbackPromote(t *testing.T) {
 	}
 	if k.Authorization() != pending || k.Session() != pending || k.Fallback() {
 		t.Fatal("после повышения — один секрет")
-	}
-}
-
-// Ключ шифрования создаётся один раз (0600) и дальше читается тот же;
-// повреждённый файл — ошибка, а не молча новый ключ.
-func TestEncryptionKey(t *testing.T) {
-	dir := t.TempDir()
-	k1, err := EncryptionKey(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(filepath.Join(dir, encryptionKeyFile))
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("файл ключа: %v %v", info, err)
-	}
-	k2, err := EncryptionKey(dir)
-	if err != nil || !k1.Equal(k2) {
-		t.Fatalf("ключ не тот же: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, encryptionKeyFile), []byte("мусор"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := EncryptionKey(dir); err == nil {
-		t.Fatal("повреждённый файл принят")
 	}
 }

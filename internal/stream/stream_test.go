@@ -3,7 +3,7 @@ package stream
 import (
 	"testing"
 
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 func TestSeqAckAndOverflow(t *testing.T) {
@@ -21,5 +21,19 @@ func TestSeqAckAndOverflow(t *testing.T) {
 	}
 	if env := b.Add(message.Envelope{}); env.Seq != 6 {
 		t.Fatalf("нумерация сквозная: %d", env.Seq)
+	}
+}
+
+// Remove — только указанное сообщение, порядок остальных сохраняется.
+func TestRemove(t *testing.T) {
+	b := New(10)
+	for range 3 {
+		b.Add(message.Envelope{Type: "status"})
+	}
+	b.Remove(2)
+	b.Remove(42)
+	got := b.Unacked()
+	if len(got) != 2 || got[0].Seq != 1 || got[1].Seq != 3 {
+		t.Fatalf("после Remove: %+v", got)
 	}
 }

@@ -1,0 +1,88 @@
+# Запрос к воркеру
+
+`agents.fetch` — HTTP-запрос к воркеру на узле через агента, как обычный `fetch`: ответ —
+стандартный `Response` с потоком тела. Формат — [sdk/spec §7](../spec/README.md#7-запрос-к-воркеру-fetch),
+образцы — [fetch.json](../spec/examples/fetch.json).
+
+## Вызов
+
+```ts
+const res = await agents.fetch(agentId, "echo", "/echo?upper=1", {
+  method: "POST", // по умолчанию GET
+  headers: { "content-type": "application/json" }, // объект или Headers
+  body: JSON.stringify({ text: "привет" }), // string | Uint8Array | ArrayBuffer
+  timeoutMs: 5000, // по умолчанию 30 000, не больше 600 000
+  signal: AbortSignal.timeout(10_000), // отмена
+});
+res.status; // 200
+res.headers.get("content-type");
+await res.json(); // или text(), arrayBuffer(), bytes(), body — ReadableStream
+```
+
+`Response` приходит, как только воркер ответил заголовком, — тело ещё может идти. Строковое тело
+уходит как есть, двоичное — в base64. Тело запроса — до 4 МБ, ответа — до 32 МБ.
+
+**Что уходит по сети.** `fetch {worker, method, path, headers, body, timeoutMs}` → агент делает
+запрос к сокету воркера → `fetch.head {status, headers}`, куски `fetch.chunk` (до 64 КБ), конец
+`fetch.end`. Отмена — `fetch.cancel`.
+
+## Поток
+
+Тело читается по мере прихода кусков — так можно отдавать большие файлы и длинные ответы,
+не собирая их целиком:
+
+```ts
+const res = await agents.fetch(agentId, "report", "/export");
+for await (const chunk of res.body!) out.write(chunk);
+```
+
+Отдать ответ воркера клиенту бэкенда как есть:
+
+```ts
+import { pipeline } from "node:stream/promises";
+
+const r = await agents.fetch(agentId, "report", "/export");
+res.writeHead(r.status, Object.fromEntries(r.headers));
+await pipeline(r.body!, res);
+```
+
+Перестали читать — `res.body.cancel()`: агент получит `fetch.cancel` и прервёт запрос к воркеру.
+
+## Ошибки
+
+Ошибка до ответа воркера — `fetch` отклоняется с `AgentsError` (`code`, `message`, `status` —
+HTTP-статус, с которым её удобно вернуть клиенту). Ошибка после заголовка — ошибка чтения тела
+с тем же `AgentsError`.
+
+| Код                  | Статус | Когда                                                                                                                                |
+| -------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `AGENT_NOT_FOUND`    | 404    | нет такого агента                                                                                                                    |
+| `AGENT_REVOKED`      | 409    | агент отозван                                                                                                                        |
+| `AGENT_OFFLINE`      | 503    | агент без связи                                                                                                                      |
+| `AGENT_ELSEWHERE`    | 421    | соединение агента в другом процессе бэкенда ([connection.md](connection.md#несколько-процессов-бэкенда))                             |
+| `WORKER_UNKNOWN`     | 404    | воркера нет в настройках агента                                                                                                      |
+| `WORKER_UNAVAILABLE` | 502    | воркер не запущен или не отвечает                                                                                                    |
+| `WORKER_INVALID`     | 502    | воркер не зарегистрирован: не ответил как нужно на `GET /health` или `GET /manifest` ([workers.md](workers.md#обязательный-минимум)) |
+| `TIMEOUT`            | 504    | истёк `timeoutMs`                                                                                                                    |
+| `CANCELLED`          | 499    | отменено (`signal`)                                                                                                                  |
+| `PATH_FORBIDDEN`     | 403    | служебный путь: `/config/*`, `/metrics`, `/health`, `/cleanup`                                                                       |
+| `BODY_TOO_LARGE`     | 413    | тело запроса больше 4 МБ или ответа больше 32 МБ                                                                                     |
+| `BUSY`               | 503    | у агента уже 64 запроса                                                                                                              |
+| `DISCONNECTED`       | 502    | связь с агентом оборвалась до конца ответа                                                                                           |
+| `MESSAGE_INVALID`    | 400    | неверное имя воркера, путь или метод                                                                                                 |
+
+Маршрут по манифесту агент не сверяет: запрос уходит воркеру как есть, нет маршрута — ответ
+воркера (обычно `404`). Проверить заранее — помощник `supports`
+([sdk/README.md](../README.md#манифест-воркера)).
+
+Ответ воркера с ошибкой (например, `500`) — не ошибка `fetch`: это обычный `Response` со
+статусом воркера.
+
+**Повторы.** Запрос живёт только в текущем соединении: при обрыве он не повторяется
+(`DISCONNECTED`). Повторять ли — решает бэкенд: для неидемпотентных действий воркеру лучше
+принимать свой ключ повтора.
+
+## Аудит
+
+`agents.by(actor).fetch(...)` — то же с записью в событие `audit` (`action: "fetch"`, воркер,
+метод, путь). Без `by` запросы в аудит не попадают.

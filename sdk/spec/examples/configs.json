@@ -1,0 +1,79 @@
+{
+  "config.put": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "config.put",
+      "data": {
+        "worker": "report",
+        "key": "main",
+        "version": 42,
+        "data": {
+          "target": "https://example.com/report",
+          "intervalSec": 60
+        }
+      }
+    }
+  },
+  "config.delete": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "config.delete",
+      "data": {
+        "worker": "report",
+        "key": "limits"
+      }
+    }
+  },
+  "config.applied": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "config.applied",
+      "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "data": {
+        "worker": "report",
+        "key": "main",
+        "version": 42,
+        "ok": true
+      }
+    }
+  },
+  "config.applied.error": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "config.applied",
+      "id": "b2c3d4e5f60718293a4b5c6d7e8f90a1",
+      "data": {
+        "worker": "report",
+        "key": "main",
+        "version": 43,
+        "ok": false,
+        "error": {
+          "code": "CONFIG_REJECTED",
+          "message": "intervalSec: должно быть больше 0"
+        }
+      }
+    }
+  },
+  "config.applied.key-unknown": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "config.applied",
+      "id": "9e8d7c6b5a4f30211203f4e5d6c7b8a9",
+      "data": {
+        "worker": "report",
+        "key": "retention",
+        "version": 1,
+        "ok": false,
+        "error": {
+          "code": "CONFIG_KEY_UNKNOWN",
+          "message": "ключа retention нет в манифесте воркера (configs)"
+        }
+      }
+    }
+  }
+}

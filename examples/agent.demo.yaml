@@ -1,5 +1,5 @@
-# Агент для примера: сервер на Node.js (examples/server) и пять воркеров.
-# ${…} подставляет scripts/demo.sh. Второй агент — DEMO_AGENT=2 (свой каталог данных).
+# Агент стенда: сервер examples/server и четыре воркера-примера без SDK. ${…} подставляет
+# scripts/demo.sh. Второй агент — DEMO_AGENT=2: свой каталог данных и своё имя.
 server:
   url: ${AGENT_SERVER_URL}
 dataDir: ${DEMO_ROOT}/.dev/demo-agent-${DEMO_AGENT}
@@ -8,40 +8,48 @@ labels:
   env: demo
 enroll:
   token: ${AGENT_ENROLL_TOKEN}
+# Агент стенда себя не обновляет: обновление из выпуска проверяют сквозные тесты (scripts/e2e.sh).
 update:
   mode: disabled
+# На сервер — записи журнала с warn; пока открыт поток /api/agents/{id}/watch, сервер просит подробнее.
+log:
+  forward: warn
+# Метрики узла собирает встроенный воркер sysmetrics (в workers его не описывают). Сверх
+# стандартных групп — диски, сокеты, процессы и температура.
+telemetry:
+  metrics:
+    [cpu, load, memory, swap, disk, diskio, network, interfaces, conntrack, sockets, processes, uptime, temperatures]
 workers:
-  # Python: задачи очереди example.echo (текст, файлы, повторы).
+  # Python, только стандартная библиотека: POST /echo, GET /stream, GET /bytes, POST /work
+  # (долгая работа: события, busy в health, ход — на диске), POST /hang, настройка settings,
+  # метрики, health, cleanup.
   - name: echo
-    command: ["python3", "examples/workers/echo_worker.py"]
+    command: ["python3", "examples/workers/echo/main.py"]
     dir: ${DEMO_ROOT}
     env:
-      PYTHONPATH: ${DEMO_ROOT}/sdk/python
-    stopTimeout: 30s
-  # Python: пакетная обработка example.batch — этапы, события, остановка, выходной файл.
-  - name: batch
-    command: ["python3", "examples/workers/batch_worker.py"]
+      PYTHONUNBUFFERED: "1"
+      ECHO_WORK_DIR: ${DEMO_ROOT}/.dev/demo-agent-${DEMO_AGENT}/echo-work
+    # Жизнь воркера: остальное — по умолчанию (перезапуск и остановка агента его не прерывают,
+    # замена ждёт окончания работы до 24 ч). Здесь — короче для стенда.
+    lifecycle:
+      stopTimeout: 10s
+      busy: { wait: true, timeout: 10m }
+      health: { interval: 5s, timeout: 2s, failures: 3 }
+    logs: { maxSize: 1MB, maxFiles: 2 }
+  # Node.js, только node:http: то же, что echo.
+  - name: node-echo
+    command: ["node", "examples/workers/node-echo/main.mjs"]
     dir: ${DEMO_ROOT}
-    env:
-      PYTHONPATH: ${DEMO_ROOT}/sdk/python
-      BATCH_TELEMETRY_INTERVAL: "2"
-    stopTimeout: 30s
-  # Python: сервис — желаемое состояние example.kv, команда, телеметрия, события.
-  - name: kv
-    command: ["python3", "examples/workers/kv_worker.py"]
-    dir: ${DEMO_ROOT}
-    env:
-      PYTHONPATH: ${DEMO_ROOT}/sdk/python
-      KV_DIR: ${DEMO_ROOT}/.dev/demo-kv-${DEMO_AGENT}
-  # Go (sdk/go/worker): команды, раздел состояния example.sys.banner, показатели, событие.
+    lifecycle:
+      stopTimeout: 10s
+  # Go: GET /info, настройка banner, метрики процесса, событие sys.started. Перезапуск агента
+  # (agent restart, обновление) его не трогает, остановка агента останавливает и его; вышел
+  # сам с кодом 0 — не перезапускается.
   - name: sysinfo
     command: ["${SYSINFO_BIN}"]
-  # Node.js: agent-sdk/worker — задачи example.hash, команды, домен example.node.config,
-  # телеметрия, события. TypeScript — через tsx из node_modules воркера (--import
-  # ищет его от рабочего каталога; sdk/node собран и зависимости стоят: demo.sh build).
-  - name: node
-    command: ["node", "--import", "tsx", "main.ts"]
-    dir: ${DEMO_ROOT}/examples/workers/node
-    env:
-      NODE_TELEMETRY_INTERVAL_MS: "2000"
-    stopTimeout: 30s
+    lifecycle:
+      onAgentStop: stop
+      restart: on-failure
+  # Go: проверка сети до целей из настройки targets, итоги — в GET /metrics.
+  - name: netprobe
+    command: ["${NETPROBE_BIN}"]

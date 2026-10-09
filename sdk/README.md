@@ -1,492 +1,291 @@
-# SDK агента: Go, Node.js, Python
+# SDK бэкенда: agent-sdk для Node.js
 
-У SDK две части. Обе есть на трёх языках и работают одинаково:
-
-| Часть      | Для кого            | Что берёт на себя                                                                                                      |
-| ---------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| **worker** | для воркера на узле | связь с агентом, задачи, команды, состояние, показатели, события, контекст, здоровье, пауза, остановка, уборка         |
-| **server** | для бэкенда         | приём агентов, связь с ними, задачи и команды, доставка состояния, подписки, метрики, уведомления, выпуск и обновление |
-
-Этот документ — обзор и **справочник API** (точные сигнатуры на трёх языках). Разбор каждой
-возможности по шагам «бэкенд → сеть → агент → воркер → результат» с примерами — в
-[sdk/docs](docs/README.md).
+Агент на узле держит связь с бэкендом, запускает воркеры и передаёт им запросы, настройки,
+метрики и события. Бэкенду для этого нужен один пакет — `agent-sdk` (Node.js ≥ 24, TypeScript,
+ESM; зависимости — `ws`, `zod`, `semver`, `lru-cache`, `@cfworker/json-schema`). Воркерам SDK не нужен:
+воркер — обычный HTTP-сервис на unix-сокете на любом языке ([docs/workers.md](docs/workers.md)).
 
 ```
-sdk/
-├── README.md     этот документ — обзор и справочник API
-├── docs/         разбор по темам с примерами: с чего начать, связь, задачи, команды, состояние,
-│                 воркер, наблюдение, события, выпуск, хранилище
-├── spec/         формат сообщений (README.md) и образцы сообщений по темам (examples/)
-├── go/worker     Go: воркер
-├── go/server     Go: бэкенд
-├── go/message    Go: типы сообщений (общие с агентом)
-├── go/sealed     Go: запечатанные секреты в состоянии
-├── node/         npm-пакет agent-sdk: agent-sdk/worker, agent-sdk/server — особенности: node/README.md
-└── python/       пакет agent-sdk: agent_sdk.worker, agent_sdk.server, agent_sdk.message — особенности: python/README.md
+бэкенд (agent-sdk) ──WebSocket──► агент ──HTTP по unix-сокету──► воркер
 ```
 
 ## Установка
 
-Всё ставится с GitHub, без npm и PyPI. Версия SDK совпадает с версией агента; `<версия>` — номер
-выпуска без `v`, например `1.1.0`; список выпусков — <https://github.com/epifanovmd/agent/releases>.
-
 ```bash
-# Go ≥ 1.25 — пакеты из репозитория: server, worker, message, sealed
-go get github.com/epifanovmd/agent/sdk/go/...@v<версия>
-# Node ≥ 24 — готовый архив из GitHub Release (TypeScript уже собран)
+# Готовый архив из GitHub Release (TypeScript уже собран)
 npm install https://github.com/epifanovmd/agent/releases/download/v<версия>/agent-sdk-<версия>.tgz
-# Python ≥ 3.10 — готовый пакет из GitHub Release (зависимостей нет)
-pip install https://github.com/epifanovmd/agent/releases/download/v<версия>/agent_sdk-<версия>-py3-none-any.whl
-# или Python — прямо из репозитория
-pip install "git+https://github.com/epifanovmd/agent@v<версия>#subdirectory=sdk/python"
+# или из репозитория
+npm install ./sdk/node   # затем: cd sdk/node && npm run build
 ```
 
-Для Node есть только архив из Release: из подкаталога git-репозитория npm пакет не ставит, а
-собранного кода в репозитории нет. Особенности языков — [node/README.md](node/README.md),
-[python/README.md](python/README.md).
-
-**Без SDK тоже можно.** Агент, воркер и сервер обмениваются строками JSON. Формат — в
-[sdk/spec](spec/README.md), образцы сообщений по темам — в [spec/examples](spec/examples). SDK
-ничего своего в сообщения не добавляет.
-
-**Одинаково во всех языках.** Одно понятие называется одинаково, с поправкой на стиль языка:
-`maxAttempts` / `MaxAttempts` / `max_attempts`. Каждый SDK проверяется на тех же образцах.
+Импорт — `agent-sdk/server`. Корень пакета `agent-sdk` отдаёт то же самое и ещё `SDK_VERSION` — версию
+SDK.
 
 ## Документация
 
-| Раздел                                    | О чём                                                                                        |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------- |
-| [С чего начать](docs/README.md)           | бэкенд, агент и воркер за 10 минут; что выбрать: задача, команда или состояние               |
-| [Регистрация и связь](docs/connection.md) | токен, метки, WebSocket и HTTP, несколько адресов, прокси, TLS, смена ключа, отзыв, процессы |
-| [Задачи](docs/jobs.md)                    | постановка, места, срок, повторы, отмена, прогресс, события, файлы, сверка                   |
-| [Команды](docs/commands.md)               | `command` и `call`, вывод, срок, ошибки, встроенные команды агента                           |
-| [Состояние](docs/state.md)                | общий и личный снимок, версии, удаление, история и откат, повтор, секреты, отчёт             |
-| [Воркер](docs/workers.md)                 | регистрация, контекст, здоровье, пауза, перезапуск, замена, уборка, ограничения, выпуск      |
-| [Наблюдение](docs/observe.md)             | статус, метрики узла, подписки, показатели воркеров, лог, сведения об узле, история          |
-| [События](docs/events.md)                 | события воркеров, `change`, уведомления о проблемах, аудит                                   |
-| [Выпуск](docs/releases.md)                | сборка и раздача выпуска, установка одной командой, обновление агента и воркеров, удаление   |
-| [Хранилище](docs/store.md)                | методы `Store` по языкам, правила, пример на SQL                                             |
+| Где                                      | О чём                                                                   |
+| ---------------------------------------- | ----------------------------------------------------------------------- |
+| [docs/README.md](docs/README.md)         | с чего начать: бэкенд, агент и воркер за 10 минут                       |
+| [docs/connection.md](docs/connection.md) | регистрация, связь, отзыв, смена ключа, несколько процессов, фреймворки |
+| [docs/workers.md](docs/workers.md)       | воркер без SDK на Python, Node и Go                                     |
+| [docs/fetch.md](docs/fetch.md)           | запросы к воркеру                                                       |
+| [docs/configs.md](docs/configs.md)       | настройки воркеров                                                      |
+| [docs/observe.md](docs/observe.md)       | метрики, watch, журнал, события, проблемы                               |
+| [docs/releases.md](docs/releases.md)     | выпуск, установка, обновления                                           |
+| [docs/store.md](docs/store.md)           | хранилище, пример на Postgres                                           |
+| [spec/README.md](spec/README.md)         | формат сообщений — источник правды; образцы — `spec/examples`           |
 
-## Как это устроено
+## Agents
 
+```ts
+import { createServer } from "node:http";
+import { Agents } from "agent-sdk/server";
+
+const agents = new Agents({ enrollToken: process.env.AGENT_ENROLL_TOKEN });
+const server = createServer(async (req, res) => {
+  if (await agents.handle(req, res)) return;
+  res.writeHead(404).end();
+});
+agents.attach(server);
+server.listen(8080);
 ```
-бэкенд ── Agents (server SDK) ◀──── WebSocket / HTTP ────▶ агент ◀── канал на узле (fd 3) ──▶ воркер (worker SDK)
-  enqueue / command / setState        job.assign, cmd.run,          выбирает воркер,           обработчики job,
-  subscribe / revoke / …              state.put, config             хранит важное на диске     command, state, …
-  события change, metrics, alert ◀─── status, metrics, итоги ◀───── повторяет, досылает ◀───── итоги, показатели
-```
 
-- Соединение открывает **только агент**: входящие порты на узле не нужны.
-- **Сервер хранит, что должно быть сделано** (задачи, команды, состояние), и присылает это
-  заново после каждого подключения; агент узнаёт повторы по id.
-- **Агент** держит связь, хранит важные сообщения на диске до подтверждения, работает без связи,
-  запускает воркеры. **Воркер** знает только свою предметную область.
+### Настройки
 
----
-
-## worker — воркер на узле
-
-Воркер запускает агент (список `workers` в его настройках) и сразу даёт ему канал связи —
-дескриптор из `AGENT_IPC_FD`. SDK находит канал сам; для тестов можно подставить свой. Разбор —
-[docs/workers.md](docs/workers.md).
-
-### Worker
-
-| Что                                 | Go (`sdk/go/worker`)                                                  | Node (`agent-sdk/worker`)                                             | Python (`agent_sdk.worker`)                                               |
-| ----------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| создать                             | `worker.New(name, version string, opts ...Option) *Worker`            | `new Worker({ name?, version?, transport?, log? })`                   | `Worker(name=None, *, version="0.0.0", channel=None)`                     |
-| очередь задач                       | `w.Job(queue string, concurrency int, fn JobHandler)`                 | `w.job(queue, { concurrency? }, handler)` или `w.job(queue, handler)` | `@w.job(queue, concurrency=1)` или `w.register(queue, fn, concurrency=1)` |
-| команда                             | `w.Command(name string, fn CommandHandler)`                           | `w.command(name, handler)`                                            | `@w.command(name)`                                                        |
-| раздел состояния                    | `w.State(domain string, fn StateHandler)`                             | `w.state(domain, (version, spec) => report)`                          | `@w.state(domain)` → `fn(version, spec)`                                  |
-| показатели (агент спрашивает сам)   | `w.Telemetry(channel string, interval time.Duration, fn func() any)`  | `w.telemetry(channel, { intervalMs?: number \| "auto" }, fn)`         | `@w.telemetry(channel, interval=15.0)` — секунды или `"auto"`             |
-| объявить канал показателей          | `w.Channel(name string)`                                              | `w.channel(name)`                                                     | `w.channel(name)`                                                         |
-| прислать показатели                 | `w.Report(channel string, data any) error`                            | `w.report(channel, data)`                                             | `w.report(channel, data)`                                                 |
-| событие                             | `w.Event(typ string, data any) error`                                 | `w.event(type, data?)`                                                | `w.event(type, data=None)`                                                |
-| уборка при удалении агента          | `w.Cleanup(fn func(ctx) error)`                                       | `w.cleanup(async () => {})`                                           | `@w.cleanup`                                                              |
-| контекст агента                     | `w.Context() worker.Context`, `w.OnContext(fn func(worker.Context))`  | `w.context`, `w.on("context", fn)`                                    | `w.context`, `@w.on_context`                                              |
-| здоровье                            | `w.SetHealth(ok bool, msg string) error`                              | `w.setHealth(ok, message?)`                                           | `w.set_health(ok, message=None)`                                          |
-| пауза / снять паузу очередей        | `w.Pause(queues ...string) error`, `w.Resume(queues ...string) error` | `w.pause(queues?)`, `w.resume(queues?)`                               | `w.pause(queues=None)`, `w.resume(queues=None)`                           |
-| попросить замену                    | `w.RequestRestart(reason string) error`                               | `w.requestRestart(reason?)`                                           | `w.request_restart(reason=None)`                                          |
-| запустить                           | `w.Run(ctx context.Context) error`                                    | `await w.run({ signals? })`                                           | `w.run(install_signals=True)`                                             |
-| сигнал «пора останавливаться»       | `<-w.Stopping()`                                                      | `w.stopping` (`AbortSignal`)                                          | `w.stopping` (`threading.Event`)                                          |
-| остановиться (доработать и выйти)   | `w.Drain()`                                                           | `w.drain()`                                                           | `w.drain()`                                                               |
-| имена, которые агент не принял      | `w.Rejected() []string`                                               | `w.rejected: string[]`                                                | `w.rejected: set`                                                         |
-| свой канал связи (тесты)            | `worker.WithConn(io.ReadWriteCloser)`                                 | `new Worker({ transport: Duplex })`                                   | `Worker(…, channel=Channel(sock))`                                        |
-| свой лог, без обработчиков сигналов | `worker.WithLogger(*slog.Logger)`, `worker.WithoutSignals()`          | `log: (level, msg) => …`, `run({ signals: false })`                   | логгер `agent_sdk.worker`, `run(install_signals=False)`                   |
-
-Обработчики: Go — `JobHandler func(ctx, *Job) (any, error)`, `CommandHandler func(ctx,
-*Command) (any, error)`, `StateHandler func(ctx, version int64, spec json.RawMessage) (any,
-error)`; Node — `async (job) => result`, `async (cmd) => result`, `async (version, spec) =>
-report`; Python — обычные функции, работают в потоках. Авто-интервал показателей —
-`worker.AutoInterval`, `AUTO_INTERVAL` (`"auto"`), `"auto"`: частота подписки на канал, иначе
-частота метрик агента, иначе 15 с ([docs/observe.md](docs/observe.md#показатели-воркеров)).
-
-### Job
-
-| Что                               | Go (`*worker.Job`)                                               | Node (`Job`)                                     | Python (`Job`)                                                                                            |
-| --------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| что пришло                        | `ID`, `Queue`, `Data json.RawMessage`, `Attempt`, `LeaseSeconds` | `id`, `queue`, `data`, `attempt`, `leaseSeconds` | `id`, `queue`, `data`, `attempt`, `lease_seconds`                                                         |
-| прогресс 0..1 и текст             | `Progress(value float64, text ...string)`                        | `progress(value, text?)`                         | `progress(value, text=None)`                                                                              |
-| строка журнала                    | `Log(line string)`                                               | `log(line)`                                      | `log(line)`                                                                                               |
-| событие задачи                    | `Event(typ string, data any) error`                              | `event(type, data?)`                             | `event(type, data=None)`                                                                                  |
-| отменили                          | `ctx.Done()`                                                     | `signal` (`AbortSignal`), `cancelled`            | `cancelled`, `check_cancelled()` → `Cancelled`; ждать с отменой — `wait(timeout) -> bool`, `cancel_event` |
-| просят закончить пораньше         | `StopRequested() <-chan struct{}`                                | `stopRequested`                                  | `stop_requested`                                                                                          |
-| имена файлов                      | `Inputs() []string`, `Outputs() []string`                        | `inputs`, `outputs`                              | `inputs`, `outputs`                                                                                       |
-| входной файл во временный каталог | `InputPath(ctx, name) (string, error)`                           | `await inputPath(name)`                          | `input_path(name) -> Path`                                                                                |
-| скачать в своё место              | `Download(ctx, name, path string) error`                         | `await download(name, target)`                   | `download(name, target) -> Path`                                                                          |
-| загрузить результат               | `Upload(ctx, name, data []byte)`, `UploadFile(ctx, name, path)`  | `await upload(name, Uint8Array \| путь)`         | `upload(name, bytes \| путь)`                                                                             |
-| свежие ссылки                     | `RefreshURLs(ctx, inputs, outputs []string) error`               | `await refreshUrls(inputs?, outputs?)`           | `refresh_urls(inputs=None, outputs=None)`                                                                 |
-
-Подробно — [docs/jobs.md](docs/jobs.md).
-
-### Command
-
-| Что        | Go (`*worker.Command`)                             | Node (`Command`)                   | Python (`Command`)                                                                      |
-| ---------- | -------------------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------- |
-| что пришло | `ID`, `Name`, `Args json.RawMessage`, `TimeoutSec` | `id`, `name`, `args`, `timeoutSec` | `id`, `name`, `args`, `timeout_sec`                                                     |
-| вывод      | `Write(p []byte)` — это `io.Writer`                | `write(text)`                      | `write(text)`                                                                           |
-| срок истёк | `ctx.Done()`                                       | `signal`, `cancelled`              | `cancelled`, `check_cancelled()` → `Cancelled`; `wait(timeout) -> bool`, `cancel_event` |
-
-Подробно — [docs/commands.md](docs/commands.md).
-
-### Ошибки
-
-|                                     | Go                                                    | Node                                      | Python                                     |
-| ----------------------------------- | ----------------------------------------------------- | ----------------------------------------- | ------------------------------------------ |
-| задача: свой код                    | `worker.Fail(code, msg string, retryable bool) error` | `new JobError(code, msg, { retryable? })` | `JobFailed(code, message, retryable=True)` |
-| команда: свой код                   | `worker.CommandError(code, msg string) error`         | `new CommandError(code, msg)`             | `CommandFailed(code, message)`             |
-| состояние: не применилось с отчётом | `worker.StateFailed(msg string, report any) error`    | `new StateError(msg, report?)`            | `StateFailed(message, report=None)`        |
-| агент отклонил запрос               | `*message.Error`                                      | `AgentError(code, message, retryable)`    | `AgentError(code, message, retryable)`     |
-
-Код — `^[A-Z0-9_]{1,64}$`; код не по этому правилу SDK заменяет на `WORKER_ERROR` (задача) или
-`COMMAND_FAILED` (команда), а исходный код дописывает в начало текста. Любая другая ошибка,
-исключение или паника: задача — `WORKER_ERROR` (сервер повторит), команда — `COMMAND_FAILED`,
-состояние — «не применилось» с текстом (агент повторит). Воркер при этом не падает.
-
-Итог, который нельзя отправить, тоже не роняет воркер — агент получает ответ с ошибкой:
-
-- результат не превращается в JSON (Node: `BigInt`, цикл; Python: объект, `NaN`): задача —
-  `WORKER_ERROR`, команда — `COMMAND_FAILED`, состояние и уборка — `ok: false` с текстом;
-- строка сообщения длиннее 16 МБ (предел канала): задача — `RESULT_TOO_LARGE` без повторов
-  (крупные данные — выходным файлом), команда — `RESULT_TOO_LARGE`, состояние и уборка —
-  `ok: false` с текстом `RESULT_TOO_LARGE: …`;
-- событие или показатели больше 16 МБ не отправляются — запись в лог воркера, связь с агентом
-  остаётся. Данные события или показателей не в JSON — ошибка сразу у вызова (Go — `error`,
-  Node — `TypeError`, Python — `TypeError`/`ValueError`).
-
-Константы Go: `worker.CodeWorkerError`, `worker.CodeWorkerStopping`, `worker.CodeCommandFailed`,
-`worker.CodeCommandUnknown`, `worker.CodeResultTooLarge`; Node — `RESULT_TOO_LARGE`; Python —
-`agent_sdk.worker.errors.RESULT_TOO_LARGE`.
-
-### Контекст
-
-`worker.context` — что агент сообщает о себе: `mode` (`run` | `cleanup`), `agent` (`id`, `name`,
-`version`, `labels`), `online`, `metricsIntervalMs`, `channels` (подписки на каналы этого
-воркера: канал → мс), `logLevel`. Go — `worker.Context` (= `message.WorkerContext`), Node —
-`WorkerContext`, Python — `WorkerContext` (`metrics_interval_ms`, `log_level`). Подробно —
-[docs/workers.md](docs/workers.md#контекст-воркера).
-
-### Как ведёт себя SDK воркера (во всех языках одинаково)
-
-- При старте сообщает агенту очереди (с `concurrency`), команды, разделы состояния, каналы.
-  Неверное имя — сразу ошибка: Python и Node — исключение при объявлении, Go — из `Run`.
-- Задачи выполняет параллельно — до `concurrency` на очередь; команды и состояние —
-  параллельно с задачами. Один раздел состояния не применяется дважды одновременно.
-- Прогресс и журнал прореживает (агенту — не чаще двух раз в секунду), вывод команд режет на
-  куски до 64 КБ, ссылки на файлы обновляет сам, загрузку повторяет до 4 раз.
-- Задача, пришедшая во время остановки, возвращается с `WORKER_STOPPING` — сервер отдаст её
-  другим.
-- Отмена задачи (`job.cancel`): итог обработчика не уходит; когда обработчик вернулся, SDK сам
-  сообщает агенту `job.fail` с кодом `CANCELLED` — так агент освобождает место. Обработчику
-  достаточно вернуться.
-- Повторный `job.assign` той же задачи с той же попыткой ничего не меняет; с большей попыткой —
-  прежняя попытка отменяется так же, новая выполняется. Задача, отменённая, пока ждала места в
-  очереди, обработчик не вызывает; при обрыве связи ждущие задачи убираются.
-- `setHealth`, `pause`, `resume`, `requestRestart`, `report`, `event` (и их варианты в Go и
-  Python) можно вызывать и до запуска: сообщения копятся и уходят сразу после того, как агент
-  принял воркер (`worker.ready`), по порядку. Копится не больше 1000 — лишние вытесняют самые
-  старые (запись в лог).
-- Сообщает агенту, что отвечает на проверку (`ping: true` в `worker.register`), и отвечает на
-  `worker.ping` сообщением `worker.pong` — по ним агент замечает зависший воркер.
-- Имя входного файла во временном каталоге задачи — только последняя часть имени: каталоги и
-  `..` отбрасываются. Каталог создаётся при первом входном файле и удаляется после задачи.
-- Node учитывает заторы канала: пока поток не принимает, сообщения ждут в очереди по порядку; при
-  долгом заторе прогресс задач и показатели отбрасываются (запись в лог), остальное ждёт.
-- Остановка (SIGTERM или `worker.drain`): новых задач не берёт, текущие задачи и команды
-  дорабатывает, выходит. Пропала связь с агентом — всё отменяет и выходит.
-- Показатели начинает собирать после того, как агент принял воркер; ошибка сбора — в лог.
-  Каналы, которые агент отклонил (`worker.ready.rejected`), не опрашиваются; источник вернул
-  `nil` / `undefined` / `null` / `None` — точка не отправляется.
-- Сообщение `error` от агента пишет в лог с кодом и текстом.
-- Свой лог пишет в stderr — агент добавляет его в свой журнал с именем воркера.
-
----
-
-## server — бэкенд, к которому подключаются агенты
-
-Бэкенд создаёт **`Agents`** — «все подключённые агенты» — и подключает его к своему
-HTTP-серверу. Всю работу со связью он делает сам; бэкенду остаются его данные и решения.
-Разбор — [docs/README.md](docs/README.md) и разделы по темам.
-
-### Настройки `Agents`
-
-| Настройка (Node)                                          | Go (`server.Options`)                                          | Python (`Agents(…)`)                                      | По умолчанию                             | Что                                                                                                                                 |
-| --------------------------------------------------------- | -------------------------------------------------------------- | --------------------------------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `enrollToken`                                             | `EnrollToken string`                                           | `enroll_token`                                            | —                                        | общий токен регистрации                                                                                                             |
-| `enroll(token, {name, labels, host}) → {labels?} \| null` | `Enroll func(token string, info EnrollInfo) (labels, ok bool)` | `enroll(token, {name, labels, host}) → {labels?} \| None` | —                                        | своя проверка токена; `labels` — выданные метки                                                                                     |
-| `store`                                                   | `Store`                                                        | `store`                                                   | `MemoryStore`                            | хранилище ([docs/store.md](docs/store.md))                                                                                          |
-| `files`                                                   | `Files`                                                        | `files`                                                   | `MemoryFiles`                            | где лежат файлы задач                                                                                                               |
-| `statusIntervalMs`                                        | `StatusInterval time.Duration`                                 | `status_interval_ms`                                      | 5000                                     | как часто агент присылает статус                                                                                                    |
-| `metricsIntervalMs`                                       | `MetricsInterval`                                              | `metrics_interval_ms`                                     | 15000                                    | как часто агент присылает метрики                                                                                                   |
-| `offlineGraceMs`                                          | `OfflineGrace`                                                 | `offline_grace_ms`                                        | 20000                                    | сколько агент считается на связи после обрыва                                                                                       |
-| `offlineAfterMs`                                          | `OfflineAfter`                                                 | `offline_after_ms`                                        | max(3 × статус, 30 с) + `offlineGraceMs` | без вестей дольше — без связи, даже если его процесс бэкенда упал                                                                   |
-| `metricsStoreIntervalMs`                                  | `MetricsStoreInterval`                                         | `metrics_store_interval_ms`                               | 15000                                    | не чаще скольких мс сохранять точку метрик в `Store`                                                                                |
-| `metricsRetentionMs`                                      | `MetricsRetention`                                             | `metrics_retention_ms`                                    | 7 суток                                  | сколько хранить историю метрик                                                                                                      |
-| `enrollFailureLimit`                                      | `EnrollFailureLimit int`                                       | `enroll_failure_limit`                                    | 10                                       | неудачных регистраций с одного адреса за окно                                                                                       |
-| `enrollFailureWindowMs`                                   | `EnrollFailureWindow`                                          | `enroll_failure_window_ms`                                | 60000                                    | окно подсчёта неудачных регистраций                                                                                                 |
-| `releasesDir`                                             | `ReleasesDir`                                                  | `releases_dir`                                            | —                                        | каталог выпуска ([docs/releases.md](docs/releases.md))                                                                              |
-| `publicKey`                                               | `PublicKey`                                                    | `public_key`                                              | —                                        | открытый ключ подписи (base64), вписывается в `install.sh`                                                                          |
-| `baseUrl`                                                 | `PublicURL` (или `SetPublicURL(url)`)                          | `base_url`                                                | из запроса                               | публичный адрес: ссылки на файлы задач, `install.sh`, `installCommand`                                                              |
-| `trustProxy`                                              | `TrustProxy bool`                                              | `trust_proxy`                                             | `false`                                  | бэкенд за доверенным прокси: адрес клиента — первый из `X-Forwarded-For`, адрес сервера — из `X-Forwarded-Host`/`X-Forwarded-Proto` |
-| `log: (msg, extra) => …`                                  | `Log *slog.Logger`                                             | `log` — `logging.Logger` или `fn(msg, extra)`             | —                                        | лог                                                                                                                                 |
-| —                                                         | —                                                              | `max_body`                                                | 32 МБ                                    | предел тела запроса для адаптеров (`body_limit(path)`; регистрация — 64 КБ)                                                         |
-
-`0` в `metricsStoreIntervalMs`, `metricsRetentionMs`, `enrollFailureLimit` — в Node и Python
-«каждую точку», «хранить всегда», «без ограничения»; в Go для этого — отрицательное значение
-(ноль — значение по умолчанию). Без `enrollToken` и `enroll` агенты не зарегистрируются; Node и
-Python сразу бросают ошибку при создании `Agents`. События в Go — функции в `Options`
-([ниже](#события)).
-
-Регистрация (`POST …/enroll`): тело — не больше 64 КБ (больше — `413`), `token` и `name` —
-непустые строки, `name` — до 128 символов, `labels` — до 64 меток, ключ — непустая строка до 256
-символов, значение — строка до 256 символов (иначе — `400 MESSAGE_INVALID`). Неудачи считаются по адресу клиента — так же, как
-`Agent.address` (с `trustProxy` — первый из `X-Forwarded-For`).
-
-### Подключение к HTTP-серверу
-
-| Go                                                      | Node                                                                                | Python                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `agents := server.New(opts)`                            | `const agents = new Agents(opts)`                                                   | `agents = Agents(…)`                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `agents.Handler() http.Handler` или `agents.Mount(mux)` | `await agents.handle(req, res)` → обработан ли; `agents.attach(server)` — WebSocket | `AgentsApp(agents, fallback=None)` (`agent_sdk.server.asgi`) — ASGI-приложение маршрутов агентов; или по методу на маршрут: `handle_enroll(body, remote=None, forwarded_for=None)`, `handle_sync(auth, body, is_disconnected=None, *, base_url, remote, forwarded_for)`, `authenticate(auth)`, `serve_websocket(auth, conn, *, base_url, remote, forwarded_for)`, `handle_file(method, key, body)`, `handle_release(path, base_url)` |
-| `agents.Close()`                                        | `agents.close()`                                                                    | `await agents.close()`                                                                                                                                                                                                                                                                                                                                                                                                               |
-
-Маршруты: `POST /api/v1/agent-link/enroll`, `GET /api/v1/agent-link` (WebSocket), `POST
-/api/v1/agent-link/sync`, `GET /api/v1/agent-link/releases/<file>`, `GET
-/api/v1/agent-link/install.sh`, `GET`/`PUT /files/<jobId>/(in|out)/<имя>` (для `MemoryFiles`).
-`close` закрывает сессии кодом `1012` — агенты переподключатся сразу. Подключение к Express,
-Fastify, NestJS, FastAPI — [docs/connection.md](docs/connection.md#связь-websocket-и-http).
+| Опция                   | По умолчанию                            | Что это                                                                                                           |
+| ----------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `enrollToken`           | —                                       | токен регистрации агентов                                                                                         |
+| `enroll(token, info)`   | —                                       | своя проверка: `false`, `null` или `undefined` — отказ, `true` или `{ labels?, name? }` — принять                 |
+| `store`                 | `MemoryStore`                           | хранилище ([store.md](docs/store.md))                                                                             |
+| `instanceId`            | случайный                               | имя процесса в `agent.session.instance`                                                                           |
+| `statusIntervalMs`      | 30 000                                  | как часто агент шлёт `status`                                                                                     |
+| `metricsIntervalMs`     | 10 000                                  | как часто агент шлёт метрики                                                                                      |
+| `onEvent(event)`        | —                                       | обработчик событий воркеров; подтверждение агенту — после него ([observe](docs/observe.md#события-воркеров))      |
+| `offlineGraceMs`        | 20 000                                  | агент после обрыва ещё `online` столько                                                                           |
+| `offlineAfterMs`        | max(3 × statusIntervalMs, 30 с) + grace | без вестей дольше — `offline` (процесс с соединением упал)                                                        |
+| `actionTimeoutMs`       | 60 000                                  | срок итога действия                                                                                               |
+| `updateTimeoutMs`       | 300 000                                 | срок итога `updateAgent`, `updateWorker`                                                                          |
+| `releasesDir`           | —                                       | каталог выпуска: manifest.json, сборки, install.sh                                                                |
+| `publicKey`             | —                                       | ключ проверки выпуска для install.sh                                                                              |
+| `baseUrl`               | из запроса                              | публичный адрес бэкенда для install.sh и `installCommand`                                                         |
+| `enrollFailureLimit`    | 10                                      | неудачных регистраций с адреса за окно, дальше — 429 (`0` — без предела)                                          |
+| `enrollFailureWindowMs` | 60 000                                  | окно подсчёта неудачных регистраций                                                                               |
+| `trustProxy`            | `false`                                 | адрес клиента из `X-Forwarded-For`, адрес сервера — из `X-Forwarded-Host/Proto`                                   |
+| `validateConfigs`       | `false`                                 | `setConfig` проверяет значение по схеме ключа из манифеста воркера ([configs](docs/configs.md#проверка-по-схеме)) |
+| `log(msg, extra)`       | строки `agents: …` в stdout             | журнал SDK                                                                                                        |
 
 ### Методы
 
-Go — методы `*server.Agents` (ошибки — `error`, чаще `*message.Error` с `Code`); Node и Python —
-асинхронные, кроме `on`, `off`, `by`, `installCommand` / `install_command`.
+| Метод                                                                               | Результат                                     | Раздел                                                                    |
+| ----------------------------------------------------------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------- |
+| `handle(req, res)`                                                                  | `Promise<boolean>` — запрос обработан         | [connection](docs/connection.md#подключение-к-http-серверу-и-фреймворкам) |
+| `attach(server)`                                                                    | WebSocket агентов на этом сервере             | там же                                                                    |
+| `close()`                                                                           | `Promise<void>`; соединения — код 1012        | там же                                                                    |
+| `by(actor)`                                                                         | `Actor` — изменяющие методы с автором         | [connection](docs/connection.md#агенты-список-отзыв-удаление)             |
+| `listAgents()`, `getAgent(id)`                                                      | `Agent[]`, `Agent \| undefined`               | там же                                                                    |
+| `revoke(id)`, `deleteAgent(id)`                                                     | `Agent`, `void`                               | там же                                                                    |
+| `rotateKey(id, { timeoutMs? })`                                                     | `void`                                        | [connection](docs/connection.md#смена-ключа)                              |
+| `refresh(agentId?)`                                                                 | применить изменения других процессов          | [connection](docs/connection.md#несколько-процессов-бэкенда)              |
+| `fetch(id, worker, path, { method, headers, body, timeoutMs, signal })`             | `Response`                                    | [fetch](docs/fetch.md)                                                    |
+| `setConfig(id, worker, key, data)`                                                  | `ConfigRecord` (с `version`)                  | [configs](docs/configs.md)                                                |
+| `getConfig(id, worker, key)`, `listConfigs(id)`                                     | `ConfigRecord \| undefined`, `ConfigRecord[]` | там же                                                                    |
+| `deleteConfig(id, worker, key)`                                                     | `boolean` — ключ был                          | там же                                                                    |
+| `configStatus(id, worker?)`                                                         | `ConfigStatus[]`                              | там же                                                                    |
+| `watch(id, { id?, metricsIntervalMs?, logLevel?, ttlMs? })`, `unwatch(id, watchId)` | `{ id, until }`, `void`                       | [observe](docs/observe.md#наблюдение-watch)                               |
+| `listAlerts(agentId?)`                                                              | `Alert[]` — текущие проблемы                  | [observe](docs/observe.md#проблемы)                                       |
+| `logs(id, { worker?, lines? })`                                                     | `LogEntry[]`                                  | [observe](docs/observe.md#журнал)                                         |
+| `restartWorker(id, name, { force?, timeoutMs? })`                                   | `void`                                        | [workers](docs/workers.md#долгая-работа)                                  |
+| `updateWorker(id, name, { force?, timeoutMs? })`, `updateAgent(id, { timeoutMs? })` | `{ version, previous? }`                      | [releases](docs/releases.md)                                              |
+| `release()`, `updateCandidates()`, `workerUpdateCandidates()`                       | манифест и кандидаты на обновление            | [releases](docs/releases.md)                                              |
+| `installCommand(opts)`                                                              | строка `curl … \| sudo sh -s -- …`            | [releases](docs/releases.md#установка-одной-командой)                     |
 
-**Задачи** — [docs/jobs.md](docs/jobs.md)
+`fetch` и действия (`restartWorker`, `updateWorker`, `updateAgent`, `rotateKey`, `logs`)
+работают в процессе, у которого соединение агента, `watch` действует там же; остальное — в
+любом. Итог действия — результат промиса вызова и событие `action`. `restartWorker` и
+`updateWorker` занятого воркера (`health.busy`) ждут окончания его работы (`pending` в status;
+срок `timeoutMs` отсчитывается заново, пока замена ждёт); `force: true` — заменить сразу.
 
-| Что                | Go                                                           | Node                                                                                   | Python                                                                                                            |
-| ------------------ | ------------------------------------------------------------ | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| поставить          | `Enqueue(req JobRequest) (*Job, error)`                      | `enqueue(req: JobRequest): Promise<Job>`                                               | `enqueue(queue, data=None, *, max_attempts=1, lease_seconds=60, inputs=None, outputs=None, agent_id=None) -> Job` |
-| отменить           | `CancelJob(id string) error`                                 | `cancelJob(id): Promise<Job>`                                                          | `cancel_job(job_id) -> Job`                                                                                       |
-| закончить пораньше | `StopJob(id string) error`                                   | `stopJob(id): Promise<Job>`                                                            | `stop_job(job_id) -> Job`                                                                                         |
-| прочитать          | `Job(id) (*Job, error)`, `Jobs(f JobFilter) ([]*Job, error)` | `getJob(id)`, `listJobs(filter?: {status?, queue?, agentId?, limit?, after?})`         | `get_job(job_id)`, `list_jobs(*, status=None, queue=None, agent_id=None, limit=0, after=None)`                    |
-| убрать старые      | `Prune(PruneOptions) (int, error)`                           | `prune({jobsOlderThanMs?, commandsOlderThanMs?, eventsOlderThanMs?}): Promise<number>` | `prune(*, jobs_older_than_ms=None, commands_older_than_ms=None, events_older_than_ms=None) -> int`                |
+### Манифест воркера
 
-Списки задач — новые первыми; `limit` и `after` (id последней записи прошлой страницы) — чтение
-страницами; записи `after` нет — страница пустая ([docs/store.md](docs/store.md#методы-по-языкам)). `prune` удаляет завершённые задачи,
-команды и события старше заданных сроков ([docs/store.md](docs/store.md#уборка)).
+Воркер обязан описать себя манифестом — версия (обязательно), ключи настроек со схемой,
+маршруты, события ([workers](docs/workers.md#манифест-что-воркер-умеет)). Без корректного
+манифеста агент не регистрирует воркер (`state: invalid`). SDK принимает манифест от агента
+терпимо: неверные и незнакомые поля пропускаются. Бэкенд видит его в
+`agent.workers[].manifest` (`WorkerManifest`), а проверять удобно помощниками:
 
-`JobRequest`: `queue`, `data`, `maxAttempts` (1), `leaseSeconds` (60, не меньше 5), `inputs` (имя →
-содержимое или ссылка), `outputs` (имена файлов-результатов), `agentId` (закрепить).
+```ts
+import { matchRoute, supports, workerManifest } from "agent-sdk/server";
 
-**Команды** — [docs/commands.md](docs/commands.md)
+const agent = await agents.getAgent(agentId);
+if (!agent) throw new Error("нет агента");
 
-| Что                    | Go                                                               | Node                                                                           | Python                                                                                         |
-| ---------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| отправить              | `Command(req CommandRequest) (*Command, error)`                  | `command(req: CommandRequest): Promise<Command>`                               | `command(name, args=None, *, timeout_sec=60, agent_id=None) -> Command`                        |
-| отправить и ждать итог | `Call(ctx, req CommandRequest) (*Command, error)`                | `call(req): Promise<Command>`                                                  | `call(name, args=None, *, timeout_sec=60, agent_id=None) -> Command`                           |
-| отменить               | `CancelCommand(id string) (*Command, error)`                     | `cancelCommand(id): Promise<Command>`                                          | `cancel_command(command_id) -> Command`                                                        |
-| прочитать              | `CommandByID(id) (*Command, error)`, `Commands(f CommandFilter)` | `getCommand(id)`, `listCommands(filter?: {status?, agentId?, limit?, after?})` | `get_command(command_id)`, `list_commands(*, status=None, agent_id=None, limit=0, after=None)` |
+supports(agent, "echo", { route: { method: "POST", path: "/echo" } }); // true — маршрут описан
+supports(agent, "echo", { config: "settings", event: "echo.done" }); // все условия сразу
+workerManifest(agent, "echo"); // WorkerManifest | undefined
+matchRoute("/items/{id}", "/items/42?full=1"); // true: {id} — один сегмент, ?… не учитывается
+```
 
-Списки команд — новые первыми, страницами — как задачи.
+`supports` — `true`, если в манифесте воркера есть всё заданное: маршрут (метод без учёта
+регистра, путь по шаблону), ключ настроек, тип события. Нет манифеста — `false`.
 
-`CommandRequest`: `name`, `args`, `timeoutSec` (60), `agentId` (без него — агент на связи,
-объявивший команду).
-
-**Состояние** — [docs/state.md](docs/state.md)
-
-| Что               | Go                                                                                   | Node                                                                  | Python                                                                |
-| ----------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| задать снимок     | `SetState(domain string, spec any, agentID string) (*DesiredState, error)`           | `setState(domain, spec, { agentId? }): Promise<DesiredState>`         | `set_state(domain, spec, agent_id=None) -> DesiredState`              |
-| удалить снимок    | `DeleteState(domain, agentID string) (*DesiredState, error)`                         | `deleteState(domain, { agentId? }): Promise<DesiredState \| null>`    | `delete_state(domain, agent_id=None) -> DesiredState \| None`         |
-| история раздела   | `StateHistory(domain, agentID string, limit int) ([]*DesiredState, error)`           | `stateHistory(domain, { agentId?, limit? }): Promise<DesiredState[]>` | `state_history(domain, agent_id=None, limit=20)`                      |
-| откатить к версии | `RollbackState(domain string, version int64, agentID string) (*DesiredState, error)` | `rollbackState(domain, version, { agentId? })`                        | `rollback_state(domain, version, agent_id=None)`                      |
-| все снимки        | `States() ([]*DesiredState, error)`                                                  | `listStates()`                                                        | `list_states()`                                                       |
-| запечатать секрет | `Seal(agentID string, value any) (json.RawMessage, error)`                           | `seal(agentId, value): Promise<Sealed>`                               | `seal(agent_id, value) -> {"$sealed": …}` (нужен `agent-sdk[crypto]`) |
-
-**Агенты и связь** — [docs/connection.md](docs/connection.md)
-
-| Что                                  | Go                                                                          | Node                                        | Python                                 |
-| ------------------------------------ | --------------------------------------------------------------------------- | ------------------------------------------- | -------------------------------------- |
-| все агенты                           | `List() ([]*Agent, error)`                                                  | `listAgents(): Promise<Agent[]>`            | `list_agents() -> List[Agent]`         |
-| агент                                | `Agent(id) (*Agent, error)`                                                 | `getAgent(id): Promise<Agent \| undefined>` | `get_agent(agent_id) -> Agent \| None` |
-| отозвать                             | `Revoke(agentID string) error`                                              | `revoke(agentId): Promise<Agent>`           | `revoke(agent_id) -> Agent`            |
-| удалить отозванного                  | `DeleteAgent(agentID string) error`                                         | `deleteAgent(agentId): Promise<void>`       | `delete_agent(agent_id) -> None`       |
-| сменить ключ                         | `RotateKey(agentID string) (*Command, error)`                               | `rotateKey(agentId): Promise<Command>`      | `rotate_key(agent_id) -> Command`      |
-| доставить изменения других процессов | `Refresh(agentID string)` — `""` — все                                      | `refresh(agentId?): Promise<void>`          | `refresh(agent_id=None)`               |
-| регистрация вручную                  | `Enroll(token string, info EnrollInfo) (agentID, secret string, err error)` | —                                           | —                                      |
-
-**Воркеры** — [docs/workers.md](docs/workers.md)
-
-| Что                    | Go                                                                       | Node                                                        | Python                                                 |
-| ---------------------- | ------------------------------------------------------------------------ | ----------------------------------------------------------- | ------------------------------------------------------ |
-| пауза очередей воркера | `PauseWorker(agentID, name string, queues ...string) (*Command, error)`  | `pauseWorker(agentId, name, { queues? }): Promise<Command>` | `pause_worker(agent_id, name, queues=None) -> Command` |
-| снять паузу сервера    | `ResumeWorker(agentID, name string, queues ...string) (*Command, error)` | `resumeWorker(agentId, name, { queues? })`                  | `resume_worker(agent_id, name, queues=None)`           |
-
-**Наблюдение** — [docs/observe.md](docs/observe.md)
-
-| Что               | Go                                                                      | Node                                                                   | Python                                                                                                                  |
-| ----------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| подписка          | `Subscribe(agentID string, req SubscribeRequest) (Subscription, error)` | `subscribe(agentId, opts: SubscribeOptions): Promise<SubscriptionRef>` | `subscribe(agent_id, *, id=None, ttl_ms=30000, status=None, metrics=None, logs=None, channels=None) -> {"id", "until"}` |
-| снять подписку    | `Unsubscribe(agentID, id string) error`                                 | `unsubscribe(agentId, id): Promise<void>`                              | `unsubscribe(agent_id, id)`                                                                                             |
-| история метрик    | `Metrics(agentID string, since int64) ([]MetricsPoint, error)`          | `listMetrics(agentId, { since? }): Promise<MetricsPoint[]>`            | `list_metrics(agent_id, since=None) -> List[MetricsPoint]`                                                              |
-| события воркеров  | `Events(n int) ([]AgentEvent, error)` — новые первыми                   | `listEvents(limit = 100)` — новые первыми                              | `list_events(limit=100)` — новые первыми                                                                                |
-| активные проблемы | `Alerts() ([]Alert, error)`                                             | `alerts(): Promise<Alert[]>`                                           | `alerts() -> List[Alert]`                                                                                               |
-
-Подписка: `id?`, `ttlMs` (30000; Go — `TTL time.Duration`), `status: {intervalMs}`, `metrics:
-{intervalMs?, groups?}`, `logs: {level}`, `channels: {канал: {intervalMs}}`; Go —
-`server.SubscribeRequest{ID, TTL, Status *IntervalSpec, Metrics *MetricsSpec, Logs *LogsSpec,
-Channels map[string]IntervalSpec}`. Интервалы — не меньше 200 мс.
-
-**Выпуск и обновление** — [docs/releases.md](docs/releases.md)
-
-| Что                    | Go                                                          | Node                                             | Python                                         |
-| ---------------------- | ----------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------- |
-| манифест выпуска       | `Release() *Release`                                        | `release(): Promise<ReleaseManifest \| null>`    | `release() -> dict \| None`                    |
-| кого обновить          | `UpdateCandidates() ([]UpdateCandidate, error)`             | `updateCandidates(): Promise<UpdateCandidate[]>` | `update_candidates() -> List[UpdateCandidate]` |
-| обновить агента        | `UpdateAgent(agentID string) (*Command, error)`             | `updateAgent(agentId): Promise<Command>`         | `update_agent(agent_id) -> Command`            |
-| какие воркеры обновить | `WorkerUpdateCandidates() ([]WorkerUpdateCandidate, error)` | `workerUpdateCandidates()`                       | `worker_update_candidates()`                   |
-| обновить воркер        | `UpdateWorker(agentID, name string) (*Command, error)`      | `updateWorker(agentId, name): Promise<Command>`  | `update_worker(agent_id, name) -> Command`     |
-| команда установки      | `InstallCommand(opts InstallOptions) (string, error)`       | `installCommand(opts: InstallOptions): string`   | `install_command(**opts) -> str`               |
-
-**От имени пользователя** — `by(actor)` ([docs/events.md](docs/events.md#журнал-аудита)): Go
-`agents.By(actor) *server.Actor`, Node `agents.by(actor): Actor`, Python `agents.by(actor) ->
-Actor` — те же изменяющие методы (задачи, команды и `cancelCommand`, состояние, `revoke`,
-`deleteAgent`, `rotateKey`, `updateAgent`, `updateWorker`, `pauseWorker`, `resumeWorker`) с
-отметкой `actor`.
-
-### Команда установки
-
-`installCommand(opts)` собирает строку `curl -fsSL '<адрес>/api/v1/agent-link/install.sh' | sudo
-sh -s -- --token '…' [флаги]` — по флагу `install.sh` на каждую заданную опцию:
-
-| Опция (Node)                      | Go (`InstallOptions`) | Python                | Флаг                                   |
-| --------------------------------- | --------------------- | --------------------- | -------------------------------------- |
-| `token` или `tokenFile`           | `Token`, `TokenFile`  | `token`, `token_file` | `--token`, `--token-file`              |
-| `name`                            | `Name`                | `name`                | `--name`                               |
-| `user`                            | `User`                | `user`                | `--user`                               |
-| `config`                          | `Config`              | `config`              | `--config`                             |
-| `privileged`                      | `Privileged`          | `privileged`          | `--privileged`                         |
-| `killMode` (`process` \| `mixed`) | `KillMode`            | `kill_mode`           | `--kill-mode`                          |
-| `packages`                        | `Packages`            | `packages`            | `--packages`                           |
-| `packagesByManager`               | `PackagesByManager`   | `packages_by_manager` | `--packages-apt` … `--packages-zypper` |
-| `sysctl`                          | `Sysctl`              | `sysctl`              | `--sysctl` (по алфавиту ключей)        |
-| `rwPaths`                         | `RWPaths`             | `rw_paths`            | `--rw-path`                            |
-| `caFile`                          | `CAFile`              | `ca_file`             | `--ca-file`                            |
-| `workers`                         | `Workers`             | `workers`             | `--worker`                             |
-| `stopTimeout`                     | `StopTimeout`         | `stop_timeout`        | `--stop-timeout`                       |
-| `baseUrl`                         | `BaseURL`             | `base_url`            | адрес (иначе — `baseUrl` `Agents`)     |
-
-Что делает каждый флаг — [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md#установка); примеры —
-[docs/releases.md](docs/releases.md#установка-одной-командой).
+Историю SDK не хранит: метрики, события воркеров, журнал, итоги действий, проблемы и аудит
+приходят событиями (и `onEvent`), а последнее состояние агента — `hello`, `status`, последняя
+точка метрик, текущие проблемы — в записи агента (`getAgent`, `listAlerts`). Нужна история —
+сохраняйте её сами из событий ([observe](docs/observe.md)).
 
 ### События
 
-| Событие         | Go (`server.Options`)                                    | Node (`agents.on(…)`)                                       | Python (`agents.on(…)`) | Что                                  |
-| --------------- | -------------------------------------------------------- | ----------------------------------------------------------- | ----------------------- | ------------------------------------ |
-| `change`        | `OnChange func(Change)`                                  | `(c: Change) => …`                                          | `fn(Change)`            | что изменилось: `{kind, id}`         |
-| `metrics`       | `OnMetrics func(agentID string, p MetricsPoint)`         | `(agentId, point) => …`                                     | `fn(agent_id, point)`   | каждая точка метрик                  |
-| `log`           | `OnLog func(agentID string, entries []message.LogEntry)` | `(agentId, entries) => …`                                   | `fn(agent_id, entries)` | пачка записей лога агента и воркеров |
-| `alert`         | `OnAlert func(Alert)`                                    | `(a: Alert) => …`                                           | `fn(Alert)`             | проблема началась или закончилась    |
-| `audit`         | `OnAudit func(AuditEntry)`                               | `(e: AuditEntry) => …`                                      | `fn(AuditEntry)`        | изменяющее действие API              |
-| `stateDeleted`  | `OnStateDeleted func(domain, agentID string)`            | `({ domain, agentId? }) => …`                               | `fn(domain, agent_id)`  | снимок удалён                        |
-| по видам (Node) | —                                                        | `agent`, `job`, `command`, `state`, `stateApplied`, `event` | —                       | готовые объекты                      |
+```ts
+agents.on("agent", (a: Agent) => {}); // регистрация, подключение, отключение, status, отзыв
+agents.on("event", (e: AgentEvent) => {}); // событие воркера (после onEvent)
+agents.on("metrics", (m: MetricsEvent) => {}); // каждая точка метрик
+agents.on("log", ({ agentId, entries }: LogEvent) => {}); // журнал агента
+agents.on("config", (s: ConfigStatus) => {}); // статус ключа настроек изменился
+agents.on("alert", (a: AlertEvent) => {}); // проблема началась (active) или закончилась
+agents.on("action", (a: ActionRecord) => {}); // итог действия
+agents.on("audit", (e: AuditEntry) => {}); // кто что сделал
+agents.on("change", ({ agentId, reason }: ChangeEvent) => {}); // другим процессам — refresh(agentId)
+```
 
-Go вызывает обработчики синхронно, вне блокировки `Agents` — не блокируйте, методы `Agents`
-вызывать можно. Python принимает функцию или корутину; `on` возвращает функцию отписки, есть
-`off(event, fn)`. Node — типизированный `EventEmitter`. Подробно —
-[docs/events.md](docs/events.md).
+Ошибка в подписчике не мешает работе `Agents`: она попадает в журнал.
+
+### Ошибки
+
+Методы отклоняются с `AgentsError`: `code` (строка), `message`, `status` — HTTP-статус, с которым
+ошибку удобно вернуть клиенту бэкенда, `retryAfterSec` — для 429.
+
+| Код                    | Статус   | Когда                                                                                                                                                                                                                                                                                                                                                                                         |
+| ---------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MESSAGE_INVALID`      | 400      | неверные аргументы: имя воркера или ключа, путь, значение                                                                                                                                                                                                                                                                                                                                     |
+| `AGENT_NOT_FOUND`      | 404      | нет агента                                                                                                                                                                                                                                                                                                                                                                                    |
+| `AGENT_REVOKED`        | 409      | агент отозван                                                                                                                                                                                                                                                                                                                                                                                 |
+| `AGENT_OFFLINE`        | 503      | агент без связи                                                                                                                                                                                                                                                                                                                                                                               |
+| `AGENT_ELSEWHERE`      | 421      | соединение агента в другом процессе                                                                                                                                                                                                                                                                                                                                                           |
+| `TIMEOUT`              | 504      | нет ответа или итога в срок                                                                                                                                                                                                                                                                                                                                                                   |
+| `CANCELLED`            | 499      | `fetch` отменён (`signal`); действие ждало итога, а `Agents` остановили (`close()`)                                                                                                                                                                                                                                                                                                           |
+| `CONFLICT`             | 409      | запись агента в Store всё время меняется: условная запись не удалась 20 раз подряд ([store](docs/store.md#правила))                                                                                                                                                                                                                                                                           |
+| `BODY_TOO_LARGE`       | 413      | значение настройки больше 4 МБ, тело запроса больше 4 МБ                                                                                                                                                                                                                                                                                                                                      |
+| `UPDATE_NOT_AVAILABLE` | 409      | нет выпуска или сборки под агента                                                                                                                                                                                                                                                                                                                                                             |
+| `WORKER_NOT_RELEASED`  | 409      | воркер не из выпуска                                                                                                                                                                                                                                                                                                                                                                          |
+| `CONFIG_INVALID`       | 400      | `validateConfigs`: значение не подходит под схему ключа из манифеста воркера                                                                                                                                                                                                                                                                                                                  |
+| `WORKER_INVALID`       | 502      | `fetch`: воркер запущен, но не зарегистрирован — не ответил как нужно на `GET /health` или `GET /manifest` ([workers](docs/workers.md#обязательный-минимум))                                                                                                                                                                                                                                  |
+| коды агента            | 409, 5xx | `fetch` — [fetch.md](docs/fetch.md#ошибки); настройки (`ConfigStatus.error`, не исключение) — `CONFIG_REJECTED`, `CONFIG_KEY_UNKNOWN`, `WORKER_INVALID` ([configs.md](docs/configs.md#статус-применения)); действия — `ACTION_UNKNOWN`, `WORKER_UNKNOWN`, `BUSY`, `UPDATE_NOT_VERIFIED`, `UPDATE_NOT_SUPPORTED`, `UPDATE_FAILED`, `ACTION_FAILED` ([spec §15](spec/README.md#15-коды-ошибок)) |
 
 ### Модели
 
-Поля одинаковые во всех SDK; в JSON — camelCase, в Python — `snake_case` (dataclass'ы,
-`to_dict()` — JSON для интерфейса).
+```ts
+interface Agent {
+  id: string;
+  name: string;
+  labels: Record<string, string>;
+  online: boolean;
+  revoked: boolean;
+  enrolledAt: number;
+  lastSeenAt?: number;
+  connectedAt?: number;
+  address?: string; // IP последнего подключения
+  version?: string; // версия агента
+  bootId?: string;
+  startedAt?: number;
+  host?: { os; arch; hostname; kernel? };
+  workers: AgentWorker[]; // из hello и последнего status: name, state, message, version, release, builtin, restarts, health (с busy), pending, configs, manifest
+  // state: "starting" | "running" | "invalid" | "backoff" | "stopped"; message — причина invalid
+  hello?: Hello;
+  status?: Status;
+  statusAt?: number;
+  metrics?: MetricsPoint; // последняя точка
+  alerts: Alert[];
+  session?: { id; instance; since }; // какой процесс держит соединение
+}
 
-- **Agent**: `id`, `name`, `labels`, `online`, `revoked`, `transport` (`ws` | `http`),
-  `address`, `enrolledAt`, `lastSeenAt`, `hello`, `capabilities`, `status`, `metrics` (последняя
-  живая точка), `inventory`, `stateApplied` (раздел → последний отчёт), `subscriptions`. Ключ
-  агента наружу не отдаётся.
-- **Job**: `id`, `queue`, `data`, `status` (`queued` | `running` | `completed` | `failed` |
-  `cancelled`), `attempt`, `maxAttempts`, `leaseSeconds`, `agentId`, `pinnedAgentId`,
-  `accepted`, `progress`, `text`, `log` (последние 500 строк), `events` (`[{seq, type, data,
-at}]`), `result`, `error` (`{code, message}`), `stopRequested`, `inputs`, `outputs`,
-  `createdAt`, `finishedAt`, `actor`.
-- **Command**: `id`, `agentId`, `name`, `args`, `timeoutSec`, `status` (`pending` | `running` |
-  `succeeded` | `failed` | `cancelled`), `output` (последние 256 КБ), `result`, `error`, `exitCode` (код выхода
-  из `cmd.done`), `createdAt`, `finishedAt`, `actor`.
-- **DesiredState**: `domain`, `agentId` (пусто — общий), `version`, `spec`, `updatedAt`, `actor`.
-- **AgentEvent**: `agentId`, `agentName`, `source`, `type`, `data`, `at`.
-- **MetricsPoint**: `at` (мс, часы сервера), `backfill`, `metrics`.
-- **Alert**: `type`, `agentId`, `agentName`, `active`, `message`, `at`, `domain?`, `worker?`.
-- **AuditEntry**: `at`, `actor`, `action`, `agentId?`, `target`, `details?`.
-- **Change**: `kind` (`agent` | `job` | `command` | `state` | `event`), `id`.
-- **UpdateCandidate**: `agentId`, `name`, `online`, `current`, `target`, `os`, `arch`;
-  **WorkerUpdateCandidate**: `agentId`, `agentName`, `online`, `worker`, `current`, `target`, `os`,
-  `arch`.
+interface ConfigRecord {
+  agentId;
+  worker;
+  key;
+  version: number;
+  data: unknown;
+  updatedAt;
+  actor?;
+}
+interface ConfigStatus {
+  agentId;
+  worker;
+  key;
+  version: number | null;
+  delivered?;
+  applied?;
+  state: "pending" | "applying" | "applied" | "failed" | "deleting";
+  error?;
+  updatedAt?;
+}
+interface AgentEvent {
+  id;
+  agentId;
+  worker;
+  type;
+  data?;
+  at;
+  receivedAt;
+}
+interface MetricsPoint {
+  at;
+  collectedAt;
+  host?: Record<string, unknown>;
+  workers?: Record<string, unknown>;
+}
+interface Alert {
+  key;
+  agentId;
+  agentName;
+  type: "offline" | "workerDown" | "workerInvalid" | "workerUnhealthy" | "configFailed";
+  worker?;
+  configKey?;
+  message;
+  since;
+}
+interface ActionRecord {
+  id;
+  agentId;
+  name: "worker.restart" | "worker.update" | "agent.update" | "agent.rotateKey" | "agent.logs";
+  args?;
+  actor?;
+  status: "done" | "failed";
+  result?;
+  error?;
+  createdAt;
+  finishedAt;
+}
+interface LogEntry {
+  at;
+  level: "debug" | "info" | "warn" | "error";
+  source;
+  msg;
+  attrs?;
+}
+```
 
-### Хранилище
+Типы сообщений (`Hello`, `Status`, `WorkerStatus`, `WorkerManifest`, `Metrics`, `Envelope`, …) и константы
+(`LINK_PATH`, `WS_CHANNEL`, `Close`, `NAME_PATTERN`) тоже экспортируются.
 
-`Store` — интерфейс хранения агентов, задач, команд, состояния с историей, событий и метрик;
-`MemoryStore` — в памяти, для разработки. Методы по языкам, служебные поля, правила (условная
-запись по `rev`, растущие версии, история, уборка) и пример на SQL — [docs/store.md](docs/store.md).
+### Store
 
-### Файлы задач
+`Store` — интерфейс хранилища, `MemoryStore` — в памяти. Свой Store и пример на Postgres —
+[docs/store.md](docs/store.md).
 
-`Files` — откуда агент и воркер берут ссылки на файлы задач. Go — `Inputs(job, inputs) error`,
-`URLs(job, baseURL) (message.JobURLs, error)` (если провайдер ещё и `http.Handler`, `Agents`
-обслуживает им `/files/`); Node — `saveInputs(jobId, inputs)`, `urls(job, baseUrl, only?)`,
-`handle?(req, res, path)`; Python — `prepare(job, inputs)`, `urls(job, base_url)`,
-`handle(method, key, body)`. `MemoryFiles` — файлы в памяти, ссылки на час. Подробно —
-[docs/jobs.md](docs/jobs.md#файлы-задачи).
+### HTTP-помощники
 
-### Ошибки API
-
-Node — `AgentsError` (`code`, `status` — HTTP-статус для ответа, `retryAfterSec`), Python —
-`AgentsError(code, message, status)`, Go — `*message.Error` (`Code`, `Message`) или
-`server.ErrNotFound` при чтении.
-
-| Код                                       | Когда                                                                        |
-| ----------------------------------------- | ---------------------------------------------------------------------------- |
-| `MESSAGE_INVALID`                         | неверные аргументы: имя не по правилу, интервал меньше 200 мс, нет токена    |
-| `AGENT_NOT_FOUND`                         | агента нет                                                                   |
-| `AGENT_REVOKED`                           | агент отозван (`subscribe`, `rotateKey`, `pauseWorker`, …)                   |
-| `AGENT_NOT_REVOKED`                       | `deleteAgent`: агент не отозван (`409`)                                      |
-| `JOB_NOT_FOUND`, `JOB_NOT_ACTIVE`         | `cancelJob` / `stopJob`: задачи нет или она уже завершена                    |
-| `COMMAND_NOT_SUPPORTED`                   | ни один агент (или этот агент) не объявил команду                            |
-| `COMMAND_NOT_FOUND`, `COMMAND_NOT_ACTIVE` | `cancelCommand`: команды нет (`404`) или она уже завершена (`409`)           |
-| `STORE_CONFLICT`                          | запись всё время меняют другие процессы, 8 попыток не записались (`409`)     |
-| `STATE_VERSION_NOT_FOUND`                 | `rollbackState`: версии нет в истории                                        |
-| `SEAL_NOT_AVAILABLE`                      | `seal`: агент не сообщил ключ шифрования (в Python — ещё нет `cryptography`) |
-| `UPDATE_NOT_AVAILABLE`                    | `updateAgent` / `updateWorker`: нет выпуска, сборки или агент не умеет       |
-| `ENROLL_RATE_LIMITED`                     | регистрация: слишком много неудачных попыток (`429`)                         |
-| `MESSAGE_INVALID` (`413`)                 | регистрация: тело больше 64 КБ                                               |
-| `AGENT_ENROLLMENT_TOKEN_INVALID`          | регистрация: неверный токен (`401`)                                          |
-
----
+`readBody(req, limit)`, `readJSON(req, limit)`, `sendJSON(res, status, body)`,
+`baseUrl(req, trustProxy)`, `clientAddress(req, trustProxy)` — для своих маршрутов без
+фреймворка.
 
 ## Проверки
 
-- Каждый SDK проверяется на образцах сообщений [spec/examples](spec/examples) и своими тестами.
-- Настоящий агент проходит один и тот же сценарий против серверов на всех трёх SDK
-  (`test/conformance`): Go — `test/testserver`, Node — `examples/server`, Python —
-  `examples/server-python`.
-- Как менять формат сообщений и SDK — [CONTRIBUTING.md](../CONTRIBUTING.md).
+```bash
+cd sdk/node && npm ci && npm run lint && npm run typecheck && npm test && npm run build
+```
+
+Тесты (`node:test`) прогоняют все образцы `spec/examples` между сервером и агентом через SDK с
+фейковым агентом на WebSocket, а также сценарии: регистрацию с её пределами, коды закрытия,
+повторы важного и потока, `fetch` с потоком, отменой и сроком, настройки и их сверку, манифест
+воркера и проверку настроек по схеме, сводку `watch`, метрики, проблемы, смену ключа, выпуск и
+несколько процессов с общим Store.

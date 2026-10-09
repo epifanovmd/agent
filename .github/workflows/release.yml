@@ -1,8 +1,8 @@
-# Выпуск по тегу v*: проверки → подписанные сборки агента (scripts/release.sh) и SDK (архив
-# Node, пакет Python) → один GitHub Release; образы в GHCR: agent:<версия>-python,
-# agent-dist:<версия>. Всё ставится с GitHub — без npm и PyPI. Тег с «-» (v1.2.0-rc.1) —
-# предварительный выпуск.
-# Нужны в настройках репозитория (agent keygen выдаёт пару):
+# Выпуск по тегу v*: проверки → подписанные сборки агента (scripts/release.sh) и архив
+# серверного SDK (npm pack) → один GitHub Release; образы в GHCR: agent:<версия> (минимальный),
+# agent:<версия>-python (с python3 для воркеров), agent-dist:<версия>. Всё ставится с GitHub —
+# без npm. Тег с «-» (v1.2.0-rc.1) — предварительный выпуск.
+# Нужны в настройках репозитория (agent-release keygen выдаёт пару):
 #   секрет AGENT_SIGNING_KEY — закрытый ключ подписи (base64 seed Ed25519);
 #   переменная AGENT_UPDATE_PUBLIC_KEY — открытый ключ: вшивается в сборки агента,
 #   чтобы они проверяли обновления без настройки update.publicKey.
@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 jobs:
-  # То же, что make vet, race, sdk-test, examples-test, — и версия совпадает с тегом.
+  # То же, что make vet, race, sdk-test, examples-test, e2e, — и версия совпадает с тегом.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -26,28 +26,22 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.13"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
-      - run: pip install websockets cryptography
       - name: SDK Node
         working-directory: sdk/node
         run: npm ci && npm run lint && npm run typecheck && npm test && npm run build
-      - name: SDK Python
-        working-directory: sdk/python
-        run: python -m unittest discover -s tests -t .
       - name: Примеры
         run: |
-          (cd examples/server && npm ci && npm run typecheck && npm test)
-          (cd examples/workers/node && npm ci && npm run typecheck)
-          (cd examples/web && npm ci && npm run build)
-          python -m unittest discover -s examples/server-python/tests -t examples/server-python
+          (cd examples/server && npm ci && npm run lint && npm run typecheck)
+          node --check examples/workers/node-echo/main.mjs
+          python3 -m py_compile examples/workers/echo/main.py
       - run: go vet ./...
-      # Агент, Go-SDK, эталоны, integration, conformance (серверы на Go, Node, Python).
+      # Агент, образцы сообщений, integration (сервер на agent-sdk/server).
       - run: go test -race ./...
+      - name: Сквозные тесты стенда
+        run: scripts/e2e.sh
 
   # Выпуск агента: сборки linux/darwin × amd64/arm64, manifest.json с подписями, install.sh.
   build:
@@ -74,7 +68,7 @@ jobs:
           path: out/*
           if-no-files-found: error
 
-  # SDK: Node — архив npm (agent-sdk-<версия>.tgz, с собранным dist), Python — wheel и sdist.
+  # Серверный SDK — архив npm (agent-sdk-<версия>.tgz, с собранным dist).
   sdk:
     runs-on: ubuntu-latest
     needs: test
@@ -83,19 +77,11 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.13"
       - name: SDK Node
         working-directory: sdk/node
         run: |
           npm ci && npm run lint && npm run typecheck && npm test
           mkdir -p ../../out && npm pack --pack-destination ../../out
-      - name: SDK Python
-        run: |
-          pip install websockets cryptography build
-          (cd sdk/python && python -m unittest discover -s tests -t .)
-          python -m build sdk/python --outdir out
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sdk
@@ -128,9 +114,15 @@ jobs:
       matrix:
         include:
           - file: deploy/Dockerfile
+            target: agent
+            image: agent
+            suffix: ""
+          - file: deploy/Dockerfile
+            target: agent-python
             image: agent
             suffix: "-python"
           - file: deploy/Dockerfile.dist
+            target: ""
             image: agent-dist
             suffix: ""
     steps:
@@ -156,6 +148,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -164,5 +157,5 @@ jobs:
             agent_signing_key=${{ secrets.AGENT_SIGNING_KEY }}
           build-args: |
             AGENT_UPDATE_PUBLIC_KEY=${{ vars.AGENT_UPDATE_PUBLIC_KEY }}
-          cache-from: type=gha,scope=release-${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=release-${{ matrix.image }}
+          cache-from: type=gha,scope=release-${{ matrix.image }}${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.image }}${{ matrix.suffix }}

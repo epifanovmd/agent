@@ -1,0 +1,146 @@
+{
+  "action.worker.restart": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "action",
+      "id": "d4e5f60718293a4b5c6d7e8f90a1b2c3",
+      "data": { "name": "worker.restart", "args": { "name": "echo" } }
+    }
+  },
+  "action.worker.restart.force": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "action",
+      "id": "c3d4e5f60718293a4b5c6d7e8f90a1b2",
+      "data": { "name": "worker.restart", "args": { "name": "echo", "force": true } }
+    }
+  },
+  "action.worker.update": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "action",
+      "id": "e5f60718293a4b5c6d7e8f90a1b2c3d4",
+      "data": {
+        "name": "worker.update",
+        "args": {
+          "name": "report",
+          "version": "1.5.0",
+          "url": "/api/v1/agent-link/releases/report-1.5.0-linux-amd64",
+          "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+          "signature": "MEUCIQDexampleSignatureBase64AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+        }
+      }
+    }
+  },
+  "action.agent.update": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "action",
+      "id": "f60718293a4b5c6d7e8f90a1b2c3d4e5",
+      "data": {
+        "name": "agent.update",
+        "args": {
+          "version": "1.1.0",
+          "url": "/api/v1/agent-link/releases/agent-linux-amd64",
+          "sha256": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752",
+          "signature": "MEUCIQDexampleSignatureBase64BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=="
+        }
+      }
+    }
+  },
+  "action.agent.rotateKey": {
+    "from": "server",
+    "to": "agent",
+    "message": { "type": "action", "id": "0718293a4b5c6d7e8f90a1b2c3d4e5f7", "data": { "name": "agent.rotateKey" } }
+  },
+  "action.agent.logs": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "action",
+      "id": "18293a4b5c6d7e8f90a1b2c3d4e5f607",
+      "data": { "name": "agent.logs", "args": { "worker": "echo", "lines": 100 } }
+    }
+  },
+  "action.result.worker.restart": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.result",
+      "id": "293a4b5c6d7e8f90a1b2c3d4e5f60718",
+      "re": "d4e5f60718293a4b5c6d7e8f90a1b2c3",
+      "data": { "ok": true }
+    }
+  },
+  "action.result.worker.update": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.result",
+      "id": "3a4b5c6d7e8f90a1b2c3d4e5f6071829",
+      "re": "e5f60718293a4b5c6d7e8f90a1b2c3d4",
+      "data": { "ok": true, "result": { "version": "1.5.0", "previous": "1.4.0" } }
+    }
+  },
+  "action.result.agent.update": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.result",
+      "id": "4b5c6d7e8f90a1b2c3d4e5f60718293a",
+      "re": "f60718293a4b5c6d7e8f90a1b2c3d4e5",
+      "data": { "ok": true, "result": { "version": "1.1.0", "previous": "1.0.0" } }
+    }
+  },
+  "action.result.agent.rotateKey": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.result",
+      "id": "5c6d7e8f90a1b2c3d4e5f60718293a4b",
+      "re": "0718293a4b5c6d7e8f90a1b2c3d4e5f7",
+      "data": {
+        "ok": true,
+        "result": { "secretHash": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae" }
+      }
+    }
+  },
+  "action.result.agent.logs": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.result",
+      "id": "6d7e8f90a1b2c3d4e5f60718293a4b5c",
+      "re": "18293a4b5c6d7e8f90a1b2c3d4e5f607",
+      "data": {
+        "ok": true,
+        "result": {
+          "entries": [
+            { "at": 1791380001000, "level": "info", "source": "echo", "msg": "слушаю сокет" },
+            { "at": 1791380011200, "level": "warn", "source": "echo", "msg": "listen: address already in use" }
+          ]
+        }
+      }
+    }
+  },
+  "action.result.error": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.result",
+      "id": "7e8f90a1b2c3d4e5f60718293a4b5c6d",
+      "re": "e5f60718293a4b5c6d7e8f90a1b2c3d4",
+      "data": {
+        "ok": false,
+        "error": {
+          "code": "UPDATE_FAILED",
+          "message": "новая сборка не ответила ok на GET /health за минуту; возвращена 1.4.0"
+        }
+      }
+    }
+  }
+}

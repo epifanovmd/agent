@@ -4,13 +4,15 @@ package worker
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
-	"log/slog"
+	"io"
+	"net/http"
+	"path/filepath"
+	"strings"
 
 	"github.com/epifanovmd/agent/internal/config"
-	"github.com/epifanovmd/agent/internal/jobs"
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 // CleanupResult — итог уборки одного воркера; Err == nil — убрано.
@@ -19,80 +21,95 @@ type CleanupResult struct {
 	Err    error
 }
 
-// Cleanup — уборка при удалении агента с узла (`agent cleanup`, без связи с
-// сервером): каждый воркер конфигурации по очереди запускается одной копией,
-// после регистрации получает worker.cleanup, ответ worker.cleaned ждётся до
-// его stopTimeout, затем воркер останавливается. До worker.cleanup воркер
-// получает контекст wctx с mode cleanup.
-func Cleanup(ctx context.Context, specs []config.Worker, log *slog.Logger, wctx message.WorkerContext) []CleanupResult {
-	sup := New(nil, jobs.New(noSender{}, log, func() {}), log, func() {}, wctx.Agent.Version)
-	sup.cleaning = true
-	wctx.Mode = message.WorkerModeCleanup
-	sup.SetContext(wctx)
-	results := make([]CleanupResult, 0, len(specs))
-	for _, spec := range specs {
-		spec.Replicas = 1
-		// Уборка идёт вне службы агента (из install.sh): группы cgroup
-		// службы нет — без ограничений.
-		spec.Limits = config.Limits{}
-		err := sup.cleanupOne(ctx, &worker{spec: spec})
-		if err != nil {
-			log.Error("уборка воркера не удалась", "worker", spec.Name, "err", err)
-		} else {
-			log.Info("воркер убрал за собой", "worker", spec.Name)
-		}
-		results = append(results, CleanupResult{Worker: spec.Name, Err: err})
+// Cleanup — уборка перед удалением агента (`agent uninstall`, §13): каждый
+// воркер по очереди подхватывается (если работает после остановки агента)
+// или запускается, получает POST /cleanup (срок — stopTimeout) и
+// останавливается. Процессы воркеров, которых нет в настройках,
+// останавливаются. Токены воркеров — у Supervisor s (сокет агента на это
+// время тоже работает).
+func (s *Supervisor) Cleanup(ctx context.Context) []CleanupResult {
+	known := map[string]bool{}
+	for _, name := range s.Names() {
+		known[name] = true
 	}
-	return results
+	s.stopOrphans(known)
+	s.wg.Wait()
+	var out []CleanupResult
+	for _, name := range s.Names() {
+		w := s.get(name)
+		w.mu.Lock()
+		spec := w.spec
+		w.mu.Unlock()
+		err := w.cleanup(ctx, spec)
+		if err != nil {
+			s.opts.Log.Error("уборка воркера не удалась", "worker", name, "err", err)
+		} else {
+			s.opts.Log.Info("воркер убрал за собой", "worker", name)
+		}
+		out = append(out, CleanupResult{Worker: name, Err: err})
+	}
+	return out
 }
 
-func (s *Supervisor) cleanupOne(ctx context.Context, w *worker) error {
-	timeout := w.spec.StopTimeout.Std()
-	inst, err := startInstance(s, w, w.spec.Name+"#cleanup")
-	if err != nil {
-		return err
+func (w *Worker) cleanup(ctx context.Context, spec config.Worker) error {
+	p, _ := w.adopt(ctx, spec)
+	if p == nil {
+		var err error
+		if p, err = w.start(ctx, spec); err != nil {
+			return err
+		}
 	}
 	defer func() {
-		stopCtx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		inst.terminate(stopCtx)
+		p.stop()
+		removeState(w.sup.stateDir, w.name)
 	}()
-	select {
-	case <-inst.ready:
-	case <-inst.exited:
-		return fmt.Errorf("завершился до регистрации: %s", inst.exitReason())
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	stopTimeout := spec.Lifecycle.StopTimeout.Std()
+	cctx, cancel := context.WithTimeout(ctx, stopTimeout)
 	defer cancel()
-	env := message.MustNew(message.TypeWorkerCleanup, struct{}{})
-	env.ID = message.NewID()
-	reply, err := inst.await(callCtx, "cleanup:"+env.ID, env, nil)
+	req, _ := http.NewRequestWithContext(cctx, http.MethodPost, "http://worker"+message.CleanupPath, nil)
+	resp, err := p.client.Do(req)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			return fmt.Errorf("нет ответа на worker.cleanup за %s", timeout)
+		if cctx.Err() != nil && ctx.Err() == nil {
+			return fmt.Errorf("нет ответа на POST /cleanup за %s", stopTimeout)
 		}
 		return err
 	}
-	var cleaned message.WorkerCleaned
-	if err := reply.Decode(&cleaned); err != nil {
-		return err
-	}
-	if !cleaned.OK {
-		if cleaned.Error == "" {
-			cleaned.Error = "уборка не удалась"
-		}
-		return errors.New(cleaned.Error)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return nil // убирать нечего: воркер уборку не поддерживает
+	case resp.StatusCode/100 != 2:
+		return fmt.Errorf("POST /cleanup: HTTP %d %s", resp.StatusCode, ErrorText(body))
 	}
 	return nil
 }
 
-// noSender — сервера при уборке нет: задач воркеру не выдаётся.
-type noSender struct{}
+// ErrorText — текст ошибки из ответа воркера: поле message JSON или тело
+// как есть (до 1000 символов).
+func ErrorText(body []byte) string {
+	var e message.WorkerError
+	if json.Unmarshal(body, &e) == nil && e.Message != "" {
+		return e.Message
+	}
+	text := strings.TrimSpace(string(body))
+	if r := []rune(text); len(r) > 1000 {
+		text = string(r[:1000]) + "…"
+	}
+	return text
+}
 
-func (noSender) Stream(string, any)         {}
-func (noSender) Reliable(string, any) error { return nil }
-func (noSender) Request(context.Context, string, any, any) error {
-	return errors.New("нет связи с сервером")
+// StopProcesses — `agent stop-workers`: остановить процессы воркеров,
+// оставшиеся работать после остановки агента (файлы dataDir/processes):
+// SIGTERM, не вышел за stopTimeout — SIGKILL. Итог — имена остановленных.
+func StopProcesses(dataDir string) []string {
+	dir := filepath.Join(dataDir, ProcessesDir)
+	var out []string
+	for _, name := range stateNames(dir) {
+		if st, ok := readState(dir, name); ok && stopOrphan(st) {
+			out = append(out, name)
+		}
+		removeState(dir, name)
+	}
+	return out
 }

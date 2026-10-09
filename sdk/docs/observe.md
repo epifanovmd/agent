@@ -1,414 +1,179 @@
-# Наблюдение: метрики, подписки, показатели, логи
+# Наблюдение: состояние, метрики, журнал, события, проблемы
 
-Что агент присылает о себе и об узле, как попросить присылать чаще и подробнее, пока на узел
-смотрят, и где всё это видно в бэкенде. Справочник API — [sdk/README.md](../README.md), формат —
-[sdk/spec §6.2](../spec/README.md#62-статус-и-метрики),
-[§6.8](../spec/README.md#68-лог-агента-и-воркеров-log),
-[§6.9](../spec/README.md#69-подписка-сервера), образцы —
-[observe.json](../spec/examples/observe.json), [connection.json](../spec/examples/connection.json)
-(`welcome.subscription`, `config.subscription`).
+Что бэкенд знает об агенте и его воркерах и как смотреть на узел «вживую». `Agents` хранит
+только последнее состояние агента (в его записи в Store): `hello`, `status`, последнюю точку
+метрик, текущие проблемы. Всё остальное приходит событиями — историю метрик, ленту событий,
+журнал, итоги действий и аудит бэкенд сохраняет сам, если они ему нужны. Формат —
+[sdk/spec §6, §9, §12](../spec/README.md#9-метрики-лог-и-самочувствие), образцы —
+[observe.json](../spec/examples/observe.json), [events.json](../spec/examples/events.json).
 
-- [Статус агента](#статус-агента)
-- [Метрики узла](#метрики-узла)
-- [Метрики без связи и время точки](#метрики-без-связи-и-время-точки)
-- [Подписки](#подписки)
-- [Показатели воркеров](#показатели-воркеров)
-- [Лог агента и воркеров](#лог-агента-и-воркеров)
-- [Сведения об узле](#сведения-об-узле)
-- [История метрик](#история-метрик)
-- [Событие metrics](#событие-metrics)
+- [Состояние воркеров](#состояние-воркеров)
+- [Метрики](#метрики)
+- [Наблюдение (watch)](#наблюдение-watch)
+- [Журнал](#журнал)
+- [События воркеров](#события-воркеров)
+- [Проблемы](#проблемы)
+- [Итоги действий и аудит](#итоги-действий-и-аудит)
 
-## Статус агента
+## Состояние воркеров
 
-**Бэкенд.**
+Агент присылает `status` раз в `statusIntervalMs` (по умолчанию 30 с) и при изменениях.
 
 ```ts
-const agent = await agents.getAgent(agentId);
-agent?.status; // { state, message?, slots, capacity, jobs, workers, outbox }
+const a = await agents.getAgent(agentId);
+a?.workers; // [{ name, state, message?, version?, release?, builtin?, restarts, health?, pending?, configs? }]
+agents.on("agent", (a) => ui.update(a)); // подключение, отключение, каждый status
 ```
 
-```go
-agent, err := agents.Agent(agentID) // agent.Status *message.Status
-```
+- `state` — `starting | running | invalid | backoff | stopped`; `running` — воркер
+  зарегистрирован и работает; `invalid` — процесс запущен, но не ответил как нужно на
+  `GET /health` или `GET /manifest` ([workers.md](workers.md#обязательный-минимум)): настроек и
+  запросов не получает, агент повторяет проверку; `backoff` — упал и ждёт перезапуска;
+- `message` — причина состояния `invalid`, например «GET /manifest: HTTP 404 — нужен манифест с
+  version»;
+- `health` — последний ответ воркера на `GET /health`: `{ ok, busy?, message?, info? }`; нет поля —
+  подходящего ответа ещё не было; `busy: true` — воркер ведёт долгую работу;
+- `pending` — `restart` или `update`: замена воркера ждёт, пока он занят
+  ([workers.md](workers.md#долгая-работа)); нет поля — не ждёт;
+- `configs` — что у агента на диске по каждому ключу и чем кончилось применение
+  ([configs.md](configs.md#статус-применения));
+- `sysmetrics` — встроенный воркер агента (`builtin: true`), собирает метрики узла.
 
-```python
-agent = await agents.get_agent(agent_id)  # agent.status — dict
-```
+## Метрики
 
-Частота — `statusIntervalMs` (по умолчанию 5000; в Go — `StatusInterval`), чаще — по
-[подписке](#подписки).
-
-**Что уходит по сети.** `status` — при каждом изменении и не реже `statusIntervalMs`:
-
-| Поле       | Что                                                                                                           |
-| ---------- | ------------------------------------------------------------------------------------------------------------- |
-| `state`    | `starting`, `idle`, `busy`, `draining` (дорабатывает, новое не берёт), `updating`, `degraded` (что-то не так) |
-| `message`  | почему `degraded`: воркеры перезапускаются, воркер сообщил о неполадке                                        |
-| `slots`    | очередь → сколько задач ещё можно взять                                                                       |
-| `capacity` | очередь → сколько всего                                                                                       |
-| `jobs`     | `[{jobId, attempt, queue, startedAt}]` — задачи в работе (продлевают их срок)                                 |
-| `workers`  | `[{name, state, instances, version, release?, health?, message?, paused?}]`                                   |
-| `outbox`   | сколько важных сообщений ждут подтверждения                                                                   |
-
-**Агент** (`internal/runtime`) собирает статус из задач, воркеров и очереди на диске;
-несколько изменений подряд — один `status`.
-
-**Воркер** влияет на статус через места очередей, [здоровье](workers.md#здоровье) и
-[паузу](workers.md#пауза-очередей).
-
-**Результат.** `agent.status`; событие `change` `{kind: "agent"}` — только если статус
-изменился (одинаковый «пульс» уведомления не вызывает). По статусу приходят уведомления
-`degraded`, `workerDown`, `workerDegraded` ([events.md](events.md#уведомления-о-проблемах)).
-
-## Метрики узла
-
-**Бэкенд** задаёт частоту: `metricsIntervalMs` (по умолчанию 15000; в Go — `MetricsInterval`).
-Какие группы собирать — решает узел, бэкенд может добавить группы [подпиской](#подписки).
-
-**Что уходит по сети.** `metrics {collectedAt, clockOffsetMs, backfill?, host, gpus, channels}`
-раз в `metricsIntervalMs`. В `host` — поля включённых групп (нет группы — нет полей):
-
-| Группа         | Поля `metrics.host`                                                                                                |
-| -------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `cpu`          | `cpuPercent`                                                                                                       |
-| `cpu.cores`    | `cpuCores: [процент по ядрам]`                                                                                     |
-| `load`         | `load1`, `load5`, `load15`                                                                                         |
-| `memory`       | `memUsedBytes`, `memTotalBytes`, `memAvailableBytes`                                                               |
-| `swap`         | `swapUsedBytes`, `swapTotalBytes`                                                                                  |
-| `disk`         | `diskUsedBytes`, `diskTotalBytes` (корень `/`), `disks: [{mount, usedBytes, totalBytes, inodesUsed, inodesTotal}]` |
-| `diskio`       | `diskReadBps`, `diskWriteBps`, `diskReadIops`, `diskWriteIops` (сумма по физическим дискам)                        |
-| `network`      | `netRxBps`, `netTxBps`, `netErrors`, `netDrops` (за интервал)                                                      |
-| `interfaces`   | `interfaces: [{name, rxBps, txBps, errors, drops}]`                                                                |
-| `conntrack`    | `conntrack`, `conntrackMax` (Linux)                                                                                |
-| `sockets`      | `tcp: {established, timeWait, closeWait, listen}`                                                                  |
-| `processes`    | `processes`, `threads`                                                                                             |
-| `fds`          | `fdsOpen`, `fdsMax` (Linux)                                                                                        |
-| `uptime`       | `uptimeSec`                                                                                                        |
-| `temperatures` | `temperatures: {maxC, sensors: [{name, c}]}` (где есть датчики)                                                    |
-
-Видеокарты — отдельно, `gpus: [{index, name, utilPercent, memUsedBytes, memTotalBytes,
-temperatureC}]`. Показатели воркеров — `channels` ([ниже](#показатели-воркеров)).
-
-**Агент** (`internal/telemetry`, настройки — [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#настройки)):
-
-```yaml
-telemetry:
-  metrics: [cpu, load, memory, swap, disk, network, interfaces, conntrack, uptime] # по умолчанию; [] — без метрик узла
-  disks: ["/", "/data"] # для metrics.host.disks; ["all"] — все реальные файловые системы
-  gpu: auto # auto — через nvidia-smi, если он есть; off
-  excludeInterfaces: [lo, veth, docker, br-] # префиксы интерфейсов, которые не показывать
-```
-
-Неизвестная группа — ошибка настроек. Всё это перечитывается на ходу (`systemctl reload
-agent`). Скорости считаются по разнице с прошлым сбором.
-
-**Воркер** не участвует (кроме своих показателей).
-
-**Результат.** `agent.metrics` — последняя точка (без досланных); каждая точка — событие
-[`metrics`](#событие-metrics); история — [listMetrics](#история-метрик).
-
-## Метрики без связи и время точки
-
-**Бэкенд** ничего не вызывает: `Agents` сам ставит каждой точке время по часам сервера.
-
-**Что уходит по сети.** `clockOffsetMs` — насколько часы сервера впереди часов агента (агент
-считает по `welcome.serverTime`); `backfill: true` — точка собрана без связи и дослана позже.
-
-**Агент** (`internal/runtime`): без связи продолжает собирать метрики — до `telemetry.backlog`
-точек в памяти (по умолчанию 720; `0` — не копить), после `welcome` досылает их по порядку с
-`backfill: true`. Перезапуск агента накопленное теряет.
-
-**Воркер** не участвует.
-
-**Результат.** `MetricsPoint {at, backfill, metrics}`: `at = collectedAt + clockOffsetMs` (без
-смещения — время получения). Досланные точки попадают в историю и событие `metrics`, но не
-меняют `agent.metrics` — по ним не принимают решений «здесь и сейчас».
-
-## Подписки
-
-Подписка — «присылай это, так часто, столько времени»: например, пока человек смотрит на узел в
-интерфейсе. Подписчиков у агента может быть несколько, у каждой подписки свой id и срок.
-
-**Бэкенд.**
+Раз в `metricsIntervalMs` (по умолчанию 10 с) агент присылает точку: метрики узла от
+`sysmetrics` в `host` и ответы `GET /metrics` воркеров в `workers`.
 
 ```ts
-const sub = await agents.subscribe(agentId, {
-  ttlMs: 30_000, // срок (30 с); продлить — вызвать снова с тем же id
-  status: { intervalMs: 1000 },
-  metrics: { intervalMs: 1000, groups: ["diskio", "sockets", "temperatures"] },
-  logs: { level: "debug" },
-  channels: { "example.report": { intervalMs: 1000 } },
-}); // → { id, until }
-
-await agents.subscribe(agentId, { id: sub.id, ttlMs: 30_000, metrics: { intervalMs: 1000 } }); // продлить и заменить
-await agents.unsubscribe(agentId, sub.id);
+agents.on("metrics", (m) => chart.push(m)); // { agentId, at, collectedAt, host?, workers? } — каждая точка
+const a = await agents.getAgent(agentId); // a?.metrics — последняя точка
 ```
 
-```go
-sub, err := agents.Subscribe(agentID, server.SubscribeRequest{
-	TTL:      30 * time.Second,
-	Status:   &server.IntervalSpec{IntervalMs: 1000},
-	Metrics:  &server.MetricsSpec{IntervalMs: 1000, Groups: []string{"diskio", "sockets"}},
-	Logs:     &server.LogsSpec{Level: "debug"},
-	Channels: map[string]server.IntervalSpec{"example.report": {IntervalMs: 1000}},
-}) // sub.ID, sub.Until
-err = agents.Unsubscribe(agentID, sub.ID)
-```
+- Событие `metrics` — каждая точка, в том числе частые по `watch`. Историю `Agents` не хранит:
+  нужен график за час или неделю — сохраняйте точки из события сами (например, раз в минуту в
+  свою таблицу). Так делает сервер стенда (`examples/server/src/history.ts`).
+- `host` — `cpuPercent`, `load1`, `memUsedBytes`, `diskUsedBytes`, `netRxBps`, `gpus` и др.;
+  набор групп задаёт `telemetry.metrics` в настройках агента, полный список — в
+  [sdk/spec §9](../spec/README.md#9-метрики-лог-и-самочувствие). Нет значения на платформе — нет
+  поля.
+- `workers["<имя>"]` — ответ воркера как есть: его формат решает воркер.
+- Без связи агент держит последние 600 сообщений потока (`server.streamBuffer`) и досылает их; `at` — время сбора на узле.
 
-```python
-sub = await agents.subscribe(agent_id, ttl_ms=30000,
-                             status={"intervalMs": 1000},
-                             metrics={"intervalMs": 1000, "groups": ["diskio", "sockets"]},
-                             logs={"level": "debug"},
-                             channels={"example.report": {"intervalMs": 1000}})   # {"id", "until"}
-await agents.unsubscribe(agent_id, sub["id"])
-```
+## Наблюдение (watch)
 
-- все части необязательны: нет части — подписка её не касается;
-- интервалы — не меньше 200 мс; группы — по форме имени (`^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$`),
-  незнакомые агент пропустит; уровень — `debug`, `info`, `warn`, `error`; каналы — по правилу
-  имён. Иначе — `MESSAGE_INVALID`; агента нет — `AGENT_NOT_FOUND`; отозван — `AGENT_REVOKED`;
-- снять несуществующую подписку — не ошибка;
-- подписки хранятся в записи агента (`agent.subscriptions`) и видны всем процессам бэкенда:
-  агенту на связи с другим процессом их доставит `refresh`
-  ([connection.md](connection.md#несколько-процессов-бэкенда)); истёкшие удаляет сверка (раз в
-  секунду); `revoke` удаляет все подписки агента.
-
-Типичное использование — продлевать подписку, пока открыта страница узла:
+Пока на узел смотрят (например, открыта его страница), можно попросить агента присылать метрики
+чаще и журнал подробнее:
 
 ```ts
-const id = `ui:${sessionId}:${agentId}`;
-const keep = setInterval(
-  () => void agents.subscribe(agentId, { id, ttlMs: 30_000, metrics: { intervalMs: 1000 } }),
-  10_000,
-);
-// страница закрыта:
-clearInterval(keep);
-await agents.unsubscribe(agentId, id);
+const w = await agents.watch(agentId, { metricsIntervalMs: 1000, logLevel: "debug", ttlMs: 60_000 });
+// { id, until } — продлевать повтором с тем же id, пока страница открыта
+await agents.watch(agentId, { id: w.id, metricsIntervalMs: 1000, logLevel: "debug", ttlMs: 60_000 });
+agents.unwatch(agentId, w.id); // страницу закрыли
 ```
 
-**Что уходит по сети.** Агенту — одна **сводная подписка** по всем действующим
-([§6.9](../spec/README.md#69-подписка-сервера)):
+Зрителей может быть много: `Agents` хранит их в памяти процесса и сводит в один `watch` —
+частота самая высокая, уровень журнала самый подробный, срок самый поздний. Изменилась сводка
+(пришёл, ушёл или истёк зритель) — агент получает новый `watch`; зрителей нет — `watch {}`.
+Частота — не чаще раза в секунду; `ttlMs` — по умолчанию минута, не больше суток. Зритель
+действует, пока агент на связи с этим процессом: зритель, заведённый до подключения, агент
+получит сразу после `welcome`; при нескольких процессах вызывайте `watch` там же, где `fetch`
+([connection.md](connection.md#несколько-процессов-бэкенда)).
 
-```json
-{
-  "statusIntervalMs": 1000,
-  "metricsIntervalMs": 1000,
-  "metrics": ["diskio", "sockets"],
-  "logLevel": "debug",
-  "channels": { "example.report": 1000 }
-}
-```
+## Журнал
 
-- интервалы — наименьшие из подписок, группы — объединение без повторов, уровень лога — самый
-  подробный, каналы — наименьший интервал по каждому;
-- в `welcome.config.subscription` — текущая сводная (подписок нет — поля нет);
-- изменилась (подписку добавили, сняли, она истекла) — `config {subscription}` целиком;
-  `config {subscription: {}}` — подписок больше нет. Одинаковую повторно сервер не шлёт.
-
-**Агент** (`internal/runtime`, `internal/telemetry`, `internal/logx`) — подписка только
-ужесточает его настройки:
-
-- статус — не реже меньшего из `statusIntervalMs` и подписки;
-- метрики — не реже меньшего из `metricsIntervalMs`, `metricsIntervalMs` подписки и **всех**
-  интервалов `channels` (показатели воркеров уходят в `metrics`);
-- группы метрик — `telemetry.metrics` плюс группы подписки;
-- лог — более подробный уровень из `log.forward` и `logLevel`;
-- воркерам — новый `worker.context` (`metricsIntervalMs`, `channels`, `logLevel`).
-
-Новая сессия начинается без подписки: агент берёт ту, что пришла в `welcome`.
-
-**Воркер** узнаёт о подписке из [контекста](workers.md#контекст-воркера) и может собирать
-показатели с её частотой ([ниже](#показатели-воркеров)).
-
-**Результат.** `agent.subscriptions: [{id, until, status?, metrics?, logs?, channels?}]`; чаще
-приходят события `metrics` и `log`, в точках — группы подписки.
-
-## Показатели воркеров
-
-Показатели — цифры воркера, которые уходят вместе с метриками узла: длина очереди, число
-подключений. Что внутри — решает воркер.
-
-**Бэкенд** читает их из точки метрик и может ускорить подпиской на канал:
+Агент присылает записи журнала (`log`) с уровня `log.forward` своих настроек (по умолчанию
+`warn`) или `watch.logLevel`, если он подробнее. Вывод воркеров тоже попадает в журнал: stdout —
+`info`, stderr — `warn`.
 
 ```ts
-agents.on("metrics", (agentId, point) => chart(agentId, point.at, point.metrics.channels?.["example.report"]));
-await agents.subscribe(agentId, { channels: { "example.report": { intervalMs: 1000 } } });
+agents.on("log", ({ agentId, entries }) => logs.append(agentId, entries)); // [{ at, level, source, msg, attrs? }]
 ```
 
-```go
-server.Options{OnMetrics: func(agentID string, p server.MetricsPoint) {
-	raw := p.Metrics.Channels["example.report"] // json.RawMessage
-	_ = raw
-}}
-```
-
-```python
-agents.on("metrics", lambda agent_id, point: chart(agent_id, point.metrics.get("channels", {}).get("example.report")))
-```
-
-**Что уходит по сети.** На узле — `telemetry {channel, data}`; серверу — `metrics.channels:
-{канал: data}`; канал объявлен в `capabilities.telemetry.channels`.
-
-**Агент** (`internal/telemetry`) хранит **последние** данные каждого канала и кладёт их в
-ближайшую точку `metrics`. Воркер остановился — его показатели пропадают из `metrics`, пока он не
-пришлёт новые.
-
-**Воркер** — два способа:
-
-```python
-@worker.telemetry("example.report", interval="auto")   # агент спрашивает сам; секунды или "auto"
-def stats() -> dict:
-    return {"queue": queue_len()}
-
-worker.channel("example.events")                      # шлёт сам, когда хочет
-worker.report("example.events", {"connections": 42})
-```
-
-```go
-w.Telemetry("example.report", worker.AutoInterval, func() any { return map[string]int{"queue": queueLen()} })
-w.Channel("example.events")
-_ = w.Report("example.events", map[string]int{"connections": 42})
-```
+`Agents` журнал не хранит — сохраните сами, если нужен. Последние строки с узла по запросу:
 
 ```ts
-worker.telemetry("example.report", { intervalMs: AUTO_INTERVAL }, () => ({ queue: queueLen() })); // "auto"
-worker.channel("example.events");
-worker.report("example.events", { connections: 42 });
+const entries = await agents.logs(agentId, { worker: "echo", lines: 200 }); // без worker — журнал агента
 ```
 
-**Авто-интервал** (`"auto"`, `worker.AutoInterval`, `AUTO_INTERVAL`) — частота подписки сервера
-на этот канал (`context.channels`), если она есть; иначе действующая частота метрик агента
-(`context.metricsIntervalMs`); пока неизвестна — 15 с. Меняется на ходу вместе с контекстом.
-Явный интервал: Python — секунды (`interval=15`), Go — `time.Duration`, Node — `intervalMs`
-(по умолчанию 15000). Источник опрашивается после регистрации; ошибка — в лог, воркер не
-падает. Источник вернул `nil` / `None` / `undefined` / `null` — точка пропускается. Канал,
-который агент отклонил (`worker.ready.rejected`), не опрашивается. Показатели больше 16 МБ
-(предел строки канала с агентом) не отправляются — запись в лог воркера. `report` можно вызывать
-и до запуска: данные уйдут после регистрации ([workers.md](workers.md#здоровье)).
+`lines` — по умолчанию 200, не больше 5000; агент отдаёт их из памяти (`log.buffer` его настроек).
+Срок ответа — `actionTimeoutMs`. Ответ агента не по формату — `AgentsError` с кодом
+`MESSAGE_INVALID` (502) и запись в журнал (`log`). Как и другие действия, `logs` работает в процессе, у которого
+соединение агента.
 
-**Результат.** `point.metrics.channels["example.report"]`, `agent.metrics.channels`.
+## События воркеров
 
-## Лог агента и воркеров
+Воркер сообщает о том, что случилось, через агента (`POST /events` на `AGENT_SOCKET`,
+[workers.md](workers.md#что-агент-обслуживает-для-воркера)). Агент хранит событие на диске, пока
+бэкенд не подтвердит, — оно дойдёт и после обрыва связи и перезапуска.
 
-**Бэкенд** получает записи событием — SDK их не хранит:
+Важное событие обрабатывайте в опции `onEvent`: `Agents` ждёт обработчик и только после его
+успешного завершения подтверждает событие агенту.
 
 ```ts
-agents.on("log", (agentId, entries) => saveLogs(agentId, entries)); // [{ at, level, source, msg, attrs? }]
-await agents.subscribe(agentId, { logs: { level: "debug" } }); // подробнее на время
+const agents = new Agents({
+  enrollToken,
+  // { id, agentId, worker, type, data?, at, receivedAt }
+  onEvent: async (e) => {
+    // Повтор доставки приходит с тем же id: уникальный ключ (agent_id, id) отсекает его.
+    await pg.query("INSERT INTO events (agent_id, id, record) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", [
+      e.agentId,
+      e.id,
+      e,
+    ]);
+  },
+});
+agents.on("event", (e) => ui.push(e)); // после onEvent — для живых экранов
 ```
 
-```go
-server.Options{OnLog: func(agentID string, entries []message.LogEntry) { saveLogs(agentID, entries) }}
-```
+- **Обработчик завершился** — событие подтверждено, агент удаляет его у себя; затем выходит
+  событие `event`.
+- **Обработчик бросил ошибку** — подтверждения нет: агент получает `error` с `retryable: true` и
+  пришлёт событие снова (тем же `id`), в том числе после обрыва связи и перезапуска.
+- **Повторы.** Агент может прислать событие ещё раз (подтверждение потерялось при обрыве, агент
+  переподключился к другому процессу). Процесс помнит id последних 10 000 обработанных событий и
+  повтор подтверждает, не вызывая обработчик; повтор, пришедший в другой процесс или после
+  перезапуска, отсекает бэкенд — по `event.id`.
+- **Без `onEvent`** событие подтверждается сразу и выходит только как событие `event`: если в
+  этот момент процесс упадёт или подписчик не сохранит событие, оно потеряется.
 
-```python
-agents.on("log", lambda agent_id, entries: save_logs(agent_id, entries))
-```
+Тип — `^[a-z][a-z0-9._-]{0,63}$`, `data` — до 64 КБ. Тип должен быть объявлен в манифесте
+воркера (`manifest.events`): необъявленное событие агент отклоняет (`400 EVENT_UNDECLARED`
+воркеру), до бэкенда оно не доходит.
 
-Последние строки по запросу — встроенная команда `agent.logs`
-([commands.md](commands.md#встроенные-команды-агента)).
+## Проблемы
 
-**Что уходит по сети.** `log {entries: [{at, level, source, msg, attrs?}]}` — `level`: `debug` |
-`info` | `warn` | `error`; `source` — `agent` или имя воркера.
+`Agents` сам замечает проблемы и хранит текущие в записи агента (история — события `alert`):
 
-**Агент** (`internal/logx`):
-
-- отправляет записи своего лога и вывод воркеров от уровня `log.forward` (`off`, `error`, `warn`,
-  `info`, `debug`; по умолчанию `warn`), подписка может временно сделать подробнее;
-- пачками не чаще раза в секунду, до 500 записей; буфер — 1000 записей, лишние отбрасываются с
-  записью «пропущено N»;
-- без связи записи не копятся.
-
-**Воркер** пишет как обычно — в stdout/stderr (лог SDK — тоже в stderr); агент добавляет строки
-в свой лог с именем воркера. Действующий уровень — `context.logLevel`.
-
-**Результат.** Событие `log` с пачкой записей.
-
-## Сведения об узле
-
-**Бэкенд.**
+| `type`            | Когда начинается                                   | Когда заканчивается                |
+| ----------------- | -------------------------------------------------- | ---------------------------------- |
+| `offline`         | агент без связи дольше `offlineGraceMs`            | агент подключился                  |
+| `workerDown`      | воркер в `backoff` или `stopped`                   | воркер снова `running`             |
+| `workerInvalid`   | воркер в `invalid`; причина — в `message`          | воркер зарегистрирован (`running`) |
+| `workerUnhealthy` | воркер работает, но `health.ok: false`             | `health.ok: true`                  |
+| `configFailed`    | воркер отказал в настройке (`worker`, `configKey`) | версия применена или ключ удалён   |
 
 ```ts
-const agent = await agents.getAgent(agentId);
-agent?.inventory; // { collectedAt, os, cpu, memoryBytes, disks, interfaces, gpus, ports }
+agents.on("alert", (a) => notify(a)); // { key, agentId, agentName, type, worker?, configKey?, message, since, active }
+const now = await agents.listAlerts(); // текущие у всех агентов; (agentId) — у одного
 ```
 
-```go
-agent, _ := agents.Agent(agentID) // agent.Inventory
-```
+`active: true` — проблема началась, `false` — закончилась. Куда слать уведомления (почта,
+мессенджер) — решает бэкенд.
 
-```python
-agent = await agents.get_agent(agent_id)  # agent.inventory
-```
+## Итоги действий и аудит
 
-**Что уходит по сети.** `inventory` — ОС (`hostname`, `platform`, `kernel`, `arch`,
-`virtualization`), процессор (`model`, `cores`, `threads`), память, диски (`mount`, `fs`,
-`totalBytes`), сетевые интерфейсы (`name`, `mac`, `addresses`), видеокарты, открытые порты
-(`ports: {tcp, udp}`). Ещё — краткие сведения в `hello.host`.
-
-**Агент** (`internal/telemetry/inventory.go`) присылает сведения после каждого подключения и
-при изменении; проверяет раз в `telemetry.inventoryInterval` (по умолчанию 10 минут; `0` — не
-присылать вовсе).
-
-**Воркер** не участвует.
-
-**Результат.** `agent.inventory` (последние присланные), `agent.hello.host`; событие `change`
-`{kind: "agent"}`.
-
-## История метрик
-
-**Бэкенд.**
+Итог действия (`restartWorker`, `updateWorker`, `updateAgent`, `rotateKey`, `logs`) —
+результат промиса вызова: он ждёт `action.result` от агента или срока (`TIMEOUT`). Замена
+занятого воркера (`restartWorker`, `updateWorker`) ждёт окончания его работы — итог приходит
+после замены; пока `status` показывает `pending`, срок `timeoutMs` отсчитывается заново, а
+`{ force: true }` заменяет сразу. Тот же итог
+выходит событием `action`; кто что сделал (`by(actor)`) — событием `audit`.
 
 ```ts
-const points = await agents.listMetrics(agentId, { since: Date.now() - 3600_000 }); // по возрастанию at
-new Agents({ enrollToken, metricsStoreIntervalMs: 15_000, metricsRetentionMs: 7 * 24 * 3600_000 });
+agents.on("action", (a) => save(a)); // { id, agentId, name, args?, actor?, status: "done" | "failed", result?, error?, createdAt, finishedAt }
+agents.on("audit", (e) => save(e)); // { at, actor, action, agentId, details? }
 ```
 
-```go
-points, err := agents.Metrics(agentID, time.Now().Add(-time.Hour).UnixMilli())
-server.New(server.Options{EnrollToken: token, MetricsStoreInterval: 15 * time.Second, MetricsRetention: 7 * 24 * time.Hour})
-```
-
-```python
-points = await agents.list_metrics(agent_id, since=now_ms() - 3600_000)
-Agents(enroll_token=token, metrics_store_interval_ms=15000, metrics_retention_ms=7 * 24 * 3600_000)
-```
-
-- `since` — только точки строго позже;
-- **прореживание**: в `Store` точка сохраняется не чаще раза в `metricsStoreIntervalMs` (15 с)
-  на агента — иначе при частых метриках по подписке история быстро разрастается. Досланные
-  точки прореживаются отдельно от живых. Событие `metrics` и `agent.metrics` получают **каждую**
-  точку;
-- **срок хранения**: точки старше `metricsRetentionMs` (7 суток) удаляются при запуске и раз в
-  час (`Store.pruneMetrics`);
-- `0` в Node и Python — «каждую точку» и «хранить всегда»; в Go — отрицательное значение (ноль
-  — значение по умолчанию);
-- `MemoryStore` держит ещё не больше 4320 точек на агента.
-
-**Что уходит по сети** — обычные `metrics`.
-
-**Агент** и **воркер** не участвуют.
-
-**Результат.** `MetricsPoint[]`: `at` (мс, часы сервера), `backfill`, `metrics` (сообщение
-целиком: узел, видеокарты, показатели воркеров).
-
-## Событие metrics
-
-Для живых графиков каждая принятая точка — отдельное событие, включая досланные и не
-сохранённые в историю прореживанием.
-
-```ts
-agents.on("metrics", (agentId, point) => ws.broadcast({ agentId, at: point.at, cpu: point.metrics.host?.cpuPercent }));
-```
-
-```go
-server.Options{OnMetrics: func(agentID string, p server.MetricsPoint) { broadcast(agentID, p) }}
-```
-
-```python
-agents.on("metrics", lambda agent_id, point: broadcast(agent_id, point.to_dict()))
-```
-
-Обработчик не должен блокировать: вызывается после обработки сообщения (в Go — вне блокировки
-`Agents`, из него можно вызывать методы `Agents`).
+Ожидание итога живёт в памяти процесса, который отправил действие. Если агент переподключится к
+другому процессу и пришлёт итог туда, тот подтвердит его агенту и пропустит, а вызвавший
+получит `TIMEOUT`.

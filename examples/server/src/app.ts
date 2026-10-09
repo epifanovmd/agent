@@ -1,449 +1,355 @@
-// Бэкенд примера на agent-sdk/server: механику связи (регистрация агентов,
-// WebSocket и HTTP sync, задачи, команды, состояние, файлы) делает Agents; здесь —
-// только API веб-интерфейса и раздача его статики. Без авторизации — пример
-// для локального запуска.
+// Сервер стенда на agent-sdk/server: связь с агентами (регистрация, WebSocket, запросы к
+// воркерам, настройки, метрики, события, действия, выпуск) делает Agents; здесь — небольшой HTTP
+// API над ним (examples/API.md) и история в памяти (history.ts). Без авторизации — пример для
+// запуска у себя.
 import { randomUUID } from "node:crypto";
-import { createReadStream, existsSync, statSync } from "node:fs";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { extname, join, normalize } from "node:path";
-import type { Duplex } from "node:stream";
-import { WebSocketServer, type WebSocket } from "ws";
-import { LINK_PATH, type LogEntry, type LogEntryLevel } from "agent-sdk";
 import {
-  baseUrl,
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
+import { Readable } from "node:stream";
+import type { ReadableStream } from "node:stream/web";
+
+import {
+  type Actor,
+  type AgentEvent,
+  type Agents,
   AgentsError,
+  baseUrl,
+  LOG_LEVELS,
+  type LogEvent,
+  type LogLevel,
+  MAX_FETCH_BODY,
+  type MetricsEvent,
+  readBody,
   readJSON,
   sendJSON,
-  type Agent,
-  type AgentEvent,
-  type Alert,
-  type AuditEntry,
-  type Command,
-  type DesiredState,
-  type Agents,
-  type Job,
-  type MemoryFiles,
-  type MetricsPoint,
+  supports,
 } from "agent-sdk/server";
 
-/** Поток для интерфейса (examples/API.md). */
-export const WS_PATH = "/api/ws";
-/**
- * Группы метрик узла сверх настройки агента, пока карточку агента смотрят: диск чтение/запись,
- * TCP-соединения, процессы, температура (подписка клиента потока, metrics.groups).
- */
-export const SUBSCRIPTION_METRICS = ["diskio", "sockets", "processes", "temperatures"];
-/** Частота метрик и показателей воркеров, пока карточку агента смотрят, мс. */
-export const SUBSCRIPTION_INTERVAL_MS = 1000;
-
-/** Тайминги потока (тесты уменьшают). */
-export const wsDefaults = {
-  /** Продление подписки клиента потока, мс (её срок — 30 с). */
-  subscriptionRenewMs: 20_000,
-  /** Ping клиентов: не ответил до следующего — соединение закрывается. */
-  pingIntervalMs: 20_000,
-};
-
-const MIME: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript",
-  ".css": "text/css",
-  ".svg": "image/svg+xml",
-  ".json": "application/json",
-  ".ico": "image/x-icon",
-};
-
-/**
- * Всё для интерфейса: агенты, задачи (новые первыми, с загруженными выходами), команды,
- * состояние, события, активные уведомления о проблемах.
- */
-export async function snapshot(agents: Agents, files: MemoryFiles) {
-  const [list, jobs, commands, states, events, alerts] = await Promise.all([
-    agents.listAgents(),
-    agents.listJobs(),
-    agents.listCommands(),
-    agents.listStates(),
-    agents.listEvents(500),
-    agents.alerts(),
-  ]);
-  return {
-    serverTime: Date.now(),
-    agents: list,
-    jobs: jobs.map((j) => withFiles(j, files)),
-    commands,
-    states,
-    events,
-    alerts,
-  };
-}
-
-/** Задача с именами загруженных выходных файлов. */
-function withFiles(j: Job, files: MemoryFiles) {
-  return { ...j, files: files.outputs(j.id).filter((n) => j.outputs.includes(n)) };
-}
+import { History } from "./history";
 
 export interface AppOptions {
+  /** История событий, метрик и действий: её onEvent передан в Agents, follow — вызван. */
+  history: History;
   /** Токен регистрации — для команды установки агента в /api/releases. */
   enrollToken?: string;
-  log?: (msg: string, extra?: Record<string, unknown>) => void;
+  /** Публичный адрес сервера для команды установки; по умолчанию — из запроса. */
+  publicUrl?: string;
 }
 
-export function createApp(agents: Agents, files: MemoryFiles, webDir: string, opts: AppOptions = {}): Server {
-  const server = createServer(async (req, res) => {
-    try {
-      if (await agents.handle(req, res)) return; // агенты: enroll, sync, файлы задач, релизы, install.sh
-      if (!(await api(agents, files, opts, req, res))) staticFile(webDir, req, res);
-    } catch (err) {
-      const e = err instanceof AgentsError ? err : new AgentsError("MESSAGE_INVALID", (err as Error).message);
-      if (!res.headersSent) sendJSON(res, e.status, { code: e.code, message: e.message });
-    }
+/** Сроки потока /watch (тесты не меняют: агент не присылает метрики чаще раза в секунду). */
+const WATCH = { metricsIntervalMs: 1000, ttlMs: 60_000, renewMs: 20_000 };
+
+/** Заголовки ответа воркера, которые не передаются дальше как есть. */
+const HOP_HEADERS = new Set([
+  "connection",
+  "content-length",
+  "transfer-encoding",
+]);
+
+/** Разобранный запрос к API. */
+interface Call {
+  method: string;
+  /** Части пути после /api/. */
+  parts: string[];
+  query: URLSearchParams;
+  req: IncomingMessage;
+  res: ServerResponse;
+}
+
+const num = (v: string | null): number | undefined => {
+  if (v === null || v === "") return undefined;
+  const n = Number(v);
+
+  return Number.isFinite(n) ? n : undefined;
+};
+
+const isLogLevel = (v: unknown): v is LogLevel =>
+  LOG_LEVELS.includes(v as LogLevel);
+
+const notFound = (res: ServerResponse) =>
+  sendJSON(res, 404, { code: "NOT_FOUND", message: "Нет такого метода" });
+
+const agentNotFound = (res: ServerResponse) =>
+  sendJSON(res, 404, { code: "AGENT_NOT_FOUND", message: "Агент не найден" });
+
+/** Что проверить в манифесте воркера: ?method=&path=, ?config=, ?event=. */
+const supportsQuery = (query: URLSearchParams) => {
+  const method = query.get("method");
+  const path = query.get("path");
+
+  return {
+    route: method && path ? { method, path } : undefined,
+    config: query.get("config") || undefined,
+    event: query.get("event") || undefined,
+  };
+};
+
+/** HTTP-сервер стенда: маршруты агентов, их WebSocket и API (examples/API.md). */
+export const createApp = (agents: Agents, opts: AppOptions): Server => {
+  const server = createServer((req, res) => {
+    handle(agents, opts, req, res).catch(err => {
+      const e =
+        err instanceof AgentsError
+          ? err
+          : new AgentsError("MESSAGE_INVALID", (err as Error).message);
+
+      if (!res.headersSent)
+        sendJSON(res, e.status, { code: e.code, message: e.message });
+      else res.destroy();
+    });
   });
-  agents.attach(server); // WebSocket агентов
-  serveStream(server, agents, files, opts);
-  return server;
-}
 
-async function api(
+  agents.attach(server);
+
+  return server;
+};
+
+const handle = async (
   agents: Agents,
-  files: MemoryFiles,
   opts: AppOptions,
   req: IncomingMessage,
   res: ServerResponse,
-): Promise<boolean> {
+): Promise<void> => {
+  if (await agents.handle(req, res)) return; // регистрация, выпуск, install.sh
   const url = new URL(req.url ?? "/", "http://x");
-  const path = url.pathname;
-  const method = req.method ?? "GET";
-  const reply = (status: number, body: unknown) => (sendJSON(res, status, body), true);
-  const found = (v: unknown, what: string) =>
-    v ? reply(200, v) : reply(404, { code: "NOT_FOUND", message: `${what} не найдена` });
-  let m: RegExpMatchArray | null;
-  // Кто действует: заголовок X-Actor (в примере без авторизации — как назвался), иначе "web".
-  const as = agents.by(String(req.headers["x-actor"] ?? "").trim() || "web");
 
-  if (method === "GET" && path === "/api/snapshot") return reply(200, await snapshot(agents, files));
-  if (method === "POST" && path === "/api/jobs") return reply(201, await as.enqueue(await readJSON(req)));
-  if (method === "GET" && (m = path.match(/^\/api\/jobs\/([^/]+)$/))) return found(await agents.getJob(m[1]), "Задача");
-  if (method === "POST" && (m = path.match(/^\/api\/jobs\/([^/]+)\/(cancel|stop)$/))) {
-    return reply(200, m[2] === "cancel" ? await as.cancelJob(m[1]) : await as.stopJob(m[1]));
-  }
-  if (method === "POST" && path === "/api/commands") return reply(201, await as.command(await readJSON(req)));
-  if (method === "GET" && (m = path.match(/^\/api\/commands\/([^/]+)$/)))
-    return found(await agents.getCommand(m[1]), "Команда");
-  // Отмена команды: ждущая или выполняющаяся → cancelled (агенту — cmd.cancel, если уже отправлена).
-  if (method === "POST" && (m = path.match(/^\/api\/commands\/([^/]+)\/cancel$/)))
-    return reply(200, await as.cancelCommand(decodeURIComponent(m[1])));
-  if (method === "PUT" && (m = path.match(/^\/api\/state\/([^/]+)$/))) {
-    const agentId = url.searchParams.get("agentId") || undefined;
-    return reply(200, await as.setState(decodeURIComponent(m[1]), await readJSON(req), { agentId }));
-  }
-  // Удалить снимок: с agentId — личный (агенту переиздаётся общий), без — общий.
-  if (method === "DELETE" && (m = path.match(/^\/api\/state\/([^/]+)$/))) {
-    const agentId = url.searchParams.get("agentId") || undefined;
-    return reply(200, { state: await as.deleteState(decodeURIComponent(m[1]), { agentId }) });
-  }
-  // История версий раздела (общая или агента) и откат к версии (новой версией с тем же spec).
-  if (method === "GET" && (m = path.match(/^\/api\/state\/([^/]+)\/history$/))) {
-    const agentId = url.searchParams.get("agentId") || undefined;
-    const limit = Number(url.searchParams.get("limit"));
+  if (!url.pathname.startsWith("/api/")) return notFound(res);
+  const call: Call = {
+    method: req.method ?? "GET",
+    parts: url.pathname.split("/").slice(2).map(decodeURIComponent),
+    query: url.searchParams,
+    req,
+    res,
+  };
+
+  if (call.parts[0] === "agents" && call.parts[1])
+    return agentRoute(agents, opts.history, call);
+  const reply = (body: unknown) => sendJSON(res, 200, body);
+  const { method, query } = call;
+  const path = call.parts.join("/");
+
+  if (method === "GET" && path === "agents")
+    return reply(await agents.listAgents());
+  if (method === "GET" && path === "alerts")
+    return reply(await agents.listAlerts(query.get("agentId") || undefined));
+  if (method === "GET" && path === "events")
     return reply(
-      200,
-      await agents.stateHistory(decodeURIComponent(m[1]), {
-        agentId,
-        limit: url.searchParams.has("limit") && Number.isFinite(limit) ? limit : undefined,
+      opts.history.listEvents({
+        agentId: query.get("agentId") || undefined,
+        worker: query.get("worker") || undefined,
+        type: query.get("type") || undefined,
+        before: num(query.get("before")),
+        limit: num(query.get("limit")),
       }),
     );
-  }
-  if (method === "POST" && (m = path.match(/^\/api\/state\/([^/]+)\/rollback$/))) {
-    const body = await readJSON(req);
-    if (typeof body?.version !== "number")
-      return reply(400, { code: "MESSAGE_INVALID", message: "Нужна version (число)" });
-    return reply(
-      200,
-      await as.rollbackState(decodeURIComponent(m[1]), body.version, { agentId: body.agentId || undefined }),
-    );
-  }
-  // Подписка на агента (тело — как у agents.subscribe) и её снятие.
-  if (method === "POST" && (m = path.match(/^\/api\/agents\/([^/]+)\/subscriptions$/))) {
-    const body = (await readJSON(req)) ?? {};
-    if (typeof body !== "object" || Array.isArray(body))
-      return reply(400, { code: "MESSAGE_INVALID", message: "Тело — объект подписки" });
-    return reply(200, await agents.subscribe(decodeURIComponent(m[1]), body));
-  }
-  if (method === "DELETE" && (m = path.match(/^\/api\/agents\/([^/]+)\/subscriptions\/([^/]+)$/))) {
-    await agents.unsubscribe(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
-    return reply(200, {});
-  }
-  // Удалить отозванного агента (его запись и историю метрик).
-  if (method === "DELETE" && (m = path.match(/^\/api\/agents\/([^/]+)$/))) {
-    await as.deleteAgent(decodeURIComponent(m[1]));
-    return reply(200, {});
-  }
-  // Агенты: история метрик, отзыв, обновление, смена ключа.
-  if ((m = path.match(/^\/api\/agents\/([^/]+)\/(metrics|revoke|update|rotate-key)$/))) {
-    const id = decodeURIComponent(m[1]);
-    if (method === "GET" && m[2] === "metrics") {
-      if (!(await agents.getAgent(id))) return reply(404, { code: "AGENT_NOT_FOUND", message: "Агент не найден" });
-      const since = Number(url.searchParams.get("since"));
-      return reply(
-        200,
-        await agents.listMetrics(id, {
-          since: url.searchParams.has("since") && Number.isFinite(since) ? since : undefined,
-        }),
-      );
-    }
-    if (method === "POST" && m[2] === "revoke") return reply(200, await as.revoke(id));
-    if (method === "POST" && m[2] === "update") return reply(201, await as.updateAgent(id));
-    if (method === "POST" && m[2] === "rotate-key") return reply(201, await as.rotateKey(id));
-  }
-  // Обновление воркера из выпуска (release: true в agent.yaml узла) — команда worker.update.
-  if (method === "POST" && (m = path.match(/^\/api\/agents\/([^/]+)\/workers\/([^/]+)\/update$/)))
-    return reply(201, await as.updateWorker(decodeURIComponent(m[1]), decodeURIComponent(m[2])));
-  // Пауза воркера с сервера (команда worker.pause / worker.resume); тело — {queues?} (пусто — все очереди).
-  if (method === "POST" && (m = path.match(/^\/api\/agents\/([^/]+)\/workers\/([^/]+)\/(pause|resume)$/))) {
-    const body = await readJSON(req);
-    const queues = Array.isArray(body?.queues) ? body.queues.map(String) : undefined;
-    const [id, name] = [decodeURIComponent(m[1]), decodeURIComponent(m[2])];
-    return reply(
-      201,
-      m[3] === "pause" ? await as.pauseWorker(id, name, { queues }) : await as.resumeWorker(id, name, { queues }),
-    );
-  }
-  // Выпуск агента: манифест, кандидаты на обновление агентов и воркеров, команда установки на новый узел.
-  if (method === "GET" && path === "/api/releases") {
+  if (method === "GET" && path === "releases") {
     const [release, candidates, workerCandidates] = await Promise.all([
       agents.release(),
       agents.updateCandidates(),
       agents.workerUpdateCandidates(),
     ]);
     const installCommand = agents.installCommand({
-      baseUrl: agents.publicUrl(baseUrl(req)),
+      baseUrl: opts.publicUrl || baseUrl(req),
       token: opts.enrollToken ?? "<ENROLL_TOKEN>",
     });
-    return reply(200, { release, candidates, workerCandidates, installCommand });
+
+    return reply({ release, candidates, workerCandidates, installCommand });
   }
-  if (path.startsWith("/api/")) return reply(404, { code: "NOT_FOUND", message: "Нет такого метода" });
-  return false;
-}
+  notFound(res);
+};
 
-/** Сообщение клиенту потока (сервер → клиент). */
-export type StreamMessage =
-  | { type: "snapshot"; data: Awaited<ReturnType<typeof snapshot>> }
-  | { type: "agent"; data: Agent }
-  | { type: "job"; data: Job & { files: string[] } }
-  | { type: "command"; data: Command }
-  | { type: "state"; data: DesiredState }
-  /** Снимок удалён: agentId нет — общий; переизданный общий придёт сообщением state. */
-  | { type: "stateDeleted"; domain: string; agentId?: string }
-  | { type: "event"; data: AgentEvent }
-  /** Проблема началась (active) или закончилась. */
-  | { type: "alert"; data: Alert }
-  /** Изменяющее действие (журнал аудита). */
-  | { type: "audit"; data: AuditEntry }
-  | { type: "metrics"; agentId: string; point: MetricsPoint }
-  /** Записи лога агента (подписанным, с выбранного клиентом уровня). */
-  | { type: "log"; agentId: string; entries: LogEntry[] };
+/** /api/agents/{id}/… */
+const agentRoute = async (
+  agents: Agents,
+  history: History,
+  call: Call,
+): Promise<void> => {
+  const { method, query, req, res } = call;
+  const [, id, section, worker, ...rest] = call.parts;
+  const reply = (body: unknown) => sendJSON(res, 200, body);
+  // Кто действует: заголовок X-Actor (в примере без авторизации — как назвался), иначе "api".
+  const as = agents.by(String(req.headers["x-actor"] ?? "").trim() || "api");
+  const route = `${method} ${section ?? ""}`;
 
-/** Уровни лога от подробного к важному. */
-const LOG_LEVELS: LogEntryLevel[] = ["debug", "info", "warn", "error"];
-const isLogLevel = (v: unknown): v is LogEntryLevel => LOG_LEVELS.includes(v as LogEntryLevel);
-/** Уровень логов подписки по умолчанию. */
-const DEFAULT_LOG_LEVEL: LogEntryLevel = "info";
+  if (section === "workers" && worker && rest[0] === "fetch")
+    return proxy(as, call, id, worker, rest.slice(1));
+  if (
+    section === "workers" &&
+    worker &&
+    rest.length === 1 &&
+    method === "POST"
+  ) {
+    // Тело { force: true } — заменить сразу, не дожидаясь окончания работы воркера.
+    const force = (await readJSON(req))?.force === true;
 
-/** Клиент потока: до отправки snapshot дельты копятся (snapshot их не перекроет). */
-interface StreamClient {
-  /** id соединения: из него — id подписок клиента. */
-  id: string;
-  ws: WebSocket;
-  ready: boolean;
-  queued: string[];
-  /** Подписки: agentId → уровень логов, с которого клиенту слать записи, и таймер продления. */
-  subs: Map<string, { level: LogEntryLevel; timer: NodeJS.Timeout }>;
-  alive: boolean;
-}
+    if (rest[0] === "restart")
+      return (await as.restartWorker(id, worker, { force }), reply({}));
+    if (rest[0] === "update")
+      return reply(await as.updateWorker(id, worker, { force }));
+  }
+  if (section === "configs" && worker && rest.length === 1) {
+    if (method === "PUT")
+      return reply(
+        await as.setConfig(id, worker, rest[0], await readJSON(req)),
+      );
+    if (method === "DELETE")
+      return reply({ deleted: await as.deleteConfig(id, worker, rest[0]) });
+  }
+  if (
+    section === "workers" &&
+    worker &&
+    rest.length === 1 &&
+    rest[0] === "supports" &&
+    method === "GET"
+  ) {
+    const agent = await agents.getAgent(id);
+
+    if (!agent) return agentNotFound(res);
+
+    return reply({ supported: supports(agent, worker, supportsQuery(query)) });
+  }
+  if (worker !== undefined) return notFound(res);
+
+  switch (route) {
+    case "GET ": {
+      const agent = await agents.getAgent(id);
+
+      return agent ? reply(agent) : agentNotFound(res);
+    }
+    case "DELETE ":
+      return (await as.deleteAgent(id), reply({}));
+    case "POST revoke":
+      return reply(await as.revoke(id));
+    case "POST rotate-key":
+      return (await as.rotateKey(id), reply({}));
+    case "POST update":
+      return reply(await as.updateAgent(id));
+    case "GET actions":
+      return reply(history.listActions(id, num(query.get("limit"))));
+    case "GET configs": {
+      const [configs, status] = await Promise.all([
+        agents.listConfigs(id),
+        agents.configStatus(id),
+      ]);
+
+      return reply({ configs, status });
+    }
+    case "GET metrics":
+      return reply(
+        history.listMetrics(id, {
+          since: num(query.get("since")),
+          limit: num(query.get("limit")),
+        }),
+      );
+    case "GET logs":
+      return reply(
+        await as.logs(id, {
+          worker: query.get("worker") || undefined,
+          lines: num(query.get("lines")),
+        }),
+      );
+    case "GET watch":
+      return watch(agents, call, id);
+    default:
+      return notFound(res);
+  }
+};
 
 /**
- * WebSocket /api/ws: snapshot при подключении, дальше — изменения по событиям Agents;
- * точки metrics и записи log — только подписанным (subscribe {agentId, logLevel?}, logLevel
- * {agentId, level}, unsubscribe). Пока клиент подписан на агента, сервер держит его подписку
- * agents.subscribe (id — соединение и агент): метрики и показатели всех воркеров агента раз в
- * секунду, группы SUBSCRIPTION_METRICS, лог с уровня клиента; продлевает её, снимает при
- * unsubscribe и закрытии соединения.
+ * Запрос к воркеру как есть: метод, путь после /fetch с параметрами, тело и Content-Type; срок —
+ * заголовок X-Timeout-Ms. Ответ воркера передаётся потоком; закрыли запрос — запрос к воркеру
+ * отменяется.
  */
-function serveStream(server: Server, agents: Agents, files: MemoryFiles, opts: AppOptions): void {
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 << 10 });
-  const clients = new Set<StreamClient>();
-  const log = opts.log ?? (() => {});
+const proxy = async (
+  as: Actor,
+  call: Call,
+  id: string,
+  worker: string,
+  path: string[],
+): Promise<void> => {
+  const { method, req, res } = call;
+  const search = new URL(req.url ?? "/", "http://x").search;
+  const body =
+    method === "GET" || method === "HEAD"
+      ? undefined
+      : new Uint8Array(await readBody(req, MAX_FETCH_BODY));
+  const abort = new AbortController();
+  const headers: Record<string, string> = {};
 
-  const send = (c: StreamClient, raw: string) => {
-    if (!c.ready) c.queued.push(raw);
-    else if (c.ws.readyState === c.ws.OPEN) c.ws.send(raw);
-  };
-  const broadcast = (msg: StreamMessage) => {
-    const raw = JSON.stringify(msg);
-    for (const c of clients) send(c, raw);
-  };
+  if (req.headers["content-type"])
+    headers["content-type"] = req.headers["content-type"];
+  res.on("close", () => {
+    if (!res.writableFinished) abort.abort();
+  });
+  const reply = await as.fetch(id, worker, `/${path.join("/")}${search}`, {
+    method,
+    headers,
+    body: body?.length ? body : undefined,
+    timeoutMs: num(String(req.headers["x-timeout-ms"] ?? "")),
+    signal: abort.signal,
+  });
 
-  const subscriptionId = (c: StreamClient, agentId: string) => `${c.id}:${agentId}`;
-  /** Подписка клиента на агента: создать или продлить (каналы — по текущим воркерам агента). */
-  const renew = async (c: StreamClient, agentId: string) => {
-    const sub = c.subs.get(agentId);
-    if (!sub) return;
-    try {
-      const agent = await agents.getAgent(agentId);
-      const channels = Object.fromEntries(
-        (agent?.capabilities?.telemetry?.channels ?? []).map((ch) => [ch, { intervalMs: SUBSCRIPTION_INTERVAL_MS }]),
-      );
-      await agents.subscribe(agentId, {
-        id: subscriptionId(c, agentId),
-        metrics: { intervalMs: SUBSCRIPTION_INTERVAL_MS, groups: SUBSCRIPTION_METRICS },
-        logs: { level: sub.level },
-        channels,
-      });
-    } catch (e) {
-      log("подписка на агента не удалась", { agentId, err: String((e as Error).message) });
-    }
-  };
-  const subscribe = (c: StreamClient, agentId: string, level: LogEntryLevel) => {
-    if (c.subs.has(agentId)) return setLogLevel(c, agentId, level);
-    const timer = setInterval(() => void renew(c, agentId), wsDefaults.subscriptionRenewMs);
-    timer.unref();
-    c.subs.set(agentId, { level, timer });
-    void renew(c, agentId);
-  };
-  const setLogLevel = (c: StreamClient, agentId: string, level: LogEntryLevel) => {
-    const sub = c.subs.get(agentId);
-    if (!sub || sub.level === level) return;
-    sub.level = level;
-    void renew(c, agentId);
-  };
-  const unsubscribe = (c: StreamClient, agentId: string) => {
-    const sub = c.subs.get(agentId);
-    if (!sub) return;
-    clearInterval(sub.timer);
-    c.subs.delete(agentId);
-    agents
-      .unsubscribe(agentId, subscriptionId(c, agentId))
-      .catch((e) => log("снять подписку на агента не удалось", { agentId, err: String((e as Error).message) }));
-  };
+  for (const [k, v] of reply.headers)
+    if (!HOP_HEADERS.has(k)) res.setHeader(k, v);
+  res.writeHead(reply.status);
+  if (!reply.body) return void res.end();
+  Readable.fromWeb(reply.body as ReadableStream<Uint8Array>)
+    .on("error", () => res.destroy())
+    .pipe(res);
+};
 
-  const listeners = {
-    agent: (data: Agent) => broadcast({ type: "agent", data }),
-    job: (j: Job) => broadcast({ type: "job", data: withFiles(j, files) }),
-    command: (data: Command) => broadcast({ type: "command", data }),
-    state: (data: DesiredState) => broadcast({ type: "state", data }),
-    stateDeleted: (d: { domain: string; agentId?: string }) => broadcast({ type: "stateDeleted", ...d }),
-    event: (data: AgentEvent) => broadcast({ type: "event", data }),
-    alert: (data: Alert) => broadcast({ type: "alert", data }),
-    audit: (data: AuditEntry) => broadcast({ type: "audit", data }),
-    metrics: (agentId: string, point: MetricsPoint) => {
-      const raw = JSON.stringify({ type: "metrics", agentId, point } satisfies StreamMessage);
-      for (const c of clients) if (c.subs.has(agentId)) send(c, raw);
-    },
-    log: (agentId: string, entries: LogEntry[]) => {
-      for (const c of clients) {
-        const sub = c.subs.get(agentId);
-        if (!sub) continue;
-        const min = LOG_LEVELS.indexOf(sub.level);
-        const mine = entries.filter((e) => LOG_LEVELS.indexOf(e.level) >= min);
-        if (mine.length) send(c, JSON.stringify({ type: "log", agentId, entries: mine } satisfies StreamMessage));
-      }
-    },
-  };
-  agents.on("agent", listeners.agent);
-  agents.on("job", listeners.job);
-  agents.on("command", listeners.command);
-  agents.on("state", listeners.state);
-  agents.on("stateDeleted", listeners.stateDeleted);
-  agents.on("event", listeners.event);
-  agents.on("alert", listeners.alert);
-  agents.on("audit", listeners.audit);
-  agents.on("metrics", listeners.metrics);
-  agents.on("log", listeners.log);
-
-  const ping = setInterval(() => {
-    for (const c of clients) {
-      if (!c.alive) {
-        c.ws.terminate();
-        continue;
-      }
-      c.alive = false;
-      c.ws.ping();
-    }
-  }, wsDefaults.pingIntervalMs);
-  ping.unref();
-
-  server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
-    const path = new URL(req.url ?? "/", "http://x").pathname;
-    if (path === LINK_PATH) return; // агентов обслуживает Agents
-    if (path !== WS_PATH)
-      return void socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      const c: StreamClient = { id: randomUUID(), ws, ready: false, queued: [], subs: new Map(), alive: true };
-      clients.add(c);
-      ws.on("pong", () => (c.alive = true));
-      ws.on("message", (raw) => {
-        c.alive = true;
-        let msg: { type?: unknown; agentId?: unknown; logLevel?: unknown; level?: unknown };
-        try {
-          msg = JSON.parse(raw.toString());
-        } catch {
-          return;
-        }
-        if (typeof msg?.agentId !== "string" || !msg.agentId) return;
-        if (msg.type === "subscribe")
-          subscribe(c, msg.agentId, isLogLevel(msg.logLevel) ? msg.logLevel : DEFAULT_LOG_LEVEL);
-        else if (msg.type === "logLevel" && isLogLevel(msg.level)) setLogLevel(c, msg.agentId, msg.level);
-        else if (msg.type === "unsubscribe") unsubscribe(c, msg.agentId);
-      });
-      ws.on("close", () => {
-        clients.delete(c);
-        for (const id of [...c.subs.keys()]) unsubscribe(c, id);
-      });
-      ws.on("error", () => ws.terminate());
-      snapshot(agents, files).then(
-        (data) => {
-          if (ws.readyState !== ws.OPEN) return;
-          ws.send(JSON.stringify({ type: "snapshot", data } satisfies StreamMessage));
-          c.ready = true;
-          for (const raw of c.queued.splice(0)) ws.send(raw);
-        },
-        (e) => {
-          log("снимок для потока не удался", { err: String(e) });
-          ws.close(1011);
-        },
-      );
+/**
+ * Поток Server-Sent Events: пока он открыт, агент присылает метрики раз в секунду и журнал с
+ * уровня logLevel (watch); сюда идут события metrics, log и event этого агента.
+ */
+const watch = async (agents: Agents, call: Call, id: string): Promise<void> => {
+  const { query, res } = call;
+  const level = isLogLevel(query.get("logLevel"))
+    ? (query.get("logLevel") as LogLevel)
+    : "info";
+  const watchId = `api-${randomUUID()}`;
+  const renew = () =>
+    agents.watch(id, {
+      id: watchId,
+      metricsIntervalMs: WATCH.metricsIntervalMs,
+      logLevel: level,
+      ttlMs: WATCH.ttlMs,
     });
-  });
 
-  server.on("close", () => {
-    clearInterval(ping);
-    for (const c of clients) for (const sub of c.subs.values()) clearInterval(sub.timer);
-    agents.off("agent", listeners.agent);
-    agents.off("job", listeners.job);
-    agents.off("command", listeners.command);
-    agents.off("state", listeners.state);
-    agents.off("stateDeleted", listeners.stateDeleted);
-    agents.off("event", listeners.event);
-    agents.off("alert", listeners.alert);
-    agents.off("audit", listeners.audit);
-    agents.off("metrics", listeners.metrics);
-    agents.off("log", listeners.log);
-    for (const c of clients) c.ws.terminate();
-    wss.close();
+  await renew();
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
   });
-}
+  res.write(": watch\n\n");
+  const send = (type: string, data: unknown) =>
+    res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+  const min = LOG_LEVELS.indexOf(level);
+  const onMetrics = (m: MetricsEvent) => {
+    if (m.agentId === id) send("metrics", m);
+  };
+  const onLog = ({ agentId, entries }: LogEvent) => {
+    const mine = entries.filter(e => LOG_LEVELS.indexOf(e.level) >= min);
 
-/** Собранный интерфейс (examples/web/dist); неизвестный путь — index.html (SPA). */
-function staticFile(dir: string, req: IncomingMessage, res: ServerResponse): void {
-  if (req.method !== "GET") return void res.writeHead(405).end();
-  const index = join(dir, "index.html");
-  if (!existsSync(index)) {
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end("Интерфейс не собран: cd examples/web && npm install && npm run build (или npm run dev)\n");
-    return;
-  }
-  let file = normalize(join(dir, decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname)));
-  if (!file.startsWith(dir) || !existsSync(file) || statSync(file).isDirectory()) file = index;
-  res.writeHead(200, { "Content-Type": MIME[extname(file)] ?? "application/octet-stream" });
-  createReadStream(file).pipe(res);
-}
+    if (agentId === id && mine.length) send("log", mine);
+  };
+  const onEvent = (e: AgentEvent) => {
+    if (e.agentId === id) send("event", e);
+  };
+  const timer = setInterval(() => void renew().catch(() => {}), WATCH.renewMs);
+
+  agents.on("metrics", onMetrics);
+  agents.on("log", onLog);
+  agents.on("event", onEvent);
+  res.on("close", () => {
+    clearInterval(timer);
+    agents.off("metrics", onMetrics);
+    agents.off("log", onLog);
+    agents.off("event", onEvent);
+    agents.unwatch(id, watchId);
+  });
+};

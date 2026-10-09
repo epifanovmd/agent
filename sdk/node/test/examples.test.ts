@@ -1,292 +1,442 @@
-// Образцы sdk/spec/examples (§9): сервер принимает каждый агент → сервер; воркер
-// формирует сообщения воркер → агент и понимает агент → воркер.
+// Все образцы sdk/spec/examples между сервером и агентом проходят через SDK: сообщения сервера
+// SDK строит сам (и они совпадают с образцами), сообщения агента SDK принимает и подтверждает.
 import assert from "node:assert/strict";
-import { test } from "node:test";
-import type { Subscription } from "../src/index";
-import { Agents, Session, type SubscribeOptions } from "../src/server/index";
-import { publicKeyOf, unseal } from "../src/server/seal";
-import { between, example, sealedExample } from "./examples";
-import { fakeAgent, sleep } from "./helpers";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, describe, it } from "node:test";
 
-test("server: образцы агент → сервер принимаются (ни один не отклонён как неизвестный или некорректный)", async () => {
-  const agents = new Agents({ enrollToken: "t", metricsStoreIntervalMs: 0 });
-  const { agentId, secret } = await agents.enrollAgent({ token: "t", name: "examples" });
-  const agent = (await agents.authenticate(`Agent ${agentId}.${secret}`))!;
-  const ss = new Session(agent.id, "ws", "http://localhost");
-  const logs: unknown[] = [];
-  agents.on("log", (_id, entries) => logs.push(...entries));
-  const found = between("agent", "server");
-  assert.ok(found.length > 10);
-  for (const [name, hello] of found.filter(([n]) => n.startsWith("hello"))) {
-    await agents.open(ss, hello);
-    assert.equal(ss.take()[0].type, "welcome", name);
-  }
-  for (const [i, [name, env]] of found.filter(([n]) => !n.startsWith("hello")).entries()) {
-    // Новый запуск агента перед каждым: seq образцов не обязаны расти по порядку имён.
-    const hello = example("hello");
-    hello.data.agent.bootId = `boot-${i}`;
-    await agents.open(ss, hello);
-    ss.take();
-    await agents.process(ss, env);
-    for (const out of ss.take()) {
-      if (out.type !== "error") continue;
-      // Итог задачи, которой у агента нет, — семантический отказ, а не ошибка схемы.
-      assert.equal(out.data.code, "JOB_LEASE_LOST", `${name}: ${JSON.stringify(out.data)}`);
+import type { AgentEvent, Envelope } from "../src/server/index";
+import {
+  type Creds,
+  enroll,
+  FakeAgent,
+  sample,
+  samples,
+  startServer,
+  type TestServer,
+} from "./helpers";
+
+const covered = new Set<string>();
+const use = (name: string) => {
+  covered.add(name);
+
+  return sample(name);
+};
+
+/** Сообщение сервера совпадает с образцом (id, которые порождает сервер, не сравниваются). */
+const same = (got: Envelope, name: string, ignore: string[] = []) => {
+  const want = use(name);
+  const strip = (e: Envelope) => {
+    const c = structuredClone(e) as Envelope & Record<string, unknown>;
+
+    if (want.id) delete c.id;
+    if (want.re) delete c.re;
+    for (const path of ignore) {
+      const [a, b] = path.split(".");
+
+      if (b) delete (c[a] as Record<string, unknown>)?.[b];
+      else delete c[a];
     }
-  }
-  const a = (await agents.getAgent(agentId))!;
-  assert.ok(a.status && a.metrics && a.capabilities, "status, metrics, capabilities сохранены");
-  assert.deepEqual(a.inventory, example("inventory").data, "inventory сохранено");
-  assert.notEqual(a.metrics?.backfill, true, "agent.metrics — не backfill");
-  const points = await agents.listMetrics(agentId);
-  assert.deepEqual(points.map((p) => p.backfill).sort(), [false, true], "обе точки metrics — в истории");
-  assert.ok((await agents.listEvents()).length > 0, "событие сохранено");
-  assert.deepEqual(logs, example("log").data.entries, "событие log");
-  agents.close();
-});
 
-test("worker: worker.register совпадает со схемой образца", async () => {
-  const want = example("worker.register").data;
-  const a = fakeAgent({ name: want.name, version: want.version });
-  a.worker
-    .job(want.queues[0].name, { concurrency: want.queues[0].concurrency }, async () => null)
-    .command(want.commands[0], async () => null)
-    .state(want.domains[0], async () => null)
-    .channel(want.channels[0]);
-  const done = a.worker.run({ signals: false });
-  const reg = await a.inbox.wait("worker.register");
-  assert.match(reg.data.sdk, /^node\/\d+\.\d+\.\d+$/);
-  assert.deepEqual({ ...reg.data, sdk: want.sdk }, want);
-  a.close();
-  await done;
-});
+    return c;
+  };
 
-test("worker: worker.ping → worker.pong по образцам", async () => {
-  const ping = example("worker.ping");
-  const pong = example("worker.pong");
-  const a = fakeAgent();
-  a.worker.channel("example.app");
-  const done = a.worker.run({ signals: false });
-  assert.equal((await a.inbox.wait("worker.register")).data.ping, true);
-  a.send(ping.type, ping.data, { id: ping.id });
-  const got = await a.inbox.wait(pong.type);
-  assert.equal(got.re, pong.re);
-  assert.deepEqual(got.data, pong.data);
-  a.close();
-  await done;
-});
+  assert.deepEqual(strip(got), strip(want));
+};
 
-test("worker: понимает агент → воркер (ready, state.put, cmd.cancel, drain) и шлёт telemetry/event/state.applied по образцам", async () => {
-  const applied = example("state.applied@worker");
-  const telemetry = example("telemetry");
-  const event = example("event@worker");
-  const put = example("state.put@agent");
-  const a = fakeAgent();
-  a.worker.state(put.data.domain, async () => applied.data.report);
-  a.worker.channel(telemetry.data.channel);
-  a.worker.command(
-    "example.app.slow",
-    (cmd) => new Promise((resolve) => cmd.signal.addEventListener("abort", () => resolve(null))),
+const releaseDir = (): string => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-release-"));
+  const upd = sample("action.agent.update").data.args;
+  const wupd = sample("action.worker.update").data.args;
+
+  writeFileSync(
+    join(dir, "manifest.json"),
+    JSON.stringify({
+      version: upd.version,
+      artifacts: [
+        {
+          os: "linux",
+          arch: "amd64",
+          file: "agent-linux-amd64",
+          sha256: upd.sha256,
+          signature: upd.signature,
+        },
+      ],
+      workers: [
+        {
+          name: "report",
+          version: wupd.version,
+          os: "linux",
+          arch: "amd64",
+          file: "report-1.5.0-linux-amd64",
+          sha256: wupd.sha256,
+          signature: wupd.signature,
+        },
+      ],
+    }),
   );
-  const done = a.worker.run({ signals: false });
 
-  const ready = example("worker.ready");
-  a.send(ready.type, ready.data);
-  await sleep(10);
-  assert.deepEqual(a.worker.rejected, ready.data.rejected);
+  return dir;
+};
 
-  a.send(put.type, put.data, { id: put.id });
-  const got = await a.inbox.wait("state.applied");
-  assert.equal(got.re, applied.re);
-  assert.deepEqual(got.data, applied.data);
+describe("образцы", () => {
+  let s: TestServer;
+  let creds: Creds;
+  let fa: FakeAgent;
+  const logged: string[] = [];
 
-  a.worker.report(telemetry.data.channel, telemetry.data.data);
-  assert.deepEqual((await a.inbox.wait("telemetry")).data, telemetry.data);
-  a.worker.event(event.data.type, event.data.data);
-  assert.deepEqual((await a.inbox.wait("event")).data, event.data);
-
-  const cancel = example("cmd.cancel@agent");
-  a.send("cmd.run", { commandId: cancel.data.commandId, name: "example.app.slow", timeoutSec: 1 });
-  await sleep(10);
-  a.send(cancel.type, cancel.data);
-
-  const drain = example("worker.drain");
-  a.send(drain.type, drain.data);
-  await done; // команда отменена, задач нет — воркер завершился
-  assert.equal(a.inbox.all("cmd.done").length, 0);
-});
-
-test("worker: worker.cleanup → worker.cleaned / worker.cleaned.failed по образцам", async () => {
-  const req = example("worker.cleanup");
-  const ok = example("worker.cleaned");
-  const a = fakeAgent();
-  let fail = "";
-  a.worker.command("example.noop", async () => null);
-  a.worker.cleanup(async () => {
-    if (fail) throw new Error(fail);
+  before(async () => {
+    s = await startServer({
+      releasesDir: releaseDir(),
+      log: msg => logged.push(msg),
+    });
   });
-  const done = a.worker.run({ signals: false });
-  a.send(req.type, req.data, { id: req.id });
-  const got = await a.inbox.wait("worker.cleaned");
-  assert.equal(got.re, ok.re ?? req.id);
-  assert.deepEqual(got.data, ok.data);
-  const failed = example("worker.cleaned.failed");
-  fail = failed.data.error;
-  a.send(req.type, req.data, { id: "again" });
-  const bad = await a.inbox.wait("worker.cleaned", (e) => e.re === "again");
-  assert.deepEqual(bad.data, failed.data, "ошибка — текст исключения");
-  a.close();
-  await done;
-});
+  after(async () => {
+    await s.close();
+    const all = [...samples()]
+      .filter(([, v]) => v.file !== "worker")
+      .map(([k]) => k);
 
-/** Раскрыть все {"$sealed"} в значении (как агент перед передачей воркеру). */
-function unsealDeep(privateKey: string, v: unknown): unknown {
-  if (Array.isArray(v)) return v.map((x) => unsealDeep(privateKey, x));
-  if (v && typeof v === "object") {
-    const o = v as Record<string, unknown>;
-    if (Object.keys(o).length === 1 && typeof o.$sealed === "string") return unseal(privateKey, o.$sealed);
-    return Object.fromEntries(Object.entries(o).map(([k, x]) => [k, unsealDeep(privateKey, x)]));
-  }
-  return v;
-}
+    assert.deepEqual(
+      all.filter(n => !covered.has(n)),
+      [],
+      "все образцы сервер ↔ агент прогнаны",
+    );
+  });
 
-test("seal: образец sealed.json раскрывается, seal SDK раскрывается тем же ключом", async () => {
-  const fx = sealedExample();
-  const { privateKey, publicKey } = fx.agentKey;
-  assert.equal(publicKeyOf(privateKey), publicKey, "открытый ключ — от закрытого");
-  for (const s of fx.samples) assert.deepEqual(unseal(privateKey, s.sealed.$sealed), s.value);
-  assert.deepEqual(unsealDeep(privateKey, fx.snapshot.spec), fx.snapshot.unsealed);
-  assert.throws(() => unseal(privateKey, fx.wrongKey.$sealed), "чужой ключ — не раскрывается");
-  const put = example("state.put.sealed");
-  assert.deepEqual(unsealDeep(privateKey, put.data.spec), fx.snapshot.unsealed);
+  it("enroll и enroll.denied", async () => {
+    for (const name of ["enroll", "enroll.denied"]) {
+      covered.add(name);
+      const ex = samples().get(name)!;
+      const res = await fetch(s.url + ex.request!.path, {
+        method: ex.request!.method,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(ex.request!.body),
+      });
 
-  // seal SDK: ключ из hello.agent.encryptionKey образца.
-  const agents = new Agents({ enrollToken: "t" });
-  try {
-    const { agentId, secret } = await agents.enrollAgent({ token: "t", name: "sealed" });
-    const agent = (await agents.authenticate(`Agent ${agentId}.${secret}`))!;
-    const hello = example("hello");
-    assert.equal(hello.data.agent.encryptionKey, publicKey, "hello образца — с ключом тестовой пары");
-    await agents.open(new Session(agent.id, "ws", "http://localhost"), hello);
-    for (const s of fx.samples) {
-      const sealed = await agents.seal(agentId, s.value);
-      assert.deepEqual(unseal(privateKey, sealed.$sealed), s.value);
+      assert.equal(res.status, ex.response!.status);
+      const body = await res.json();
+
+      if (res.status === 200) {
+        assert.equal(typeof body.agentId, "string");
+        assert.equal(typeof body.secret, "string");
+        creds = body;
+      } else assert.deepEqual(body, ex.response!.body);
     }
-  } finally {
-    agents.close();
-  }
-});
-
-test("worker: worker.context — worker.context и событие context как в образце", async () => {
-  const a = fakeAgent();
-  a.worker.command("example.noop", async () => null);
-  const got: unknown[] = [];
-  a.worker.on("context", (ctx) => got.push(ctx));
-  const done = a.worker.run({ signals: false });
-  for (const f of ["worker.context", "worker.context.cleanup"]) {
-    const env = example(f);
-    a.send(env.type, env.data);
-    await sleep(20);
-    // Нет меток в сообщении — {} (значение по умолчанию).
-    const want = { ...env.data, agent: { labels: {}, ...env.data.agent } };
-    assert.deepEqual(a.worker.context, want, f);
-    assert.deepEqual(got.at(-1), want, f);
-  }
-  a.close();
-  await done;
-});
-
-test("worker: worker.health, worker.pause, worker.resume, worker.restart — по образцам", async () => {
-  const cases: [string, (w: import("../src/worker/index").Worker, d: Record<string, never>) => void][] = [
-    ["worker.health", (w, d) => w.setHealth(d.ok, d.message)],
-    ["worker.health.degraded", (w, d) => w.setHealth(d.ok, d.message)],
-    ["worker.pause", (w, d) => w.pause(d.queues)],
-    ["worker.resume", (w, d) => w.resume(d.queues)],
-    ["worker.restart", (w, d) => w.requestRestart(d.reason)],
-  ];
-  const a = fakeAgent();
-  a.worker.job("example.convert", async () => null);
-  const done = a.worker.run({ signals: false });
-  await a.inbox.wait("worker.register");
-  a.send("worker.ready", { agentVersion: "1.1.0" });
-  for (const [f, call] of cases) {
-    const env = example(f);
-    const before = a.inbox.all(env.type).length;
-    call(a.worker, env.data);
-    const sent = await a.inbox.wait(env.type, () => a.inbox.all(env.type).length > before);
-    assert.ok(sent);
-    assert.deepEqual(a.inbox.all(env.type).at(-1)!.data, env.data ?? {}, f);
-  }
-  a.close();
-  await done;
-});
-
-test("server: pauseWorker — cmd.run как образец cmd.run.workerPause", async () => {
-  const fx = example("cmd.run.workerPause").data;
-  const agents = new Agents({ enrollToken: "t" });
-  try {
-    const { agentId, secret } = await agents.enrollAgent({ token: "t", name: "pause" });
-    const agent = (await agents.authenticate(`Agent ${agentId}.${secret}`))!;
-    const ss = new Session(agent.id, "ws", "http://localhost");
-    const hello = example("hello");
-    hello.data.capabilities = { ...hello.data.capabilities, commands: { names: ["worker.pause", "worker.resume"] } };
-    await agents.open(ss, hello);
-    ss.take();
-    const cmd = await agents.pauseWorker(agentId, fx.args.name, { queues: fx.args.queues });
-    const run = ss.take().find((e) => e.type === "cmd.run");
-    assert.equal(run?.data.name, fx.name);
-    assert.deepEqual(run?.data.args, fx.args);
-    assert.equal(run?.data.timeoutSec, fx.timeoutSec);
-    assert.equal(cmd.name, fx.name);
-  } finally {
-    agents.close();
-  }
-});
-
-/** Подписка, сводная которой — sub (образец config.subscription). */
-function subscribeOptions(sub: Subscription): SubscribeOptions {
-  const opts: SubscribeOptions = {};
-  if (sub.statusIntervalMs) opts.status = { intervalMs: sub.statusIntervalMs };
-  if (sub.metricsIntervalMs || sub.metrics) opts.metrics = { intervalMs: sub.metricsIntervalMs, groups: sub.metrics };
-  if (sub.logLevel) opts.logs = { level: sub.logLevel };
-  if (sub.channels)
-    opts.channels = Object.fromEntries(Object.entries(sub.channels).map(([ch, intervalMs]) => [ch, { intervalMs }]));
-  return opts;
-}
-
-test("server: subscribe и unsubscribe — config как образцы config.subscription*", async () => {
-  const fx = example("config.subscription").data;
-  const agents = new Agents({ enrollToken: "t" });
-  try {
-    const { agentId, secret } = await agents.enrollAgent({ token: "t", name: "subscription" });
-    const agent = (await agents.authenticate(`Agent ${agentId}.${secret}`))!;
-    const ss = new Session(agent.id, "ws", "http://localhost");
-    await agents.open(ss, example("hello"));
-    ss.take();
-    const { id } = await agents.subscribe(agentId, subscribeOptions(fx.subscription));
-    assert.deepEqual(ss.take().find((e) => e.type === "config")?.data, fx);
-    await agents.unsubscribe(agentId, id);
-    assert.deepEqual(ss.take().find((e) => e.type === "config")?.data, example("config.subscription.empty").data);
-  } finally {
-    agents.close();
-  }
-});
-
-test("server: welcome с подпиской — как образец welcome.subscription", async () => {
-  const fx = example("welcome.subscription").data;
-  const agents = new Agents({
-    enrollToken: "t",
-    statusIntervalMs: fx.config.statusIntervalMs,
-    metricsIntervalMs: fx.config.metricsIntervalMs,
   });
-  try {
-    const { agentId, secret } = await agents.enrollAgent({ token: "t", name: "welcome" });
-    const agent = (await agents.authenticate(`Agent ${agentId}.${secret}`))!;
-    await agents.subscribe(agentId, subscribeOptions(fx.config.subscription));
-    const ss = new Session(agent.id, "ws", "http://localhost");
-    await agents.open(ss, example("hello"));
-    assert.deepEqual(ss.take().find((e) => e.type === "welcome")?.data.config, fx.config);
-  } finally {
-    agents.close();
-  }
+
+  it("hello → welcome, config.delete лишнего ключа; config.put по версии hello", async () => {
+    // У сервера есть report/main; у агента в hello — main 41 и limits 7.
+    await s.agents.setConfig(
+      creds.agentId,
+      "report",
+      "main",
+      use("config.put").data.data,
+    );
+    fa = await FakeAgent.open(s.ws, creds);
+    fa.send(use("hello"));
+    const welcome = await fa.next("welcome");
+
+    same(welcome, "welcome", [
+      "data.serverTime",
+      "data.metricsIntervalMs",
+      "data.statusIntervalMs",
+    ]);
+    assert.equal(typeof welcome.data.serverTime, "number");
+    // Версия сервера (1) старше, чем у агента (41): setConfig после hello поднимет её выше.
+    same(await fa.next("config.delete"), "config.delete");
+    const rec = await s.agents.setConfig(
+      creds.agentId,
+      "report",
+      "main",
+      sample("config.put").data.data,
+    );
+
+    assert.equal(rec.version, 42);
+    same(await fa.next("config.put"), "config.put");
+  });
+
+  it("status, metrics, log — ack seq", async () => {
+    for (const name of ["status", "metrics", "log"]) {
+      const m = use(name);
+
+      fa.send(m);
+      await fa.ackSeq(m.seq!);
+    }
+    const a = await s.agents.getAgent(creds.agentId);
+
+    assert.equal(a?.status?.workers.length, 5);
+    assert.equal(a?.status?.workers[3]?.state, "invalid");
+    assert.equal(
+      a?.status?.workers[3]?.message,
+      sample("status").data.workers[3].message,
+    );
+    assert.equal(a?.status?.workers[1]?.pending, "restart");
+    assert.equal(a?.status?.workers[1]?.health?.busy, true);
+    assert.equal(a?.metrics?.at, sample("metrics").data.collectedAt);
+  });
+
+  it("ack ids на event; error на неверное событие", async () => {
+    const ev = use("event");
+    const events: AgentEvent[] = [];
+
+    s.agents.on("event", e => events.push(e));
+    fa.send(ev);
+    const ack = await fa.ackOf(ev.id!);
+
+    assert.deepEqual(Object.keys(ack).sort(), Object.keys(use("ack")).sort());
+    assert.deepEqual([events[0].id, events[0].type], [ev.id, ev.data.type]);
+
+    const err = sample("error");
+
+    fa.send({ type: "event", id: err.re, data: { worker: "report", at: 1 } });
+    const got = await fa.next("error");
+
+    assert.equal(got.re, err.re);
+    assert.equal(got.data.code, err.data.code);
+    assert.equal(got.data.retryable, err.data.retryable);
+    covered.add("error");
+  });
+
+  it("config.applied и config.applied.error", async () => {
+    const ok = use("config.applied");
+
+    fa.send(ok);
+    await fa.ackOf(ok.id!);
+    let st = (await s.agents.configStatus(creds.agentId, "report")).find(
+      c => c.key === "main",
+    )!;
+
+    assert.equal(st.state, "applied");
+    assert.equal(st.applied, 42);
+    await s.agents.setConfig(creds.agentId, "report", "main", {
+      intervalSec: 0,
+    });
+    await fa.next("config.put", e => e.data.version === 43);
+    const bad = use("config.applied.error");
+
+    fa.send(bad);
+    await fa.ackOf(bad.id!);
+    st = (await s.agents.configStatus(creds.agentId, "report")).find(
+      c => c.key === "main",
+    )!;
+    assert.equal(st.state, "failed");
+    assert.equal(st.applied, 42);
+    assert.deepEqual(st.error, bad.data.error);
+  });
+
+  it("config.applied.key-unknown — отказ с кодом CONFIG_KEY_UNKNOWN", async () => {
+    const m = use("config.applied.key-unknown");
+
+    await s.agents.setConfig(creds.agentId, "report", m.data.key, {
+      days: 30,
+    });
+    await fa.next("config.put", e => e.data.key === m.data.key);
+    fa.send(m);
+    await fa.ackOf(m.id!);
+    const st = (await s.agents.configStatus(creds.agentId, "report")).find(
+      c => c.key === m.data.key,
+    )!;
+
+    assert.equal(st.state, "failed");
+    assert.deepEqual(st.error, m.data.error);
+    await s.agents.deleteConfig(creds.agentId, "report", m.data.key);
+    await fa.next("config.delete", e => e.data.key === m.data.key);
+  });
+
+  it("fetch, fetch.head, fetch.chunk, fetch.end", async () => {
+    const want = sample("fetch").data;
+    const resP = s.agents.fetch(creds.agentId, want.worker, want.path, {
+      method: want.method,
+      headers: want.headers,
+      body: want.body,
+      timeoutMs: want.timeoutMs,
+    });
+    const req = await fa.next("fetch");
+
+    same(req, "fetch");
+    const reply = (name: string) => {
+      const m = use(name);
+
+      m.re = req.id;
+      fa.send(m);
+    };
+
+    reply("fetch.head");
+    reply("fetch.chunk");
+    const res = await resP;
+
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "application/json");
+    reply("fetch.chunk.base64");
+    reply("fetch.end");
+    const body = Buffer.from(await res.arrayBuffer());
+    const text = Buffer.from(sample("fetch.chunk").data.data, "utf8");
+    const bin = Buffer.from(sample("fetch.chunk.base64").data.data, "base64");
+
+    assert.deepEqual(body, Buffer.concat([text, bin]));
+  });
+
+  it("fetch.binary, fetch.cancel, fetch.end.error, fetch.end.invalid", async () => {
+    const want = sample("fetch.binary").data;
+    const ac = new AbortController();
+    const p = s.agents.fetch(creds.agentId, want.worker, want.path, {
+      method: want.method,
+      headers: want.headers,
+      body: new Uint8Array([0, 1, 2, 3, 4, 5]),
+      signal: ac.signal,
+    });
+    const req = await fa.next("fetch");
+
+    same(req, "fetch.binary");
+    ac.abort();
+    await assert.rejects(p, { code: "CANCELLED" });
+    const cancel = await fa.next("fetch.cancel");
+
+    same(cancel, "fetch.cancel");
+    assert.equal(cancel.re, req.id);
+
+    const p2 = s.agents.fetch(creds.agentId, "echo", "/x");
+    const req2 = await fa.next("fetch");
+    const end = use("fetch.end.error");
+
+    end.re = req2.id;
+    fa.send(end);
+    await assert.rejects(p2, {
+      code: "WORKER_UNAVAILABLE",
+      message: end.data.error.message,
+    });
+
+    const p3 = s.agents.fetch(creds.agentId, "legacy", "/x");
+    const req3 = await fa.next("fetch");
+    const inv = use("fetch.end.invalid");
+
+    inv.re = req3.id;
+    fa.send(inv);
+    await assert.rejects(p3, {
+      code: "WORKER_INVALID",
+      status: 502,
+      message: inv.data.error.message,
+    });
+  });
+
+  it("watch и watch.off", async () => {
+    const want = sample("watch").data;
+    const ref = await s.agents.watch(creds.agentId, {
+      metricsIntervalMs: want.metricsIntervalMs,
+      logLevel: want.logLevel,
+    });
+    const w = await fa.next("watch");
+
+    same(w, "watch", ["data.untilMs"]);
+    assert.equal(w.data.untilMs, ref.until);
+    await s.agents.unwatch(creds.agentId, ref.id);
+    same(await fa.next("watch"), "watch.off");
+  });
+
+  it("действия и их итоги", async () => {
+    const run = async (
+      name: string,
+      call: () => Promise<unknown>,
+      result: string,
+      check: (v: unknown) => void,
+    ) => {
+      const p = call();
+      const act = await fa.next("action");
+
+      same(act, name);
+      const r = use(result);
+
+      r.re = act.id;
+      fa.send(r);
+      await fa.ackOf(r.id!);
+      check(await p);
+    };
+
+    await run(
+      "action.worker.restart",
+      () => s.agents.restartWorker(creds.agentId, "echo"),
+      "action.result.worker.restart",
+      v => assert.equal(v, undefined),
+    );
+    await run(
+      "action.worker.restart.force",
+      () => s.agents.restartWorker(creds.agentId, "echo", { force: true }),
+      "action.result.worker.restart",
+      v => assert.equal(v, undefined),
+    );
+    await run(
+      "action.worker.update",
+      () => s.agents.updateWorker(creds.agentId, "report"),
+      "action.result.worker.update",
+      v =>
+        assert.deepEqual(v, sample("action.result.worker.update").data.result),
+    );
+    await run(
+      "action.agent.update",
+      () => s.agents.updateAgent(creds.agentId),
+      "action.result.agent.update",
+      v =>
+        assert.deepEqual(v, sample("action.result.agent.update").data.result),
+    );
+    await run(
+      "action.agent.logs",
+      () => s.agents.logs(creds.agentId, { worker: "echo", lines: 100 }),
+      "action.result.agent.logs",
+      v =>
+        assert.deepEqual(
+          v,
+          sample("action.result.agent.logs").data.result.entries,
+        ),
+    );
+
+    // Ответ agent.logs не разобран — ошибка MESSAGE_INVALID (502) и запись в журнал.
+    const lp = s.agents.logs(creds.agentId);
+    const la = await fa.next("action");
+    const bad = use("action.result.agent.logs");
+
+    bad.re = la.id;
+    bad.data.result = { entries: "x" };
+    fa.send(bad);
+    await assert.rejects(lp, { code: "MESSAGE_INVALID", status: 502 });
+    assert.ok(logged.includes("ответ agent.logs не принят"));
+
+    // Ошибка действия — AgentsError с кодом из итога.
+    const p = s.agents.updateWorker(creds.agentId, "report");
+    const act = await fa.next("action");
+    const r = use("action.result.error");
+
+    r.re = act.id;
+    fa.send(r);
+    await assert.rejects(p, { code: "UPDATE_FAILED" });
+
+    // Смена ключа: сервер запоминает хеш и закрывает соединение кодом 1012.
+    const rot = s.agents.rotateKey(creds.agentId);
+    const ra = await fa.next("action");
+
+    same(ra, "action.agent.rotateKey");
+    const rr = use("action.result.agent.rotateKey");
+
+    rr.re = ra.id;
+    fa.send(rr);
+    await rot;
+    await fa.ackOf(rr.id!);
+    assert.equal((await fa.closed).code, 1012);
+    const rec = await s.agents.store.getAgent(creds.agentId);
+
+    assert.equal(rec?.pendingSecretHash, rr.data.result.secretHash);
+  });
+
+  it("незнакомый тип — error UNKNOWN_TYPE", async () => {
+    const c2 = await enroll(s.url, { name: "node-02" });
+    const fb = await FakeAgent.connect(s.ws, c2, { configs: {} });
+
+    fb.send({ type: "example.unknown", id: "u1" });
+    const e = await fb.next("error", x => x.re === "u1");
+
+    assert.equal(e.data.code, "UNKNOWN_TYPE");
+    assert.equal(e.data.retryable, false);
+    await fb.close();
+  });
 });

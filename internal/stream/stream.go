@@ -1,11 +1,12 @@
-// Package stream — поток сообщений агента: сквозная нумерация seq в пределах
-// запуска и буфер неподтверждённого в памяти для досылки после переподключения.
+// Package stream — поток сообщений агента (status, metrics, log): сквозная
+// нумерация seq в пределах запуска и последние неподтверждённые сообщения в
+// памяти для досылки после переподключения (§3).
 package stream
 
 import (
 	"sync"
 
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 // Buffer — неподтверждённые потоковые сообщения (не больше Limit, старые вытесняются).
@@ -44,6 +45,18 @@ func (b *Buffer) Ack(seq int64) {
 	}
 	if i > 0 {
 		b.items = append([]message.Envelope(nil), b.items[i:]...)
+	}
+}
+
+// Remove — убрать сообщение seq из буфера (его нельзя отправить).
+func (b *Buffer) Remove(seq int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for i, env := range b.items {
+		if env.Seq == seq {
+			b.items = append(b.items[:i:i], b.items[i+1:]...)
+			return
+		}
 	}
 }
 

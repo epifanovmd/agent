@@ -4,43 +4,15 @@ package app
 
 import (
 	"context"
-	"net/http"
 	"os"
 	"os/signal"
-	"slices"
 	"strings"
 	"syscall"
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/logx"
-	"github.com/epifanovmd/agent/internal/telemetry"
+	"github.com/epifanovmd/agent/internal/worker"
 )
-
-// httpClient — клиент для всех запросов агента к серверу (WebSocket, HTTP
-// sync, регистрация, загрузка обновлений): прокси из окружения, системные
-// корни + server.caFile, клиентский сертификат server.certFile/keyFile.
-func httpClient(s config.Server) (*http.Client, error) {
-	tlsCfg, err := s.TLSConfig()
-	if err != nil {
-		return nil, err
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	// Прокси — HTTPS_PROXY / HTTP_PROXY / NO_PROXY на момент запуска (proxyFromEnv).
-	transport.Proxy = proxyFromEnv()
-	if tlsCfg != nil {
-		transport.TLSClientConfig = tlsCfg
-	}
-	return &http.Client{Transport: transport}, nil
-}
-
-func telemetryOptions(cfg config.Config) telemetry.Options {
-	return telemetry.Options{
-		Metrics: cfg.Telemetry.Metrics,
-		Disks:   cfg.Telemetry.Disks,
-		GPU:     cfg.Telemetry.GPU != "off",
-		Exclude: cfg.Telemetry.ExcludeInterfaces,
-	}
-}
 
 // ReloadOnSignal — по SIGHUP перечитать настройки из path (и окружения) до
 // отмены ctx. Подписка на сигнал действует уже при возврате.
@@ -73,11 +45,9 @@ func (a *App) ReloadFile(path string) error {
 	return nil
 }
 
-// Reload — применить новые настройки без перезапуска агента и без разрыва
-// очереди важных сообщений: лог, показатели, state.resyncInterval — сразу;
-// воркеры — Supervisor.Apply; имя, метки, встроенные команды и другие
-// изменения возможностей — новым hello (переподключение). Ключи, которые на
-// ходу не меняются (config.Compare: Restart), остаются прежними до перезапуска.
+// Reload — применить новые настройки без перезапуска агента: лог — сразу,
+// воркеры и метрики узла — заменой изменённых воркеров, имя и метки — новым
+// hello. Ключи, которые на ходу не меняются, остаются прежними до перезапуска.
 func (a *App) Reload(next config.Config) {
 	a.reloadMu.Lock()
 	defer a.reloadMu.Unlock()
@@ -95,39 +65,51 @@ func (a *App) Reload(next config.Config) {
 	a.cfgMu.Lock()
 	a.cfg = next
 	a.cfgMu.Unlock()
-
 	if diff.Log {
 		a.logCtl.Set(logx.Options{Level: next.Log.Level, Format: next.Log.Format})
 		a.forward.SetLevel(next.Log.Forward)
 	}
-	channels, cmds := a.telemetry.Channels(), a.commands.Names()
-	if diff.Telemetry {
-		a.telemetry.Configure(telemetryOptions(next))
-		a.rt.SetTelemetry(next.Telemetry.Backlog, next.Telemetry.InventoryInterval.Std())
+	if diff.Workers || diff.Telemetry {
+		if err := prepareRunDir(next, a.runDir); err != nil {
+			a.log.Error("каталог сокетов", "err", err)
+		}
+		a.workers.Apply(workerSpecs(next, a.sysmetricsCmd))
 	}
-	if diff.Resync {
-		a.state.SetResync(next.State.ResyncInterval.Std())
-	}
-	if diff.Tuning {
-		a.state.SetApplyTimeout(next.State.ApplyTimeout.Std())
-		a.commands.SetMaxConcurrent(next.Commands.MaxConcurrent)
-		a.jobs.SetCancelTimeout(next.Jobs.CancelTimeout.Std())
-		a.outbox.SetLimit(next.Outbox.MaxMessages, nil)
-	}
-	a.applyBuiltins(next)
-	var removed []string
-	if diff.Workers {
-		removed = a.workers.Apply(next.Workers)
-	}
-	a.rt.SetIdentity(next.Name, next.Labels)
-	a.pushWorkerContext() // имя, метки, log.forward
-	renew := diff.Hello || len(removed) > 0 ||
-		!slices.Equal(channels, a.telemetry.Channels()) || !slices.Equal(cmds, a.commands.Names())
 	a.log.Info("настройки перечитаны и применены", "log", diff.Log, "telemetry", diff.Telemetry,
-		"resync", diff.Resync, "tuning", diff.Tuning, "workers", diff.Workers, "hello", renew)
-	if renew {
-		// Возможности сузились или изменилось приветствие: capabilities
-		// только добавляет — серверу нужен новый hello. Очередь сохраняется.
+		"workers", diff.Workers, "hello", diff.Hello || diff.Workers)
+	if diff.Hello || diff.Workers {
+		// hello несёт имя, метки и список воркеров: серверу нужен новый.
 		a.link.Reconnect()
+	}
+}
+
+// Serve — работать как служба до сигнала (§13): SIGTERM и SIGINT —
+// остановка (воркеры — по lifecycle.onAgentStop), SIGUSR1 (`agent restart`)
+// — выход для перезапуска менеджером службы (ErrRestart; воркеры — по
+// lifecycle.onAgentRestart), SIGHUP — перечитать настройки из path.
+func (a *App) Serve(path string) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sig := make(chan os.Signal, 4)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1)
+	defer signal.Stop(sig)
+	a.ReloadOnSignal(ctx, path)
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	for {
+		select {
+		case err := <-done:
+			return err
+		case s := <-sig:
+			if s == syscall.SIGUSR1 {
+				a.log.Info("SIGUSR1: перезапуск агента")
+				a.restart.Store(true)
+				a.setExit(worker.ExitRestart)
+			} else {
+				a.log.Info("остановка агента", "signal", s.String())
+				a.setExit(worker.ExitStop)
+			}
+			cancel()
+		}
 	}
 }

@@ -1,8 +1,8 @@
 //go:build unix
 
-// Package app — сборка агента: связь, задачи, воркеры, команды, желаемое
-// состояние, телеметрия, самообновление. Предметная область — только в
-// воркерах; агент один для всех проектов.
+// Package app — сборка агента: связь с сервером, воркеры, настройки
+// воркеров, запросы к воркерам, сокет агента, метрики, лог, встроенные
+// действия, самообновление. Предметная область — только в воркерах.
 package app
 
 import (
@@ -12,10 +12,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	neturl "net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -24,78 +22,77 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/epifanovmd/agent/internal/agentsock"
 	"github.com/epifanovmd/agent/internal/backoff"
-	"github.com/epifanovmd/agent/internal/commands"
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/configs"
+	"github.com/epifanovmd/agent/internal/fetch"
 	"github.com/epifanovmd/agent/internal/identity"
-	"github.com/epifanovmd/agent/internal/jobs"
 	"github.com/epifanovmd/agent/internal/link"
 	"github.com/epifanovmd/agent/internal/logx"
+	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/outbox"
-	"github.com/epifanovmd/agent/internal/runtime"
-	"github.com/epifanovmd/agent/internal/state"
 	"github.com/epifanovmd/agent/internal/stream"
-	"github.com/epifanovmd/agent/internal/telemetry"
+	"github.com/epifanovmd/agent/internal/sysmetrics"
 	"github.com/epifanovmd/agent/internal/update"
 	"github.com/epifanovmd/agent/internal/worker"
-	"github.com/epifanovmd/agent/sdk/go/message"
-	"github.com/epifanovmd/agent/sdk/go/sealed"
 )
-
-// SDK — версия Go SDK агента в hello (agent.sdk).
-const SDK = "go/1.1.0"
-
-// streamLimit — потоковых сообщений в памяти до подтверждения.
-const streamLimit = 2000
 
 // BuiltinUpdateKey — ключ проверки сборок, вшитый при сборке (cmd/agent,
 // -ldflags "-X main.updateKey=…"); настройка update.publicKey важнее.
 var BuiltinUpdateKey string
 
-// ErrRestart — агент остановлен для перезапуска (команда или обновление):
-// процесс завершается, менеджер (systemd, Docker) запускает его снова.
+// ErrRestart — агент остановлен для перезапуска (обновление): процесс
+// завершается, менеджер (systemd, Docker) запускает его снова.
 var ErrRestart = errors.New("agent: перезапуск")
 
 // App — агент.
 type App struct {
-	// cfgMu — cfg меняется при перечитывании настроек (Reload).
 	cfgMu    sync.Mutex
 	cfg      config.Config
 	reloadMu sync.Mutex
 	version  string
-	log      *slog.Logger
-	logCtl   *logx.Control
-	// forward — записи лога для сервера (сообщение log).
+	bootID   string
+	started  time.Time
+
+	log     *slog.Logger
+	logCtl  *logx.Control
 	forward *logx.Forwarder
-	ring    *logx.Ring
+	journal *logx.Journal
 	client  *http.Client
 
-	rt        *runtime.Runtime
-	link      *link.Link
-	auth      *auth
-	jobs      *jobs.Manager
-	commands  *commands.Registry
-	state     *state.Manager
-	workers   *worker.Supervisor
-	telemetry *telemetry.Collector
-	outbox    *outbox.Outbox
-	update    update.Paths
-	pubKey    ed25519.PublicKey
+	auth    *auth
+	outbox  *outbox.Outbox
+	link    *link.Link
+	workers *worker.Supervisor
+	configs *configs.Store
+	tunnel  *fetch.Tunnel
+	runDir  string
+	update  update.Paths
+	pubKey  ed25519.PublicKey
+	// sysmetricsCmd — запуск встроенного воркера sysmetrics.
+	sysmetricsCmd []string
+
+	obs observer
+	act actions
+
+	errMu     sync.Mutex
+	lastErr   string
+	lastErrAt time.Time
 
 	restart atomic.Bool
 	cancel  context.CancelFunc
-	// lock — блокировка каталога данных (снимается после Run или Close).
-	lock *Lock
+	lock    *Lock
 }
 
-// New — агент по конфигурации.
+// New — агент по настройкам.
 func New(cfg config.Config, version string) (*App, error) {
-	ring := logx.NewRing(5000)
-	log, logCtl := logx.NewSwitchable(os.Stderr, ring, logx.Options{Level: cfg.Log.Level, Format: cfg.Log.Format})
+	journal := logx.NewJournal(cfg.Log.Buffer)
+	log, logCtl := logx.New(os.Stderr, journal, logx.Options{Level: cfg.Log.Level, Format: cfg.Log.Format})
 	forward := logx.NewForwarder(cfg.Log.Forward)
 	logCtl.SetForwarder(forward)
 	if cfg.Insecure() {
-		log.Warn("связь без шифрования — ключ агента и состояние (в нём могут быть секреты) идут открытым текстом; нужен https://",
+		log.Warn("связь без шифрования — ключ агента и настройки воркеров идут открытым текстом; нужен https://",
 			"server", strings.Join(cfg.Server.Addresses(), ", "))
 	}
 	lock, err := LockDataDir(cfg.DataDir)
@@ -112,22 +109,18 @@ func New(cfg config.Config, version string) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	ob.SetLimit(cfg.Outbox.MaxMessages, log)
+	ob.SetLimit(cfg.Outbox.MaxMessages)
 	client, err := httpClient(cfg.Server)
 	if err != nil {
 		return nil, err
 	}
 	a := &App{
-		cfg:     cfg,
-		version: version,
-		log:     log,
-		logCtl:  logCtl,
-		forward: forward,
-		ring:    ring,
-		client:  client,
-		outbox:  ob,
-		lock:    lock,
+		cfg: cfg, version: version, bootID: message.NewBootID(), started: time.Now(),
+		log: log, logCtl: logCtl, forward: forward, journal: journal, client: client,
+		outbox: ob, lock: lock, runDir: RunDir(cfg.DataDir),
+		sysmetricsCmd: SysmetricsCommand(),
 	}
+	a.obs.init()
 	if key := cmp.Or(cfg.Update.PublicKey, BuiltinUpdateKey); key != "" {
 		if a.pubKey, err = update.ParsePublicKey(key); err != nil {
 			return nil, err
@@ -136,134 +129,150 @@ func New(cfg config.Config, version string) (*App, error) {
 	if exe, err := os.Executable(); err == nil {
 		a.update = update.NewPaths(exe)
 	}
-
-	ctx := context.Background()
-	host := telemetry.HostInfo(ctx)
-	codeHash, _ := update.FileHash(a.update.Binary)
-	// Пара ключей для запечатанных значений в состоянии: открытый — в hello.
-	encKey, err := identity.EncryptionKey(cfg.DataDir)
+	if err := prepareRunDir(cfg, a.runDir); err != nil {
+		return nil, err
+	}
+	a.auth = &auth{store: identity.NewStore(cfg.DataDir), cfg: cfg, client: client, host: HostInfo(), log: log, onError: a.recordError}
+	a.link = link.New(link.Options{
+		ServerURLs: cfg.Server.Addresses(),
+		Auth:       a.auth,
+		Outbox:     ob,
+		Stream:     stream.New(cfg.Server.StreamBuffer),
+		Backoff:    reconnect(cfg.Server),
+		HTTPClient: client,
+		Log:        log,
+	}, a)
+	a.workers = worker.New(workerSpecs(cfg, a.sysmetricsCmd), worker.Options{
+		RunDir:       a.runDir,
+		DataDir:      cfg.DataDir,
+		AgentSocket:  filepath.Join(a.runDir, AgentSocketName),
+		AgentVersion: version,
+		Log:          log,
+		OnStarted:    func(name string) { a.configs.Started(name) },
+		OnAdopted:    func(name string) { a.configs.Adopted(name) },
+		OnChange:     a.statusChanged,
+	})
+	a.configs, err = configs.Open(filepath.Join(cfg.DataDir, "configs"), configWorkers{a.workers}, a.configApplied, log)
 	if err != nil {
 		return nil, err
 	}
-	a.rt = runtime.New(runtime.Info{
-		Name: cfg.Name, Version: version, SDK: SDK, CodeHash: codeHash,
-		Labels: cfg.Labels, Host: host, EncryptionKey: sealed.EncodeKey(encKey.PublicKey().Bytes()),
-	}, log)
-	a.auth = &auth{store: identity.NewStore(cfg.DataDir), cfg: cfg, client: a.client, host: host, log: log}
-	a.link = link.New(link.Options{
-		ServerURLs: cfg.Server.Addresses(),
-		Transport:  cfg.Server.Transport,
-		Auth:       a.auth,
-		Outbox:     ob,
-		Stream:     stream.New(streamLimit),
-		HTTPClient: a.client,
-		Log:        log,
-	}, a.rt)
-	a.rt.SetSender(a.link)
-	a.rt.SetOutbox(ob.Len)
-
-	a.telemetry = telemetry.New(telemetryOptions(cfg), log)
-	a.rt.SetMetrics(a.telemetry)
-	a.rt.SetTelemetry(cfg.Telemetry.Backlog, cfg.Telemetry.InventoryInterval.Std())
-	a.jobs = jobs.New(a.link, log, a.rt.Changed)
-	a.jobs.SetUnreported(ob.JobRefs)
-	a.jobs.SetCancelTimeout(cfg.Jobs.CancelTimeout.Std())
-	a.commands = commands.New(a.link, log)
-	a.commands.SetMaxConcurrent(cfg.Commands.MaxConcurrent)
-	a.state = state.New(filepath.Join(cfg.DataDir, "state"), a.link, log)
-	a.state.SetUnseal(func(spec json.RawMessage) (json.RawMessage, error) { return sealed.Unseal(encKey, spec) })
-	a.state.SetResync(cfg.State.ResyncInterval.Std())
-	a.state.SetApplyTimeout(cfg.State.ApplyTimeout.Std())
-	a.workers = worker.New(cfg.Workers, a.jobs, log, a.rt.Changed, version)
-	// Пауза очередей от сервера переживает перезапуск агента.
-	a.workers.SetPauseFile(filepath.Join(cfg.DataDir, "worker-pause.json"))
-	if cfg.Server.CAFile != "" {
-		// Файлы задач воркеры скачивают сами: им тоже нужен CA сервера.
-		ca, _ := filepath.Abs(cfg.Server.CAFile)
-		env := map[string]string{"AGENT_SERVER_CA_FILE": ca, "NODE_EXTRA_CA_CERTS": ca} // Node.js добавляет его к системным корням
-		if own, ok := os.LookupEnv("NODE_EXTRA_CA_CERTS"); ok {
-			env["NODE_EXTRA_CA_CERTS"] = own
-		}
-		a.workers.SetEnv(env)
-	}
-	a.workers.SetBridge(worker.Bridge{
-		Commands:  a.commands,
-		State:     a.state,
-		Telemetry: a.telemetry,
-		Events:    a.link,
-		Changed:   a.rt.CapabilitiesChanged,
-		Narrowed:  a.link.Reconnect,
-	})
-
-	a.applyBuiltins(cfg)
-	forward.SetOnline(a.link.Connected)
-	a.rt.OnLogLevel(func(level string) {
-		if err := forward.Override(level); err != nil {
-			log.Warn("сервер прислал неверный порог лога (subscription.logLevel) — пропущен", "err", err)
-		}
-	})
-	// Контекст воркеров (worker.context): связь, частота метрик, порог лога, подписки на каналы.
-	a.rt.WhenContextChanged(a.pushWorkerContext)
-	a.pushWorkerContext()
-	a.rt.WhenWelcomed(func(message.Welcome) {
-		if a.update.Marker != "" {
-			update.Healthy(a.update)
-		}
-	})
+	a.tunnel = fetch.New(configWorkers{a.workers}, log)
 	ok = true
 	return a, nil
 }
 
-// Close — снять блокировку каталога данных у агента, который не запускался
-// (Run снимает её сам).
+// prepareRunDir — каталог сокетов: проходимый для воркеров с user (у
+// каждого свой подкаталог 0700); каталог данных — тоже проходимый, если
+// такие воркеры есть.
+func prepareRunDir(cfg config.Config, dir string) error {
+	if err := os.MkdirAll(dir, 0o711); err != nil {
+		return fmt.Errorf("agent: каталог сокетов: %w", err)
+	}
+	if err := os.Chmod(dir, 0o711); err != nil {
+		return err
+	}
+	if slices.ContainsFunc(cfg.Workers, func(w config.Worker) bool { return w.User != "" }) {
+		return os.Chmod(cfg.DataDir, 0o711)
+	}
+	return nil
+}
+
+// configWorkers — воркеры, которым сервер может слать настройки и запросы:
+// встроенный sysmetrics — часть агента, для сервера его нет.
+type configWorkers struct{ s *worker.Supervisor }
+
+func (c configWorkers) Has(name string) bool {
+	spec, ok := c.s.Spec(name)
+	return ok && !spec.Builtin
+}
+
+// ConfigRetry — повтор неприменённых настроек воркера (lifecycle.configRetry).
+func (c configWorkers) ConfigRetry(name string) time.Duration {
+	spec, _ := c.s.Spec(name)
+	return spec.Lifecycle.ConfigRetry.Std()
+}
+
+// Manifest — манифест воркера (ключи, которые ему можно передавать).
+func (c configWorkers) Manifest(name string) *message.WorkerManifest { return c.s.Manifest(name) }
+
+func (c configWorkers) Client(name string) (*http.Client, error) {
+	if !c.Has(name) {
+		return nil, worker.ErrUnknown
+	}
+	return c.s.Client(name)
+}
+
+// Close — снять блокировку каталога данных у агента, который не запускался.
 func (a *App) Close() { a.lock.Unlock() }
 
-// Run — работать до отмены ctx (или команды перезапуска); ErrRestart —
-// процесс нужно запустить снова.
+// Run — работать до отмены ctx; ErrRestart — процесс нужно запустить снова.
 func (a *App) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	a.cancel = cancel
 	defer cancel()
 	defer a.lock.Unlock()
 
-	if err := a.auth.ensure(ctx); err != nil {
+	sock, err := listenSocket(a)
+	if err != nil {
 		return err
 	}
-	a.pushWorkerContext() // id агента известен
-
-	a.rt.Register(a.jobs)
-	a.rt.Register(a.commands)
-	a.rt.Register(a.workers)
-	// Домены могут появиться позже — от воркеров; без доменов возможность не объявляется.
-	a.rt.Register(a.state)
-	a.rt.Register(telemetryCapability{a.telemetry})
-	a.rt.Register(updateCapability{mode: a.config().Update.Mode})
-	a.rt.Register(logCapability{f: a.forward, link: a.link})
-	a.rt.Register(heartbeat{path: filepath.Join(a.config().DataDir, StatusFile), online: a.rt.Online})
+	defer sock.Close()
 
 	cfg := a.config()
-	a.log.Info("агент запущен", "version", a.version, "name", cfg.Name, "server", strings.Join(cfg.Server.Addresses(), ", "), "workers", len(cfg.Workers))
-	err := a.rt.Run(ctx, a.link.Run, a.stopTimeout())
+	a.log.Info("агент запущен", "version", a.version, "name", cfg.Name, "server", strings.Join(cfg.Server.Addresses(), ", "),
+		"workers", len(cfg.Workers))
+	var wg sync.WaitGroup
+	run := func(f func(context.Context)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f(ctx)
+		}()
+	}
+	run(func(ctx context.Context) {
+		_ = heartbeat{path: filepath.Join(cfg.DataDir, StatusFile), snapshot: a.snapshot}.run(ctx)
+	})
+	run(a.workers.Run)
+	run(a.configs.Run)
+	run(a.metricsLoop)
+	run(a.statusLoop)
+	run(a.logLoop)
+	run(func(ctx context.Context) {
+		// Воркеры работают и без связи; связь — после регистрации.
+		if err := a.auth.ensure(ctx); err != nil {
+			if ctx.Err() == nil {
+				a.log.Error("агент не зарегистрирован — работает без связи", "err", err)
+				a.recordError(err)
+			}
+			return
+		}
+		_ = a.link.Run(ctx)
+	})
+	<-ctx.Done()
+	wg.Wait()
 	if a.restart.Load() {
 		return ErrRestart
 	}
-	return err
+	return ctx.Err()
 }
 
-// stopTimeout — срок доработки при остановке: самая долгая из воркеров.
-func (a *App) stopTimeout() time.Duration {
-	timeout := 30 * time.Second
-	for _, w := range a.config().Workers {
-		timeout = max(timeout, w.StopTimeout.Std())
-	}
-	return timeout + 5*time.Second
-}
-
+// requestRestart — выйти для перезапуска (ErrRestart): воркеры — по
+// lifecycle.onAgentRestart.
 func (a *App) requestRestart() {
 	a.restart.Store(true)
+	a.setExit(worker.ExitRestart)
 	if a.cancel != nil {
 		a.cancel()
 	}
+}
+
+// setExit — что будет с воркерами при выходе. В контейнере (update.mode:
+// external) воркеры не переживают агента: останавливаются всегда.
+func (a *App) setExit(e worker.Exit) {
+	if a.config().Update.Mode == config.UpdateExternal {
+		e = worker.ExitShutdown
+	}
+	a.workers.SetExit(e)
 }
 
 // config — текущие настройки (меняются Reload).
@@ -273,246 +282,221 @@ func (a *App) config() config.Config {
 	return a.cfg
 }
 
-// applyBuiltins — встроенные команды по настройкам: выключенные
-// (commands.disabled) снимаются, остальные подключаются.
-func (a *App) applyBuiltins(cfg config.Config) {
-	builtins := map[string]commands.Handler{
-		message.CommandLogs:          a.logsCommand,
-		message.CommandDrain:         a.drainCommand,
-		message.CommandResume:        a.resumeCommand,
-		message.CommandRotateKey:     a.auth.rotate,
-		message.CommandRestart:       a.restartCommand,
-		message.CommandUpdate:        a.updateCommand,
-		message.CommandWorkerRestart: a.workerRestartCommand,
-		message.CommandWorkerUpdate:  a.workerUpdateCommand,
-		message.CommandWorkerPause:   a.workerPauseCommand,
-		message.CommandWorkerResume:  a.workerResumeCommand,
-	}
-	for name, h := range builtins {
-		enabled := !slices.Contains(cfg.Commands.Disabled, name)
-		switch name {
-		case message.CommandUpdate:
-			enabled = enabled && cfg.Update.Mode == message.UpdateSelf
-		case message.CommandWorkerRestart, message.CommandWorkerPause, message.CommandWorkerResume:
-			enabled = enabled && len(cfg.Workers) > 0
-		case message.CommandWorkerUpdate:
-			// Только если есть воркер из выпуска и обновление не выключено.
-			enabled = enabled && cfg.Update.Mode != message.UpdateDisabled &&
-				slices.ContainsFunc(cfg.Workers, func(w config.Worker) bool { return w.Release })
-		}
-		if enabled {
-			a.commands.Register(name, h)
-		} else {
-			a.commands.Unregister(name)
-		}
-	}
+func (a *App) recordError(err error) {
+	a.errMu.Lock()
+	defer a.errMu.Unlock()
+	a.lastErr, a.lastErrAt = err.Error(), time.Now()
 }
 
-func (a *App) logsCommand(_ context.Context, args json.RawMessage, out io.Writer) (any, error) {
-	var req struct {
-		Lines int `json:"lines"`
-	}
-	_ = json.Unmarshal(args, &req)
-	if req.Lines <= 0 || req.Lines > 5000 {
-		req.Lines = 500
-	}
-	lines := a.ring.Tail(req.Lines)
-	_, _ = io.WriteString(out, strings.Join(lines, "\n")+"\n")
-	return map[string]int{"lines": len(lines)}, nil
-}
+// ─── link.Handler ──────────────────────────────────────────────────────
 
-func (a *App) drainCommand(context.Context, json.RawMessage, io.Writer) (any, error) {
-	a.rt.Drain()
-	return a.rt.Status(), nil
-}
-
-func (a *App) resumeCommand(context.Context, json.RawMessage, io.Writer) (any, error) {
-	a.rt.Resume()
-	return a.rt.Status(), nil
-}
-
-func (a *App) restartCommand(context.Context, json.RawMessage, io.Writer) (any, error) {
-	// Ответ уходит до остановки: перезапуск — чуть позже.
-	time.AfterFunc(time.Second, a.requestRestart)
-	return nil, nil
-}
-
-func (a *App) workerRestartCommand(ctx context.Context, args json.RawMessage, out io.Writer) (any, error) {
-	var req struct {
-		Name string `json:"name"`
-	}
-	_ = json.Unmarshal(args, &req)
-	names := a.workers.Names()
-	if req.Name != "" {
-		names = []string{req.Name}
-	}
-	for _, name := range names {
-		fmt.Fprintf(out, "перезапуск %s…\n", name)
-		if err := a.workers.Restart(ctx, name); err != nil {
-			var ce *commands.Error
-			if errors.As(err, &ce) {
-				return nil, ce
-			}
-			return nil, commands.Errorf("WORKER_RESTART", "%s: %v", name, err)
-		}
-	}
-	return map[string]any{"restarted": names}, nil
-}
-
-// workerPauseCommand — worker.pause {name, queues?}: места воркера по
-// очередям (без queues — по всем) — 0; пауза сервера, отдельная от паузы
-// самого воркера.
-func (a *App) workerPauseCommand(_ context.Context, args json.RawMessage, _ io.Writer) (any, error) {
-	return a.workerPauseDo(args, a.workers.Pause)
-}
-
-// workerResumeCommand — worker.resume {name, queues?}: снять паузу сервера.
-func (a *App) workerResumeCommand(_ context.Context, args json.RawMessage, _ io.Writer) (any, error) {
-	return a.workerPauseDo(args, a.workers.Resume)
-}
-
-func (a *App) workerPauseDo(args json.RawMessage, do func(name string, queues []string) error) (any, error) {
-	var req message.WorkerPauseArgs
-	if err := json.Unmarshal(args, &req); err != nil || req.Name == "" {
-		return nil, commands.Errorf("WORKER_ARGS", "нужно name — имя воркера")
-	}
-	if err := do(req.Name, req.Queues); err != nil {
-		if errors.Is(err, worker.ErrUnknownWorker) {
-			return nil, commands.Errorf("WORKER_UNKNOWN", "воркера %q нет в настройках агента", req.Name)
-		}
-		return nil, err
-	}
-	return map[string]any{"name": req.Name, "paused": a.workers.Paused(req.Name)}, nil
-}
-
-// pushWorkerContext — текущий контекст агента воркерам (worker.context);
-// одинаковый повторно не отправляется.
-func (a *App) pushWorkerContext() {
+// Hello — первое сообщение соединения (§4).
+func (a *App) Hello() message.Hello {
 	cfg := a.config()
-	a.workers.SetContext(message.WorkerContext{
-		Mode: message.WorkerModeRun,
-		Agent: message.WorkerContextAgent{
-			ID: a.auth.agentID(), Name: cfg.Name, Version: a.version, Labels: cfg.Labels,
-		},
-		Online:            a.rt.Online(),
-		MetricsIntervalMs: a.rt.MetricsInterval().Milliseconds(),
-		// Все подписанные каналы; каждый воркер получает только свои (Supervisor).
-		Channels: a.rt.Subscription().Channels,
-		LogLevel: a.forward.Level(),
-	})
+	h := message.Hello{
+		Agent:   message.HelloAgent{Version: a.version, BootID: a.bootID, StartedAt: a.started.UnixMilli()},
+		Host:    a.auth.host,
+		Labels:  cfg.Labels,
+		Configs: a.configs.Versions(),
+	}
+	for _, st := range a.workers.Status() {
+		if !st.Builtin {
+			h.Workers = append(h.Workers, message.HelloWorker{Name: st.Name, Version: st.Version, Release: st.Release,
+				Manifest: st.Manifest})
+		}
+	}
+	return h
 }
 
-// workerUpdateCommand — worker.update: сборка воркера из выпуска скачивается
-// с сервера агента (url от корня — с его ключом), проверяется (sha256,
-// подпись ключом update.publicKey) и ставится с откатом (Supervisor.Update).
-func (a *App) workerUpdateCommand(ctx context.Context, args json.RawMessage, out io.Writer) (any, error) {
-	var req message.WorkerUpdate
-	if err := json.Unmarshal(args, &req); err != nil || req.Name == "" || req.Version == "" || req.URL == "" || req.SHA256 == "" {
-		return nil, commands.Errorf("UPDATE_ARGS", "нужны name, version, url, sha256, signature")
+// OnWelcome — соединение открыто: частоты от сервера, отметка «новая
+// версия вышла на связь», итог agent.update, свежий status (§4).
+func (a *App) OnWelcome(_ *link.Session, w message.Welcome) {
+	a.obs.setWelcome(w)
+	if a.update.Marker != "" {
+		update.Healthy(a.update)
 	}
-	if !a.workers.Released(req.Name) {
-		return nil, commands.Errorf(message.ErrWorkerNotReleased, "воркер %q не из выпуска (нет в настройках или release: true не задан)", req.Name)
-	}
-	if a.pubKey == nil {
-		return nil, commands.Errorf(message.ErrUpdateNotVerified, "не задан ключ проверки сборок (update.publicKey) — сборку нельзя проверить")
-	}
-	url := req.URL
-	if strings.HasPrefix(url, "/") {
-		url = strings.TrimRight(a.link.ServerURL(), "/") + url
-	}
-	// Подпись — над сборкой этого воркера этой версии под эту машину (§7).
-	build := update.Local(req.Name, req.Version, req.SHA256)
-	fetch := func(dst string) error {
-		if isArchive(url) {
-			return update.FetchArchive(ctx, a.client, a.auth.Session(), a.pubKey, build, url, req.Signature, dst)
+	a.finishAgentUpdate()
+	a.sendStatus()
+}
+
+// OnMessage — сообщение сервера (§5).
+func (a *App) OnMessage(s *link.Session, env message.Envelope) {
+	switch env.Type {
+	case message.TypeConfigPut:
+		var p message.ConfigPut
+		if err := env.Decode(&p); err != nil {
+			a.log.Warn("config.put: неверное сообщение", "err", err)
+			return
 		}
-		return update.Fetch(ctx, a.client, a.auth.Session(), a.pubKey, build, url, req.Signature, dst)
+		a.configs.Put(p)
+		a.statusChanged()
+	case message.TypeConfigDelete:
+		var d message.ConfigDelete
+		if err := env.Decode(&d); err != nil {
+			a.log.Warn("config.delete: неверное сообщение", "err", err)
+			return
+		}
+		a.configs.Delete(d)
+		a.statusChanged()
+	case message.TypeFetch:
+		a.tunnel.Handle(s, env)
+	case message.TypeFetchCancel:
+		a.tunnel.Cancel(s, env.Re)
+	case message.TypeWatch:
+		var w message.Watch
+		if err := env.Decode(&w); err != nil {
+			a.log.Warn("watch: неверное сообщение", "err", err)
+			return
+		}
+		a.setWatch(w)
+	case message.TypeAction:
+		a.action(env)
+	case message.TypeWelcome:
+	default:
+		a.log.Warn("незнакомое сообщение сервера — пропущено", "type", env.Type)
 	}
-	res, err := a.workers.Update(ctx, req.Name, req.Version, fetch, out)
+}
+
+// OnDisconnect — связь потеряна.
+func (a *App) OnDisconnect(err error) {
+	if err != nil {
+		a.recordError(err)
+	}
+}
+
+// configApplied — итог применения настроек серверу (важное сообщение).
+func (a *App) configApplied(c message.ConfigApplied) {
+	if err := a.link.Important(message.MustNew(message.TypeConfigApplied, c)); err != nil {
+		a.log.Error("config.applied не записан в outbox", "err", err)
+	}
+	a.statusChanged()
+}
+
+// ─── сокет агента ──────────────────────────────────────────────────────
+
+func listenSocket(a *App) (*agentsock.Server, error) {
+	sock, err := agentsock.Listen(filepath.Join(a.runDir, AgentSocketName), sockAgent{a}, a.log)
+	if err != nil {
+		return nil, fmt.Errorf("agent: сокет агента: %w", err)
+	}
+	return sock, nil
+}
+
+func newKeys(a *App, creds identity.Credentials) *identity.Keys {
+	return identity.NewKeys(a.auth.store, creds)
+}
+
+// snapshot — что агент сообщает о себе в отметке для agent status.
+func (a *App) snapshot() AgentStatus {
+	cfg := a.config()
+	a.errMu.Lock()
+	errText, errAt := a.lastErr, a.lastErrAt
+	a.errMu.Unlock()
+	st := a.status()
+	s := AgentStatus{
+		Online: a.link.Connected(), StartedAt: a.started.UnixMilli(), Version: a.version, Name: cfg.Name,
+		AgentID: a.auth.agentID(), Server: a.link.ServerURL(), Outbox: st.Outbox, Workers: st.Workers, LastError: errText,
+	}
+	if !errAt.IsZero() {
+		s.LastErrorAt = errAt.UnixMilli()
+	}
+	return s
+}
+
+type sockAgent struct{ a *App }
+
+func (s sockAgent) ByToken(token string) (string, bool) { return s.a.workers.ByToken(token) }
+
+func (s sockAgent) Event(e message.Event) error {
+	env, err := message.New(message.TypeEvent, e)
+	if err != nil {
+		return err
+	}
+	return s.a.link.Important(env)
+}
+
+// Declared — тип события объявлен в манифесте воркера (§12). Событие,
+// присланное сразу после запуска, ждёт итога первой проверки регистрации.
+func (s sockAgent) Declared(ctx context.Context, name, typ string) bool {
+	return s.a.workers.WaitManifest(ctx, name).DeclaresEvent(typ)
+}
+
+func (s sockAgent) Config(name, key string) (message.ConfigValue, bool) {
+	return s.a.configs.Get(name, key)
+}
+
+func (s sockAgent) Context() message.Context {
+	cfg := s.a.config()
+	return message.Context{
+		Agent:  message.ContextAgent{ID: s.a.auth.agentID(), Name: cfg.Name, Version: s.a.version, Labels: cfg.Labels},
+		Online: s.a.link.Connected(),
+	}
+}
+
+// ─── воркеры ───────────────────────────────────────────────────────────
+
+// SysmetricsCommand — как запустить встроенный воркер sysmetrics: эта же
+// программа в режиме `agent sysmetrics`.
+func SysmetricsCommand() []string {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = os.Args[0]
+	}
+	return []string{exe, sysmetrics.Command}
+}
+
+// workerSpecs — воркеры из настроек и встроенный sysmetrics, если есть
+// группы метрик узла (telemetry.metrics).
+func workerSpecs(cfg config.Config, sysmetricsCmd []string) []config.Worker {
+	specs := slices.Clone(cfg.Workers)
+	if len(cfg.Telemetry.Metrics) > 0 {
+		set, _ := json.Marshal(sysmetrics.Settings{
+			Metrics: cfg.Telemetry.Metrics, Disks: cfg.Telemetry.Disks, ExcludeInterfaces: cfg.Telemetry.ExcludeInterfaces,
+		})
+		specs = append(specs, config.Worker{
+			Name: config.SysmetricsWorker, Command: sysmetricsCmd, Builtin: true,
+			Env:       map[string]string{sysmetrics.EnvSettings: string(set)},
+			Lifecycle: config.Lifecycle{StopTimeout: config.Duration(5 * time.Second)},
+		})
+	}
+	return specs
+}
+
+// reconnect — пауза переподключения и повтора регистрации (server.reconnect).
+func reconnect(s config.Server) backoff.Policy {
+	return backoff.Policy{Min: s.Reconnect.Min.Std(), Max: s.Reconnect.Max.Std()}
+}
+
+// httpClient — клиент для запросов агента к серверу (WebSocket,
+// регистрация, загрузка сборок): прокси из окружения, системные корни +
+// server.caFile, клиентский сертификат.
+func httpClient(s config.Server) (*http.Client, error) {
+	tlsCfg, err := s.TLSConfig()
 	if err != nil {
 		return nil, err
 	}
-	return res, nil
-}
-
-// isArchive — сборка воркера в выпуске — архив .tar.gz (по имени файла в url).
-func isArchive(rawURL string) bool {
-	path := rawURL
-	if u, err := neturl.Parse(rawURL); err == nil {
-		path = u.Path
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = proxyFromEnv()
+	if tlsCfg != nil {
+		transport.TLSClientConfig = tlsCfg
 	}
-	return strings.HasSuffix(path, ".tar.gz")
+	return &http.Client{Transport: transport}, nil
 }
 
-func (a *App) updateCommand(ctx context.Context, args json.RawMessage, out io.Writer) (any, error) {
-	var rel update.Release
-	if err := json.Unmarshal(args, &rel); err != nil || rel.URL == "" || rel.SHA256 == "" {
-		return nil, commands.Errorf("UPDATE_ARGS", "нужны version, url, sha256, signature")
-	}
-	if strings.HasPrefix(rel.URL, "/") {
-		rel.URL = strings.TrimRight(a.link.ServerURL(), "/") + rel.URL
-	}
-	a.rt.SetUpdating(true)
-	defer a.rt.SetUpdating(false)
-	fmt.Fprintf(out, "загрузка %s…\n", rel.Version)
-	if err := update.Install(ctx, a.client, a.auth.Session(), a.update, a.pubKey, rel); err != nil {
-		if errors.Is(err, update.ErrNotVerified) {
-			return nil, commands.Errorf(message.ErrUpdateNotVerified, "%v", err)
-		}
-		return nil, commands.Errorf("UPDATE_FAILED", "%v", err)
-	}
-	fmt.Fprintln(out, "установлено, перезапуск после доработки задач")
-	time.AfterFunc(time.Second, a.requestRestart)
-	return map[string]string{"version": rel.Version}, nil
-}
+// ─── ключ агента ───────────────────────────────────────────────────────
 
-// telemetryCapability — объявление каналов телеметрии.
-type telemetryCapability struct{ c *telemetry.Collector }
-
-func (t telemetryCapability) Declare(caps *message.Capabilities) {
-	caps.Telemetry = &message.TelemetryCapability{Channels: t.c.Channels()}
-}
-func (telemetryCapability) Handles() []string                              { return nil }
-func (telemetryCapability) Handle(context.Context, message.Envelope) error { return nil }
-
-// logCapability — отправка записей лога серверу пачками (сообщение log),
-// пока агент работает.
-type logCapability struct {
-	f    *logx.Forwarder
-	link *link.Link
-}
-
-func (logCapability) Declare(*message.Capabilities)                  {}
-func (logCapability) Handles() []string                              { return nil }
-func (logCapability) Handle(context.Context, message.Envelope) error { return nil }
-func (l logCapability) Start(ctx context.Context) error {
-	l.f.Run(ctx, logx.ForwardEvery, func(b message.LogBatch) { l.link.Stream(message.TypeLog, b) })
-	return nil
-}
-
-// updateCapability — режим обновления.
-type updateCapability struct{ mode string }
-
-func (u updateCapability) Declare(caps *message.Capabilities) {
-	caps.Update = &message.UpdateCapability{Mode: u.mode}
-}
-func (updateCapability) Handles() []string                              { return nil }
-func (updateCapability) Handle(context.Context, message.Envelope) error { return nil }
-
-// ─── учётные данные ────────────────────────────────────────────────────
-
-// auth — учётные данные агента: загрузка, регистрация, повторная регистрация,
-// смена секрета (agent.rotateKey) через ожидающий секрет.
+// auth — ключ агента: загрузка, регистрация, регистрация заново, смена
+// секрета через ожидающий секрет.
 type auth struct {
-	store  *identity.Store
-	cfg    config.Config
-	client *http.Client
-	host   message.Host
-	log    *slog.Logger
-	keys   atomic.Pointer[identity.Keys]
+	store   *identity.Store
+	cfg     config.Config
+	client  *http.Client
+	host    message.Host
+	log     *slog.Logger
+	keys    atomic.Pointer[identity.Keys]
+	onError func(error)
 }
 
-// Authorization — заголовок для подключения (сначала ожидающий секрет).
 func (a *auth) Authorization() string {
 	if k := a.keys.Load(); k != nil {
 		return k.Authorization()
@@ -528,7 +512,7 @@ func (a *auth) agentID() string {
 	return ""
 }
 
-// Session — заголовок, принятый в последней сессии (запросы вне подключения).
+// Session — заголовок, принятый в последнем соединении (загрузка сборок).
 func (a *auth) Session() string {
 	if k := a.keys.Load(); k != nil {
 		return k.Session()
@@ -557,21 +541,21 @@ func (a *auth) Accepted(authorization string) {
 }
 
 // rotate — agent.rotateKey: новый ожидающий секрет, итог — его хеш.
-func (a *auth) rotate(context.Context, json.RawMessage, io.Writer) (any, error) {
+func (a *auth) rotate() (message.RotateKeyResult, error) {
 	k := a.keys.Load()
 	if k == nil {
-		return nil, commands.Errorf("ROTATE_KEY", "учётных данных нет")
+		return message.RotateKeyResult{}, errors.New("ключа агента нет")
 	}
 	hash, err := k.Rotate()
 	if err != nil {
-		return nil, commands.Errorf("ROTATE_KEY", "%v", err)
+		return message.RotateKeyResult{}, err
 	}
 	a.log.Info("создан новый секрет агента — ждёт признания сервером")
 	return message.RotateKeyResult{SecretHash: hash}, nil
 }
 
-// ensure — учётные данные есть или агент регистрируется (с повтором, пока
-// сервер недоступен; отклонённый токен — ошибка запуска).
+// ensure — ключ есть или агент регистрируется (с повтором, пока сервер
+// недоступен; отклонённый токен — ошибка).
 func (a *auth) ensure(ctx context.Context) error {
 	creds, ok, err := a.store.Load()
 	if err != nil {
@@ -589,8 +573,13 @@ func (a *auth) ensure(ctx context.Context) error {
 		if err == nil || errors.Is(err, identity.ErrTokenRejected) {
 			return err
 		}
-		delay := backoff.Default.Delay(attempt)
+		delay := reconnect(a.cfg.Server).Delay(attempt)
+		var rl *identity.RateLimited
+		if errors.As(err, &rl) {
+			delay = rl.After
+		}
 		a.log.Warn("регистрация не удалась — повтор", "err", err, "retryIn", delay.Round(time.Millisecond))
+		a.onError(err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -599,30 +588,25 @@ func (a *auth) ensure(ctx context.Context) error {
 	}
 }
 
-// Renew — учётные данные отозваны: регистрация заново, если есть токен.
+// Renew — ключ отозван: регистрация заново, если есть токен.
 func (a *auth) Renew(ctx context.Context) error {
 	if a.cfg.Enroll.Token == "" {
-		return errors.New("agent: учётные данные отозваны, токена регистрации нет")
+		return errors.New("agent: ключ агента отозван, токена регистрации нет")
 	}
-	// Прежние учётные данные заменяются только новыми: регистрация не
-	// удалась — они остаются (сервер может снова их принять).
 	return a.enroll(ctx)
 }
 
 // enroll — регистрация по токену: адреса сервера по порядку, пока один не
 // ответит (отклонённый токен — сразу ошибка).
 func (a *auth) enroll(ctx context.Context) error {
-	req := identity.EnrollRequest{
-		Token:  a.cfg.Enroll.Token,
-		Name:   a.cfg.Name,
-		Labels: a.cfg.Labels,
-		Host:   &identity.EnrollHost{Hostname: a.host.Hostname, OS: a.host.OS, Arch: a.host.Arch},
-	}
+	req := message.Enroll{Token: a.cfg.Enroll.Token, Name: a.cfg.Name, Labels: a.cfg.Labels,
+		Host: message.Host{OS: a.host.OS, Arch: a.host.Arch, Hostname: a.host.Hostname}}
 	var creds identity.Credentials
 	var err error
 	for _, addr := range a.cfg.Server.Addresses() {
 		creds, err = identity.Enroll(ctx, a.client, addr, req)
-		if err == nil || errors.Is(err, identity.ErrTokenRejected) || ctx.Err() != nil {
+		var rl *identity.RateLimited
+		if err == nil || errors.Is(err, identity.ErrTokenRejected) || errors.As(err, &rl) || ctx.Err() != nil {
 			break
 		}
 		a.log.Warn("регистрация: адрес недоступен", "server", addr, "err", err)

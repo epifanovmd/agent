@@ -1,496 +1,694 @@
-# Воркер
+# Как написать воркер
 
-Воркер — программа проекта на любом языке, которую агент запускает на узле рядом с собой.
-Агент держит связь с сервером, хранит важное на диске, повторяет и обновляет; воркер знает
-только свою предметную область. Какие воркеры работают на узле, решают только настройки
-агента (`agent.yaml`): сервер не может запустить на узле свою программу. Справочник API —
-[sdk/README.md](../README.md#worker--воркер-на-узле), формат —
-[sdk/spec §10](../spec/README.md#10-связь-воркера-с-агентом), образцы —
-[workers.json](../spec/examples/workers.json).
+Воркер — обычный HTTP-сервис на unix-сокете, на любом языке и без SDK. Агент запускает его,
+передаёт ему запросы бэкенда и настройки, спрашивает метрики и самочувствие, а воркер сам
+сообщает о событиях. Формат — [sdk/spec §12–§13](../spec/README.md#12-воркер), образцы HTTP —
+[worker.json](../spec/examples/worker.json).
 
-- [Запуск и регистрация](#запуск-и-регистрация)
-- [Регистрация и имена](#регистрация-и-имена)
-- [Контекст воркера](#контекст-воркера)
-- [Здоровье](#здоровье)
-- [Пауза очередей](#пауза-очередей)
-- [Просьба о перезапуске](#просьба-о-перезапуске)
-- [Замена воркера](#замена-воркера)
-- [Остановка и падение](#остановка-и-падение)
-- [Уборка при удалении агента](#уборка-при-удалении-агента)
-- [Ограничения ресурсов и пользователь](#ограничения-ресурсов-и-пользователь)
-- [Воркеры из выпуска](#воркеры-из-выпуска)
-- [Изменить воркеры на ходу](#изменить-воркеры-на-ходу)
+- [Обязательный минимум](#обязательный-минимум)
+- [Что агент даёт воркеру](#что-агент-даёт-воркеру)
+- [Что воркер обслуживает](#что-воркер-обслуживает)
+- [Манифест: что воркер умеет](#манифест-что-воркер-умеет)
+- [Что агент обслуживает для воркера](#что-агент-обслуживает-для-воркера)
+- [Python](#python)
+- [Node.js](#nodejs)
+- [Go](#go)
+- [Запуск, остановка, перезапуск](#запуск-остановка-перезапуск)
+- [Долгая работа](#долгая-работа)
 
-## Запуск и регистрация
+## Обязательный минимум
 
-**Бэкенд** ничего не вызывает: воркер появляется, когда его запустил агент.
+Воркер обязан отвечать на два запроса — `GET /health` и `GET /manifest`. Всё остальное
+необязательно.
 
-**Агент** (`internal/worker`) запускает воркеры из `agent.yaml`:
+| Запрос          | Ответ                                                                                      |
+| --------------- | ------------------------------------------------------------------------------------------ |
+| `GET /health`   | `2xx` и JSON с полем `ok` (`true` или `false`): `{ ok, busy?, message?, info? }`           |
+| `GET /manifest` | `2xx` и манифест не больше 64 КБ с непустым `version` — [ниже](#манифест-что-воркер-умеет) |
 
-```yaml
-workers:
-  - name: report # обязательно
-    command: ["/opt/report/.venv/bin/python", "-m", "report_worker"] # обязательно (кроме release: true)
-    args: ["--verbose"] # дописываются к command
-    dir: /opt/report # рабочий каталог
-    env: { REPORT_MODE: fast } # переменные окружения
-    replicas: 2 # копий процесса (1)
-    queues: [example.render] # ограничить очереди на этом узле (по умолчанию — все объявленные)
-    stopTimeout: 5m # сколько ждать доработки задач при остановке (30s)
-    restart: rolling # rolling | stop-first
-    limits: { memory: 512M, cpu: "50%", pids: 256 }
-    user: report # от какого пользователя (агент — от root)
-  - name: batch
-    release: true # воркер из выпуска: файл ведёт агент
-```
+**Регистрация.** После каждого запуска воркера, как только его сокет начал отвечать, агент
+задаёт оба запроса (срок ответа — 2 с).
 
-- каждой копии — свой процесс и канал связи: unix socketpair, дескриптор из `AGENT_IPC_FD`
-  (3); по строке JSON на сообщение;
-- переменные окружения: `AGENT_IPC_FD`, `AGENT_WORKER` (имя), `AGENT_VERSION`; воркеру из
-  выпуска — ещё `AGENT_WORKER_RELEASE_VERSION`; со своим корневым сертификатом сервера —
-  `AGENT_SERVER_CA_FILE` (Node — ещё `NODE_EXTRA_CA_CERTS`);
-- stdout и stderr воркера агент пишет в свой лог с именем воркера построчно — они видны в
-  `agent.logs` и уходят на сервер по `log.forward` ([observe.md](observe.md#лог-агента-и-воркеров));
-- воркер должен зарегистрироваться не позже 120 с после запуска, иначе агент считает запуск
-  неудачным.
+- Оба ответа подходят — воркер **зарегистрирован**: в `status` у него `state: running`. Только
+  такой воркер получает настройки и запросы `agents.fetch(...)`, у него спрашивают метрики.
+  `ok: false` в `GET /health` регистрации не мешает: это самочувствие воркера, а не ошибка ответа.
+- Ответ не подошёл (нет маршрута, не `2xx`, не JSON, нет `ok` или `version`, ошибка в манифесте) —
+  в `status` у воркера `state: invalid`, причина — в `status.workers[].message`, бэкенд видит
+  проблему `workerInvalid` ([observe.md](observe.md#проблемы)). Процесс работает дальше, но
+  настроек и запросов не получает: `agents.fetch(...)` и применение настроек заканчиваются
+  ошибкой `WORKER_INVALID`.
+- Агент пишет предупреждение в свой журнал и повторяет проверку с растущей паузой. Ответы стали
+  подходить — воркер регистрируется и сразу получает сохранённые настройки.
+- Зависший воркер (нет ответа на `GET /health` три раза подряд) агент перезапускает и в состоянии
+  `invalid`.
+- Событие, отправленное до конца первой проверки, ждёт её итога.
 
-**Что уходит по сети.** На узле: `worker.register {name, version, sdk, queues, commands,
-domains, channels, ping}` → `worker.ready {agentVersion, rejected?}` → `worker.context`. Серверу
-агент сообщает новые возможности сообщением `capabilities` (или в следующем `hello`).
+Самый простой воркер слушает HTTP на сокете `AGENT_WORKER_SOCKET` и отвечает только на эти два
+запроса.
 
-**Проверка «жив ли».** Все SDK пишут в `worker.register` `ping: true` и отвечают на
-`worker.ping` сообщением `worker.pong` (сами, без кода воркера). Агент шлёт `worker.ping` каждой
-копии раз в 30 с; три запроса подряд без ответа за 10 с — копия зависла, агент перезапускает её
-как упавшую. Обработчики задач и команд проверке не мешают: SDK отвечает из цикла приёма
-сообщений (Python и Go — свой поток, Node — если обработчик не занимает цикл событий надолго).
-
-**Воркер.**
+Python (только стандартная библиотека):
 
 ```python
-worker = Worker("report", version="1.0.0")   # имя по умолчанию — из AGENT_WORKER
-...
-worker.run()                                  # регистрация, работа до остановки; SIGTERM/SIGINT — сам
+import json, os, socketserver
+from http.server import BaseHTTPRequestHandler
+
+MANIFEST = {"version": "1.0.0"}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            return self.reply(200, {"ok": True})
+        if self.path == "/manifest":
+            return self.reply(200, MANIFEST)
+        self.reply(404, {"message": "нет маршрута"})
+
+    def reply(self, status, body):
+        raw = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, fmt, *args):  # журнал — в stdout, агент его сохранит
+        print(fmt % args, flush=True)
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+path = os.environ["AGENT_WORKER_SOCKET"]
+if os.path.exists(path):
+    os.unlink(path)
+Server(path, Handler).serve_forever()
 ```
 
+Node.js (только `node:http`):
+
+```js
+import { rmSync } from "node:fs";
+import { createServer } from "node:http";
+
+const MANIFEST = { version: "1.0.0" };
+
+const json = (res, status, body) =>
+  res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+
+const server = createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/health") return json(res, 200, { ok: true });
+  if (req.method === "GET" && req.url === "/manifest") return json(res, 200, MANIFEST);
+  json(res, 404, { message: "нет маршрута" });
+});
+
+rmSync(process.env.AGENT_WORKER_SOCKET, { force: true });
+server.listen(process.env.AGENT_WORKER_SOCKET);
+process.on("SIGTERM", () => server.close(() => process.exit(0)));
+```
+
+Go (только стандартная библиотека):
+
 ```go
-w := worker.New("report", "1.0.0") // опции: worker.WithConn(conn), worker.WithLogger(l), worker.WithoutSignals()
-if err := w.Run(ctx); err != nil {
-	log.Fatal(err)
+package main
+
+import (
+	"encoding/json"
+	"net"
+	"net/http"
+	"os"
+)
+
+func main() {
+	reply := func(w http.ResponseWriter, body any) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(body)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("GET /manifest", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, map[string]any{"version": "1.0.0"})
+	})
+
+	path := os.Getenv("AGENT_WORKER_SOCKET")
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		panic(err)
+	}
+	panic(http.Serve(ln, mux))
 }
 ```
 
-```ts
-const worker = new Worker({ name: "report", version: "1.0.0" }); // name по умолчанию — AGENT_WORKER
-await worker.run(); // { signals: false } — не ставить обработчики SIGTERM/SIGINT
+Полные примеры с настройками, метриками и событиями — [Python](#python), [Node.js](#nodejs),
+[Go](#go).
+
+## Что агент даёт воркеру
+
+Переменные окружения при запуске:
+
+| Переменная            | Что это                                                            |
+| --------------------- | ------------------------------------------------------------------ |
+| `AGENT_WORKER`        | имя воркера из настроек агента                                     |
+| `AGENT_WORKER_SOCKET` | путь unix-сокета, на котором воркер слушает HTTP                   |
+| `AGENT_SOCKET`        | путь unix-сокета агента: события, свои настройки, сведения об узле |
+| `AGENT_WORKER_TOKEN`  | токен для запросов к агенту: `Authorization: Bearer <токен>`       |
+| `AGENT_VERSION`       | версия агента на момент запуска воркера (текущая — `GET /context`) |
+
+Агент сам создаёт каталог сокета. Перед `listen` удалите старый файл сокета, если он остался.
+
+## Что воркер обслуживает
+
+`GET /health` и `GET /manifest` — обязательно ([выше](#обязательный-минимум)). Остальное
+необязательно: нет маршрута — `404`, агент считает, что воркер этого не умеет.
+
+| Запрос                 | Когда                                                       | Ответ                                                                      |
+| ---------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `PUT /config/{key}`    | после запуска — все сохранённые ключи; потом — новые версии | тело `{ version, data }`; `2xx` — применено, иначе `{ message }` или текст |
+| `DELETE /config/{key}` | бэкенд удалил ключ                                          | `2xx` (`404` — тоже успех)                                                 |
+| `GET /metrics`         | раз в `metricsIntervalMs` (чаще — пока на узел смотрят)     | любой JSON — до бэкенда дойдёт как есть                                    |
+| `GET /health`          | обязательно: при регистрации, потом раз в 10 с              | `{ ok, busy?, message?, info? }`                                           |
+| `POST /cleanup`        | удаление агента с узла (`agent uninstall`)                  | убрать всё, что воркер создал на узле; `2xx` — готово                      |
+| `GET /manifest`        | обязательно: при регистрации после каждого запуска          | что воркер умеет — [ниже](#манифест-что-воркер-умеет)                      |
+| остальные пути         | `agents.fetch(...)` с бэкенда                               | что угодно                                                                 |
+
+- **Настройки.** Агент передаёт только ключи, объявленные в манифесте (`configs`), по одному и
+  ждёт ответа (до 30 с). Отказ (не `2xx`) — бэкенд увидит ошибку с текстом ответа, агент
+  повторит через 25 с и после следующей регистрации воркера. Применять ли частично — решает
+  воркер; версия только растёт.
+- **Самочувствие.** Не `2xx` или неверное тело — `ok: false`. Три раза подряд нет ответа —
+  агент считает воркер зависшим и перезапускает. `info` — то, что полезно видеть бэкенду:
+  версия, занятые порты и т. п. `busy: true` — идёт долгая работа: агент не заменяет воркер, пока
+  она не закончится ([ниже](#долгая-работа)). Отвечать на `GET /health` нужно и во время работы.
+- **Метрики.** Срок ответа — 2 с, размер — до 1 МБ. Нет ответа — в этой точке воркера нет.
+- **Уборка.** Обычная остановка (`SIGTERM`) ничего не убирает: созданное воркером продолжает
+  работать. Убирают только по `POST /cleanup`.
+
+## Манифест: что воркер умеет
+
+Манифест — ответ на `GET /manifest`: версия воркера, его ключи настроек (со схемой значения),
+маршруты и события. Обязательно только `version`; ключи настроек и события, которыми воркер
+пользуется, нужно перечислить — агент сверяется с ними. Бэкенд видит манифест в
+`agent.workers[].manifest` и может:
+
+- узнать, умеет ли воркер нужное, — помощник `supports`
+  ([sdk/README.md](../README.md#манифест-воркера));
+- проверить значение настройки по схеме до отправки агенту — опция `validateConfigs`
+  ([configs.md](configs.md#проверка-по-схеме)).
+
+```json
+{
+  "version": "1.2.0",
+  "description": "Эхо",
+  "configs": [
+    {
+      "key": "settings",
+      "description": "Как отвечать",
+      "schema": {
+        "type": "object",
+        "properties": { "prefix": { "type": "string", "maxLength": 64 } },
+        "additionalProperties": false
+      }
+    }
+  ],
+  "routes": [
+    { "method": "POST", "path": "/echo", "description": "Текст с префиксом" },
+    { "method": "GET", "path": "/items/{id}", "description": "Один элемент" }
+  ],
+  "events": [{ "type": "example.echoed", "description": "Текст отправлен" }]
+}
 ```
 
-Для тестов канал можно подменить: Go — `worker.WithConn(io.ReadWriteCloser)`, Node —
-`new Worker({ transport: Duplex })`, Python — `Worker(…, channel=Channel(sock))`.
+- Обязательно только `version` (от 1 до 64 символов). `schema` —
+  [JSON Schema](https://json-schema.org) значения ключа (по умолчанию версия 2020-12; другую
+  задаёт `$schema`). `{id}` в `path` — один любой сегмент пути.
+- Агент спрашивает манифест после каждого запуска воркера (срок — 2 с) и держит его в памяти.
+  Новая сборка с другим манифестом — бэкенд сразу получает новый `status`.
+- `version` манифеста бэкенд видит как версию воркера. У воркера из выпуска это версия сборки
+  ([releases.md](releases.md)), манифест передаётся как есть.
+- Нет маршрута (`404`), нет ответа, нет `version`, манифест больше 64 КБ или с ошибкой (имя ключа
+  не по правилу, метод не заглавными буквами, путь без `/` в начале — все пределы в
+  [§16](../spec/README.md#16-пределы-и-сроки)) — воркер не зарегистрирован (`state: invalid`,
+  [выше](#обязательный-минимум)).
+- **Что агент проверяет по манифесту.** Событие, типа которого нет в `events`, агент отклоняет:
+  `POST /events` отвечает `400 EVENT_UNDECLARED`, до бэкенда оно не доходит. Ключ настроек,
+  которого нет в `configs`, агент воркеру не передаёт: бэкенд видит ошибку `CONFIG_KEY_UNKNOWN`
+  ([configs.md](configs.md#статус-применения)); агент проверит ключ снова, когда воркер
+  зарегистрируется в следующий раз (например, после обновления).
+- **Что агент не проверяет.** Значение настройки по `schema` проверяет бэкенд (опция
+  `validateConfigs`), а не агент. Маршруты агент тоже не сверяет: запрос `agents.fetch(...)`
+  уходит воркеру как есть.
 
-**Результат.** `agent.capabilities` пополняется очередями, командами, разделами, каналами;
-`agent.status.workers[] = {name, state, instances, version, release?, health?, message?,
-paused?}`.
-
-## Регистрация и имена
-
-**Бэкенд** видит, что объявлено, в `agent.capabilities`.
-
-**Что уходит по сети.** `worker.ready.rejected` — имена, которые воркеру не достались.
-
-**Агент** (`internal/worker/bridge.go`):
-
-- имена очередей, команд, разделов и каналов — латиница, цифры, `.`, `_`, `-`, с буквы или
-  цифры, до 64 символов (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`);
-- имена на `agent.` и `worker.` принадлежат агенту;
-- каждое имя команды, раздела или канала принадлежит **первому** объявившему его воркеру;
-  остальным — отказ в `rejected`. Очереди могут обслуживать несколько воркеров.
-
-**Воркер.** Неверное имя SDK отклоняет сразу: Python и Node — исключение при объявлении, Go —
-ошибка из `Run`. Не доставшиеся имена:
+Python (обработчик из [примера ниже](#python)):
 
 ```python
-worker.rejected        # множество имён
+MANIFEST = {
+    "version": "1.2.0",
+    "configs": [{"key": "settings", "schema": {"type": "object"}}],
+    "routes": [{"method": "POST", "path": "/echo"}],
+    "events": [{"type": "example.echoed"}],
+}
+
+# в do_GET:
+if self.path == "/manifest":
+    return self.reply(200, MANIFEST)
 ```
+
+Node.js:
+
+```js
+const MANIFEST = {
+  version: "1.2.0",
+  configs: [{ key: "settings", schema: { type: "object" } }],
+  routes: [{ method: "POST", path: "/echo" }],
+  events: [{ type: "example.echoed" }],
+};
+
+// в обработчике запросов:
+if (method === "GET" && url === "/manifest") return json(res, 200, MANIFEST);
+```
+
+Go:
 
 ```go
-w.Rejected() // []string
-```
-
-```ts
-worker.rejected; // string[]
-```
-
-**Результат.** Отклонённые имена не попадают в `agent.capabilities`.
-
-## Контекст воркера
-
-Агент сообщает воркеру о себе: режим, кто он, есть ли связь, как часто сейчас уходят метрики,
-на какие каналы воркера есть подписки, с какого уровня уходит лог.
-
-**Бэкенд** напрямую контекст не задаёт: он меняется вместе со связью, подписками
-([observe.md](observe.md#подписки)) и настройками агента.
-
-**Что уходит по сети.** `worker.context` (агент → воркер, без ответа) — сразу после
-`worker.ready` и при каждом изменении любого поля, не чаще раза в 100 мс; одинаковый повторно не
-шлётся:
-
-| Поле                | Что                                                                                             |
-| ------------------- | ----------------------------------------------------------------------------------------------- |
-| `mode`              | `run` — обычная работа; `cleanup` — запущен командой `agent cleanup` только для уборки          |
-| `agent.id`          | id агента; пусто, пока агент не зарегистрирован                                                 |
-| `agent.name`        | имя агента                                                                                      |
-| `agent.version`     | версия агента                                                                                   |
-| `agent.labels`      | метки агента                                                                                    |
-| `online`            | есть ли связь с сервером                                                                        |
-| `metricsIntervalMs` | действующая частота метрик агента, мс (с учётом подписок)                                       |
-| `channels`          | `{канал: мс}` — подписки сервера на каналы **этого** воркера; нет подписок — поля нет           |
-| `logLevel`          | с какого уровня агент сейчас отправляет лог на сервер (`off`, `error`, `warn`, `info`, `debug`) |
-
-**Агент** (`internal/app`, `internal/worker/control.go`) собирает контекст из своего
-состояния и рассылает всем копиям воркеров; каждая видит только свои каналы.
-
-**Воркер.**
-
-```python
-from agent_sdk.worker import WorkerContext
-
-@worker.on_context                       # или worker.on_context(fn)
-def changed(ctx: WorkerContext) -> None:
-    log.info("связь: %s, метрики раз в %d мс", ctx.online, ctx.metrics_interval_ms)
-
-worker.context.agent.id                  # последний контекст: mode, agent, online, metrics_interval_ms, channels, log_level
-```
-
-```go
-w.OnContext(func(c worker.Context) {
-	log.Printf("связь: %v, метрики раз в %d мс", c.Online, c.MetricsIntervalMs)
+mux.HandleFunc("GET /manifest", func(w http.ResponseWriter, _ *http.Request) {
+	reply(w, 200, map[string]any{
+		"version": "1.2.0",
+		"configs": []any{map[string]any{"key": "settings", "schema": map[string]any{"type": "object"}}},
+		"routes":  []any{map[string]any{"method": "POST", "path": "/echo"}},
+		"events":  []any{map[string]any{"type": "example.echoed"}},
+	})
 })
-id := w.Context().Agent.ID // Mode, Agent{ID, Name, Version, Labels}, Online, MetricsIntervalMs, Channels, LogLevel
 ```
 
-```ts
-worker.on("context", (ctx) => console.log(ctx.online, ctx.metricsIntervalMs));
-worker.context.agent.id; // mode, agent, online, metricsIntervalMs, channels, logLevel
-```
+## Что агент обслуживает для воркера
 
-До первого сообщения — значения по умолчанию: `mode: run`, `online: false`,
-`metricsIntervalMs: 0`. Обработчик вызывается из цикла приёма сообщений — долгую работу
-выносите отдельно; исключение пишется в лог.
+На сокете `AGENT_SOCKET`, с заголовком `Authorization: Bearer $AGENT_WORKER_TOKEN` (без токена —
+`401`):
 
-**Результат.** Ничего не уходит на сервер: контекст — для самого воркера (например, частота
-своих проверок, пропуск подготовки в режиме `cleanup`, показатели с частотой подписки —
-[observe.md](observe.md#показатели-воркеров)).
+| Запрос              | Что делает                                                                                                                                                                                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `POST /events`      | тело `{ type, data? }` → `202` после записи на диск; бэкенд получит событие и после обрыва связи; очередь полна — `503 OUTBOX_FULL`, не записано по другой причине — `500 INTERNAL`; типа нет в `manifest.events` — `400 EVENT_UNDECLARED` |
+| `GET /config/{key}` | `{ version, data }` — сохранённые настройки этого воркера; нет ключа — `404`                                                                                                                                                               |
+| `GET /context`      | `{ agent: { id, name, version, labels }, online }` — `online`: есть ли связь с бэкендом                                                                                                                                                    |
 
-## Здоровье
+Тип события — `^[a-z][a-z0-9._-]{0,63}$`, `data` — до 64 КБ. Агент добавляет имя воркера и время.
+Ошибки — JSON `{ code, message }`: неверное тело или тип — `400 MESSAGE_INVALID`, `data` больше
+64 КБ — `413 BODY_TOO_LARGE`, нет пути — `404 NOT_FOUND`.
 
-Воркер сам сообщает «в порядке» или «не в порядке и почему»: например, потерял базу данных.
+Всё, что воркер пишет в stdout и stderr, агент сохраняет в журнале: бэкенд читает его через
+`agents.logs(agentId, { worker })` ([observe.md](observe.md#журнал)).
 
-**Бэкенд** узнаёт об этом из статуса и уведомления:
+## Python
 
-```ts
-agents.on("alert", (a) => a.type === "workerDegraded" && notify(a.agentName, a.worker, a.message));
-```
-
-```go
-server.Options{OnAlert: func(a server.Alert) { /* a.Type == server.AlertWorkerDegraded */ }}
-```
+Только стандартная библиотека, Python ≥ 3.10.
 
 ```python
-agents.on("alert", lambda a: a.type == "workerDegraded" and notify(a))
+import http.client, json, os, socket, socketserver, threading
+from http.server import BaseHTTPRequestHandler
+
+configs = {}           # ключ → data
+lock = threading.Lock()
+sent = 0
+MANIFEST = {
+    "version": "1.2.0",
+    "configs": [{"key": "settings", "schema": {"type": "object"}}],
+    "routes": [{"method": "POST", "path": "/echo"}],
+    "events": [{"type": "example.echoed"}],
+}
+
+
+class AgentConnection(http.client.HTTPConnection):
+    """HTTP к агенту по unix-сокету AGENT_SOCKET."""
+
+    def __init__(self):
+        super().__init__("agent")
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(os.environ["AGENT_SOCKET"])
+
+
+def agent(method, path, body=None):
+    conn = AgentConnection()
+    headers = {"authorization": "Bearer " + os.environ["AGENT_WORKER_TOKEN"]}
+    raw = None
+    if body is not None:
+        raw = json.dumps(body).encode()
+        headers["content-type"] = "application/json"
+    conn.request(method, path, raw, headers)
+    res = conn.getresponse()
+    data = res.read()
+    conn.close()
+    return res.status, (json.loads(data) if data else None)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, status, body=None):
+        raw = b"" if body is None else json.dumps(body).encode()
+        self.send_response(status)
+        if body is not None:
+            self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def body(self):
+        n = int(self.headers.get("content-length") or 0)
+        return json.loads(self.rfile.read(n) or b"null")
+
+    def do_PUT(self):
+        if self.path.startswith("/config/"):
+            req = self.body()
+            if not isinstance(req["data"], dict):
+                return self.reply(422, {"message": "data: нужен объект"})
+            with lock:
+                configs[self.path[8:]] = req["data"]
+            return self.reply(204)
+        self.reply(404)
+
+    def do_DELETE(self):
+        if self.path.startswith("/config/"):
+            with lock:
+                configs.pop(self.path[8:], None)
+            return self.reply(204)
+        self.reply(404)
+
+    def do_GET(self):
+        if self.path == "/health":
+            return self.reply(200, {"ok": True, "info": {"keys": sorted(configs)}})
+        if self.path == "/manifest":
+            return self.reply(200, MANIFEST)
+        if self.path == "/metrics":
+            return self.reply(200, {"sent": sent})
+        self.reply(404, {"message": "нет маршрута"})
+
+    def do_POST(self):
+        global sent
+        if self.path == "/cleanup":
+            # убрать созданное на узле: файлы, правила, службы
+            return self.reply(204)
+        if self.path == "/echo":
+            req = self.body()
+            sent += 1
+            agent("POST", "/events", {"type": "example.echoed", "data": {"text": req.get("text")}})
+            return self.reply(200, {"echo": req})
+        self.reply(404, {"message": "нет маршрута"})
+
+    def log_message(self, fmt, *args):  # журнал — в stdout, агент его сохранит
+        print(fmt % args, flush=True)
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+path = os.environ["AGENT_WORKER_SOCKET"]
+if os.path.exists(path):
+    os.unlink(path)
+Server(path, Handler).serve_forever()
 ```
 
-**Что уходит по сети.** На узле — `worker.health {ok, message?}`; серверу — `status` с
-`workers[].health = "ok" | "degraded"`, `workers[].message` и `state: "degraded"`.
+## Node.js
 
-**Агент** запоминает оценку каждой копии; хоть одна не в порядке — воркер `degraded`, и весь
-агент — `status.state = degraded` с причиной в `status.message`.
+Только `node:http`, Node ≥ 18.
 
-**Воркер.**
+```js
+import { createServer, request } from "node:http";
+import { rmSync } from "node:fs";
 
-```python
-worker.set_health(False, "нет связи с базой")
-worker.set_health(True)
+const configs = new Map();
+let sent = 0;
+const MANIFEST = {
+  version: "1.2.0",
+  configs: [{ key: "settings", schema: { type: "object" } }],
+  routes: [{ method: "POST", path: "/echo" }],
+  events: [{ type: "example.echoed" }],
+};
+
+/** HTTP к агенту по unix-сокету AGENT_SOCKET. */
+function agent(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const raw = body === undefined ? undefined : JSON.stringify(body);
+    const req = request(
+      {
+        socketPath: process.env.AGENT_SOCKET,
+        method,
+        path,
+        headers: {
+          authorization: `Bearer ${process.env.AGENT_WORKER_TOKEN}`,
+          ...(raw ? { "content-type": "application/json" } : {}),
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve({ status: res.statusCode, body: data ? JSON.parse(data) : null }));
+      },
+    );
+    req.on("error", reject);
+    req.end(raw);
+  });
+}
+
+const json = (res, status, body) => {
+  if (body === undefined) return res.writeHead(status).end();
+  res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+};
+
+const readBody = async (req) => {
+  let data = "";
+  for await (const c of req) data += c;
+  return data ? JSON.parse(data) : null;
+};
+
+const server = createServer(async (req, res) => {
+  const { method, url } = req;
+  if (url.startsWith("/config/")) {
+    const key = url.slice(8);
+    if (method === "PUT") {
+      configs.set(key, (await readBody(req)).data);
+      return json(res, 204);
+    }
+    if (method === "DELETE") {
+      configs.delete(key);
+      return json(res, 204);
+    }
+  }
+  if (method === "GET" && url === "/health") return json(res, 200, { ok: true });
+  if (method === "GET" && url === "/manifest") return json(res, 200, MANIFEST);
+  if (method === "GET" && url === "/metrics") return json(res, 200, { sent });
+  if (method === "POST" && url === "/cleanup") return json(res, 204);
+  if (method === "POST" && url === "/echo") {
+    const body = await readBody(req);
+    sent++;
+    await agent("POST", "/events", { type: "example.echoed", data: { text: body?.text } });
+    return json(res, 200, { echo: body });
+  }
+  json(res, 404, { message: "нет маршрута" });
+});
+
+rmSync(process.env.AGENT_WORKER_SOCKET, { force: true });
+server.listen(process.env.AGENT_WORKER_SOCKET);
+process.on("SIGTERM", () => server.close(() => process.exit(0)));
 ```
+
+## Go
+
+Только стандартная библиотека.
 
 ```go
-_ = w.SetHealth(false, "нет связи с базой")
-_ = w.SetHealth(true, "")
-```
+package main
 
-```ts
-worker.setHealth(false, "нет связи с базой");
-worker.setHealth(true);
-```
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"sync/atomic"
+	"syscall"
+)
 
-Здоровье, паузу, просьбу о перезапуске, события и показатели можно отправлять и до запуска
-(`run` / `Run`): во всех SDK сообщения копятся и уходят сразу после того, как агент принял
-воркер (`worker.ready`), по порядку. Копится не больше 1000 сообщений — лишние вытесняют самые
-старые (запись в лог воркера).
+// agent — HTTP-клиент к агенту по unix-сокету AGENT_SOCKET.
+var agent = &http.Client{Transport: &http.Transport{
+	DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", os.Getenv("AGENT_SOCKET"))
+	},
+}}
 
-**Результат.** `agent.status.workers[].health`, `.message`; `alert` `workerDegraded`
-(`worker`, `message`) — начало при `degraded`, конец при `ok` или исчезновении воркера; плюс
-`degraded` для агента ([events.md](events.md#уведомления-о-проблемах)).
+func event(typ string, data any) error {
+	body, _ := json.Marshal(map[string]any{"type": typ, "data": data})
+	req, _ := http.NewRequest("POST", "http://agent/events", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("AGENT_WORKER_TOKEN"))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := agent.Do(req)
+	if err != nil {
+		return err
+	}
+	return res.Body.Close()
+}
 
-## Пауза очередей
+func main() {
+	var (
+		mu      sync.Mutex
+		configs = map[string]json.RawMessage{}
+		sent    atomic.Int64
+	)
+	reply := func(w http.ResponseWriter, status int, body any) {
+		if body == nil {
+			w.WriteHeader(status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(body)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /config/{key}", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Version int64           `json:"version"`
+			Data    json.RawMessage `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			reply(w, 422, map[string]string{"message": err.Error()})
+			return
+		}
+		mu.Lock()
+		configs[r.PathValue("key")] = req.Data
+		mu.Unlock()
+		reply(w, 204, nil)
+	})
+	mux.HandleFunc("DELETE /config/{key}", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		delete(configs, r.PathValue("key"))
+		mu.Unlock()
+		reply(w, 204, nil)
+	})
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("GET /manifest", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, map[string]any{
+			"version": "1.2.0",
+			"configs": []any{map[string]any{"key": "settings", "schema": map[string]any{"type": "object"}}},
+			"routes":  []any{map[string]any{"method": "POST", "path": "/echo"}},
+			"events":  []any{map[string]any{"type": "example.echoed"}},
+		})
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, map[string]any{"sent": sent.Load()})
+	})
+	mux.HandleFunc("POST /cleanup", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 204, nil) // убрать созданное на узле
+	})
+	mux.HandleFunc("POST /echo", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent.Add(1)
+		_ = event("example.echoed", map[string]any{"text": body["text"]})
+		reply(w, 200, map[string]any{"echo": body})
+	})
 
-Воркер (или сервер) может временно не брать новые задачи своих очередей: выданные
-доделываются. Пауза воркера и пауза сервера **независимы**: возобновление от сервера не снимает
-паузу, выставленную воркером, и наоборот.
-
-**Бэкенд.**
-
-```ts
-await agents.pauseWorker(agentId, "report", { queues: ["example.render"] }); // без queues — все очереди
-await agents.resumeWorker(agentId, "report");
-```
-
-```go
-cmd, err := agents.PauseWorker(agentID, "report", "example.render")
-cmd, err = agents.ResumeWorker(agentID, "report")
-```
-
-```python
-await agents.pause_worker(agent_id, "report", queues=["example.render"])
-await agents.resume_worker(agent_id, "report")
-```
-
-Это встроенные команды `worker.pause` / `worker.resume` со сроком 30 с. Ошибки:
-`AGENT_NOT_FOUND`, `AGENT_REVOKED`, `MESSAGE_INVALID` (имя не по правилу),
-`COMMAND_NOT_SUPPORTED` (у агента нет воркеров или команда выключена). Аудит `worker.pause`,
-`worker.resume` с `details: {worker, queues?, commandId}`.
-
-**Что уходит по сети.** От сервера — `cmd.run {name: "worker.pause", args: {name, queues?}}` →
-`cmd.done {result: {name, paused}}`. От воркера на узле — `worker.pause {queues?}` /
-`worker.resume {queues?}`. Серверу — `status` с `slots` = 0 по этим очередям и
-`workers[].paused: true`.
-
-**Агент** (`internal/worker/control.go`, `internal/jobs`): места воркера по очередям на паузе —
-0, новых `job.assign` ему не достаётся. Пауза сервера хранится у воркера в памяти агента и
-переживает перезапуск копий воркера; пауза воркера — у его копии. Неизвестный воркер —
-`WORKER_UNKNOWN`.
-
-**Воркер.**
-
-```python
-worker.pause(["example.render"])   # без списка — все свои очереди
-worker.resume(["example.render"])
-```
-
-```go
-_ = w.Pause("example.render")
-_ = w.Resume("example.render")
-```
-
-```ts
-worker.pause(["example.render"]);
-worker.resume(["example.render"]);
-```
-
-**Результат.** `agent.status.workers[].paused`, `agent.status.slots[queue] = 0`; задачи очереди
-ждут в `queued` или уходят другим агентам.
-
-## Просьба о перезапуске
-
-Воркер может попросить агента заменить себя — например, заметил утечку памяти. Замена идёт
-штатно, его способом (`rolling` или `stop-first`), без статуса сбоя и без уведомлений.
-
-**Бэкенд** ничего не вызывает; заменить воркер с сервера — команда `worker.restart`
-([ниже](#замена-воркера)).
-
-**Что уходит по сети.** На узле — `worker.restart {reason?}`; серверу — обычные изменения
-`status.workers`.
-
-**Агент** делает то же, что по команде `worker.restart`. Повторные просьбы во время замены и
-просьбы уходящей копии не учитываются. Причина — в лог агента.
-
-**Воркер.**
-
-```python
-worker.request_restart("память выросла до 2 ГБ")
-```
-
-```go
-_ = w.RequestRestart("память выросла до 2 ГБ")
-```
-
-```ts
-worker.requestRestart("память выросла до 2 ГБ");
-```
-
-Этот процесс затем получит `worker.drain` (при `rolling`) или SIGTERM.
-
-**Результат.** Новая копия воркера; задачи старой доделываются.
-
-## Замена воркера
-
-**Бэкенд.**
-
-```ts
-await agents.call({ name: "worker.restart", agentId, args: { name: "report" } }); // без name — все
-```
-
-```go
-cmd, err := agents.Call(ctx, server.CommandRequest{Name: "worker.restart", AgentID: agentID, Args: map[string]string{"name": "report"}})
-```
-
-```python
-cmd = await agents.call("worker.restart", {"name": "report"}, agent_id=agent_id)
-```
-
-**Что уходит по сети.** `cmd.run {name: "worker.restart", args: {name?}}` → `cmd.done {result:
-{restarted: [...]}}`; ошибка — `WORKER_RESTART`.
-
-**Агент** заменяет копии по `restart` воркера в `agent.yaml`:
-
-- `rolling` (по умолчанию) — новая копия запускается рядом; когда она зарегистрировалась,
-  старая получает `worker.drain`, перестаёт брать задачи и уходит, доделав текущие. Без
-  простоя;
-- `stop-first` — сначала уходит старая (не успела за `stopTimeout` — SIGTERM, затем SIGKILL),
-  потом запускается новая. Для воркеров, которые держат то, что нельзя делить: порт, сетевой
-  интерфейс, файл.
-
-Новая копия снова получает последние снимки своих разделов состояния.
-
-**Воркер.** По `worker.drain` SDK перестаёт брать задачи, дорабатывает текущие и выходит.
-Свои фоновые циклы воркер останавливает по сигналу `stopping`:
-
-```python
-while not worker.stopping.wait(10):    # threading.Event
-    probe()
-```
-
-```go
-for {
-	select {
-	case <-w.Stopping():
-		return
-	case <-time.After(10 * time.Second):
-		probe()
+	path := os.Getenv("AGENT_WORKER_SOCKET")
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		panic(err)
+	}
+	srv := &http.Server{Handler: mux}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	go func() { <-ctx.Done(); _ = srv.Shutdown(context.Background()) }()
+	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+		panic(err)
 	}
 }
 ```
 
-```ts
-const timer = setInterval(probe, 10_000);
-worker.stopping.addEventListener("abort", () => clearInterval(timer)); // AbortSignal
+## Запуск, остановка, перезапуск
+
+Воркеры описываются в настройках агента (`agent.yaml`); добавить или убрать воркер бэкенд не
+может.
+
+```yaml
+workers:
+  - name: echo # ^[a-z][a-z0-9-]{0,31}$
+    command: ["python3", "/opt/example/echo.py"]
+    env: { LOG_LEVEL: info }
+    user: example # по умолчанию — пользователь агента; другой — только у агента от root
+    lifecycle: # всё — необязательно; здесь — значения по умолчанию
+      onAgentRestart: keep # перезапуск агента воркер не трогает
+      onAgentStop: keep # остановка агента — тоже (stop — остановить вместе с ним)
+      restart: on-failure # always | on-failure | never — после выхода процесса
+      backoff: { min: 1s, max: 30s } # пауза перед перезапуском после падения
+      maxRestarts: 0 # падений подряд не больше (0 — без предела)
+      startTimeout: 60s # сокет должен начать отвечать
+      stopTimeout: 30s
+      keepChildren: false # true — дочерние процессы переживают остановку воркера
+      busy: { wait: true, timeout: 24h }
+      health: { interval: 10s, timeout: 2s, failures: 3 }
+      probeTimeout: 2s # срок GET /manifest, GET /metrics и регистрации
+      configRetry: 25s # повтор неприменённых настроек
+      updateHealthyTimeout: 1m # новая сборка должна ответить ok: true
+    logs: { maxSize: 10MB, maxFiles: 1 } # файлы вывода в <dataDir>/logs
+  - name: report
+    release: true # сборка — из выпуска на бэкенде (releases.md)
 ```
 
-**Результат.** `status.workers[].state`: `starting` → `running`; `instances`, `version`.
+- **Запуск.** Агент запускает процесс и ждёт, пока сокет начнёт отвечать (до 60 с), затем
+  регистрирует воркер (`GET /health` и `GET /manifest`, [выше](#обязательный-минимум)) и передаёт
+  ему все сохранённые настройки по `PUT /config/{key}`.
+- **Вывод.** stdout и stderr воркера — файлы `<dataDir>/logs/<имя>.log` и `<имя>.err.log`; агент
+  читает их в свой журнал (`agents.logs(agentId, { worker })`): строки stdout — с уровнем `info`,
+  stderr — `warn`; строка длиннее 16 КБ обрезается. Пишите в них построчно.
+- **Остановка воркера** (перезапуск, обновление воркера) — `SIGTERM`; не вышел за `stopTimeout` —
+  `SIGKILL`. Копия воркера всегда одна: новая запускается после ухода прежней.
+- **Перезапуск и обновление агента** воркер не трогают: он работает дальше, новый агент его
+  подхватывает (тот же процесс, тот же токен). Пока агента нет, сокет агента не отвечает —
+  повторяйте `POST /events` позже.
+- **Выход процесса** — по `lifecycle.restart`; перезапуск — с растущей паузой (1–30 с), в
+  `status` — `state: backoff`. Без перезапуска (или после `maxRestarts` падений подряд) —
+  `state: stopped` до перезапуска с бэкенда или изменения настроек воркера. В обоих случаях
+  бэкенд видит проблему `workerDown`.
+- **Перезапуск с бэкенда** — `agents.restartWorker(agentId, "echo")`; пока воркер занят, замена
+  ждёт, `{ force: true }` — сразу.
 
-## Остановка и падение
+## Долгая работа
 
-**Бэкенд** ничего не вызывает.
+Работа, которая идёт минуты и часы (отчёт, обучение, выгрузка), не должна прерываться
+перезапусками агента и плановой заменой воркера. Схема:
 
-**Что уходит по сети.** Серверу — `status.workers[].state` (`running`, `starting`, `backoff`,
-`stopped`) и итоги задач.
+1. **Запуск — `202`.** Бэкенд вызывает маршрут воркера (`agents.fetch(agentId, "echo", "/work",
+{ method: "POST", body })`), воркер начинает работу в фоне и сразу отвечает `202 { id }`: ответ
+   `fetch` не ждёт конца работы.
+2. **Ход — событиями.** Воркер шлёт `POST /events` на шаге и в конце (`example.progress`,
+   `example.done`); бэкенд получает их событием `event` (`agents.on("event", …)`). События хранятся
+   на диске агента, пока бэкенд их не подтвердит; если сокет агента не отвечает (агент
+   перезапускается), воркер повторяет отправку.
+3. **Состояние и отмена — маршрутами.** `GET /work/{id}` — ход работы, `POST /work/{id}/cancel` —
+   прервать. Маршруты опишите в манифесте.
+4. **`busy` в `GET /health`.** Пока работа идёт, воркер отвечает `{ ok: true, busy: true, message:
+"шаг 40 из 100" }`. Агент не заменяет занятый воркер: `worker.restart`, `worker.update` и
+   изменение его настроек в `agent.yaml` ждут окончания работы (не дольше `lifecycle.busy.timeout`,
+   по умолчанию 24 ч), в `status` — `pending: "restart"` или `"update"`. Итог действия на бэкенде
+   приходит после замены; `{ force: true }` — заменить сразу.
+5. **Ход — на диск.** Воркер сохраняет ход работы после каждого шага (файл на работу, запись через
+   временный файл и переименование) и, запустившись, продолжает незаконченные. Тогда работу не
+   теряет ни `force`, ни падение воркера, ни перезагрузка узла.
 
-**Агент:**
+Перезапуск и обновление самого агента работу не прерывают вовсе: воркер их не замечает. Зависший
+воркер (нет ответа на `GET /health` три раза подряд) агент перезапускает и во время работы —
+поэтому отвечайте на `GET /health` из другого потока, чем идёт работа.
 
-- **остановка** (SIGTERM агенту, перезапуск, замена) — воркер получает SIGTERM, дорабатывает
-  задачи не дольше `stopTimeout`, затем SIGKILL. Всё, что воркер создал на узле (интерфейсы,
-  правила, файлы), **остаётся** — следующий запуск это подхватит;
-- **падение** — задачи воркера проваливаются с `WORKER_CRASHED` (сервер их повторит), агент
-  перезапускает процесс с растущей паузой от 1 до 30 с (проработал больше минуты — пауза снова
-  с начала); пока воркер в паузе, `state: backoff`, агент — `degraded`;
-- **отмена задачи** — место задачи занято, пока воркер не подтвердит отмену (`job.fail` с кодом
-  `CANCELLED`; SDK шлёт его сам, когда обработчик вернулся). Нет подтверждения за
-  `jobs.cancelTimeout` (30 с) — агент заменяет копию воркера новой
-  ([jobs.md](jobs.md#отмена-и-закончи-пораньше)).
+Пример — `POST /work` воркера echo ([examples/workers/echo](../../examples/workers/echo/main.py)):
+ход хранится в `ECHO_WORK_DIR`.
 
-**Воркер.** SDK сам: по SIGTERM (если не выключено) — `drain`: новых задач не брать, текущие
-задачи и команды доработать и выйти. Пропала связь с агентом — всё отменить (задачи, ждущие
-места в очереди, убираются без вызова обработчика) и выйти. Вручную — `worker.drain()` /
-`w.Drain()`. Зависший воркер (не отвечает на `worker.ping`) агент перезапускает как упавший.
-
-**Результат.** `alert` `workerDown` (воркер в `backoff`) — начало и конец
-([events.md](events.md#уведомления-о-проблемах)).
-
-## Уборка при удалении агента
-
-Когда агента удаляют с узла, каждый воркер убирает за собой всё, что создал: интерфейсы,
-правила, файлы. Связи с сервером при этом нет, и сервер уборку запустить не может;
-перезапуск, замена и обычная остановка её не вызывают.
-
-**Бэкенд** ничего не вызывает (удаление — `install.sh --uninstall` на узле,
-[releases.md](releases.md#удаление-агента-с-узла)).
-
-**Что уходит по сети** — только на узле: `worker.context {mode: "cleanup"}` →
-`worker.cleanup` (запрос) → `worker.cleaned {ok, error?}`.
-
-**Агент** (`agent cleanup`, `internal/worker/cleanup.go`): по очереди запускает каждый воркер из
-настроек одной копией, без задач, после регистрации шлёт `worker.cleanup` и ждёт ответа не
-дольше `stopTimeout`, затем останавливает воркер. Итог — в вывод команды; хоть один не убрал —
-код выхода не ноль.
-
-**Воркер.**
-
-```python
-@worker.cleanup
-def cleanup() -> None:
-    remove_interfaces()                 # исключение — {ok: false, error}
-
-@worker.on_context
-def prepare(ctx):
-    if ctx.mode == "run":
-        start_background_loops()        # в режиме cleanup подготовку можно пропустить
-```
-
-```go
-w.Cleanup(func(ctx context.Context) error { return removeInterfaces() })
-```
-
-```ts
-worker.cleanup(async () => {
-  await removeInterfaces();
-});
-```
-
-Нет обработчика — сразу `ok`. Воркер может объявить только уборку — без очередей, команд,
-разделов и каналов; ничего не объявив, `run` завершается ошибкой. Показатели и события в режиме
-уборки отбрасываются: сервера нет.
-
-**Результат.** На сервере — ничего (агент удалён). На узле — вывод `agent cleanup`.
-
-## Ограничения ресурсов и пользователь
-
-**Бэкенд** не участвует: ограничения — настройки узла. Чтобы агент мог их ставить, установщик
-пишет в службу `Delegate=yes` ([docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#установка)).
-
-**Агент** (`internal/cgroup`, `internal/worker/limits.go`):
-
-- `limits` — на все копии воркера вместе, через cgroup v2: `memory` (`512M`, `2G`, байты),
-  `cpu` (`50%` — половина ядра, `200%` или `2` — два ядра), `pids` (процессов и потоков). Агент
-  переносит себя в подгруппу `agent` и заводит воркеру подгруппу `worker-<имя>`;
-- cgroup v2 недоступны (не Linux, нет делегирования) — предупреждение в лог, воркер запускается
-  без ограничений;
-- `user` — запуск от другого пользователя (uid, gid, группы, `HOME`, `USER`, `LOGNAME` — его);
-  нужно, чтобы агент работал от root.
-
-**Воркер** ничего не делает.
-
-**Результат.** Превысил память — процесс убивает ядро, это обычное [падение](#остановка-и-падение).
-
-## Воркеры из выпуска
-
-Воркер с `release: true` агент ведёт сам: исполняемый файл лежит в
-`<dataDir>/workers/<name>/current`, `command` не задаётся. Ставит его `install.sh --worker`,
-обновляет сервер командой `worker.update` с проверкой подписи и откатом. Добавить или удалить
-воркер сервер не может. Подробно — [releases.md](releases.md#обновление-воркеров-из-выпуска).
-
-**Воркер** из выпуска должен сообщать при регистрации ту же версию, что у его сборки в выпуске:
-агент передаёт её в `AGENT_WORKER_RELEASE_VERSION`.
-
-```go
-w := worker.New("batch", os.Getenv("AGENT_WORKER_RELEASE_VERSION"))
-```
-
-## Изменить воркеры на ходу
-
-Правка `agent.yaml` и `systemctl reload agent` (SIGHUP) — без остановки агента:
-
-- новые воркеры запускаются, убранные доделывают задачи и уходят (их команды, разделы и каналы
-  снимаются), изменённые заменяются своим способом, `replicas` меняется на лету;
-- убранный воркер или выключенные возможности — агент переподключается с новым `hello`, очередь
-  важных сообщений и начатые задачи сохраняются; добавленные воркеры связь не рвут.
-
-Подробно — [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#изменить-настройки-не-останавливая-агента).
+Все настройки агента — [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md). Готовые воркеры-примеры
+на Python, Node и Go — [examples/README.md](../../examples/README.md).

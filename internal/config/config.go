@@ -1,4 +1,4 @@
-// Package config — конфигурация агента: значения по умолчанию → YAML-файл
+// Package config — настройки агента: значения по умолчанию → YAML-файл
 // (с подстановкой ${ENV}) → переменные окружения AGENT_*.
 package config
 
@@ -18,8 +18,11 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
+
+// geteuid — подменяется в тестах (проверка workers[].user).
+var geteuid = os.Geteuid
 
 // Duration — длительность в YAML строкой: "30s", "10m".
 type Duration time.Duration
@@ -27,14 +30,66 @@ type Duration time.Duration
 func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	parsed, err := time.ParseDuration(node.Value)
 	if err != nil {
-		return fmt.Errorf("длительность %q: %w", node.Value, err)
+		return fmt.Errorf("строка %d: длительность %q (нужно, например, 30s или 10m): %w", node.Line, node.Value, err)
 	}
 	*d = Duration(parsed)
 	return nil
 }
 
+// MarshalYAML — длительность строкой (agent config check).
+func (d Duration) MarshalYAML() (any, error) { return dur(d), nil }
+
 // Std — time.Duration.
 func (d Duration) Std() time.Duration { return time.Duration(d) }
+
+// ByteSize — размер в YAML: число байт или строка с единицей: "512KB",
+// "10MB", "1GB" (по 1024).
+type ByteSize int64
+
+var byteUnits = []struct {
+	suffix string
+	n      int64
+}{{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"B", 1}}
+
+// ParseByteSize — размер из строки ("10MB", "65536").
+func ParseByteSize(s string) (ByteSize, error) {
+	text := strings.ToUpper(strings.TrimSpace(s))
+	for _, u := range byteUnits {
+		if num, ok := strings.CutSuffix(text, u.suffix); ok {
+			n, err := strconv.ParseInt(strings.TrimSpace(num), 10, 64)
+			if err != nil || n < 0 {
+				break
+			}
+			return ByteSize(n * u.n), nil
+		}
+	}
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("размер %q (нужно, например, 10MB или 512KB)", s)
+	}
+	return ByteSize(n), nil
+}
+
+func (b *ByteSize) UnmarshalYAML(node *yaml.Node) error {
+	v, err := ParseByteSize(node.Value)
+	if err != nil {
+		return fmt.Errorf("строка %d: %w", node.Line, err)
+	}
+	*b = v
+	return nil
+}
+
+// MarshalYAML — размер строкой в самых крупных целых единицах.
+func (b ByteSize) MarshalYAML() (any, error) { return b.String(), nil }
+
+func (b ByteSize) String() string {
+	for _, u := range byteUnits {
+		if int64(b) >= u.n && int64(b)%u.n == 0 {
+			return strconv.FormatInt(int64(b)/u.n, 10) + u.suffix
+		}
+	}
+	return strconv.FormatInt(int64(b), 10) + "B"
+}
 
 // Config — настройки агента.
 type Config struct {
@@ -46,65 +101,46 @@ type Config struct {
 	Log       Log               `yaml:"log"`
 	Telemetry Telemetry         `yaml:"telemetry"`
 	Update    Update            `yaml:"update"`
-	State     State             `yaml:"state"`
-	Commands  Commands          `yaml:"commands"`
-	Jobs      Jobs              `yaml:"jobs"`
 	Outbox    Outbox            `yaml:"outbox"`
 	Workers   []Worker          `yaml:"workers"`
-}
 
-// Jobs — задачи.
-type Jobs struct {
-	// CancelTimeout — сколько после job.cancel держать место задачи, пока
-	// воркер её не завершил; не завершил — копия воркера заменяется. По
-	// умолчанию 30s.
-	CancelTimeout Duration `yaml:"cancelTimeout"`
+	// envErrs — неверные значения переменных AGENT_* (их сообщает Validate).
+	envErrs []string
 }
 
 // Outbox — очередь важных сообщений на диске.
 type Outbox struct {
-	// MaxMessages — сообщений в очереди не больше (по умолчанию 10000).
-	// Переполнена — отбрасываются самые старые из тех, что можно потерять
-	// (event, job.event, state.applied); таких нет — новое не принимается.
+	// MaxMessages — сколько сообщений очередь держит; полна — события
+	// воркеров отклоняются (503 OUTBOX_FULL).
 	MaxMessages int `yaml:"maxMessages"`
+}
+
+// Backoff — растущая пауза между попытками: от Min, удваивается до Max.
+type Backoff struct {
+	Min Duration `yaml:"min"`
+	Max Duration `yaml:"max"`
 }
 
 type Server struct {
 	// URL бэкенда: https://api.example.com.
 	URL string `yaml:"url"`
-	// URLs — адреса одного и того же бэкенда (вместо url или вместе с ним):
-	// агент подключается к первому доступному, при обрыве или отказе — к
-	// следующему по кругу. Учётные данные одни на все адреса.
+	// URLs — ещё адреса того же бэкенда: агент подключается к первому
+	// доступному, при обрыве или отказе — к следующему по кругу.
 	URLs []string `yaml:"urls"`
-	// Transport: auto (WebSocket, при недоступности — HTTP sync) | ws | http.
-	Transport string `yaml:"transport"`
-	// CAFile — PEM с корневыми сертификатами, которым агент доверяет в
-	// дополнение к системным (свой CA сервера).
+	// CAFile — PEM с корневыми сертификатами в дополнение к системным.
 	CAFile string `yaml:"caFile"`
 	// CertFile, KeyFile — клиентский сертификат агента (mTLS); оба или ни одного.
 	CertFile string `yaml:"certFile"`
 	KeyFile  string `yaml:"keyFile"`
-}
-
-// Commands — встроенные команды агента.
-type Commands struct {
-	// Disabled — встроенные команды (BuiltinCommands), которые агент не
-	// объявляет и не выполняет.
-	Disabled []string `yaml:"disabled"`
-	// MaxConcurrent — команд одновременно (по умолчанию 8); остальные ждут
-	// своей очереди, срок команды при этом идёт.
-	MaxConcurrent int `yaml:"maxConcurrent"`
-}
-
-// BuiltinCommands — встроенные команды агента (их можно выключить в commands.disabled).
-var BuiltinCommands = []string{
-	"agent.logs", "agent.drain", "agent.resume", "agent.restart", "agent.update", "agent.rotateKey", "worker.restart",
-	"worker.update", "worker.pause", "worker.resume",
+	// Reconnect — пауза переподключения (и повтора регистрации).
+	Reconnect Backoff `yaml:"reconnect"`
+	// StreamBuffer — сколько последних сообщений потока (status, metrics,
+	// log) агент держит без связи и досылает.
+	StreamBuffer int `yaml:"streamBuffer"`
 }
 
 type Enroll struct {
-	// Token — токен регистрации; нужен только до первой регистрации
-	// (и для эфемерных агентов — при каждом старте).
+	// Token — токен регистрации; нужен только до первой регистрации.
 	Token string `yaml:"token"`
 }
 
@@ -112,29 +148,23 @@ type Log struct {
 	Level  string `yaml:"level"`
 	Format string `yaml:"format"`
 	// Forward — с какого уровня записи лога агента и вывод воркеров уходят
-	// серверу (сообщение log): off | error | warn | info | debug, по
-	// умолчанию warn. Подписка сервера может временно сделать подробнее (subscription.logLevel).
+	// серверу (сообщение log): off | error | warn | info | debug. watch
+	// сервера может временно сделать подробнее.
 	Forward string `yaml:"forward"`
+	// Buffer — сколько последних записей журнала агент держит в памяти для
+	// каждого источника (агент и каждый воркер) — их отдаёт agent.logs.
+	Buffer int `yaml:"buffer"`
 }
 
 type Telemetry struct {
-	// GPU: auto (nvidia-smi, если есть) | off.
-	GPU string `yaml:"gpu"`
-	// Metrics — группы метрик узла (message.MetricGroups); [] — без метрик
-	// узла. По умолчанию DefaultMetrics.
+	// Metrics — группы метрик узла (message.MetricGroups); [] — без метрик узла.
 	Metrics []string `yaml:"metrics"`
-	// Disks — точки монтирования для metrics.host.disks (группа disk);
-	// ["all"] — все реальные файловые системы. По умолчанию ["/"].
+	// Disks — точки монтирования для группы disk; ["all"] — все реальные
+	// файловые системы.
 	Disks []string `yaml:"disks"`
-	// InventoryInterval — как часто проверять сведения об узле; 0 — сведения
-	// не отправляются вовсе. По умолчанию 10m.
-	InventoryInterval Duration `yaml:"inventoryInterval"`
-	// ExcludeInterfaces — префиксы имён сетевых интерфейсов, которые не
-	// показываются в метриках и сведениях; заданный список заменяет умолчание.
+	// ExcludeInterfaces — префиксы имён сетевых интерфейсов, которых нет в
+	// метриках; заданный список заменяет умолчание.
 	ExcludeInterfaces []string `yaml:"excludeInterfaces"`
-	// Backlog — точек метрик, копящихся без связи (дошлются после
-	// подключения); 0 — не копить. По умолчанию 720.
-	Backlog int `yaml:"backlog"`
 }
 
 // DefaultMetrics — группы метрик узла по умолчанию.
@@ -146,88 +176,59 @@ var DefaultMetrics = []string{
 // DisksAll — telemetry.disks: все реальные файловые системы.
 const DisksAll = "all"
 
-// DefaultExcludeInterfaces — интерфейсы, которые по умолчанию не показываются:
+// DefaultExcludeInterfaces — интерфейсы, которых по умолчанию нет в метриках:
 // петля, контейнеры, мосты и служебные интерфейсы macOS.
 var DefaultExcludeInterfaces = []string{
 	"lo", "veth", "docker", "br-", "virbr", "vnet", "cni", "flannel", "cali", "kube", "tunl",
 	"gif", "stf", "awdl", "llw", "anpi", "utun", "bridge", "ap",
 }
 
+// Режимы обновления агента.
+const (
+	UpdateSelf     = "self"
+	UpdateExternal = "external"
+	UpdateDisabled = "disabled"
+)
+
 type Update struct {
-	// Mode: self (замена исполняемого файла) | external (контейнер) | disabled.
+	// Mode: self (агент сам заменяет свой файл) | external (контейнер) | disabled.
 	Mode string `yaml:"mode"`
-	// PublicKey — ключ проверки подписи релизов Ed25519, base64.
+	// PublicKey — ключ проверки подписи выпусков Ed25519, base64.
 	PublicKey string `yaml:"publicKey"`
 }
 
-type State struct {
-	// ResyncInterval — раз в интервал агент заново отдаёт воркеру-владельцу
-	// последний снимок каждого раздела (та же версия): воркер исправляет
-	// ручные изменения на узле. 0 — выключено. По умолчанию 10m.
-	ResyncInterval Duration `yaml:"resyncInterval"`
-	// ApplyTimeout — сколько ждать ответа воркера на снимок раздела; не
-	// ответил — раздел не применён (STATE_TIMEOUT), повтор по обычному
-	// правилу. По умолчанию 5m.
-	ApplyTimeout Duration `yaml:"applyTimeout"`
-}
+// SysmetricsWorker — имя встроенного воркера метрик узла; в workers это имя занято.
+const SysmetricsWorker = message.BuiltinSysmetrics
 
-// Стратегии замены экземпляров воркера.
-const (
-	RestartRolling   = "rolling"
-	RestartStopFirst = "stop-first"
-)
-
-// Worker — воркер: дочерний процесс агента на любом языке.
+// Worker — воркер: HTTP-сервис на unix-сокете, который запускает агент.
 type Worker struct {
-	Name    string            `yaml:"name"`
-	Command []string          `yaml:"command"`
-	Dir     string            `yaml:"dir"`
-	Env     map[string]string `yaml:"env"`
-	// Replicas — экземпляров процесса (по умолчанию 1).
-	Replicas int `yaml:"replicas"`
-	// Queues — ограничить очереди воркера (по умолчанию — все, что он объявил).
-	Queues []string `yaml:"queues"`
-	// StopTimeout — сколько ждать доработки задач при остановке (по умолчанию 30s).
-	StopTimeout Duration `yaml:"stopTimeout"`
-	// Restart — замена экземпляров: rolling (по умолчанию: новый рядом, старый
-	// дорабатывает — без простоя) | stop-first (сначала уходит старый — для
-	// воркеров, держащих порт, интерфейс или другой единственный ресурс).
-	Restart string `yaml:"restart"`
+	Name    string   `yaml:"name"`
+	Command []string `yaml:"command"`
+	// Args — аргументы, дописываемые к command (или к файлу выпуска).
+	Args []string          `yaml:"args"`
+	Dir  string            `yaml:"dir"`
+	Env  map[string]string `yaml:"env"`
+	// InheritEnv — какие ещё переменные окружения агента передать воркеру
+	// сверх обычных (PATH, HOME, LANG и др.); "PREFIX_*" — все с этим
+	// началом. Переменные AGENT_* агента воркеру не передаются.
+	InheritEnv []string `yaml:"inheritEnv"`
+	// User — пользователь, от которого запускается воркер; агенту нужен root.
+	User string `yaml:"user"`
 	// Release — воркер из выпуска: сборку ведёт агент
-	// (<dataDir>/workers/<name>/current), сервер может обновить её командой
+	// (<dataDir>/workers/<name>/current), сервер обновляет её действием
 	// worker.update. Сборка — исполняемый файл или каталог из архива
 	// .tar.gz; command (если задан) выполняется в каталоге сборки, без
 	// command запускается сам файл или ./run архива.
 	Release bool `yaml:"release"`
-	// Args — аргументы, дописываемые к command (или к файлу выпуска).
-	Args []string `yaml:"args"`
-	// Limits — ограничения ресурсов воркера (все его экземпляры вместе; Linux,
-	// cgroup v2 с делегированием — иначе предупреждение и запуск без них).
-	Limits Limits `yaml:"limits"`
-	// User — пользователь, от которого запускается воркер; агенту нужен root.
-	User string `yaml:"user"`
-	// InheritEnv — какие ещё переменные окружения агента передать воркеру
-	// сверх обычных (PATH, HOME, LANG и др.); "PREFIX_*" — все с этим
-	// началом. Переменные AGENT_* агента воркеру не передаются никогда.
-	InheritEnv []string `yaml:"inheritEnv"`
-	// Backoff — пауза перед перезапуском упавшего воркера: от min до max,
-	// растёт с каждым падением подряд (по умолчанию 1s и 30s).
-	Backoff Backoff `yaml:"backoff"`
-	// MaxRestarts — перезапусков подряд не больше (0 — без предела);
-	// превышено — копия остаётся остановленной, статус degraded, вернуть —
-	// worker.restart или перечитывание настроек.
-	MaxRestarts int `yaml:"maxRestarts"`
-	// RegisterTimeout — сколько ждать worker.register после запуска (по
-	// умолчанию 120s); не дождались — перезапуск как упавшего.
-	RegisterTimeout Duration `yaml:"registerTimeout"`
-	// Dir выпуска — <dataDir>/workers/<name>; заполняет Validate для release.
+	// Lifecycle — как агент запускает, проверяет, заменяет и останавливает
+	// воркер (§13); изменение применяется без перезапуска воркера.
+	Lifecycle Lifecycle `yaml:"lifecycle"`
+	// Logs — файлы вывода воркера.
+	Logs Logs `yaml:"logs"`
+	// ReleaseDir — <dataDir>/workers/<name>; заполняет Validate для release.
 	ReleaseDir string `yaml:"-"`
-}
-
-// Backoff — пауза перед перезапуском воркера.
-type Backoff struct {
-	Min Duration `yaml:"min"`
-	Max Duration `yaml:"max"`
+	// Builtin — встроенный воркер агента (sysmetrics), в agent.yaml его нет.
+	Builtin bool `yaml:"-"`
 }
 
 // Файлы воркера из выпуска в его каталоге ReleaseDir.
@@ -240,13 +241,220 @@ const (
 	ReleaseRun = "run"
 )
 
-// Argv — команда запуска: command + args; для воркера из выпуска без
-// command — <ReleaseDir>/current + args.
-func (w Worker) Argv() []string {
-	if w.Release && len(w.Command) == 0 {
-		return append([]string{filepath.Join(w.ReleaseDir, ReleaseCurrent)}, w.Args...)
+// Что делать с воркером при перезапуске и остановке агента и после выхода
+// его процесса (Lifecycle).
+const (
+	Keep           = "keep"
+	StopWorker     = "stop"
+	RestartWorker  = "restart"
+	RestartAlways  = "always"
+	RestartFailure = "on-failure"
+	RestartNever   = "never"
+)
+
+// Lifecycle — жизнь воркера (§13). Поля-указатели: nil — значение по
+// умолчанию (у них 0 и false — тоже значение); остальные: 0 — по умолчанию.
+// Validate (FillDefaults) заполняет всё.
+type Lifecycle struct {
+	// OnAgentRestart — перезапуск агента (обновление, agent restart): keep —
+	// воркер работает дальше, новый агент его подхватывает; restart —
+	// остановить, новый агент запустит заново.
+	OnAgentRestart string `yaml:"onAgentRestart"`
+	// OnAgentStop — остановка агента (SIGTERM, SIGINT): keep | stop.
+	OnAgentStop string `yaml:"onAgentStop"`
+	// Restart — после выхода процесса: always | on-failure | never.
+	Restart string `yaml:"restart"`
+	// Backoff — пауза перед перезапуском после падения.
+	Backoff Backoff `yaml:"backoff"`
+	// MaxRestarts — перезапусков после падения подряд не больше (0 — без
+	// предела); превышено — воркер остаётся остановленным до worker.restart
+	// или изменения его настроек.
+	MaxRestarts int `yaml:"maxRestarts"`
+	// StartTimeout — сколько ждать, пока сокет воркера начнёт отвечать.
+	StartTimeout Duration `yaml:"startTimeout"`
+	// StopTimeout — сколько ждать выхода после SIGTERM, потом SIGKILL; ещё
+	// — срок POST /cleanup.
+	StopTimeout Duration `yaml:"stopTimeout"`
+	// KeepChildren — дочерние процессы воркера переживают его остановку:
+	// сигналы получает только сам воркер, а не вся группа процессов.
+	KeepChildren bool `yaml:"keepChildren"`
+	// Busy — плановая замена занятого воркера (GET /health → busy: true).
+	Busy Busy `yaml:"busy"`
+	// Health — проверка GET /health.
+	Health Health `yaml:"health"`
+	// ProbeTimeout — срок GET /manifest, GET /metrics и GET /health при регистрации.
+	ProbeTimeout Duration `yaml:"probeTimeout"`
+	// ConfigRetry — повтор неприменённых настроек.
+	ConfigRetry Duration `yaml:"configRetry"`
+	// UpdateHealthyTimeout — сколько новая сборка (worker.update) может не
+	// отвечать ok: true; потом — возврат прежней.
+	UpdateHealthyTimeout Duration `yaml:"updateHealthyTimeout"`
+}
+
+// Busy — ждать ли окончания работы перед плановой заменой и сколько.
+type Busy struct {
+	// Wait — ждать (по умолчанию true).
+	Wait *bool `yaml:"wait"`
+	// Timeout — дольше не ждать: замена идёт.
+	Timeout Duration `yaml:"timeout"`
+}
+
+// Health — проверка GET /health: раз в Interval (0 — не проверять), срок
+// ответа Timeout; Failures пропусков подряд — перезапуск (0 — не
+// перезапускать).
+type Health struct {
+	Interval *Duration `yaml:"interval"`
+	Timeout  Duration  `yaml:"timeout"`
+	Failures *int      `yaml:"failures"`
+}
+
+// Logs — файлы вывода воркера: больше MaxSize — копия в .1 (прежние —
+// .2 … до MaxFiles; 0 — без копий) и очистка.
+type Logs struct {
+	MaxSize  ByteSize `yaml:"maxSize"`
+	MaxFiles *int     `yaml:"maxFiles"`
+}
+
+// Значения по умолчанию жизни воркера.
+const (
+	DefaultStopTimeout = 30 * time.Second
+	DefaultBusyTimeout = 24 * time.Hour
+	DefaultLogMaxSize  = 10 << 20
+	DefaultLogMaxFiles = 1
+)
+
+// DefaultLifecycle — жизнь воркера по умолчанию: долгая работа не
+// прерывается перезапуском и остановкой агента и ждёт плановой замены.
+func DefaultLifecycle() Lifecycle {
+	var l Lifecycle
+	l.fill()
+	return l
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func (l *Lifecycle) fill() {
+	def := func(d *Duration, v time.Duration) {
+		if *d <= 0 {
+			*d = Duration(v)
+		}
 	}
-	return append(slices.Clone(w.Command), w.Args...)
+	str := func(s *string, v string) {
+		if *s == "" {
+			*s = v
+		}
+	}
+	str(&l.OnAgentRestart, Keep)
+	str(&l.OnAgentStop, Keep)
+	str(&l.Restart, RestartFailure)
+	def(&l.Backoff.Min, time.Second)
+	def(&l.Backoff.Max, 30*time.Second)
+	def(&l.StartTimeout, message.WorkerStartTimeout)
+	def(&l.StopTimeout, DefaultStopTimeout)
+	if l.Busy.Wait == nil {
+		l.Busy.Wait = ptr(true)
+	}
+	def(&l.Busy.Timeout, DefaultBusyTimeout)
+	if l.Health.Interval == nil {
+		l.Health.Interval = ptr(Duration(message.HealthInterval))
+	}
+	def(&l.Health.Timeout, message.ProbeTimeout)
+	if l.Health.Failures == nil {
+		l.Health.Failures = ptr(message.HealthMisses)
+	}
+	def(&l.ProbeTimeout, message.ProbeTimeout)
+	def(&l.ConfigRetry, message.ConfigRetry)
+	def(&l.UpdateHealthyTimeout, message.UpdateHealthTimeout)
+}
+
+// HealthInterval — частота GET /health (0 — не проверять).
+func (l Lifecycle) HealthInterval() time.Duration {
+	if l.Health.Interval == nil {
+		return message.HealthInterval
+	}
+	return l.Health.Interval.Std()
+}
+
+// HealthFailures — пропусков подряд до перезапуска (0 — не перезапускать).
+func (l Lifecycle) HealthFailures() int {
+	if l.Health.Failures == nil {
+		return message.HealthMisses
+	}
+	return *l.Health.Failures
+}
+
+// BusyWait — ждать окончания работы перед плановой заменой.
+func (l Lifecycle) BusyWait() bool { return l.Busy.Wait == nil || *l.Busy.Wait }
+
+// DefaultLogs — файлы вывода воркера по умолчанию.
+func DefaultLogs() Logs {
+	var l Logs
+	l.fill()
+	return l
+}
+
+func (l *Logs) fill() {
+	if l.MaxSize <= 0 {
+		l.MaxSize = DefaultLogMaxSize
+	}
+	if l.MaxFiles == nil {
+		l.MaxFiles = ptr(DefaultLogMaxFiles)
+	}
+}
+
+// Files — сколько копий хранить.
+func (l Logs) Files() int {
+	if l.MaxFiles == nil {
+		return DefaultLogMaxFiles
+	}
+	return *l.MaxFiles
+}
+
+// FillDefaults — значения по умолчанию незаданных полей жизни и файлов
+// вывода воркера.
+func (w *Worker) FillDefaults() {
+	w.Lifecycle.fill()
+	w.Logs.fill()
+}
+
+// check — допустимые значения жизни и файлов вывода воркера i.
+func (w *Worker) check(i int) []error {
+	var errs []error
+	l := w.Lifecycle
+	bad := func(field, format string, args ...any) {
+		errs = append(errs, fmt.Errorf("workers[%d].%s: "+format, append([]any{i, field}, args...)...))
+	}
+	if l.OnAgentRestart != Keep && l.OnAgentRestart != RestartWorker {
+		bad("lifecycle.onAgentRestart", "keep | restart, а не %q", l.OnAgentRestart)
+	}
+	if l.OnAgentStop != Keep && l.OnAgentStop != StopWorker {
+		bad("lifecycle.onAgentStop", "keep | stop, а не %q", l.OnAgentStop)
+	}
+	if !slices.Contains([]string{RestartAlways, RestartFailure, RestartNever}, l.Restart) {
+		bad("lifecycle.restart", "always | on-failure | never, а не %q", l.Restart)
+	}
+	if l.Backoff.Max < l.Backoff.Min {
+		bad("lifecycle.backoff", "max (%s) меньше min (%s)", dur(l.Backoff.Max), dur(l.Backoff.Min))
+	}
+	if l.MaxRestarts < 0 {
+		bad("lifecycle.maxRestarts", "не меньше 0 (0 — без предела)")
+	}
+	if l.Health.Interval != nil && *l.Health.Interval < 0 {
+		bad("lifecycle.health.interval", "не меньше 0 (0s — не проверять)")
+	}
+	if l.Health.Failures != nil && *l.Health.Failures < 0 {
+		bad("lifecycle.health.failures", "не меньше 0 (0 — не перезапускать)")
+	}
+	if l.Health.Interval != nil && *l.Health.Interval > 0 && l.Health.Timeout > *l.Health.Interval {
+		bad("lifecycle.health.timeout", "не больше interval (%s)", dur(*l.Health.Interval))
+	}
+	if w.Logs.MaxSize < 64<<10 {
+		bad("logs.maxSize", "не меньше 64KB, а не %s", w.Logs.MaxSize)
+	}
+	if n := w.Logs.Files(); n < 0 || n > 100 {
+		bad("logs.maxFiles", "от 0 до 100, а не %d", n)
+	}
+	return errs
 }
 
 // Current — сборка воркера из выпуска (<ReleaseDir>/current).
@@ -259,24 +467,21 @@ func ReleasesDir(dataDir string) string { return filepath.Join(dataDir, "workers
 func Defaults() Config {
 	host, _ := os.Hostname()
 	return Config{
-		Server:  Server{Transport: "auto"},
-		DataDir: "/var/lib/agent",
+		DataDir: DefaultDataDir(),
 		Name:    host,
 		Labels:  map[string]string{},
-		Log:     Log{Level: "info", Format: "text", Forward: "warn"},
+		Server:  Server{Reconnect: Backoff{Min: Duration(time.Second), Max: Duration(time.Minute)}, StreamBuffer: message.StreamBacklog},
+		Log:     Log{Level: "info", Format: "text", Forward: message.LogWarn, Buffer: message.MaxLogLines},
+		Outbox:  Outbox{MaxMessages: message.MaxOutbox},
 		Telemetry: Telemetry{
-			GPU: "auto", Metrics: slices.Clone(DefaultMetrics), Disks: []string{"/"}, InventoryInterval: Duration(10 * time.Minute),
-			ExcludeInterfaces: slices.Clone(DefaultExcludeInterfaces), Backlog: 720,
+			Metrics: slices.Clone(DefaultMetrics), Disks: []string{"/"},
+			ExcludeInterfaces: slices.Clone(DefaultExcludeInterfaces),
 		},
-		Update:   Update{Mode: "self"},
-		State:    State{ResyncInterval: Duration(10 * time.Minute), ApplyTimeout: Duration(5 * time.Minute)},
-		Commands: Commands{MaxConcurrent: 8},
-		Jobs:     Jobs{CancelTimeout: Duration(30 * time.Second)},
-		Outbox:   Outbox{MaxMessages: 10000},
+		Update: Update{Mode: UpdateSelf},
 	}
 }
 
-// Load — конфигурация из файла path (пустой — без файла) и окружения.
+// Load — настройки из файла path (пустой — без файла) и окружения.
 func Load(path string) (Config, error) {
 	cfg := Defaults()
 	if path != "" {
@@ -288,33 +493,32 @@ func Load(path string) (Config, error) {
 			return cfg, fmt.Errorf("config %s: %w", path, err)
 		}
 	}
-	if err := applyEnv(&cfg); err != nil {
-		return cfg, err
-	}
+	applyEnv(&cfg)
 	return cfg, cfg.Validate()
 }
 
-func applyEnv(cfg *Config) error {
+func applyEnv(cfg *Config) {
 	set := func(target *string, name string) {
 		if v, ok := os.LookupEnv(name); ok && v != "" {
 			*target = v
 		}
 	}
 	set(&cfg.Server.URL, "AGENT_SERVER_URL")
-	set(&cfg.Server.Transport, "AGENT_TRANSPORT")
 	set(&cfg.DataDir, "AGENT_DATA_DIR")
 	set(&cfg.Name, "AGENT_NAME")
 	set(&cfg.Enroll.Token, "AGENT_ENROLL_TOKEN")
 	set(&cfg.Log.Level, "AGENT_LOG_LEVEL")
 	set(&cfg.Log.Format, "AGENT_LOG_FORMAT")
 	set(&cfg.Log.Forward, "AGENT_LOG_FORWARD")
-	set(&cfg.Telemetry.GPU, "AGENT_GPU")
 	set(&cfg.Server.CAFile, "AGENT_SERVER_CA_FILE")
 	set(&cfg.Server.CertFile, "AGENT_SERVER_CERT_FILE")
 	set(&cfg.Server.KeyFile, "AGENT_SERVER_KEY_FILE")
 	set(&cfg.Update.Mode, "AGENT_UPDATE_MODE")
 	set(&cfg.Update.PublicKey, "AGENT_UPDATE_PUBLIC_KEY")
 	if labels, ok := os.LookupEnv("AGENT_LABELS"); ok {
+		if cfg.Labels == nil {
+			cfg.Labels = map[string]string{}
+		}
 		for _, pair := range strings.Split(labels, ",") {
 			if k, v, found := strings.Cut(strings.TrimSpace(pair), "="); found && k != "" {
 				cfg.Labels[k] = v
@@ -332,40 +536,43 @@ func applyEnv(cfg *Config) error {
 			}
 		}
 	}
-	list(&cfg.Commands.Disabled, "AGENT_COMMANDS_DISABLED")
 	list(&cfg.Server.URLs, "AGENT_SERVER_URLS")
 	list(&cfg.Telemetry.ExcludeInterfaces, "AGENT_TELEMETRY_EXCLUDE_INTERFACES")
 	list(&cfg.Telemetry.Metrics, "AGENT_TELEMETRY_METRICS")
 	list(&cfg.Telemetry.Disks, "AGENT_TELEMETRY_DISKS")
-	duration := func(target *Duration, name string) error {
+	number := func(target *int, name string) {
 		if v, ok := os.LookupEnv(name); ok && v != "" {
-			d, err := time.ParseDuration(v)
+			n, err := strconv.Atoi(strings.TrimSpace(v))
 			if err != nil {
-				return fmt.Errorf("%s: длительность %q: %w", name, v, err)
+				cfg.envErrs = append(cfg.envErrs, fmt.Sprintf("%s: %q — нужно целое число", name, v))
+				return
+			}
+			*target = n
+		}
+	}
+	duration := func(target *Duration, name string) {
+		if v, ok := os.LookupEnv(name); ok && v != "" {
+			d, err := time.ParseDuration(strings.TrimSpace(v))
+			if err != nil {
+				cfg.envErrs = append(cfg.envErrs, fmt.Sprintf("%s: %q — нужна длительность (например, 30s)", name, v))
+				return
 			}
 			*target = Duration(d)
 		}
-		return nil
 	}
-	if err := duration(&cfg.State.ResyncInterval, "AGENT_STATE_RESYNC"); err != nil {
-		return err
-	}
-	if err := duration(&cfg.Telemetry.InventoryInterval, "AGENT_INVENTORY_INTERVAL"); err != nil {
-		return err
-	}
-	if v, ok := os.LookupEnv("AGENT_TELEMETRY_BACKLOG"); ok && v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return fmt.Errorf("AGENT_TELEMETRY_BACKLOG: число %q: %w", v, err)
-		}
-		cfg.Telemetry.Backlog = n
-	}
-	return nil
+	duration(&cfg.Server.Reconnect.Min, "AGENT_SERVER_RECONNECT_MIN")
+	duration(&cfg.Server.Reconnect.Max, "AGENT_SERVER_RECONNECT_MAX")
+	number(&cfg.Server.StreamBuffer, "AGENT_SERVER_STREAM_BUFFER")
+	number(&cfg.Outbox.MaxMessages, "AGENT_OUTBOX_MAX_MESSAGES")
+	number(&cfg.Log.Buffer, "AGENT_LOG_BUFFER")
 }
 
-// Validate — обязательные поля и допустимые значения.
+// Validate — обязательные поля и допустимые значения; заполняет умолчания воркеров.
 func (c *Config) Validate() error {
 	var errs []error
+	for _, e := range c.envErrs {
+		errs = append(errs, errors.New(e))
+	}
 	addrs := c.Server.Addresses()
 	if len(addrs) == 0 {
 		errs = append(errs, errors.New("server.url или server.urls (AGENT_SERVER_URL, AGENT_SERVER_URLS): нужен адрес http(s)://"))
@@ -375,29 +582,11 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("server.url / server.urls: %q — нужен адрес http(s)://", addr))
 		}
 	}
-	if !oneOf(c.Log.Forward, "off", "error", "warn", "info", "debug") {
+	if !slices.Contains([]string{"off", message.LogError, message.LogWarn, message.LogInfo, message.LogDebug}, c.Log.Forward) {
 		errs = append(errs, fmt.Errorf("log.forward (AGENT_LOG_FORWARD): off | error | warn | info | debug, а не %q", c.Log.Forward))
 	}
-	if !oneOf(c.Server.Transport, "auto", "ws", "http") {
-		errs = append(errs, fmt.Errorf("server.transport: auto | ws | http, а не %q", c.Server.Transport))
-	}
-	if !oneOf(c.Update.Mode, "self", "external", "disabled") {
-		errs = append(errs, fmt.Errorf("update.mode: self | external | disabled, а не %q", c.Update.Mode))
-	}
-	if c.State.ResyncInterval < 0 {
-		errs = append(errs, errors.New("state.resyncInterval (AGENT_STATE_RESYNC): не меньше 0 (0 — выключено)"))
-	}
-	if c.State.ApplyTimeout <= 0 {
-		c.State.ApplyTimeout = Duration(5 * time.Minute)
-	}
-	if c.Commands.MaxConcurrent <= 0 {
-		c.Commands.MaxConcurrent = 8
-	}
-	if c.Jobs.CancelTimeout <= 0 {
-		c.Jobs.CancelTimeout = Duration(30 * time.Second)
-	}
-	if c.Outbox.MaxMessages <= 0 {
-		c.Outbox.MaxMessages = 10000
+	if !slices.Contains([]string{UpdateSelf, UpdateExternal, UpdateDisabled}, c.Update.Mode) {
+		errs = append(errs, fmt.Errorf("update.mode (AGENT_UPDATE_MODE): self | external | disabled, а не %q", c.Update.Mode))
 	}
 	for _, g := range c.Telemetry.Metrics {
 		if !slices.Contains(message.MetricGroups, g) {
@@ -412,75 +601,55 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf(`telemetry.disks (AGENT_TELEMETRY_DISKS): %q — нужен абсолютный путь или "all"`, d))
 		}
 	}
-	if c.Telemetry.InventoryInterval < 0 {
-		errs = append(errs, errors.New("telemetry.inventoryInterval (AGENT_INVENTORY_INTERVAL): не меньше 0 (0 — не отправлять)"))
-	}
-	if c.Telemetry.Backlog < 0 {
-		errs = append(errs, errors.New("telemetry.backlog (AGENT_TELEMETRY_BACKLOG): не меньше 0 (0 — не копить)"))
-	}
-	for _, name := range c.Commands.Disabled {
-		if !slices.Contains(BuiltinCommands, name) {
-			errs = append(errs, fmt.Errorf("commands.disabled (AGENT_COMMANDS_DISABLED): %q — не встроенная команда (%s)",
-				name, strings.Join(BuiltinCommands, ", ")))
-		}
-	}
 	if _, err := c.Server.TLSConfig(); err != nil {
 		errs = append(errs, err)
+	}
+	if r := c.Server.Reconnect; r.Min <= 0 || r.Max < r.Min {
+		errs = append(errs, fmt.Errorf("server.reconnect (AGENT_SERVER_RECONNECT_MIN, _MAX): min больше 0, max не меньше min, а не %s и %s", dur(r.Min), dur(r.Max)))
+	}
+	if n := c.Server.StreamBuffer; n < 1 || n > 100_000 {
+		errs = append(errs, fmt.Errorf("server.streamBuffer (AGENT_SERVER_STREAM_BUFFER): от 1 до 100000, а не %d", n))
+	}
+	if n := c.Outbox.MaxMessages; n < 1 || n > 1_000_000 {
+		errs = append(errs, fmt.Errorf("outbox.maxMessages (AGENT_OUTBOX_MAX_MESSAGES): от 1 до 1000000, а не %d", n))
+	}
+	if n := c.Log.Buffer; n < 100 || n > message.MaxLogLines {
+		errs = append(errs, fmt.Errorf("log.buffer (AGENT_LOG_BUFFER): от 100 до %d, а не %d", message.MaxLogLines, n))
 	}
 	if c.DataDir == "" {
 		errs = append(errs, errors.New("dataDir (AGENT_DATA_DIR) обязателен"))
 	}
-	if c.Name == "" {
-		errs = append(errs, errors.New("name (AGENT_NAME) обязателен"))
+	if !message.ValidAgentName(c.Name) {
+		errs = append(errs, fmt.Errorf("name (AGENT_NAME): непустое, до %d символов", message.MaxAgentName))
+	}
+	if err := message.CheckLabels(c.Labels); err != nil {
+		errs = append(errs, fmt.Errorf("labels (AGENT_LABELS): %w", err))
 	}
 	names := map[string]bool{}
 	for i := range c.Workers {
 		w := &c.Workers[i]
 		switch {
-		case w.Release && !message.ValidName(w.Name):
-			errs = append(errs, fmt.Errorf("workers[%d]: имя воркера из выпуска %q — латиница, цифры, «.», «_», «-», до 64 символов", i, w.Name))
-		case w.Name == "" || (!w.Release && len(w.Command) == 0):
-			errs = append(errs, fmt.Errorf("workers[%d]: нужны name и command (или release: true)", i))
+		case !message.ValidName(w.Name):
+			errs = append(errs, fmt.Errorf("workers[%d]: имя %q — строчная латиница, цифры и «-», начало — буква, до 32 символов", i, w.Name))
+		case w.Name == SysmetricsWorker:
+			errs = append(errs, fmt.Errorf("workers[%d]: имя %q занято встроенным воркером агента", i, w.Name))
+		case names[w.Name]:
+			errs = append(errs, fmt.Errorf("workers: имя %q повторяется", w.Name))
+		}
+		names[w.Name] = true
+		if !w.Release && len(w.Command) == 0 {
+			errs = append(errs, fmt.Errorf("workers[%d]: нужен command (или release: true)", i))
 		}
 		w.ReleaseDir = ""
 		if w.Release && c.DataDir != "" {
 			w.ReleaseDir = filepath.Join(ReleasesDir(c.DataDir), w.Name)
 		}
-		if names[w.Name] {
-			errs = append(errs, fmt.Errorf("workers: имя %q повторяется", w.Name))
-		}
-		names[w.Name] = true
-		if w.Replicas <= 0 {
-			w.Replicas = 1
-		}
-		if w.StopTimeout <= 0 {
-			w.StopTimeout = Duration(30 * time.Second)
-		}
-		if w.RegisterTimeout <= 0 {
-			w.RegisterTimeout = Duration(120 * time.Second)
-		}
-		if w.Backoff.Min <= 0 {
-			w.Backoff.Min = Duration(time.Second)
-		}
-		if w.Backoff.Max <= 0 {
-			w.Backoff.Max = max(Duration(30*time.Second), w.Backoff.Min)
-		}
-		if w.Backoff.Max < w.Backoff.Min {
-			errs = append(errs, fmt.Errorf("workers[%d].backoff: max не меньше min", i))
-		}
-		if w.MaxRestarts < 0 {
-			errs = append(errs, fmt.Errorf("workers[%d].maxRestarts: не меньше 0 (0 — без предела)", i))
-		}
+		w.FillDefaults()
+		errs = append(errs, w.check(i)...)
 		for _, name := range w.InheritEnv {
 			if name == "" || strings.HasPrefix(name, "AGENT_") || strings.ContainsAny(name, "= ") {
 				errs = append(errs, fmt.Errorf("workers[%d].inheritEnv: %q — имя переменной (AGENT_* воркеру не передаются)", i, name))
 			}
-		}
-		if !oneOf(w.Restart, "", RestartRolling, RestartStopFirst) {
-			errs = append(errs, fmt.Errorf("workers[%d].restart: rolling | stop-first, а не %q", i, w.Restart))
-		}
-		if err := w.Limits.Validate(); err != nil {
-			errs = append(errs, fmt.Errorf("workers[%d].limits: %w", i, err))
 		}
 		if w.User != "" && geteuid() != 0 {
 			errs = append(errs, fmt.Errorf("workers[%d].user: запуск воркера от пользователя %q возможен, только если агент работает от root", i, w.User))
@@ -500,9 +669,8 @@ func (s Server) Addresses() []string {
 	return out
 }
 
-// TLSConfig — настройки TLS для запросов агента к серверу: системные корни
-// плюс caFile, клиентский сертификат (certFile + keyFile). nil — ничего не
-// задано (умолчания Go).
+// TLSConfig — TLS для запросов агента к серверу: системные корни плюс
+// caFile, клиентский сертификат (certFile + keyFile). nil — ничего не задано.
 func (s Server) TLSConfig() (*tls.Config, error) {
 	if s.CAFile == "" && s.CertFile == "" && s.KeyFile == "" {
 		return nil, nil
@@ -536,8 +704,8 @@ func (s Server) TLSConfig() (*tls.Config, error) {
 }
 
 // Insecure — связь без шифрования (http://) не с этой машиной: ключ агента и
-// снимки состояния (в них бывают секреты) идут открытым текстом. Локальные —
-// localhost, 127.0.0.0/8, ::1.
+// настройки воркеров идут открытым текстом. Локальные — localhost,
+// 127.0.0.0/8, ::1.
 func (c *Config) Insecure() bool {
 	return slices.ContainsFunc(c.Server.Addresses(), Insecure)
 }
@@ -556,13 +724,4 @@ func Insecure(serverURL string) bool {
 		return false
 	}
 	return true
-}
-
-func oneOf(v string, options ...string) bool {
-	for _, o := range options {
-		if v == o {
-			return true
-		}
-	}
-	return false
 }

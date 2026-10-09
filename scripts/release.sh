@@ -1,12 +1,12 @@
 #!/bin/sh
 # Выпуск агента в каталог DIR: сборки linux/darwin × amd64/arm64 (agent-<os>-<arch>),
-# manifest.json (подпись — AGENT_SIGNING_KEY, base64 seed Ed25519 из agent keygen;
+# manifest.json (подпись — AGENT_SIGNING_KEY, base64 seed Ed25519 из agent-release keygen;
 # без него — без подписей, самообновление на такой выпуск не встанет) и install.sh.
 # Нужен Go: на машине без него — scripts/go.sh release (контейнер golang).
-#   scripts/release.sh DIR VERSION [--worker NAME=VERSION[,restart=…][,stopTimeout=…]]…
-# --worker — сборки воркера, положенные в DIR заранее: один файл DIR/<name>-<version>-<os>-<arch>
-# или архив DIR/<name>-<version>-<os>-<arch>.tar.gz.
-# AGENT_UPDATE_PUBLIC_KEY (base64 открытого ключа из agent keygen) вшивается в сборки агента:
+#   scripts/release.sh DIR VERSION [--worker NAME=VERSION[,stopTimeout=…][,command=…]]…
+# --worker — воркеры из выпуска: их сборки кладутся в DIR заранее — файл
+# DIR/<name>-<version>-<os>-<arch> или архив DIR/<name>-<version>-<os>-<arch>.tar.gz.
+# AGENT_UPDATE_PUBLIC_KEY (base64 открытого ключа из agent-release keygen) вшивается в сборки агента:
 # они проверяют обновления без настройки update.publicKey.
 # Раскладка выпуска — dist/<VERSION>/ (make release, CI, образ agent-dist).
 set -eu
@@ -25,6 +25,6 @@ for os in linux darwin; do
       -ldflags "$LDFLAGS" -o "$DIR/agent-$os-$arch" ./cmd/agent
   done
 done
-go run ./cmd/agent release-manifest "$DIR" "$VERSION" "$@"
+go run ./cmd/agent-release manifest "$DIR" "$VERSION" "$@"
 cp deploy/install/install.sh "$DIR/install.sh"
 echo "выпуск $VERSION: $DIR"

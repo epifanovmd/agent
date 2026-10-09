@@ -1,20 +1,20 @@
-# Агент и SDK: разработка, проверки, сборки, стенд. Go — в контейнере golang (scripts/go.sh),
-# Go на машине не нужен; Node ≥ 24 и python3 — на машине.
+# Агент и серверный SDK: разработка, проверки, сборки, стенд. Go — в контейнере golang
+# (scripts/go.sh), Go на машине не нужен; Node ≥ 24 — на машине.
 #
-# make test / race идут в контейнере golang без Node: Node-часть общего теста серверов
-# (test/conformance, сервер на agent-sdk) там пропускается — она выполняется в CI.
+# make test / race идут в контейнере golang с node: интеграционные тесты агента
+# (test/integration) запускают сервер на agent-sdk/server — sdk/node собирается перед ними.
 .DEFAULT_GOAL := help
-.PHONY: help fmt format tidy version test race vet fmt-check format-check version-check sdk-test examples-test check \
-	build release images demo-build demo-server demo-agent demo-check
+.PHONY: help fmt format tidy version node-sdk test race vet fmt-check format-check version-check sdk-test examples-test e2e check \
+	build release images demo-build demo-server demo-agent
 
 help: ## список целей
-	@awk 'BEGIN { FS = ":.*## " } /^[a-zA-Z_-]+:.*## / { printf "  %-14s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN { FS = ":.*## " } /^[a-zA-Z0-9_-]+:.*## / { printf "  %-14s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 # --- Разработка
 
 fmt: ## gofmt: отформатировать Go-код
 	scripts/go.sh fmt
-format: ## Prettier: отформатировать TS/JS, JSON, YAML, Markdown, CSS во всём проекте
+format: ## Prettier: отформатировать TS/JS, JSON, YAML, Markdown во всём проекте
 	npm ci --no-audit --no-fund --silent && npx prettier --write .
 tidy: ## go mod tidy
 	scripts/go.sh tidy
@@ -23,9 +23,11 @@ version: ## записать версию везде: make version V=1.2.0
 
 # --- Проверки
 
-test: ## Go-тесты: агент, Go-SDK, эталоны сообщений, integration, conformance
+node-sdk: ## собрать sdk/node (сервер интеграционных тестов и примеры берут agent-sdk из dist)
+	cd sdk/node && npm ci --no-audit --no-fund --silent && npm run build
+test: node-sdk ## Go-тесты: агент, образцы сообщений, integration (сервер на agent-sdk)
 	scripts/go.sh test
-race: ## Go-тесты с race-детектором
+race: node-sdk ## Go-тесты с race-детектором
 	scripts/go.sh race
 vet: ## go vet
 	scripts/go.sh vet
@@ -33,18 +35,17 @@ fmt-check: ## gofmt: проверка без изменений (замечан�
 	scripts/go.sh fmt-check
 format-check: ## Prettier: проверка без изменений
 	npm ci --no-audit --no-fund --silent && npx prettier --check .
-version-check: ## версия в VERSION, SDK, агенте и примерах одинаковая
+version-check: ## версия в VERSION, SDK и примерах одинаковая
 	scripts/version.sh check
-sdk-test: ## тесты SDK Python и Node: lint, typecheck, тесты (Go-SDK — в test / race)
-	cd sdk/python && python3 -m unittest discover -s tests -t .
+sdk-test: ## серверный SDK на Node: lint, typecheck, тесты
 	cd sdk/node && npm ci --no-audit --no-fund --silent && npm run lint && npm run typecheck && npm test
-examples-test: ## тесты бэкендов-примеров (Node, Python), typecheck Node-воркера, сборка интерфейса
-	cd sdk/node && npm ci --no-audit --no-fund --silent && npm run build   # примеры берут agent-sdk из dist
-	cd examples/server && npm ci --no-audit --no-fund --silent && npm run typecheck && npm test
-	cd examples/workers/node && npm ci --no-audit --no-fund --silent && npm run typecheck
-	python3 -m unittest discover -s examples/server-python/tests -t examples/server-python
-	cd examples/web && npm ci --no-audit --no-fund --silent && npm run build
-check: vet fmt-check format-check version-check race sdk-test examples-test ## все проверки — перед коммитом
+examples-test: node-sdk ## стенд: ESLint и проверка типов сервера, синтаксис воркеров на Node и Python
+	cd examples/server && npm ci --no-audit --no-fund --silent && npm run lint && npm run typecheck
+	node --check examples/workers/node-echo/main.mjs
+	python3 -m py_compile examples/workers/echo/main.py
+e2e: node-sdk ## сквозные тесты: сервер стенда, настоящий агент и воркеры-примеры (сборки → .dev/e2e), ~1 мин
+	scripts/e2e.sh
+check: vet fmt-check format-check version-check race sdk-test examples-test e2e ## все проверки — перед коммитом
 
 # --- Сборка
 
@@ -52,17 +53,16 @@ build: ## агент под эту машину → dist/<VERSION>/
 	scripts/go.sh build
 release: ## выпуск: сборки linux/darwin × amd64/arm64, manifest.json, install.sh → dist/<VERSION>/ (подпись — AGENT_SIGNING_KEY, ключ проверки — AGENT_UPDATE_PUBLIC_KEY)
 	scripts/go.sh release
-images: ## образы: агент с Python (agent:dev-python), каталог выпуска (agent-dist:dev)
-	docker build -f deploy/Dockerfile -t agent:dev-python .
+images: ## образы: агент (agent:dev), агент с python3 для воркеров (agent:dev-python), каталог выпуска (agent-dist:dev)
+	docker build -f deploy/Dockerfile --target agent -t agent:dev .
+	docker build -f deploy/Dockerfile --target agent-python -t agent:dev-python .
 	docker build -f deploy/Dockerfile.dist -t agent-dist:dev .
 
 # --- Стенд (examples/)
 
-demo-build: ## стенд: агент и sysinfo → .dev/bin, выпуск → dist/<VERSION>, agent-sdk, сервер и интерфейс
+demo-build: ## стенд: агент, sysinfo и netprobe → .dev/bin, выпуск → dist/<VERSION>, agent-sdk, сервер
 	scripts/demo.sh build
-demo-server: ## стенд: сервер на Node.js и интерфейс, http://localhost:8080
+demo-server: ## стенд: сервер на Node.js, API — http://localhost:8080/api
 	scripts/demo.sh server
-demo-agent: ## стенд: агент с воркерами echo, batch, kv (Python), sysinfo (Go), node (Node.js)
+demo-agent: ## стенд: агент с воркерами echo (Python), node-echo (Node.js), sysinfo и netprobe (Go)
 	scripts/demo.sh agent
-demo-check: ## стенд: самопроверка воркеров из терминала
-	scripts/demo.sh check

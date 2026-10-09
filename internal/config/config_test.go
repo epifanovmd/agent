@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -27,8 +28,9 @@ dataDir: `+dir+`
 labels: { zone: eu }
 workers:
   - name: echo
-    command: ["${PY}", "-m", "examples.echo_worker"]
-    stopTimeout: 10m
+    command: ["${PY}", "/opt/example/echo.py"]
+    lifecycle:
+      stopTimeout: 10m
 `), 0o600)
 	t.Setenv("AGENT_LABELS", "disk=ssd, pool=a")
 	t.Setenv("AGENT_LOG_LEVEL", "debug")
@@ -37,14 +39,14 @@ workers:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Server.Transport != "auto" || cfg.Update.Mode != "self" || cfg.Log.Level != "debug" {
+	if cfg.Update.Mode != "self" || cfg.Log.Level != "debug" {
 		t.Fatalf("умолчания или env: %+v", cfg)
 	}
 	if cfg.Labels["zone"] != "eu" || cfg.Labels["disk"] != "ssd" || cfg.Labels["pool"] != "a" {
 		t.Fatalf("метки: %v", cfg.Labels)
 	}
 	w := cfg.Workers[0]
-	if w.Command[0] != "/opt/venv/bin/python" || w.Replicas != 1 || w.StopTimeout.Std() != 10*time.Minute {
+	if w.Command[0] != "/opt/venv/bin/python" || w.Lifecycle.StopTimeout.Std() != 10*time.Minute || w.Lifecycle.KeepChildren {
 		t.Fatalf("воркер: %+v", w)
 	}
 }
@@ -52,10 +54,16 @@ workers:
 func TestValidate(t *testing.T) {
 	cfg := Defaults()
 	cfg.Server.URL = "ftp://x"
-	cfg.Server.Transport = "pigeon"
+	cfg.Update.Mode = "pigeon"
 	cfg.Workers = []Worker{{Name: "a"}, {Name: "a", Command: []string{"x"}}}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("ожидались ошибки")
+	}
+	builtin := Defaults()
+	builtin.Server.URL = "https://api.example.com"
+	builtin.Workers = []Worker{{Name: SysmetricsWorker, Command: []string{"x"}}}
+	if err := builtin.Validate(); err == nil || !strings.Contains(err.Error(), "занято встроенным") {
+		t.Fatalf("имя встроенного воркера: %v", err)
 	}
 	ok := Defaults()
 	ok.Server.URL = "http://10.0.0.1:8181"
@@ -89,80 +97,45 @@ func TestInsecure(t *testing.T) {
 	}
 }
 
-func TestStateResync(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "agent.yaml")
-	_ = os.WriteFile(path, []byte("server: { url: https://api.example.com }\ndataDir: "+dir+"\n"), 0o600)
-	cfg, err := Load(path)
-	if err != nil || cfg.State.ResyncInterval.Std() != 10*time.Minute {
-		t.Fatalf("по умолчанию 10m: %v %v", cfg.State.ResyncInterval.Std(), err)
-	}
-	_ = os.WriteFile(path, []byte("server: { url: https://api.example.com }\ndataDir: "+dir+"\nstate: { resyncInterval: 0 }\n"), 0o600)
-	if cfg, err = Load(path); err != nil || cfg.State.ResyncInterval != 0 {
-		t.Fatalf("0 — выключено: %v %v", cfg.State.ResyncInterval.Std(), err)
-	}
-	t.Setenv("AGENT_STATE_RESYNC", "90s")
-	if cfg, err = Load(path); err != nil || cfg.State.ResyncInterval.Std() != 90*time.Second {
-		t.Fatalf("AGENT_STATE_RESYNC: %v %v", cfg.State.ResyncInterval.Std(), err)
-	}
-	t.Setenv("AGENT_STATE_RESYNC", "часто")
-	if _, err = Load(path); err == nil {
-		t.Fatal("неверная длительность — ошибка")
-	}
-	t.Setenv("AGENT_STATE_RESYNC", "-1s")
-	if _, err = Load(path); err == nil {
-		t.Fatal("отрицательная — ошибка")
-	}
-}
-
-func TestBuiltinsTelemetryAndEnv(t *testing.T) {
+func TestTelemetryAndEnv(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "agent.yaml")
 	_ = os.WriteFile(path, []byte(`
 server: { url: https://api.example.com }
 dataDir: `+dir+`
-commands: { disabled: [agent.update, worker.restart] }
 telemetry:
-  metrics: [load, swap, cpu.cores]
+  metrics: [load, swap, gpu]
   disks: [all]
-  inventoryInterval: 0
   excludeInterfaces: [tun]
-  backlog: 0
 `), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tl := cfg.Telemetry
-	if len(cfg.Commands.Disabled) != 2 || strings.Join(tl.Metrics, ",") != "load,swap,cpu.cores" ||
-		strings.Join(tl.Disks, ",") != "all" || tl.InventoryInterval != 0 || tl.Backlog != 0 ||
+	if strings.Join(tl.Metrics, ",") != "load,swap,gpu" || strings.Join(tl.Disks, ",") != "all" ||
 		len(tl.ExcludeInterfaces) != 1 || tl.ExcludeInterfaces[0] != "tun" {
-		t.Fatalf("из файла: %+v %+v", cfg.Commands, tl)
+		t.Fatalf("из файла: %+v", tl)
 	}
 
-	// Умолчания.
 	def := Defaults()
-	if !slices.Equal(def.Telemetry.Metrics, DefaultMetrics) || strings.Join(def.Telemetry.Disks, ",") != "/" || def.Telemetry.InventoryInterval.Std() != 10*time.Minute || def.Telemetry.Backlog != 720 ||
-		len(def.Telemetry.ExcludeInterfaces) != len(DefaultExcludeInterfaces) || len(def.Commands.Disabled) != 0 {
+	if !slices.Equal(def.Telemetry.Metrics, DefaultMetrics) || strings.Join(def.Telemetry.Disks, ",") != "/" ||
+		len(def.Telemetry.ExcludeInterfaces) != len(DefaultExcludeInterfaces) || def.Update.Mode != UpdateSelf {
 		t.Fatalf("умолчания: %+v", def.Telemetry)
 	}
 
 	// Переменные окружения важнее файла.
-	t.Setenv("AGENT_COMMANDS_DISABLED", "agent.logs, agent.restart")
 	t.Setenv("AGENT_TELEMETRY_METRICS", "sockets, fds")
 	t.Setenv("AGENT_TELEMETRY_DISKS", "/,/var/lib/example")
-	t.Setenv("AGENT_INVENTORY_INTERVAL", "1m")
-	t.Setenv("AGENT_TELEMETRY_BACKLOG", "10")
 	t.Setenv("AGENT_TELEMETRY_EXCLUDE_INTERFACES", "lo,docker")
 	cfg, err = Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tl = cfg.Telemetry
-	if strings.Join(cfg.Commands.Disabled, ",") != "agent.logs,agent.restart" ||
-		strings.Join(tl.Metrics, ",") != "sockets,fds" || strings.Join(tl.Disks, ",") != "/,/var/lib/example" ||
-		tl.InventoryInterval.Std() != time.Minute || tl.Backlog != 10 || strings.Join(tl.ExcludeInterfaces, ",") != "lo,docker" {
-		t.Fatalf("из окружения: %+v %+v", cfg.Commands, tl)
+	if strings.Join(tl.Metrics, ",") != "sockets,fds" || strings.Join(tl.Disks, ",") != "/,/var/lib/example" ||
+		strings.Join(tl.ExcludeInterfaces, ",") != "lo,docker" {
+		t.Fatalf("из окружения: %+v", tl)
 	}
 	// Пустая переменная — без метрик узла.
 	t.Setenv("AGENT_TELEMETRY_METRICS", "")
@@ -173,29 +146,22 @@ telemetry:
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), `неизвестная группа "nope"`) {
 		t.Fatalf("неизвестная группа: %v", err)
 	}
-	t.Setenv("AGENT_TELEMETRY_METRICS", "load")
-
-	// Неизвестная команда, неверные host и backlog — ошибки.
-	t.Setenv("AGENT_COMMANDS_DISABLED", "agent.nope")
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "agent.nope") {
-		t.Fatalf("неизвестная команда: %v", err)
-	}
 	bad := Defaults()
 	bad.Server.URL = "https://x"
-	bad.Telemetry.Metrics = []string{"cpu", "gpu"}
 	bad.Telemetry.Disks = []string{"all", "/"}
-	bad.Telemetry.Backlog = -1
-	bad.Telemetry.InventoryInterval = -1
-	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), `неизвестная группа "gpu"`) ||
-		!strings.Contains(err.Error(), `"all" — только один`) ||
-		!strings.Contains(err.Error(), "telemetry.backlog") || !strings.Contains(err.Error(), "telemetry.inventoryInterval") {
-		t.Fatalf("ошибки телеметрии: %v", err)
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), `"all" — только один`) {
+		t.Fatalf("all и пути: %v", err)
 	}
-	bad = Defaults()
-	bad.Server.URL = "https://x"
 	bad.Telemetry.Disks = []string{"var/lib"}
 	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "абсолютный путь") {
 		t.Fatalf("относительный путь диска: %v", err)
+	}
+	bad = Defaults()
+	bad.Server.URL = "https://x"
+	bad.Name = ""
+	bad.Labels = map[string]string{"": "x"}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "name") || !strings.Contains(err.Error(), "labels") {
+		t.Fatalf("имя и метки: %v", err)
 	}
 }
 
@@ -271,7 +237,6 @@ func testCerts(t *testing.T) (caPEM, certPEM, keyPEM []byte) {
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 }
 
-// Перечитывание: что применяется на ходу, что требует перезапуска.
 func TestCompare(t *testing.T) {
 	base := Defaults()
 	base.Server.URL = "https://a.example.com"
@@ -291,39 +256,26 @@ func TestCompare(t *testing.T) {
 	next.Update.Mode = "disabled"
 	next.Enroll.Token = "t"
 	next.Log.Level = "debug"
-	next.Telemetry.Backlog = 0
 	next.Telemetry.Metrics = []string{"load"}
-	next.State.ResyncInterval = 0
 	next.Labels = map[string]string{"zone": "us"}
-	next.Commands.Disabled = []string{"agent.logs"}
-	next.Workers = []Worker{{Name: "w", Command: []string{"x"}, Replicas: 2, StopTimeout: Duration(30 * time.Second)}}
+	next.Workers = []Worker{{Name: "w", Command: []string{"x"}, Lifecycle: Lifecycle{KeepChildren: true, StopTimeout: Duration(30 * time.Second)}}}
 	d := Compare(base, next)
 	if strings.Join(d.Restart, ",") != "server.url,server.caFile,dataDir,update.mode,enroll.token" {
 		t.Fatalf("перезапуск: %v", d.Restart)
 	}
-	if !d.Log || !d.Telemetry || !d.Resync || !d.Hello || !d.Workers {
+	if !d.Log || !d.Telemetry || !d.Hello || !d.Workers {
 		t.Fatalf("на ходу: %+v", d)
 	}
-
 	kept := KeepRestartOnly(base, next)
 	if kept.Server.URL != base.Server.URL || kept.Server.CAFile != "" || kept.DataDir != base.DataDir ||
 		kept.Update.Mode != base.Update.Mode || kept.Enroll.Token != "" ||
-		kept.Log.Level != "debug" || kept.Labels["zone"] != "us" || kept.Workers[0].Replicas != 2 {
+		kept.Log.Level != "debug" || kept.Labels["zone"] != "us" || !kept.Workers[0].Lifecycle.KeepChildren {
 		t.Fatalf("ключи перезапуска — прежние, остальное новое: %+v", kept)
-	}
-
-	// Порядок commands.disabled не важен.
-	a, b := base, base
-	a.Commands.Disabled = []string{"agent.logs", "agent.drain"}
-	b.Commands.Disabled = []string{"agent.drain", "agent.logs"}
-	if Compare(a, b).Changed() {
-		t.Fatal("тот же набор выключенных команд")
 	}
 }
 
-// release: true — команда по умолчанию <dataDir>/workers/<name>/current + args;
-// с command (сборка-архив) — command + args; имя воркера из выпуска — по
-// правилу имён.
+// release: true — каталог сборки <dataDir>/workers/<name>; имена воркеров — по
+// правилу §1; ошибки настроек воркера.
 func TestWorkerRelease(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "agent.yaml")
@@ -332,45 +284,37 @@ server:
   url: https://api.example.com
 dataDir: `+dir+`
 workers:
-  - name: sysinfo
+  - name: report
     release: true
     args: ["--verbose"]
   - name: plain
     command: ["/bin/echo", "a"]
-    args: ["b"]
-  - name: packed
-    release: true
-    command: ["python3", "./main.py"]
+    lifecycle:
+      keepChildren: true
+      maxRestarts: 5
 `), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rel, plain := cfg.Workers[0], cfg.Workers[1]
-	wantDir := filepath.Join(dir, "workers", "sysinfo")
-	if !rel.Release || rel.ReleaseDir != wantDir {
+	wantDir := filepath.Join(dir, "workers", "report")
+	if !rel.Release || rel.ReleaseDir != wantDir || rel.Current() != filepath.Join(wantDir, "current") {
 		t.Fatalf("воркер из выпуска: %+v", rel)
 	}
-	if got := rel.Argv(); !slices.Equal(got, []string{filepath.Join(wantDir, "current"), "--verbose"}) {
-		t.Fatalf("argv выпуска: %v", got)
-	}
-	if got := plain.Argv(); !slices.Equal(got, []string{"/bin/echo", "a", "b"}) {
-		t.Fatalf("argv: %v", got)
-	}
-	if packed := cfg.Workers[2]; !slices.Equal(packed.Argv(), []string{"python3", "./main.py"}) ||
-		packed.Current() != filepath.Join(dir, "workers", "packed", "current") {
-		t.Fatalf("архив: %v %s", packed.Argv(), packed.Current())
+	if l := plain.Lifecycle; !l.KeepChildren || l.MaxRestarts != 5 || l.StopTimeout.Std() != DefaultStopTimeout || plain.ReleaseDir != "" {
+		t.Fatalf("воркер: %+v", plain)
 	}
 	// Повторная проверка не ломает уже проверенные настройки.
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
-
 	for name, w := range map[string]Worker{
 		"inheritEnv AGENT_": {Name: "x", Command: []string{"/bin/x"}, InheritEnv: []string{"AGENT_ENROLL_TOKEN"}},
-		"backoff max < min": {Name: "x", Command: []string{"/bin/x"}, Backoff: Backoff{Min: Duration(time.Minute), Max: Duration(time.Second)}},
-		"maxRestarts < 0":   {Name: "x", Command: []string{"/bin/x"}, MaxRestarts: -1},
+		"maxRestarts < 0":   {Name: "x", Command: []string{"/bin/x"}, Lifecycle: Lifecycle{MaxRestarts: -1}},
 		"имя с путём":       {Name: "../x", Release: true},
+		"заглавные":         {Name: "Report", Command: []string{"/bin/x"}},
+		"встроенный":        {Name: SysmetricsWorker, Command: []string{"/bin/x"}},
 		"без command":       {Name: "x"},
 	} {
 		c := Defaults()
@@ -379,9 +323,6 @@ workers:
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: ожидалась ошибка", name)
 		}
-	}
-	if !slices.Contains(BuiltinCommands, "worker.update") {
-		t.Fatal("worker.update — встроенная команда")
 	}
 }
 
@@ -476,43 +417,169 @@ func TestCompareMetrics(t *testing.T) {
 	}
 }
 
-// Пауза воркера с сервера — встроенные команды (их можно выключить).
-func TestBuiltinWorkerPause(t *testing.T) {
-	for _, name := range []string{"worker.pause", "worker.resume"} {
-		if !slices.Contains(BuiltinCommands, name) {
-			t.Fatalf("%s — встроенная команда", name)
-		}
-		c := Defaults()
-		c.Server.URL = "https://api.example.com"
-		c.Commands.Disabled = []string{name}
-		c.Name = "node"
-		if err := c.Validate(); err != nil && strings.Contains(err.Error(), name) {
-			t.Fatalf("%s можно выключить: %v", name, err)
-		}
+// workers[].user читается из agent.yaml; user без root — ошибка конфигурации.
+func TestWorkerUser(t *testing.T) {
+	defer func(f func() int) { geteuid = f }(geteuid)
+	geteuid = func() int { return 0 }
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.yaml")
+	_ = os.WriteFile(path, []byte(`
+server:
+  url: https://api.example.com
+workers:
+  - name: report
+    command: ["/bin/report"]
+    user: nobody
+`), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := cfg.Workers[0]
+	if w.User != "nobody" {
+		t.Fatalf("воркер: %+v", w)
+	}
+
+	geteuid = func() int { return 1000 }
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "workers[0].user") {
+		t.Fatalf("user без root: %v", err)
+	}
+	cfg.Workers[0].User = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("без user: %v", err)
 	}
 }
 
-// Умолчания пределов и сроков: state.applyTimeout, commands.maxConcurrent,
-// jobs.cancelTimeout, outbox.maxMessages, backoff и registerTimeout воркера.
-func TestTuningDefaults(t *testing.T) {
-	c := Defaults()
-	c.Server.URL = "https://api.example.com"
-	c.State.ApplyTimeout, c.Commands.MaxConcurrent, c.Jobs.CancelTimeout, c.Outbox.MaxMessages = 0, 0, 0, 0
-	c.Workers = []Worker{{Name: "w", Command: []string{"/bin/w"}}}
-	if err := c.Validate(); err != nil {
+// lifecycle и logs: умолчания (и у воркера, собранного в коде), заданные
+// значения — в том числе 0 и false там, где это значение; неверные — ошибка
+// с именем поля.
+func TestLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent.yaml")
+	_ = os.WriteFile(path, []byte(`
+server: { url: https://api.example.com }
+dataDir: `+dir+`
+workers:
+  - name: plain
+    command: [x]
+  - name: tuned
+    command: [x]
+    lifecycle:
+      onAgentRestart: restart
+      onAgentStop: stop
+      restart: never
+      backoff: {min: 2s, max: 1m}
+      startTimeout: 5s
+      busy: {wait: false, timeout: 1h}
+      health: {interval: 0s, failures: 0}
+      probeTimeout: 1s
+      configRetry: 5s
+      updateHealthyTimeout: 2m
+    logs: {maxSize: 1MB, maxFiles: 0}
+`), 0o600)
+	cfg, err := Load(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if c.State.ApplyTimeout.Std() != 5*time.Minute || c.Commands.MaxConcurrent != 8 ||
-		c.Jobs.CancelTimeout.Std() != 30*time.Second || c.Outbox.MaxMessages != 10000 {
-		t.Fatalf("умолчания: %+v %+v %+v %+v", c.State, c.Commands, c.Jobs, c.Outbox)
+	plain, tuned := cfg.Workers[0], cfg.Workers[1]
+	def := DefaultLifecycle()
+	if !reflect.DeepEqual(plain.Lifecycle, def) || !reflect.DeepEqual(plain.Logs, DefaultLogs()) {
+		t.Fatalf("умолчания: %+v %+v", plain.Lifecycle, plain.Logs)
 	}
-	w := c.Workers[0]
-	if w.Backoff.Min.Std() != time.Second || w.Backoff.Max.Std() != 30*time.Second || w.RegisterTimeout.Std() != 2*time.Minute {
-		t.Fatalf("воркер: %+v", w)
+	if def.OnAgentRestart != Keep || def.OnAgentStop != Keep || def.Restart != RestartFailure || !def.BusyWait() ||
+		def.Busy.Timeout.Std() != 24*time.Hour || def.HealthInterval() != 10*time.Second || def.HealthFailures() != 3 ||
+		def.StartTimeout.Std() != time.Minute || def.Backoff.Max.Std() != 30*time.Second || DefaultLogs().MaxSize != 10<<20 {
+		t.Fatalf("значения по умолчанию: %+v", def)
 	}
-	next := c
-	next.Commands.MaxConcurrent = 2
-	if d := Compare(c, next); !d.Tuning || !d.Changed() || len(d.Restart) > 0 {
-		t.Fatalf("diff: %+v", d)
+	l := tuned.Lifecycle
+	if l.OnAgentRestart != RestartWorker || l.OnAgentStop != StopWorker || l.Restart != RestartNever || l.BusyWait() ||
+		l.Busy.Timeout.Std() != time.Hour || l.HealthInterval() != 0 || l.HealthFailures() != 0 ||
+		l.Health.Timeout.Std() != 2*time.Second || l.Backoff.Min.Std() != 2*time.Second || l.StartTimeout.Std() != 5*time.Second ||
+		l.ProbeTimeout.Std() != time.Second || l.ConfigRetry.Std() != 5*time.Second || l.UpdateHealthyTimeout.Std() != 2*time.Minute ||
+		l.StopTimeout.Std() != DefaultStopTimeout || tuned.Logs.MaxSize != 1<<20 || tuned.Logs.Files() != 0 {
+		t.Fatalf("заданные: %+v %+v", l, tuned.Logs)
+	}
+	var coded Worker
+	coded.FillDefaults()
+	if !reflect.DeepEqual(coded.Lifecycle, def) {
+		t.Fatalf("воркер из кода: %+v", coded.Lifecycle)
+	}
+	for field, src := range map[string]string{
+		"lifecycle.onAgentRestart": "lifecycle: {onAgentRestart: stop}",
+		"lifecycle.onAgentStop":    "lifecycle: {onAgentStop: restart}",
+		"lifecycle.restart":        "lifecycle: {restart: sometimes}",
+		"lifecycle.backoff":        "lifecycle: {backoff: {min: 1m, max: 1s}}",
+		"lifecycle.health.timeout": "lifecycle: {health: {interval: 1s, timeout: 5s}}",
+		"logs.maxSize":             "logs: {maxSize: 1KB}",
+		"logs.maxFiles":            "logs: {maxFiles: -1}",
+	} {
+		res := Check(writeConfig(t, "server: {url: https://api.example.com}\nworkers:\n  - name: a\n    command: [a]\n    "+src+"\n"))
+		if len(res.Errors) != 1 || !strings.Contains(res.Errors[0].Text, "workers[0]."+field) || res.Errors[0].Line != 5 {
+			t.Errorf("%s: %+v", field, res.Errors)
+		}
+	}
+	if res := Check(writeConfig(t, "server: {url: https://api.example.com}\nworkers:\n  - name: a\n    command: [a]\n    logs: {maxSize: lots}\n")); len(res.Errors) != 1 || !strings.Contains(res.Errors[0].Text, "размер") {
+		t.Errorf("размер: %+v", res.Errors)
+	}
+}
+
+// Размеры: единицы, запись обратно.
+func TestByteSize(t *testing.T) {
+	for in, want := range map[string]ByteSize{"10MB": 10 << 20, "512kb": 512 << 10, "1GB": 1 << 30, "65536": 65536, "100B": 100} {
+		got, err := ParseByteSize(in)
+		if err != nil || got != want {
+			t.Errorf("%s: %d %v", in, got, err)
+		}
+	}
+	if _, err := ParseByteSize("-1MB"); err == nil {
+		t.Error("отрицательный размер")
+	}
+	if ByteSize(10<<20).String() != "10MB" || ByteSize(1500).String() != "1500B" {
+		t.Error("запись размера")
+	}
+}
+
+// Настройки агента целиком: переподключение, поток без связи, очередь
+// важных сообщений, журнал — умолчания, файл, окружение, проверка; их
+// изменение требует перезапуска агента.
+func TestAgentTuning(t *testing.T) {
+	def := Defaults()
+	if def.Server.Reconnect.Min.Std() != time.Second || def.Server.Reconnect.Max.Std() != time.Minute ||
+		def.Server.StreamBuffer != 600 || def.Outbox.MaxMessages != 10000 || def.Log.Buffer != 5000 {
+		t.Fatalf("умолчания: %+v %+v %+v", def.Server, def.Outbox, def.Log)
+	}
+	path := writeConfig(t, `server:
+  url: https://api.example.com
+  reconnect: {min: 2s, max: 5m}
+  streamBuffer: 100
+outbox: {maxMessages: 500}
+log: {buffer: 1000}
+`)
+	t.Setenv("AGENT_OUTBOX_MAX_MESSAGES", "700")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Reconnect.Max.Std() != 5*time.Minute || cfg.Server.StreamBuffer != 100 || cfg.Outbox.MaxMessages != 700 || cfg.Log.Buffer != 1000 {
+		t.Fatalf("файл и окружение: %+v %+v %+v", cfg.Server, cfg.Outbox, cfg.Log)
+	}
+	t.Setenv("AGENT_OUTBOX_MAX_MESSAGES", "много")
+	t.Setenv("AGENT_SERVER_RECONNECT_MAX", "1ms")
+	res := Check(path)
+	text := ""
+	for _, p := range res.Errors {
+		text += p.Text + "\n"
+	}
+	if !strings.Contains(text, "AGENT_OUTBOX_MAX_MESSAGES") || !strings.Contains(text, "server.reconnect") {
+		t.Fatalf("ошибки: %s", text)
+	}
+	next := cfg
+	next.Server.StreamBuffer, next.Outbox.MaxMessages, next.Log.Buffer = 50, 10, 200
+	d := Compare(cfg, next)
+	if strings.Join(d.Restart, ",") != "server.streamBuffer,outbox.maxMessages,log.buffer" || d.Log {
+		t.Fatalf("перезапуск: %+v", d)
+	}
+	if kept := KeepRestartOnly(cfg, next); kept.Outbox != cfg.Outbox || kept.Log.Buffer != cfg.Log.Buffer {
+		t.Fatalf("прежние до перезапуска: %+v", kept)
 	}
 }

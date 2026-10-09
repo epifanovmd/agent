@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/epifanovmd/agent/sdk/go/message"
+	"github.com/epifanovmd/agent/internal/message"
 )
 
 func TestAppendPendingRemoveSurvivesReopen(t *testing.T) {
@@ -16,7 +16,7 @@ func TestAppendPendingRemoveSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"a1", "b2", "c3"} {
-		env := message.MustNew(message.TypeJobComplete, message.JobComplete{JobRef: message.JobRef{JobID: id}})
+		env := message.MustNew(message.TypeEvent, message.Event{Worker: "echo", Type: "example.done"})
 		env.ID = id
 		if err := o.Append(env); err != nil {
 			t.Fatal(err)
@@ -60,55 +60,32 @@ func TestAppendRequiresIDAndSkipsGarbage(t *testing.T) {
 	}
 }
 
-func TestJobRefsOfUndeliveredResults(t *testing.T) {
+// Полная очередь не принимает события воркеров (ErrFull), итоги настроек и
+// действий записываются всегда.
+func TestLimitRejectsEvents(t *testing.T) {
 	o, _ := Open(t.TempDir())
-	for i, typ := range []string{message.TypeJobComplete, message.TypeJobEvent, message.TypeJobFail} {
-		env := message.MustNew(typ, message.JobRef{JobID: string(rune('a' + i)), Attempt: i})
-		env.ID = typ
-		_ = o.Append(env)
-	}
-	refs := o.JobRefs()
-	if len(refs) != 2 || refs[0].JobID != "a" || refs[1].JobID != "c" || refs[1].Attempt != 2 {
-		t.Fatalf("итоги в outbox: %+v", refs)
-	}
-}
-
-// Переполнение: отбрасываются самые старые необязательные (event,
-// state.applied); остались только итоги — новое не принимается (ErrFull).
-func TestLimitDropsOptionalOldest(t *testing.T) {
-	dir := t.TempDir()
-	o, _ := Open(dir)
-	o.SetLimit(3, nil)
+	o.SetLimit(2)
 	add := func(id, typ string) error {
-		env := message.MustNew(typ, message.JobRef{JobID: id})
+		env := message.MustNew(typ, struct{}{})
 		env.ID = id
 		return o.Append(env)
 	}
-	for _, m := range [][2]string{{"done1", message.TypeJobComplete}, {"ev1", message.TypeEvent}, {"st1", message.TypeStateApplied}} {
-		if err := add(m[0], m[1]); err != nil {
-			t.Fatal(err)
+	for i, id := range []string{"e1", "e2"} {
+		if err := add(id, message.TypeEvent); err != nil {
+			t.Fatal(i, err)
 		}
 	}
-	if err := add("done2", message.TypeCmdDone); err != nil {
-		t.Fatal(err)
+	if err := add("e3", message.TypeEvent); !errors.Is(err, ErrFull) {
+		t.Fatalf("событие в полную очередь: %v", err)
 	}
-	if ids := o.IDs(); len(ids) != 3 || ids[0] != "done1" || ids[1] != "st1" || ids[2] != "done2" {
-		t.Fatalf("отброшено не самое старое необязательное: %v", ids)
+	if err := add("r1", message.TypeActionResult); err != nil {
+		t.Fatalf("итог действия: %v", err)
 	}
-	if err := add("done3", message.TypeJobFail); err != nil {
-		t.Fatal(err)
+	if err := add("c1", message.TypeConfigApplied); err != nil || o.Len() != 4 {
+		t.Fatalf("итог настроек: %v, в очереди %d", err, o.Len())
 	}
-	if err := add("done4", message.TypeJobFail); !errors.Is(err, ErrFull) {
-		t.Fatalf("итоги не отбрасываются: %v %v", err, o.IDs())
-	}
-	reopened, _ := Open(dir)
-	if ids := reopened.IDs(); len(ids) != 3 || ids[2] != "done3" {
-		t.Fatalf("на диске: %v", ids)
-	}
-	if env, ok := reopened.Read("done1"); !ok || env.Type != message.TypeJobComplete {
-		t.Fatalf("чтение: %+v %v", env, ok)
-	}
-	if _, ok := reopened.Read("nope"); ok {
-		t.Fatal("нет такого")
+	o.Remove("e1", "e2", "r1", "c1")
+	if err := add("e4", message.TypeEvent); err != nil {
+		t.Fatalf("после ack событие принимается: %v", err)
 	}
 }
