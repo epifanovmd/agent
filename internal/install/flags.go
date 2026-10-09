@@ -31,17 +31,24 @@ const Usage = `agent install — поставить агента службой 
 Повторный запуск обновляет программу и службу; ключ агента, agent.yaml и
 agent.env сохраняются (переданные --token и --public-key заменяют прежние).
 
+Несколько агентов на одном узле (для разных бэкендов) — экземпляры:
+--instance ИМЯ ставит или обновляет экземпляр ИМЯ со своими путями
+(/etc/agent-ИМЯ, /var/lib/agent-ИМЯ, /opt/agent-ИМЯ, служба agent-ИМЯ);
+без флага — экземпляр по умолчанию (/etc/agent, служба agent).
+
 Флаги:
-  --server URL            адрес бэкенда (нужен, если ещё нет /etc/agent/agent.yaml)
-  --token ТОКЕН           токен регистрации → /etc/agent/agent.env (0600)
+  --instance ИМЯ          экземпляр: строчная латиница, цифры и «-», до 32 символов
+  --server URL            адрес бэкенда (нужен, если ещё нет agent.yaml экземпляра)
+  --token ТОКЕН           токен регистрации → agent.env (0600)
   --token-file ПУТЬ       токен из файла (не виден в списке процессов)
   --name ИМЯ              имя агента (по умолчанию — имя машины)
   --config ФАЙЛ           свой agent.yaml вместо создаваемого
-  --ca-file ПУТЬ          свой корневой сертификат сервера → /etc/agent/ca.pem
+  --ca-file ПУТЬ          свой корневой сертификат сервера → ca.pem рядом с agent.yaml
   --public-key КЛЮЧ       ключ проверки подписи выпусков (в сборки из выпуска вшит)
   --worker ИМЯ            воркер из выпуска (можно несколько раз)
   --releases URL          откуда брать воркеры (по умолчанию <server>/api/v1/agent-link/releases)
-  --user ИМЯ              пользователь службы (по умолчанию agent; нет — создаётся)
+  --user ИМЯ              пользователь службы (по умолчанию agent, у экземпляра — agent-ИМЯ;
+                          нет — создаётся)
   --privileged            агент и воркеры — root без ограничений (воркеры настраивают узел)
   --rw-path ПУТЬ          разрешить запись ещё в этот каталог (можно несколько раз)
   --packages "…"          системные пакеты для воркеров (apt, dnf, yum, apk, zypper)
@@ -51,7 +58,7 @@ agent.env сохраняются (переданные --token и --public-key �
                           работают дальше; mixed — и воркеры (запоминается)
   --stop-timeout СРОК     сколько systemd ждёт остановки (по умолчанию 15min)
 
-Удаление: sudo agent uninstall [--purge]
+Удаление: sudo agent uninstall [--instance ИМЯ] [--purge]
 `
 
 // ParseFlags — флаги agent install.
@@ -61,6 +68,7 @@ func ParseFlags(args []string, errOut io.Writer) (Options, error) {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	fs.Usage = func() { fmt.Fprint(errOut, Usage) }
+	fs.StringVar(&o.Instance, "instance", "", "")
 	fs.StringVar(&o.Server, "server", "", "")
 	fs.StringVar(&o.Token, "token", "", "")
 	fs.StringVar(&o.TokenFile, "token-file", "", "")

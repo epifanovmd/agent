@@ -14,7 +14,10 @@
 #                     передаётся и agent install (оттуда же — воркеры из выпуска)
 #   --ca-file ПУТЬ    свой корневой сертификат сервера для загрузки; передаётся и agent install
 #   --binary ПУТЬ     не скачивать, а поставить сборку из файла
+#   --instance ИМЯ    экземпляр агента (несколько агентов на одном узле — для разных бэкендов);
+#                     передаётся и agent install
 #   --uninstall [--purge]   удалить агента: /opt/agent/bin/agent uninstall [--purge]
+#                     (экземпляр — /opt/agent-ИМЯ/bin/agent uninstall --instance ИМЯ [--purge])
 #
 # Без скрипта — то же самое вручную: скачать agent-linux-<arch> и выполнить
 #   sudo ./agent-linux-<arch> install --server URL --token <токен>
@@ -29,7 +32,7 @@ die() {
   exit 1
 }
 
-SERVER="$DEFAULT_SERVER" RELEASES="" BINARY="" CA_FILE="" UNINSTALL="" PURGE=""
+SERVER="$DEFAULT_SERVER" RELEASES="" BINARY="" CA_FILE="" UNINSTALL="" PURGE="" INSTANCE=""
 # Свои флаги забираются, остальные остаются в "$@" по порядку (для agent install).
 n=$#
 while [ "$n" -gt 0 ]; do
@@ -39,7 +42,7 @@ while [ "$n" -gt 0 ]; do
   case "$a" in
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
-    --binary | --server | --releases | --ca-file)
+    --binary | --server | --releases | --ca-file | --instance)
       [ "$n" -gt 0 ] || die "$a: нужно значение"
       v=$1
       shift
@@ -55,6 +58,10 @@ while [ "$n" -gt 0 ]; do
           CA_FILE=$v
           set -- "$@" "$a" "$v"
           ;;
+        --instance)
+          INSTANCE=$v
+          set -- "$@" "$a" "$v"
+          ;;
       esac
       ;;
     --binary=*) BINARY=${a#*=} ;;
@@ -65,6 +72,10 @@ while [ "$n" -gt 0 ]; do
       ;;
     --ca-file=*)
       CA_FILE=${a#*=}
+      set -- "$@" "$a"
+      ;;
+    --instance=*)
+      INSTANCE=${a#*=}
       set -- "$@" "$a"
       ;;
     *) set -- "$@" "$a" ;;
@@ -107,13 +118,24 @@ fetch_agent() {
   chmod 0755 "$TMP/agent"
 }
 
+case "$INSTANCE" in
+  "") OPT=/opt/agent ;;
+  [a-z]*)
+    case "$INSTANCE" in
+      *[!a-z0-9-]*) die "--instance: имя экземпляра — строчная латиница, цифры и «-», первая — буква" ;;
+    esac
+    OPT="/opt/agent-$INSTANCE"
+    ;;
+  *) die "--instance: имя экземпляра — строчная латиница, цифры и «-», первая — буква" ;;
+esac
+
 if [ -n "$UNINSTALL" ]; then
   # Удаляет установленная программа; её уже нет (удалена без --purge) — скачанная.
-  if [ -x /opt/agent/bin/agent ]; then
-    /opt/agent/bin/agent uninstall ${PURGE:+--purge}
+  if [ -x "$OPT/bin/agent" ]; then
+    "$OPT/bin/agent" uninstall ${INSTANCE:+--instance "$INSTANCE"} ${PURGE:+--purge}
   else
     fetch_agent
-    "$TMP/agent" uninstall ${PURGE:+--purge}
+    "$TMP/agent" uninstall ${INSTANCE:+--instance "$INSTANCE"} ${PURGE:+--purge}
   fi
   exit
 fi

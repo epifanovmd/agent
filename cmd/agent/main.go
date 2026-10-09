@@ -7,6 +7,8 @@
 //	agent stop-workers                 остановить воркеры, оставшиеся работать после остановки агента
 //	agent install --server URL --token ТОКЕН [флаги]   поставить службой systemd (Linux, root)
 //	agent uninstall [--purge]          удалить службу (с --purge — настройки и данные)
+//	                                   --instance ИМЯ у install, uninstall, status, logs, restart,
+//	                                   stop-workers, cleanup, config check — экземпляр агента на узле
 //	agent init [--server URL] [--token ТОКЕН]   создать файл настроек с пояснениями
 //	agent config check                 проверить настройки и показать итоговые значения
 //	agent status [--json]              работает ли агент, связь, воркеры (код выхода 0 — работает)
@@ -16,8 +18,9 @@
 //	agent boot-guard BINARY            откат версии, не дошедшей до связи (ExecStartPre)
 //	agent sysmetrics                   встроенный воркер метрик узла (агент запускает его сам)
 //
-// Файл настроек — -config, иначе AGENT_CONFIG, иначе /etc/agent/agent.yaml
-// (на macOS ~/.agent/agent.yaml), если он есть.
+// Файл настроек — -config, иначе --instance ИМЯ (/etc/agent-ИМЯ/agent.yaml),
+// иначе AGENT_CONFIG, иначе экземпляр, чья это программа (/opt/agent-ИМЯ/bin/agent),
+// иначе /etc/agent/agent.yaml (на macOS ~/.agent/agent.yaml), если он есть.
 //
 // Ключи подписи и манифест выпуска — отдельная программа cmd/agent-release.
 //
@@ -37,6 +40,7 @@ import (
 
 	"github.com/epifanovmd/agent/internal/app"
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/install"
 	"github.com/epifanovmd/agent/internal/sysmetrics"
 	"github.com/epifanovmd/agent/internal/update"
 )
@@ -69,7 +73,11 @@ const usage = `agent — агент для узлов: связь с серве�
   agent cleanup                  воркеры убирают за собой (перед удалением агента)
   agent version                  версия
 
-Файл настроек: -config, иначе AGENT_CONFIG, иначе %s (если есть).
+Несколько агентов на узле: agent install --instance ИМЯ — экземпляр со своими путями
+(/etc/agent-ИМЯ, /var/lib/agent-ИМЯ, /opt/agent-ИМЯ, служба agent-ИМЯ); остальные команды
+с --instance ИМЯ (или через ссылку agent-ИМЯ) работают с ним.
+
+Файл настроек: -config, иначе --instance, иначе AGENT_CONFIG, иначе %s (если есть).
 `
 
 func main() {
@@ -125,9 +133,54 @@ func main() {
 	}
 }
 
-// configFlag — флаг -config (он же --config) у команды.
-func configFlag(fs *flag.FlagSet) *string {
-	return fs.String("config", "", "файл настроек (AGENT_CONFIG; по умолчанию "+config.DefaultPath()+", если есть)")
+// target — чей агент: флаги -config и --instance у команды.
+type target struct{ config, instance *string }
+
+// configFlag — флаги -config (он же --config) и --instance у команды.
+func configFlag(fs *flag.FlagSet) target {
+	return target{
+		config:   fs.String("config", "", "файл настроек (AGENT_CONFIG; по умолчанию "+config.DefaultPath()+", если есть)"),
+		instance: fs.String("instance", "", "экземпляр агента на узле (agent install --instance ИМЯ): его файл настроек и служба"),
+	}
+}
+
+// layout — экземпляр: --instance, иначе тот, чья это программа
+// (/opt/agent-ИМЯ/bin/agent, в том числе по ссылке agent-ИМЯ), иначе по умолчанию.
+func (t target) layout() (install.Paths, error) {
+	name := *t.instance
+	if name == "" && *t.config == "" && os.Getenv("AGENT_CONFIG") == "" {
+		name = selfInstance()
+	}
+	if err := install.CheckInstance(name); err != nil {
+		return install.Paths{}, err
+	}
+	return install.Layout(name), nil
+}
+
+// path — файл настроек: -config, --instance (или экземпляр программы),
+// AGENT_CONFIG, файл по умолчанию. -config и --instance — что-то одно.
+func (t target) path() (string, error) {
+	if *t.config != "" && *t.instance != "" {
+		return "", errors.New("-config и --instance — что-то одно")
+	}
+	l, err := t.layout()
+	if err != nil {
+		return "", err
+	}
+	if l.Instance != "" {
+		return l.ConfigFile, nil
+	}
+	return config.ResolvePath(*t.config), nil
+}
+
+// selfInstance — экземпляр, которому принадлежит запущенная программа ("" — нет).
+func selfInstance() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	name, _ := install.InstanceOf(exe)
+	return name
 }
 
 func run(args []string) error {
@@ -143,7 +196,10 @@ func run(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	path := config.ResolvePath(*flagPath)
+	path, err := flagPath.path()
+	if err != nil {
+		return err
+	}
 	if path != "" {
 		for _, p := range config.Unknown(path) {
 			fmt.Fprintf(os.Stderr, "agent: предупреждение: %s: %s\n", path, p)
@@ -174,8 +230,11 @@ func run(args []string) error {
 
 // loadForTool — настройки для служебных команд (cleanup, status): файл,
 // agent.env рядом с ним (как у службы), окружение.
-func loadForTool(flagPath string) (config.Config, string, error) {
-	path := config.ResolvePath(flagPath)
+func loadForTool(t target) (config.Config, string, error) {
+	path, err := t.path()
+	if err != nil {
+		return config.Config{}, "", err
+	}
 	_, _ = config.ApplyEnvFile(config.EnvFile(path))
 	cfg, err := config.Load(path)
 	return cfg, path, err
@@ -190,7 +249,7 @@ func cleanup(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, _, err := loadForTool(*flagPath)
+	cfg, _, err := loadForTool(flagPath)
 	if err != nil {
 		return err
 	}
@@ -241,7 +300,7 @@ func restartCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, _, err := loadForTool(*flagPath)
+	cfg, _, err := loadForTool(flagPath)
 	if err != nil {
 		return err
 	}
@@ -264,13 +323,14 @@ func stopWorkersCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, _, err := loadForTool(*flagPath)
+	cfg, _, err := loadForTool(flagPath)
 	if err != nil {
 		return err
 	}
 	names, err := app.StopWorkers(cfg)
 	if errors.Is(err, app.ErrLocked) {
-		return errors.New("агент работает — сначала остановите его (systemctl stop agent)")
+		l, _ := flagPath.layout()
+		return fmt.Errorf("агент работает — сначала остановите его (systemctl stop %s)", l.Unit)
 	}
 	if err != nil {
 		return err

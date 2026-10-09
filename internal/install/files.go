@@ -46,8 +46,9 @@ func yamlUnmarshal(raw []byte, v any) error {
 	return yaml.Unmarshal([]byte(os.ExpandEnv(string(raw))), v)
 }
 
-// journal — журнал установки (/etc/agent/install-state): строки «вид значение».
-// package — пакет поставлен установкой, user — пользователь службы создан
+// journal — журнал установки экземпляра (/etc/agent[-ИМЯ]/install-state):
+// строки «вид значение». package — пакет поставлен установкой, requires —
+// пакет нужен воркерам экземпляра, user — пользователь службы создан
 // установкой, sysctl — параметр ядра агента, sysctl-prev — его значение до
 // установки, kill-mode — режим остановки службы, service-user — пользователь
 // службы.
@@ -56,7 +57,7 @@ type journal struct {
 	lines []string
 }
 
-const journalHeader = "# Журнал установки агента: package — пакет поставлен установкой, user — пользователь службы создан установкой, sysctl — параметр ядра агента, sysctl-prev — его значение до установки, kill-mode — режим остановки службы, service-user — пользователь службы"
+const journalHeader = "# Журнал установки агента: package — пакет поставлен установкой, requires — пакет нужен воркерам, user — пользователь службы создан установкой, sysctl — параметр ядра агента, sysctl-prev — его значение до установки, kill-mode — режим остановки службы, service-user — пользователь службы"
 
 func loadJournal(path string) (*journal, error) {
 	j := &journal{path: path}

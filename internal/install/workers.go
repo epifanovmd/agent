@@ -26,7 +26,7 @@ var reCommand = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 // manifest.json (старшая версия; sha256 и, если есть ключ, подпись
 // сверяются) кладётся в <dataDir>/workers/<name>/current (+ version); архив
 // .tar.gz распаковывается в каталог current. Вернёт записи для agent.yaml.
-func installWorkers(ctx context.Context, s *System, o Options, user string) ([]config.TemplateWorker, error) {
+func installWorkers(ctx context.Context, s *System, l Paths, o Options, user string) ([]config.TemplateWorker, error) {
 	if len(o.Workers) == 0 {
 		return nil, nil
 	}
@@ -36,7 +36,7 @@ func installWorkers(ctx context.Context, s *System, o Options, user string) ([]c
 	}
 	client := s.HTTP
 	if client == nil {
-		tlsCfg, err := config.Server{CAFile: caIfSet(s, o)}.TLSConfig()
+		tlsCfg, err := config.Server{CAFile: caIfSet(s, l, o)}.TLSConfig()
 		if err != nil {
 			return nil, err
 		}
@@ -54,7 +54,7 @@ func installWorkers(ctx context.Context, s *System, o Options, user string) ([]c
 		}
 		pub = k
 	}
-	root := s.p(config.ReleasesDir(DataDir))
+	root := s.p(config.ReleasesDir(l.DataDir))
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, err
 	}
@@ -116,7 +116,7 @@ func installWorkers(ctx context.Context, s *System, o Options, user string) ([]c
 		if err := s.Chown(dir, user); err != nil {
 			return nil, err
 		}
-		s.say("Воркер %s %s поставлен: %s", name, a.Version, filepath.Join(config.ReleasesDir(DataDir), name, config.ReleaseCurrent))
+		s.say("Воркер %s %s поставлен: %s", name, a.Version, filepath.Join(config.ReleasesDir(l.DataDir), name, config.ReleaseCurrent))
 		w := config.TemplateWorker{Name: name, Release: true, StopTimeout: a.StopTimeout}
 		if a.Command != "" {
 			w.Command = []string{"./" + strings.TrimPrefix(a.Command, "./")}
@@ -126,9 +126,9 @@ func installWorkers(ctx context.Context, s *System, o Options, user string) ([]c
 	return out, nil
 }
 
-func caIfSet(s *System, o Options) string {
+func caIfSet(s *System, l Paths, o Options) string {
 	if o.CAFile != "" {
-		return s.p(CAFile)
+		return s.p(l.CAFile)
 	}
 	return ""
 }

@@ -232,7 +232,7 @@ func TestInstallUninstall(t *testing.T) {
 	// Удаление: уборка от пользователя службы с переменными agent.env, параметры
 	// ядра — прежние; настройки и данные остаются.
 	f.cmds = nil
-	if err := Uninstall(ctx, s, false, ""); err != nil {
+	if err := Uninstall(ctx, s, "", false, ""); err != nil {
 		t.Fatal(err)
 	}
 	cleanup := "[agent] " + filepath.Join(f.root, Binary) + " cleanup -config /etc/agent/agent.yaml"
@@ -253,7 +253,7 @@ func TestInstallUninstall(t *testing.T) {
 	// установленной программы уже нет — уборку делает запущенная.
 	f.cmds = nil
 	self := binary(t, "v3")
-	if err := Uninstall(ctx, s, true, self); err != nil {
+	if err := Uninstall(ctx, s, "", true, self); err != nil {
 		t.Fatal(err)
 	}
 	f.ran(t, "[agent] "+self+" cleanup -config /etc/agent/agent.yaml", "apt-get remove -y -qq curl", "userdel agent")
@@ -285,12 +285,130 @@ func TestInstallPrivileged(t *testing.T) {
 		}
 	}
 	f.cmds = nil
-	if err := Uninstall(ctx, s, true, ""); err != nil {
+	if err := Uninstall(ctx, s, "", true, ""); err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range f.cmds {
 		if strings.HasPrefix(c, "userdel") || strings.HasPrefix(c, "[") {
 			t.Fatalf("root: %s", c)
+		}
+	}
+}
+
+// Два экземпляра на узле: свои пути, служба, пользователь и журнал; удаление
+// одного не трогает другой, общие пакеты и параметры ядра остаются, пока
+// нужны, и уходят с последним.
+func TestInstances(t *testing.T) {
+	ctx := context.Background()
+	f, s := newFake(t, "systemctl", "useradd", "apt-get", "sysctl")
+	f.sysctl["vm.max_map_count"] = "65530"
+	def := Options{Binary: binary(t, "v1"), Server: "https://a.example.com", Token: "ta",
+		Packages: []string{"curl"}, Sysctls: []string{"vm.max_map_count=262144"}}
+	if err := Install(ctx, s, def); err != nil {
+		t.Fatal(err)
+	}
+	f.sysctl["vm.max_map_count"] = "262144"
+	f.installed["curl"] = true
+	f.cmds = nil
+	b := Options{Instance: "b", Binary: binary(t, "v2"), Server: "https://b.example.com", Token: "tb",
+		Packages: []string{"curl", "jq"}, Sysctls: []string{"vm.max_map_count=524288"}}
+	if err := Install(ctx, s, b); err != nil {
+		t.Fatal(err)
+	}
+	l := Layout("b")
+	if l.ConfigFile != "/etc/agent-b/agent.yaml" || l.DataDir != "/var/lib/agent-b" || l.Binary != "/opt/agent-b/bin/agent" ||
+		l.Service != "agent-b.service" || l.User != "agent-b" || l.SysctlFile != "/etc/sysctl.d/90-agent-b.conf" {
+		t.Fatalf("пути: %+v", l)
+	}
+	if f.read(t, l.Binary) != "v2" || f.read(t, Binary) != "v1" {
+		t.Fatal("у каждого экземпляра своя программа")
+	}
+	if target, err := os.Readlink(filepath.Join(f.root, l.Link)); err != nil || target != l.Binary {
+		t.Fatalf("ссылка экземпляра: %q %v", target, err)
+	}
+	cfg, err := config.Load(filepath.Join(f.root, l.ConfigFile))
+	if err != nil || cfg.Server.URL != "https://b.example.com" || cfg.DataDir != l.DataDir {
+		t.Fatalf("agent.yaml экземпляра: %+v %v", cfg, err)
+	}
+	if f.read(t, l.EnvFile) != "AGENT_ENROLL_TOKEN=tb\n" || f.read(t, EnvFile) != "AGENT_ENROLL_TOKEN=ta\n" {
+		t.Fatal("agent.env: у каждого свой")
+	}
+	unit := f.read(t, l.UnitFile)
+	for _, want := range []string{"Description=Agent b\n", "User=agent-b\n", "EnvironmentFile=-/etc/agent-b/agent.env\n",
+		"ExecStart=/opt/agent-b/bin/agent run -config /etc/agent-b/agent.yaml\n",
+		"ExecStartPre=-/bin/sh -c '[ ! -x /opt/agent-b/bin/agent.prev ] || /opt/agent-b/bin/agent.prev boot-guard /opt/agent-b/bin/agent'\n",
+		"ReadWritePaths=/var/lib/agent-b /opt/agent-b\n"} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("в службе нет %q:\n%s", want, unit)
+		}
+	}
+	f.ran(t, "useradd --system --home-dir /var/lib/agent-b --no-create-home --shell /usr/sbin/nologin agent-b",
+		"systemctl enable agent-b.service", "systemctl restart agent-b.service", "sysctl -q -p /etc/sysctl.d/90-agent-b.conf")
+	for _, p := range []string{l.DataDir, l.OptDir, l.EnvFile} {
+		if f.owners[p] != "agent-b" {
+			t.Errorf("%s: владелец %q", p, f.owners[p])
+		}
+	}
+	journal := f.read(t, l.JournalFile)
+	for _, want := range []string{"package jq", "requires curl", "user agent-b", "sysctl-prev vm.max_map_count=65530"} {
+		if !strings.Contains(journal, "\n"+want+"\n") {
+			t.Errorf("в журнале экземпляра нет %q:\n%s", want, journal)
+		}
+	}
+	if strings.Contains(journal, "package curl") {
+		t.Error("curl поставил другой экземпляр")
+	}
+
+	// Удаление экземпляра по умолчанию: curl нужен b — остаётся и переходит в его
+	// журнал; vm.max_map_count задаёт и b — прежнее значение не возвращается.
+	f.cmds = nil
+	if err := Uninstall(ctx, s, "", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range f.cmds {
+		if strings.HasPrefix(c, "apt-get remove") || strings.HasPrefix(c, "sysctl -q -w") || strings.Contains(c, "agent-b") {
+			t.Fatalf("затронут другой экземпляр: %s", c)
+		}
+	}
+	f.ran(t, "userdel agent", "systemctl disable --now agent.service")
+	for _, p := range []string{l.ConfigFile, l.EnvFile, l.Binary, l.UnitFile, l.DataDir, l.SysctlFile, l.Link} {
+		if !f.exists(p) {
+			t.Errorf("%s удалён вместе с другим экземпляром", p)
+		}
+	}
+	if f.exists(EtcDir) || f.exists(OptDir) || f.exists(DataDir) {
+		t.Fatal("экземпляр по умолчанию удалён не весь")
+	}
+	if !strings.Contains(f.read(t, l.JournalFile), "\npackage curl\n") {
+		t.Fatal("curl не перешёл в журнал b")
+	}
+
+	// Последний экземпляр уносит всё: пакеты, прежнее значение параметра ядра.
+	f.cmds = nil
+	if err := Uninstall(ctx, s, "b", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	f.ran(t, "systemctl disable --now agent-b.service", "apt-get remove -y -qq jq curl",
+		"sysctl -q -w vm.max_map_count=65530", "userdel agent-b",
+		"[agent-b] "+filepath.Join(f.root, l.Binary)+" cleanup -config /etc/agent-b/agent.yaml")
+	for _, p := range []string{l.EtcDir, l.OptDir, l.DataDir, l.UnitFile, l.Link, l.SysctlFile} {
+		if f.exists(p) {
+			t.Errorf("%s остался", p)
+		}
+	}
+	if err := Uninstall(ctx, s, "B", false, ""); err == nil {
+		t.Fatal("имя экземпляра не по правилу — ошибка")
+	}
+}
+
+// Программа экземпляра узнаёт его по своему пути.
+func TestInstanceOf(t *testing.T) {
+	for exe, want := range map[string]string{
+		"/opt/agent-b/bin/agent": "b", "/opt/agent-web-2/bin/agent.prev": "web-2",
+		"/opt/agent/bin/agent": "", "/tmp/agent": "", "/opt/agent-B/bin/agent": "", "/srv/agent-b/bin/agent": "",
+	} {
+		if got, ok := InstanceOf(exe); got != want || ok != (want != "") {
+			t.Errorf("%s: %q %v", exe, got, ok)
 		}
 	}
 }
@@ -317,6 +435,7 @@ func TestInstallRefuses(t *testing.T) {
 		"токен":       func(_ *fake, _ *System, o *Options) { o.TokenFile = "/nonexistent" },
 		"два токена":  func(_ *fake, _ *System, o *Options) { o.TokenFile = "/x" },
 		"rw-path":     func(_ *fake, _ *System, o *Options) { o.RWPaths = []string{"relative"} },
+		"экземпляр":   func(_ *fake, _ *System, o *Options) { o.Instance = "Web" },
 		"нет пакетного менеджера": func(_ *fake, _ *System, o *Options) {
 			o.Packages = []string{"jq"}
 		},
@@ -453,7 +572,7 @@ func TestParseFlags(t *testing.T) {
 	o, err := ParseFlags([]string{
 		"--server", "https://api.example.com", "--token", "t", "--name", "n", "--privileged", "--kill-mode", "process",
 		"--packages", "jq curl", "--packages", "git", "--packages-apk", "bind-tools", "--sysctl", "a=1", "--sysctl", "b=2",
-		"--rw-path", "/x", "--worker", "collector", "--worker", "report", "--releases", "https://example.com/r",
+		"--rw-path", "/x", "--worker", "collector", "--worker", "report", "--releases", "https://example.com/r", "--instance", "web",
 	}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
@@ -461,7 +580,7 @@ func TestParseFlags(t *testing.T) {
 	if o.Server != "https://api.example.com" || o.Token != "t" || o.Name != "n" || !o.Privileged || o.KillMode != "process" ||
 		!slices.Equal(o.Packages, []string{"jq", "curl", "git"}) || !slices.Equal(o.PackagesBy["apk"], []string{"bind-tools"}) ||
 		len(o.PackagesBy) != 1 || !slices.Equal(o.Sysctls, []string{"a=1", "b=2"}) || !slices.Equal(o.RWPaths, []string{"/x"}) ||
-		!slices.Equal(o.Workers, []string{"collector", "report"}) || o.Releases != "https://example.com/r" {
+		!slices.Equal(o.Workers, []string{"collector", "report"}) || o.Releases != "https://example.com/r" || o.Instance != "web" {
 		t.Fatalf("%+v", o)
 	}
 	if _, err := ParseFlags([]string{"--unknown"}, &bytes.Buffer{}); err == nil {
@@ -476,7 +595,7 @@ func TestParseFlags(t *testing.T) {
 // install.sh передаёт их agent install как есть: все известны.
 func TestParseFlagsInstallCommand(t *testing.T) {
 	o, err := ParseFlags([]string{
-		"--token", "tok'en", "--name", "node 01", "--user", "root", "--config", "/etc/agent/node.yaml", "--privileged",
+		"--instance", "web-2", "--token", "tok'en", "--name", "node 01", "--user", "root", "--config", "/etc/agent/node.yaml", "--privileged",
 		"--kill-mode", "process", "--packages", "jq curl", "--packages-apk", "bind-tools",
 		"--sysctl", "net.core.somaxconn=1024", "--sysctl", "vm.max_map_count=262144",
 		"--rw-path", "/etc/example", "--rw-path", "/var/lib/it's", "--ca-file", "/etc/agent/ca.pem", "--worker", "report",
@@ -486,7 +605,7 @@ func TestParseFlagsInstallCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	if o.Token != "tok'en" || o.User != "root" || o.Config != "/etc/agent/node.yaml" || o.CAFile != "/etc/agent/ca.pem" ||
-		o.StopTimeout != "15min" || o.TokenFile != "/root/agent.token" || o.PublicKey != "a2V5" {
+		o.StopTimeout != "15min" || o.TokenFile != "/root/agent.token" || o.PublicKey != "a2V5" || o.Instance != "web-2" {
 		t.Fatalf("%+v", o)
 	}
 }

@@ -399,10 +399,14 @@ export class Stand {
     this.agentStarts += 1;
     this.stopping = false;
     this.proc = proc;
-    proc.stdout.pipe(log);
-    proc.stderr.pipe(log);
-    proc.on("exit", (code, signal) => {
-      log.write(`--- агент завершился: code=${code} signal=${signal}\n`);
+    // Оба потока — в один файл: закрывает его только выход процесса (close — когда оба
+    // потока дочитаны), иначе первый закончившийся поток закрыл бы файл для второго.
+    proc.stdout.pipe(log, { end: false });
+    proc.stderr.pipe(log, { end: false });
+    proc.on("close", (code, signal) => {
+      log.end(`--- агент завершился: code=${code} signal=${signal}\n`);
+    });
+    proc.on("exit", () => {
       if (this.proc !== proc || this.stopping) return;
       this.proc = undefined;
       setTimeout(() => {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"strings"
 	"testing"
 	"time"
@@ -48,5 +49,28 @@ func TestPrintStatus(t *testing.T) {
 		!strings.Contains(text, "Последний раз завершился с ошибкой 2026-01-02 14:59:00 (1 мин назад):\n  токен отклонён\n") ||
 		strings.Contains(text, "<html>") {
 		t.Fatalf("не работает:\n%s", text)
+	}
+}
+
+// --instance: файл настроек экземпляра; вместе с -config или с плохим именем — ошибка.
+func TestInstanceFlag(t *testing.T) {
+	parse := func(args ...string) (string, error) {
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		tg := configFlag(fs)
+		if err := fs.Parse(args); err != nil {
+			return "", err
+		}
+		return tg.path()
+	}
+	if p, err := parse("--instance", "web"); err != nil || p != "/etc/agent-web/agent.yaml" {
+		t.Fatalf("%q %v", p, err)
+	}
+	if p, err := parse("-config", "/srv/a.yaml"); err != nil || p != "/srv/a.yaml" {
+		t.Fatalf("%q %v", p, err)
+	}
+	for _, args := range [][]string{{"--instance", "Web"}, {"--instance", "web", "-config", "/srv/a.yaml"}} {
+		if _, err := parse(args...); err == nil {
+			t.Errorf("%v: нет ошибки", args)
+		}
 	}
 }

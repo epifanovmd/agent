@@ -39,6 +39,10 @@ func installCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	if o.Instance == "" {
+		// Программа экземпляра (/opt/agent-ИМЯ/bin/agent) обновляет свой экземпляр.
+		o.Instance, _ = install.InstanceOf(exe)
+	}
 	o.Binary, o.Version, o.BuiltinKey = exe, version, updateKey
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -48,8 +52,12 @@ func installCmd(args []string) error {
 func uninstallCmd(args []string) error {
 	set := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	purge := set.Bool("purge", false, "удалить ещё настройки, данные и то, что поставила установка (пакеты, пользователь службы)")
+	instance := set.String("instance", "", "экземпляр агента (agent install --instance ИМЯ); без флага — по умолчанию или тот, чья это программа")
 	if err := set.Parse(args); err != nil {
 		return err
+	}
+	if *instance == "" {
+		*instance = selfInstance()
 	}
 	if runtime.GOOS != "linux" {
 		return errors.New("agent uninstall — для Linux с systemd")
@@ -57,7 +65,7 @@ func uninstallCmd(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	self, _ := os.Executable()
-	return install.Uninstall(ctx, install.Host(os.Stdout, os.Stderr), *purge, self)
+	return install.Uninstall(ctx, install.Host(os.Stdout, os.Stderr), *instance, *purge, self)
 }
 
 // initCmd — agent init / agent config init: файл настроек с пояснениями.
@@ -130,7 +138,10 @@ func configCheck(args []string) error {
 	if err := set.Parse(args); err != nil {
 		return err
 	}
-	path := config.ResolvePath(*flagPath)
+	path, err := flagPath.path()
+	if err != nil {
+		return err
+	}
 	envFile := config.EnvFile(path)
 	applied, envErr := config.ApplyEnvFile(envFile)
 	res := config.Check(path)
@@ -210,6 +221,8 @@ type statusReport struct {
 	Denied bool `json:"denied,omitempty"`
 	// LastExit — ошибка, с которой агент завершился в последний раз.
 	LastExit *app.ExitError `json:"lastExit,omitempty"`
+	// unit — экземпляр: его служба для подсказок.
+	unit install.Paths
 }
 
 // status — работает ли агент (HEALTHCHECK в Docker: код выхода 0 — да),
@@ -221,12 +234,16 @@ func status(args []string) error {
 	if err := set.Parse(args); err != nil {
 		return err
 	}
-	path := config.ResolvePath(*flagPath)
+	path, err := flagPath.path()
+	if err != nil {
+		return err
+	}
+	l, _ := flagPath.layout()
 	_, _ = config.ApplyEnvFile(config.EnvFile(path))
 	// Нужен только каталог данных: ошибки других настроек статусу не мешают.
 	dataDir := config.Check(path).Config.DataDir
 	st, err := app.Status(dataDir)
-	rep := statusReport{Running: err == nil, DataDir: dataDir}
+	rep := statusReport{Running: err == nil, DataDir: dataDir, unit: l}
 	if st.PID != 0 {
 		rep.Status = &st
 	}
@@ -266,8 +283,8 @@ func printStatus(w io.Writer, rep statusReport, now time.Time) {
 		if e := rep.LastExit; e != nil {
 			fmt.Fprintf(w, "Последний раз завершился с ошибкой %s:\n  %s\n", when(e.At), short(e.Error))
 		}
-		if isFile(install.UnitFile) {
-			fmt.Fprintln(w, "Служба: systemctl status agent; лог: agent logs (journalctl -u agent -n 100)")
+		if u := rep.unit; u.UnitFile != "" && isFile(u.UnitFile) {
+			fmt.Fprintf(w, "Служба: systemctl status %s; лог: agent logs%s (journalctl -u %s -n 100)\n", u.Unit, u.Flag(), u.Unit)
 		}
 		return
 	}
@@ -361,23 +378,28 @@ func isFile(path string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// logs — лог службы: journalctl -u agent. Без службы systemd — где искать лог.
+// logs — лог службы: journalctl -u agent[-ИМЯ]. Без службы systemd — где искать лог.
 func logs(args []string) error {
 	set := flag.NewFlagSet("logs", flag.ContinueOnError)
 	follow := set.Bool("f", false, "следить за новыми записями")
 	lines := set.Int("n", 100, "сколько последних записей показать")
+	flagPath := configFlag(set)
 	if err := set.Parse(args); err != nil {
 		return err
 	}
+	l, err := flagPath.layout()
+	if err != nil {
+		return err
+	}
 	journalctl, err := exec.LookPath("journalctl")
-	if err != nil || !isFile(install.UnitFile) {
+	if err != nil || !isFile(l.UnitFile) {
 		fmt.Println("Агент пишет лог в stderr, своих файлов лога нет:")
-		fmt.Println("  служба systemd — journalctl -u agent -f (служба не найдена на этой машине);")
+		fmt.Printf("  служба systemd — journalctl -u %s -f (служба не найдена на этой машине);\n", l.Unit)
 		fmt.Println("  контейнер — docker logs -f <контейнер>;")
 		fmt.Println("  agent run в терминале — лог в этом терминале.")
 		return errQuiet
 	}
-	argv := []string{"journalctl", "-u", "agent", "-n", strconv.Itoa(*lines), "--no-pager"}
+	argv := []string{"journalctl", "-u", l.Unit, "-n", strconv.Itoa(*lines), "--no-pager"}
 	if *follow {
 		argv = append(argv, "-f")
 	}

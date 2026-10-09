@@ -13,6 +13,7 @@ test("installCommand: флаги по порядку, кавычки POSIX, ош
   try {
     const full: InstallOptions = {
       baseUrl: "https://api.example.com:8443/agents/",
+      instance: "web-2",
       token: "tok'en",
       name: "node 01",
       user: "root",
@@ -32,7 +33,7 @@ test("installCommand: флаги по порядку, кавычки POSIX, ош
     assert.equal(
       agents.installCommand(full),
       "curl -fsSL 'https://api.example.com:8443/agents/api/v1/agent-link/install.sh' | sudo sh -s -- " +
-        "--token 'tok'\\''en' --name 'node 01' --user 'root' --config '/etc/agent/node.yaml' --privileged --kill-mode 'process' " +
+        "--instance 'web-2' --token 'tok'\\''en' --name 'node 01' --user 'root' --config '/etc/agent/node.yaml' --privileged --kill-mode 'process' " +
         "--packages 'jq curl' --packages-apk 'bind-tools' " +
         "--sysctl 'net.core.somaxconn=1024' --sysctl 'vm.max_map_count=262144' " +
         "--rw-path '/etc/example' --rw-path '/var/lib/it'\\''s' --ca-file '/etc/agent/ca.pem' --worker 'report' --stop-timeout '15min' " +
@@ -93,6 +94,11 @@ test("installCommand: флаги по порядку, кавычки POSIX, ош
         baseUrl: "https://api.example.com",
         token: "t",
         workers: ["a b"],
+      },
+      "имя экземпляра": {
+        baseUrl: "https://api.example.com",
+        token: "t",
+        instance: "Web",
       },
       "пустое имя воркера": {
         baseUrl: "https://api.example.com",

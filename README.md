@@ -114,7 +114,9 @@ sudo agent status
 ```
 
 Настройки — `/etc/agent/agent.yaml` (проверка — `sudo agent config check`), лог — `sudo agent logs -f`,
-удаление — `sudo agent uninstall`. Docker, macOS и все флаги — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#установка).
+удаление — `sudo agent uninstall`. Несколько агентов на одном узле (для разных бэкендов) — флаг
+`--instance ИМЯ` ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#несколько-агентов-на-одном-узле)).
+Docker, macOS и все флаги — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#установка).
 
 ## Команды
 

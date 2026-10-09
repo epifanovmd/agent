@@ -88,6 +88,7 @@ const manifest = await agents.release(); // ReleaseManifest | null
 
 ```ts
 const cmd = agents.installCommand({
+  instance: "example", // необязательно: ещё один агент на узле (--instance), см. ниже
   token: await issueEnrollToken(), // или tokenFile: "/run/secrets/agent-token" — ровно одно из двух
   name: "node-01",
   user: "agent",
@@ -118,6 +119,13 @@ const cmd = agents.installCommand({
 регистрируется по токену ([connection.md](connection.md#регистрация-по-токену)) и появляется в
 `agents.listAgents()`. Воркер из выпуска (`--worker report`) ставится в
 `/var/lib/agent/workers/report/current` и прописывается в `agent.yaml` с `release: true`.
+
+**Если на узле уже есть агент другого бэкенда**, ставьте своего отдельным экземпляром:
+`instance: "example"` (флаг `--instance`; имя — по правилу имён). У экземпляра свои служба
+(`agent-example`), пользователь, настройки (`/etc/agent-example`), данные
+(`/var/lib/agent-example`) и программа — агенты разных бэкендов не мешают друг другу и
+обновляются по отдельности. Пути и команды экземпляра —
+[docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#несколько-агентов-на-одном-узле).
 
 ## Обновление агента
 
@@ -173,6 +181,7 @@ await agents.updateWorker(agentId, "report", { wait: true }); // ждать ит
 sudo agent uninstall [--purge]
 # или тем же установщиком:
 curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --uninstall [--purge]
+# экземпляр (instance в installCommand) — с --instance ИМЯ; другие экземпляры не затрагиваются
 ```
 
 и отозвать агента, чтобы его ключ больше не принимался: `agents.revoke(agentId)`.

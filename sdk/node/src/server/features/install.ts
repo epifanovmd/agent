@@ -24,6 +24,8 @@ const installOptionsSchema = z
   .object({
     /** Адрес сервера; пусто — опция baseUrl Agents. */
     baseUrl: z.string().optional(),
+    /** Экземпляр агента на узле (--instance): несколько агентов для разных бэкендов; имя — по правилу имён. */
+    instance: nameSchema.optional(),
     /** Токен регистрации; ровно одно из token и tokenFile. */
     token: z.string().optional(),
     /** Путь к файлу с токеном на узле (--token-file): токен не виден в списке процессов. */
@@ -78,6 +80,7 @@ export const installCommand = (
     if (value) parts.push(`${name} ${shellQuote(value)}`);
   };
 
+  flag("--instance", opts.instance);
   flag("--token", opts.token);
   flag("--token-file", opts.tokenFile);
   flag("--name", opts.name);

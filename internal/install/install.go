@@ -23,7 +23,7 @@ import (
 	"github.com/epifanovmd/agent/internal/message"
 )
 
-// Пути установки.
+// Пути установки экземпляра по умолчанию (остальные — Layout).
 const (
 	EtcDir      = "/etc/agent"
 	ConfigFile  = "/etc/agent/agent.yaml"
@@ -126,6 +126,8 @@ type Options struct {
 	// Releases — адрес каталога выпуска для --worker (по умолчанию
 	// <server>/api/v1/agent-link/releases).
 	Releases string
+	// Instance — экземпляр (несколько агентов на узле, см. Layout); "" — по умолчанию.
+	Instance string
 }
 
 var (
@@ -142,6 +144,9 @@ var Managers = []struct{ Name, Program string }{
 // check — проверка параметров до каких-либо изменений на узле.
 func (o *Options) check() error {
 	var errs []error
+	if err := CheckInstance(o.Instance); err != nil {
+		errs = append(errs, err)
+	}
 	if o.TokenFile != "" && o.Token != "" {
 		errs = append(errs, errors.New("--token и --token-file — что-то одно"))
 	}
@@ -219,7 +224,8 @@ func Install(ctx context.Context, s *System, o Options) error {
 		}
 	}
 	o.Server = strings.TrimRight(o.Server, "/")
-	configExists := isFile(s.p(ConfigFile))
+	l := Layout(o.Instance)
+	configExists := isFile(s.p(l.ConfigFile))
 	if o.Server == "" && !configExists && o.Config == "" {
 		return errors.New("--server: адрес сервера (например, --server https://api.example.com)")
 	}
@@ -227,7 +233,7 @@ func Install(ctx context.Context, s *System, o Options) error {
 	// (agent.env, затем agent.yaml), как и остальные сохранённые значения.
 	releasesFrom := o
 	if releasesFrom.Server == "" && configExists {
-		releasesFrom.Server = savedServer(s)
+		releasesFrom.Server = savedServer(s, l)
 	}
 	if releasesFrom.Server == "" && len(o.Workers) > 0 && o.Releases == "" {
 		return errors.New("--worker: сборки воркеров берутся с сервера — нужен --server или --releases")
@@ -235,20 +241,20 @@ func Install(ctx context.Context, s *System, o Options) error {
 	if o.Config != "" && !isFile(o.Config) {
 		return fmt.Errorf("--config: нет файла %s", o.Config)
 	}
-	user := cmpOr(o.User, "agent")
+	user := cmpOr(o.User, l.User)
 	if o.Privileged {
 		user = "root"
 	}
 
-	if err := os.MkdirAll(s.p(EtcDir), 0o755); err != nil {
+	if err := os.MkdirAll(s.p(l.EtcDir), 0o755); err != nil {
 		return err
 	}
 	if o.CAFile != "" {
-		if err := installCA(s, o.CAFile); err != nil {
+		if err := installCA(s, l, o.CAFile); err != nil {
 			return err
 		}
 	}
-	j, err := loadJournal(s.p(JournalFile))
+	j, err := loadJournal(s.p(l.JournalFile))
 	if err != nil {
 		return err
 	}
@@ -270,30 +276,30 @@ func Install(ctx context.Context, s *System, o Options) error {
 	if err := installPackages(ctx, s, j, o); err != nil {
 		return err
 	}
-	if err := applySysctls(ctx, s, j, o.Sysctls); err != nil {
+	if err := applySysctls(ctx, s, l, j, o.Sysctls); err != nil {
 		return err
 	}
-	if err := ensureUser(ctx, s, j, user); err != nil {
+	if err := ensureUser(ctx, s, l, j, user); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(s.p(DataDir), 0o700); err != nil {
+	if err := os.MkdirAll(s.p(l.DataDir), 0o700); err != nil {
 		return err
 	}
-	_ = os.Chmod(s.p(DataDir), 0o700)
-	if err := s.Chown(s.p(DataDir), user); err != nil {
+	_ = os.Chmod(s.p(l.DataDir), 0o700)
+	if err := s.Chown(s.p(l.DataDir), user); err != nil {
 		return err
 	}
-	workers, err := installWorkers(ctx, s, releasesFrom, user)
+	workers, err := installWorkers(ctx, s, l, releasesFrom, user)
 	if err != nil {
 		return err
 	}
-	if err := installBinary(s, o.Binary, user); err != nil {
+	if err := installBinary(s, l, o.Binary, user); err != nil {
 		return err
 	}
-	if err := writeConfig(s, o, workers, configExists); err != nil {
+	if err := writeConfig(s, l, o, workers, configExists); err != nil {
 		return err
 	}
-	if err := writeEnv(s, user, map[string]string{
+	if err := writeEnv(s, l, user, map[string]string{
 		"AGENT_ENROLL_TOKEN":      o.Token,
 		"AGENT_UPDATE_PUBLIC_KEY": o.PublicKey,
 	}); err != nil {
@@ -309,27 +315,35 @@ func Install(ctx context.Context, s *System, o Options) error {
 			}
 		}
 	}
-	unit := Unit(UnitOptions{User: user, KillMode: killMode, StopTimeout: cmpOr(o.StopTimeout, "15min"), Privileged: o.Privileged, RWPaths: o.RWPaths})
-	if err := os.MkdirAll(filepath.Dir(s.p(UnitFile)), 0o755); err != nil {
+	unit := Unit(UnitOptions{Paths: l, User: user, KillMode: killMode, StopTimeout: cmpOr(o.StopTimeout, "15min"), Privileged: o.Privileged, RWPaths: o.RWPaths})
+	if err := os.MkdirAll(filepath.Dir(s.p(l.UnitFile)), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.p(UnitFile), []byte(unit), 0o644); err != nil {
+	if err := os.WriteFile(s.p(l.UnitFile), []byte(unit), 0o644); err != nil {
 		return err
 	}
-	for _, args := range [][]string{{"systemctl", "daemon-reload"}, {"systemctl", "enable", Service}, {"systemctl", "restart", Service}} {
+	for _, args := range [][]string{{"systemctl", "daemon-reload"}, {"systemctl", "enable", l.Service}, {"systemctl", "restart", l.Service}} {
 		if err := s.Run(ctx, Cmd{Args: args, Quiet: true}); err != nil {
 			return fmt.Errorf("%s: %w", strings.Join(args, " "), err)
 		}
 	}
-	s.say("Агент %s установлен и запущен (служба agent, пользователь %s).", o.Version, user)
-	s.say("  состояние:  sudo agent status")
-	s.say("  лог:        sudo agent logs -f   (journalctl -u agent -f)")
-	s.say("  настройки:  %s — проверить: sudo agent config check; применить: sudo systemctl reload agent", ConfigFile)
-	s.say("  удалить:    sudo agent uninstall [--purge]")
+	// Команды экземпляра: agent … --instance ИМЯ (или agent-ИМЯ …, если ссылка есть).
+	cmd := "agent"
+	if l.Instance != "" {
+		cmd = l.Binary
+		if target, err := os.Readlink(s.p(l.Link)); err == nil && target == l.Binary {
+			cmd = filepath.Base(l.Link)
+		}
+	}
+	s.say("Агент %s установлен и запущен (служба %s, пользователь %s).", o.Version, l.Unit, user)
+	s.say("  состояние:  sudo %s status", cmd)
+	s.say("  лог:        sudo %s logs -f   (journalctl -u %s -f)", cmd, l.Unit)
+	s.say("  настройки:  %s — проверить: sudo %s config check; применить: sudo systemctl reload %s", l.ConfigFile, cmd, l.Unit)
+	s.say("  удалить:    sudo %s uninstall [--purge]", cmd)
 	return nil
 }
 
-func installCA(s *System, src string) error {
+func installCA(s *System, l Paths, src string) error {
 	raw, err := os.ReadFile(src)
 	if err != nil {
 		return fmt.Errorf("--ca-file: %w", err)
@@ -337,22 +351,22 @@ func installCA(s *System, src string) error {
 	if !strings.Contains(string(raw), "BEGIN CERTIFICATE") {
 		return fmt.Errorf("--ca-file: в %s нет сертификата PEM", src)
 	}
-	if abs, _ := filepath.Abs(src); abs == s.p(CAFile) {
+	if abs, _ := filepath.Abs(src); abs == s.p(l.CAFile) {
 		return nil
 	}
-	return writeFileAtomic(s.p(CAFile), raw, 0o644)
+	return writeFileAtomic(s.p(l.CAFile), raw, 0o644)
 }
 
-// installBinary — программа в /opt/agent/bin (каталог доступен агенту на
+// installBinary — программа в /opt/agent[-ИМЯ]/bin (каталог доступен агенту на
 // запись: самообновление кладёт рядом .new, .prev и отметку) и ссылка в PATH.
-func installBinary(s *System, src, user string) error {
-	if err := os.MkdirAll(s.p(BinDir), 0o755); err != nil {
+func installBinary(s *System, l Paths, src, user string) error {
+	if err := os.MkdirAll(s.p(l.BinDir), 0o755); err != nil {
 		return err
 	}
-	if err := s.Chown(s.p(OptDir), user); err != nil {
+	if err := s.Chown(s.p(l.OptDir), user); err != nil {
 		return err
 	}
-	dst := s.p(Binary)
+	dst := s.p(l.Binary)
 	if !sameFile(src, dst) {
 		raw, err := os.ReadFile(src)
 		if err != nil {
@@ -365,54 +379,54 @@ func installBinary(s *System, src, user string) error {
 			return err
 		}
 	}
-	link := s.p(Link)
+	link := s.p(l.Link)
 	if !isDir(filepath.Dir(link)) {
 		return nil
 	}
 	if target, err := os.Readlink(link); err == nil {
-		if target == Binary {
+		if target == l.Binary {
 			return nil
 		}
-		s.warn("%s уже есть и ведёт на %s — оставлен как есть; программа агента — %s", Link, target, Binary)
+		s.warn("%s уже есть и ведёт на %s — оставлен как есть; программа агента — %s", l.Link, target, l.Binary)
 		return nil
 	}
 	if _, err := os.Lstat(link); err == nil {
-		s.warn("%s уже есть — оставлен как есть; программа агента — %s", Link, Binary)
+		s.warn("%s уже есть — оставлен как есть; программа агента — %s", l.Link, l.Binary)
 		return nil
 	}
-	return os.Symlink(Binary, link)
+	return os.Symlink(l.Binary, link)
 }
 
 // writeConfig — свой файл (--config), созданный по шаблону (если его нет) или
 // прежний без изменений — с подсказками, если в нём чего-то не хватает.
-func writeConfig(s *System, o Options, workers []config.TemplateWorker, exists bool) error {
+func writeConfig(s *System, l Paths, o Options, workers []config.TemplateWorker, exists bool) error {
 	switch {
 	case o.Config != "":
 		raw, err := os.ReadFile(o.Config)
 		if err != nil {
 			return err
 		}
-		return writeFileAtomic(s.p(ConfigFile), raw, 0o644)
+		return writeFileAtomic(s.p(l.ConfigFile), raw, 0o644)
 	case !exists:
-		t := config.TemplateOptions{ServerURL: o.Server, Name: o.Name, DataDir: DataDir, LogFormat: "json", Workers: workers}
+		t := config.TemplateOptions{ServerURL: o.Server, Name: o.Name, DataDir: l.DataDir, LogFormat: "json", Workers: workers}
 		if o.CAFile != "" {
-			t.CAFile = CAFile
+			t.CAFile = l.CAFile
 		}
-		return writeFileAtomic(s.p(ConfigFile), config.Template(t), 0o644)
+		return writeFileAtomic(s.p(l.ConfigFile), config.Template(t), 0o644)
 	}
 	cfg := config.Defaults()
-	raw, _ := os.ReadFile(s.p(ConfigFile))
+	raw, _ := os.ReadFile(s.p(l.ConfigFile))
 	if o.CAFile != "" && !strings.Contains(string(raw), "caFile:") {
-		s.warn("сертификат скопирован в %s — пропишите server.caFile: %s в %s", CAFile, CAFile, ConfigFile)
+		s.warn("сертификат скопирован в %s — пропишите server.caFile: %s в %s", l.CAFile, l.CAFile, l.ConfigFile)
 	}
 	if err := yamlUnmarshal(raw, &cfg); err == nil {
 		if o.Server != "" && cfg.Server.URL != "" && strings.TrimRight(cfg.Server.URL, "/") != o.Server {
-			s.warn("%s не менялся: в нём server.url = %s, а не %s — поправьте файл, если адрес сменился", ConfigFile, cfg.Server.URL, o.Server)
+			s.warn("%s не менялся: в нём server.url = %s, а не %s — поправьте файл, если адрес сменился", l.ConfigFile, cfg.Server.URL, o.Server)
 		}
 		for _, w := range workers {
 			if !slices.ContainsFunc(cfg.Workers, func(c config.Worker) bool { return c.Name == w.Name && c.Release }) {
-				s.warn("сборка воркера %s поставлена, но %s не менялся — добавьте в workers:\n  - name: %s\n    release: true\nи выполните systemctl reload agent",
-					w.Name, ConfigFile, w.Name)
+				s.warn("сборка воркера %s поставлена, но %s не менялся — добавьте в workers:\n  - name: %s\n    release: true\nи выполните systemctl reload %s",
+					w.Name, l.ConfigFile, w.Name, l.Unit)
 			}
 		}
 	}
@@ -421,8 +435,8 @@ func writeConfig(s *System, o Options, workers []config.TemplateWorker, exists b
 
 // savedServer — адрес сервера установленного агента: AGENT_SERVER_URL из
 // agent.env (он важнее файла, как при запуске), иначе server.url из agent.yaml.
-func savedServer(s *System) string {
-	if raw, err := os.ReadFile(s.p(EnvFile)); err == nil {
+func savedServer(s *System, l Paths) string {
+	if raw, err := os.ReadFile(s.p(l.EnvFile)); err == nil {
 		for _, l := range strings.Split(string(raw), "\n") {
 			k, v, _ := strings.Cut(l, "=")
 			if strings.TrimSpace(k) == "AGENT_SERVER_URL" {
@@ -433,7 +447,7 @@ func savedServer(s *System) string {
 		}
 	}
 	cfg := config.Defaults()
-	raw, err := os.ReadFile(s.p(ConfigFile))
+	raw, err := os.ReadFile(s.p(l.ConfigFile))
 	if err != nil || yamlUnmarshal(raw, &cfg) != nil {
 		return ""
 	}
@@ -442,8 +456,8 @@ func savedServer(s *System) string {
 
 // writeEnv — секреты в agent.env (0600): переданные заменяют прежние,
 // остальные строки сохраняются.
-func writeEnv(s *System, user string, vars map[string]string) error {
-	path := s.p(EnvFile)
+func writeEnv(s *System, l Paths, user string, vars map[string]string) error {
+	path := s.p(l.EnvFile)
 	raw, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -472,6 +486,8 @@ func writeEnv(s *System, user string, vars map[string]string) error {
 
 // UnitOptions — служба systemd.
 type UnitOptions struct {
+	// Paths — экземпляр (Layout).
+	Paths       Paths
 	User        string
 	KillMode    string
 	StopTimeout string
@@ -486,23 +502,31 @@ type UnitOptions struct {
 // перезапуск агента). Откат обновления делает прежняя версия до запуска
 // новой (ExecStartPre); перезапуск — всегда.
 func Unit(o UnitOptions) string {
+	l := o.Paths
+	if l.Binary == "" {
+		l = Layout("")
+	}
 	hardening := "# --privileged: агент и воркеры настраивают узел — без ограничений файловой системы."
 	if !o.Privileged {
 		hardening = "NoNewPrivileges=true\nProtectSystem=full\nProtectHome=read-only\nPrivateTmp=true\n" +
-			"ReadWritePaths=" + strings.Join(append([]string{DataDir, OptDir}, o.RWPaths...), " ")
+			"ReadWritePaths=" + strings.Join(append([]string{l.DataDir, l.OptDir}, o.RWPaths...), " ")
+	}
+	desc := "Agent"
+	if l.Instance != "" {
+		desc += " " + l.Instance
 	}
 	return `[Unit]
-Description=Agent
+Description=` + desc + `
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
 User=` + o.User + `
-EnvironmentFile=-` + EnvFile + `
+EnvironmentFile=-` + l.EnvFile + `
 Environment=AGENT_BOOT_GUARD=external
-ExecStartPre=-/bin/sh -c '[ ! -x ` + Binary + `.prev ] || ` + Binary + `.prev boot-guard ` + Binary + `'
-ExecStart=` + Binary + ` run -config ` + ConfigFile + `
+ExecStartPre=-/bin/sh -c '[ ! -x ` + l.Binary + `.prev ] || ` + l.Binary + `.prev boot-guard ` + l.Binary + `'
+ExecStart=` + l.Binary + ` run -config ` + l.ConfigFile + `
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2
@@ -518,7 +542,7 @@ WantedBy=multi-user.target
 
 // ensureUser — пользователь службы: нет — создаётся (системный, без входа) и
 // записывается в журнал: --purge удалит только его.
-func ensureUser(ctx context.Context, s *System, j *journal, user string) error {
+func ensureUser(ctx context.Context, s *System, l Paths, j *journal, user string) error {
 	if user == "root" {
 		return nil
 	}
@@ -535,7 +559,7 @@ func ensureUser(ctx context.Context, s *System, j *journal, user string) error {
 			break
 		}
 	}
-	if err := s.Run(ctx, Cmd{Args: []string{"useradd", "--system", "--home-dir", DataDir, "--no-create-home", "--shell", shell, user}}); err != nil {
+	if err := s.Run(ctx, Cmd{Args: []string{"useradd", "--system", "--home-dir", l.DataDir, "--no-create-home", "--shell", shell, user}}); err != nil {
 		return fmt.Errorf("useradd %s: %w", user, err)
 	}
 	j.add("user", user)
