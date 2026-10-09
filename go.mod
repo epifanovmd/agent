@@ -4,7 +4,7 @@ module github.com/epifanovmd/agent
 // агент и выпуски (scripts/go.sh, CI, образы).
 go 1.25.0
 
-toolchain go1.26.0
+toolchain go1.26.9
 
 // npm-зависимости SDK и примеров (в некоторых пакетах есть Go-код) — не часть модуля.
 ignore node_modules
