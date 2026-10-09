@@ -1,7 +1,7 @@
 // Настройки Agents: что задаёт бэкенд и значения по умолчанию.
 import { format } from "node:util";
 
-import type { AgentEvent } from "../model/types";
+import type { AgentEvent, WorkerRequest } from "../model/types";
 import type { Store } from "../store/store";
 
 /** Сведения из запроса регистрации — для хука enroll. */
@@ -90,6 +90,12 @@ export interface AgentsOptions {
    */
   onEvent?: (event: AgentEvent) => void | Promise<void>;
   /**
+   * Запрос воркера к серверу (§12): результат уходит воркеру как data ответа. Ошибка — отказ
+   * воркеру: у AgentsError — её code и message, у другой — REQUEST_FAILED. Нет обработчика —
+   * отказ REQUEST_UNHANDLED. Запрос обрабатывает процесс, с которым агент на связи.
+   */
+  onWorkerRequest?: (req: WorkerRequest) => unknown;
+  /**
    * Агент после обрыва связи остаётся online столько, мс (по умолчанию 3000): переподключение за
    * это время не считается потерей связи.
    */
@@ -144,6 +150,19 @@ export interface AgentsOptions {
    * AgentsError JOB_INVALID (400). Нет схемы — без проверки. По умолчанию false.
    */
   validateJobs?: boolean;
+  /**
+   * Проверять по JSON Schema из манифеста воркера тело fetch (routes[].request; не подходит или
+   * не JSON — AgentsError REQUEST_INVALID, 400) и data запроса воркера (requests[].schema; не
+   * подходит — отказ воркеру REQUEST_INVALID). Нет схемы — без проверки. По умолчанию false.
+   */
+  validateRequests?: boolean;
+  /**
+   * Проверять data события по events[].schema манифеста воркера: off (по умолчанию) — нет; log —
+   * журнал и событие invalidEvent, событие обрабатывается как обычно; reject — журнал и
+   * invalidEvent, событие подтверждается агенту (повтор доставки ничего не исправит), но onEvent,
+   * подписки и событие event его не получают.
+   */
+  validateEvents?: "off" | "log" | "reject";
   log?: (msg: string, extra?: Record<string, unknown>) => void;
 }
 
@@ -158,6 +177,7 @@ type Optional =
   | "enroll"
   | "enrollToken"
   | "onEvent"
+  | "onWorkerRequest"
   | "releasesDir"
   | "publicKey"
   | "baseUrl"
@@ -187,6 +207,7 @@ export const resolveOptions = (opts: AgentsOptions): Settings => {
     statusIntervalMs,
     metricsIntervalMs: opts.metricsIntervalMs ?? 10_000,
     onEvent: opts.onEvent,
+    onWorkerRequest: opts.onWorkerRequest,
     offlineGraceMs,
     pingIntervalMs: opts.pingIntervalMs ?? 5000,
     relay: opts.relay,
@@ -204,6 +225,8 @@ export const resolveOptions = (opts: AgentsOptions): Settings => {
     trustProxy: opts.trustProxy ?? false,
     validateConfigs: opts.validateConfigs ?? false,
     validateJobs: opts.validateJobs ?? false,
+    validateRequests: opts.validateRequests ?? false,
+    validateEvents: opts.validateEvents ?? "off",
     log: opts.log ?? stdoutLog,
   };
 };

@@ -300,8 +300,8 @@ func TestNetprobe(t *testing.T) {
 	}
 }
 
-// HTTP воркера: PUT /config/targets, GET /health, GET /metrics, GET /manifest, POST /jobs,
-// служебные ошибки.
+// HTTP воркера: PUT /config/targets, GET /health, GET /metrics, GET /results, GET /manifest,
+// POST /jobs, служебные ошибки.
 func TestHandler(t *testing.T) {
 	p := newProber(methods{dial: func(context.Context, string, time.Duration) error { return nil }})
 	p.gap = 0
@@ -312,6 +312,11 @@ func TestHandler(t *testing.T) {
 	go n.loop(ctx)
 	srv := httptest.NewServer(n.handler())
 	defer srv.Close()
+	if resp, err := http.Get(srv.URL + "/results"); err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("итогов ещё нет: %v %v", resp, err)
+	} else {
+		resp.Body.Close()
+	}
 	put := func(body string) int {
 		req, _ := http.NewRequest(http.MethodPut, srv.URL+"/config/targets", strings.NewReader(body))
 		resp, err := http.DefaultClient.Do(req)
@@ -344,6 +349,11 @@ func TestHandler(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	if resp, err := http.Get(srv.URL + "/results"); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("итог последнего круга: %v %v", resp, err)
+	} else {
+		resp.Body.Close()
+	}
 	resp, err := http.Get(srv.URL + "/health")
 	if err != nil {
 		t.Fatal(err)
@@ -366,7 +376,7 @@ func TestHandler(t *testing.T) {
 	// Манифест проходит проверку агента.
 	m, err := message.ParseWorkerManifest(raw)
 	if err != nil || m.Version != version || m.Configs[0].Key != configKey || len(m.Configs[0].Schema) == 0 ||
-		len(m.Jobs) != 1 || m.Jobs[0].Type != jobRun || len(m.Jobs[0].Schema) == 0 {
+		len(m.Jobs) != 1 || m.Jobs[0].Type != jobRun || len(m.Jobs[0].Schema) == 0 || !m.DeclaresRoute("GET", "/results") {
 		t.Fatalf("манифест: %+v %v", m, err)
 	}
 

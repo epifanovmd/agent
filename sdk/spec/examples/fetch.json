@@ -117,5 +117,33 @@
         }
       }
     }
+  },
+  "fetch.end.route-undeclared": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "fetch.end",
+      "re": "f0e1d2c3b4a5968778695a4b3c2d1e0f",
+      "data": {
+        "error": {
+          "code": "ROUTE_UNDECLARED",
+          "message": "маршрута DELETE /reports/7 нет в манифесте воркера report (routes)"
+        }
+      }
+    }
+  },
+  "fetch.end.job-unknown": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "fetch.end",
+      "re": "0718293a4b5c6d7e8f90a1b2c3d4e5f6",
+      "data": {
+        "error": {
+          "code": "JOB_UNKNOWN",
+          "message": "задачи report.purge нет в манифесте воркера report (jobs)"
+        }
+      }
+    }
   }
 }

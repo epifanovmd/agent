@@ -133,9 +133,10 @@ func testWorker() {
 		record("cleanup", "done")
 		w.WriteHeader(http.StatusNoContent)
 	})
-	// /manifest — версия: метка сборки или 0.1.0; все ключи и события, которые шлют тесты.
-	// Файл no-manifest в IT_STATE — манифеста нет (404): воркер не зарегистрирован; файл
-	// jobs — манифест объявляет задачи example.quick и example.long.
+	// /manifest — версия: метка сборки или 0.1.0; все ключи, маршруты, события и запросы к
+	// серверу, которые используют тесты. Файл no-manifest в IT_STATE — манифеста нет (404):
+	// воркер не зарегистрирован; файл jobs — манифест объявляет задачи example.quick и
+	// example.long.
 	mux.HandleFunc("GET /manifest", func(w http.ResponseWriter, r *http.Request) {
 		if _, err := os.Stat(filepath.Join(state, "no-manifest")); err == nil {
 			http.NotFound(w, r)
@@ -146,8 +147,9 @@ func testWorker() {
 			jobs = `,"jobs":[{"type":"example.quick"},{"type":"example.long"}]`
 		}
 		fmt.Fprintf(w, `{"version":%q,"configs":[{"key":"main","schema":{"type":"object"}},{"key":"limits"}],`+
-			`"routes":[{"method":"POST","path":"/echo"}],"events":[{"type":"example.done"},{"type":"example.later"},`+
-			`{"type":"example.offline"},{"type":"example.progress"}]%s}`, cmp.Or(tag, "0.1.0"), jobs)
+			`"routes":%s,"events":[{"type":"example.done"},{"type":"example.later"},`+
+			`{"type":"example.offline"},{"type":"example.progress"}],`+
+			`"requests":[{"type":"example.ask"},{"type":"example.slow"},{"type":"example.deny"}]%s}`, cmp.Or(tag, "0.1.0"), testRoutes, jobs)
 	})
 	mux.HandleFunc("GET /build", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, tag) })
 	mux.HandleFunc("GET /pid", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, os.Getpid()) })
@@ -264,6 +266,19 @@ func testWorker() {
 			fmt.Fprintf(w, `{"message":"нет задачи %s"}`, req.Type)
 		}
 	})
+	// /ask?type=…&timeoutMs=… — запрос к серверу через сокет агента: статус ответа агента —
+	// в X-Agent-Status, тело — как есть.
+	mux.HandleFunc("POST /ask", func(w http.ResponseWriter, r *http.Request) {
+		ms, _ := strconv.Atoi(r.URL.Query().Get("timeoutMs"))
+		body, _ := json.Marshal(message.RequestPost{Type: r.URL.Query().Get("type"), Data: json.RawMessage(`{"n":1}`), TimeoutMs: int64(ms)})
+		code, raw, err := agent(http.MethodPost, message.RequestsPath, body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("X-Agent-Status", strconv.Itoa(code))
+		_, _ = w.Write(raw)
+	})
 	mux.HandleFunc("POST /hang", func(w http.ResponseWriter, _ *http.Request) {
 		hang.Store(true)
 		w.WriteHeader(http.StatusNoContent)
@@ -300,6 +315,13 @@ func testWorker() {
 	}
 	_ = http.Serve(ln, mux)
 }
+
+// testRoutes — маршруты тестового воркера в манифесте (routes, §7).
+const testRoutes = `[{"method":"POST","path":"/echo"},{"method":"PUT","path":"/echo"},{"method":"GET","path":"/build"},` +
+	`{"method":"GET","path":"/pid"},{"method":"GET","path":"/stream"},{"method":"GET","path":"/big"},` +
+	`{"method":"GET","path":"/sleep"},{"method":"GET","path":"/agent/{key}"},{"method":"GET","path":"/agent/{key}/{name}"},` +
+	`{"method":"POST","path":"/work"},{"method":"POST","path":"/hang"},{"method":"POST","path":"/print"},` +
+	`{"method":"POST","path":"/child"},{"method":"POST","path":"/ask"}]`
 
 // bigBody — тело /big.
 func bigBody() []byte {

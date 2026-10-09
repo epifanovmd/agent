@@ -87,10 +87,10 @@ func (st procState) alive() bool {
 	return ok && start == st.Start
 }
 
-// specHash — отпечаток настроек, от которых зависит процесс: без lifecycle и
-// logs (они меняются на ходу).
+// specHash — отпечаток настроек, от которых зависит процесс: без lifecycle,
+// logs и routes (они меняются на ходу).
 func specHash(spec config.Worker) string {
-	spec.Lifecycle, spec.Logs = config.Lifecycle{}, config.Logs{}
+	spec.Lifecycle, spec.Logs, spec.Routes = config.Lifecycle{}, config.Logs{}, ""
 	raw, _ := json.Marshal(spec)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:12])

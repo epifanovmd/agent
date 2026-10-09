@@ -249,18 +249,53 @@
           {
             "method": "GET",
             "path": "/reports",
-            "description": "Список отчётов"
+            "description": "Список отчётов",
+            "response": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
           },
           {
             "method": "POST",
             "path": "/reports/{id}/send",
-            "description": "Отправить отчёт сейчас"
+            "description": "Отправить отчёт сейчас",
+            "request": {
+              "type": "object",
+              "properties": {
+                "to": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "response": {
+              "type": "object",
+              "properties": {
+                "sent": {
+                  "type": "boolean"
+                }
+              }
+            }
           }
         ],
         "events": [
           {
             "type": "report.sent",
-            "description": "Отчёт отправлен"
+            "description": "Отчёт отправлен",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "target": {
+                  "type": "string"
+                },
+                "items": {
+                  "type": "integer"
+                }
+              },
+              "required": ["target"]
+            }
           }
         ],
         "jobs": [
@@ -281,6 +316,27 @@
           {
             "type": "report.check",
             "description": "Проверить источник отчётов"
+          }
+        ],
+        "requests": [
+          {
+            "type": "report.recipients",
+            "description": "Кому отправить отчёт",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "report": {
+                  "type": "string"
+                }
+              },
+              "required": ["report"]
+            },
+            "response": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
           }
         ]
       }
@@ -598,6 +654,127 @@
           }
         },
         "online": true
+      }
+    }
+  },
+  "agent.requests": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "POST",
+      "path": "/requests",
+      "headers": {
+        "authorization": "Bearer worker-token-example",
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "report.recipients",
+        "data": {
+          "report": "daily"
+        },
+        "timeoutMs": 10000
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "data": ["ops@example.com"]
+      }
+    }
+  },
+  "agent.requests.undeclared": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "POST",
+      "path": "/requests",
+      "headers": {
+        "authorization": "Bearer worker-token-example",
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "report.unknown"
+      }
+    },
+    "response": {
+      "status": 400,
+      "body": {
+        "code": "REQUEST_UNDECLARED",
+        "message": "запроса report.unknown нет в манифесте воркера (requests)"
+      }
+    }
+  },
+  "agent.requests.offline": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "POST",
+      "path": "/requests",
+      "headers": {
+        "authorization": "Bearer worker-token-example",
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "report.recipients",
+        "data": {
+          "report": "daily"
+        }
+      }
+    },
+    "response": {
+      "status": 503,
+      "body": {
+        "code": "AGENT_OFFLINE",
+        "message": "нет связи с сервером"
+      }
+    }
+  },
+  "agent.requests.rejected": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "POST",
+      "path": "/requests",
+      "headers": {
+        "authorization": "Bearer worker-token-example",
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "report.recipients",
+        "data": {}
+      }
+    },
+    "response": {
+      "status": 422,
+      "body": {
+        "code": "REQUEST_INVALID",
+        "message": "report.recipients: нет поля report"
+      }
+    }
+  },
+  "agent.requests.timeout": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "POST",
+      "path": "/requests",
+      "headers": {
+        "authorization": "Bearer worker-token-example",
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "report.recipients",
+        "data": {
+          "report": "daily"
+        },
+        "timeoutMs": 5000
+      }
+    },
+    "response": {
+      "status": 504,
+      "body": {
+        "code": "TIMEOUT",
+        "message": "сервер не ответил за 5000 мс"
       }
     }
   }

@@ -81,3 +81,36 @@ func TestFetch(t *testing.T) {
 		t.Fatalf("воркер не запущен: %v", err)
 	}
 }
+
+// Маршруты — только из манифеста воркера (§7): необъявленный метод или путь — ROUTE_UNDECLARED
+// без обращения к воркеру; routes: open в настройках узла — запрос уходит как есть (кроме
+// служебных путей).
+func TestFetchRoutes(t *testing.T) {
+	t.Parallel()
+	s := newStand(t)
+	open := s.worker("open")
+	open.Routes = config.RoutesOpen
+	s.start(s.config(s.worker("w"), open))
+	s.running("w")
+	a := s.running("open")
+
+	for _, c := range []struct{ method, path string }{
+		{"GET", "/echo"}, {"DELETE", "/pid"}, {"GET", "/nope"}, {"GET", "/sleep/x"}, {"GET", "/agent/a/b/c"},
+	} {
+		if _, err := s.server.Fetch(a.ID, "w", c.path, testserver.FetchInit{Method: c.method}); errorCode(err) != "ROUTE_UNDECLARED" {
+			t.Errorf("%s %s: %v", c.method, c.path, err)
+		}
+	}
+	if res := s.fetch(a.ID, "w", "/pid?x=1", testserver.FetchInit{}); res.Status != 200 {
+		t.Fatalf("объявленный маршрут: %+v", res)
+	}
+	if res := s.fetch(a.ID, "open", "/nope", testserver.FetchInit{}); res.Status != 404 {
+		t.Fatalf("routes: open — запрос доходит до воркера: %+v", res)
+	}
+	if res := s.fetch(a.ID, "open", "/echo", testserver.FetchInit{Method: "DELETE"}); res.Status != 201 || res.Headers["x-method"] != "DELETE" {
+		t.Fatalf("routes: open — любой метод: %+v", res)
+	}
+	if _, err := s.server.Fetch(a.ID, "open", "/metrics", testserver.FetchInit{}); errorCode(err) != "PATH_FORBIDDEN" {
+		t.Fatalf("routes: open — служебный путь: %v", err)
+	}
+}

@@ -476,6 +476,7 @@ workers:
       configRetry: 5s
       updateHealthyTimeout: 2m
     logs: {maxSize: 1MB, maxFiles: 0}
+    routes: open
 `), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
@@ -499,6 +500,9 @@ workers:
 		l.StopTimeout.Std() != DefaultStopTimeout || tuned.Logs.MaxSize != 1<<20 || tuned.Logs.Files() != 0 {
 		t.Fatalf("заданные: %+v %+v", l, tuned.Logs)
 	}
+	if plain.OpenRoutes() || !tuned.OpenRoutes() {
+		t.Fatalf("routes: %q %q", plain.Routes, tuned.Routes)
+	}
 	var coded Worker
 	coded.FillDefaults()
 	if !reflect.DeepEqual(coded.Lifecycle, def) {
@@ -512,6 +516,7 @@ workers:
 		"lifecycle.health.timeout": "lifecycle: {health: {interval: 1s, timeout: 5s}}",
 		"logs.maxSize":             "logs: {maxSize: 1KB}",
 		"logs.maxFiles":            "logs: {maxFiles: -1}",
+		"routes":                   "routes: closed",
 	} {
 		res := Check(writeConfig(t, "server: {url: https://api.example.com}\nworkers:\n  - name: a\n    command: [a]\n    "+src+"\n"))
 		if len(res.Errors) != 1 || !strings.Contains(res.Errors[0].Text, "workers[0]."+field) || res.Errors[0].Line != 5 {

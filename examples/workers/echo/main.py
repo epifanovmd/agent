@@ -7,7 +7,8 @@ HTTP-сервис на unix-сокете AGENT_WORKER_SOCKET (sdk/spec §12):
   GET  /bytes?n=256     двоичный ответ: n байт 0, 1, …, 255, 0, …
   POST /hang            «зависнуть»: GET /health больше не отвечает (агент перезапустит воркер)
   POST /jobs            задачи (§12): {"type", "jobId", "data"}
-                          echo.quick {"text"} → 200 {"result": {"text"}} — итог сразу;
+                          echo.quick {"text", "lookup"?} → 200 {"result": {"text"}} — итог сразу;
+                          lookup: true — префикс спросить у бэкенда (запрос echo.lookup);
                           echo.long {"steps": 5, "delayMs": 500, "text"?} → 202 {"id"}; дальше события
                           job.progress {jobId, id, progress, message} и job.done {jobId, id, result}
                           через агента; пока задача идёт, GET /health отвечает busy: true (агент не
@@ -18,7 +19,8 @@ HTTP-сервис на unix-сокете AGENT_WORKER_SOCKET (sdk/spec §12):
   DELETE /config/settings  вернуть значения по умолчанию
   GET  /metrics         счётчики
   GET  /health          {ok, message, info}
-  GET  /manifest        что воркер умеет: версия, ключ настроек settings со схемой, маршруты, события
+  GET  /manifest        что воркер умеет: версия, ключ настроек settings, маршруты, события, задачи
+                        и запросы к бэкенду — со схемами
   POST /cleanup         убрать созданное на узле: файл ECHO_STATE_FILE, настройку и счётчики
 
 ECHO_STATE_FILE (необязательно) — файл на узле, куда echo записывает применённую настройку:
@@ -28,7 +30,8 @@ ECHO_JOBS_DIR (необязательно) — каталог, где echo хр�
 после каждого шага: запущенный заново воркер продолжает незаконченные задачи с сохранённого шага.
 
 События уходят агенту: POST /events на AGENT_SOCKET с заголовком
-Authorization: Bearer $AGENT_WORKER_TOKEN. Запускает воркер агент (agent.yaml → workers).
+Authorization: Bearer $AGENT_WORKER_TOKEN; запрос к бэкенду — POST /requests туда же, ответ —
+когда бэкенд ответит. Запускает воркер агент (agent.yaml → workers).
 """
 
 import http.client
@@ -48,8 +51,9 @@ VERSION = "1.0.0"
 DEFAULTS = {"prefix": "", "upper": True}
 MAX_PREFIX = 64
 
-# Манифест (sdk/spec §12): по нему сервер знает, что умеет воркер, и может проверить настройку
-# по схеме до отправки агенту.
+# Манифест (sdk/spec §12): по нему агент пропускает к воркеру только объявленные маршруты, задачи,
+# события и запросы к бэкенду, а сервер может проверить настройку, тело запроса и data события по
+# схемам.
 MANIFEST = {
     "version": VERSION,
     "description": "Эхо: текст, потоковый и двоичный ответ, быстрые и долгие задачи",
@@ -68,19 +72,33 @@ MANIFEST = {
         }
     ],
     "routes": [
-        {"method": "POST", "path": "/echo", "description": "Текст с префиксом"},
+        {
+            "method": "POST",
+            "path": "/echo",
+            "description": "Текст с префиксом",
+            "request": {"type": "object", "properties": {"text": {"type": "string"}}},
+            "response": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+        },
         {"method": "GET", "path": "/stream", "description": "Ответ по частям, ?n= строк"},
         {"method": "GET", "path": "/bytes", "description": "Двоичный ответ, ?n= байт"},
         {"method": "POST", "path": "/hang", "description": "Зависнуть: GET /health больше не отвечает"},
     ],
     "events": [
-        {"type": "echo.started", "description": "Воркер запущен"},
+        {
+            "type": "echo.started",
+            "description": "Воркер запущен",
+            "schema": {
+                "type": "object",
+                "properties": {"version": {"type": "string"}, "pid": {"type": "integer"}},
+                "required": ["version", "pid"],
+            },
+        },
     ],
     "jobs": [
         {
             "type": "echo.quick",
-            "description": "Текст с префиксом — итог сразу",
-            "schema": {"type": "object", "properties": {"text": {"type": "string"}}},
+            "description": "Текст с префиксом — итог сразу; lookup: true — префикс от бэкенда",
+            "schema": {"type": "object", "properties": {"text": {"type": "string"}, "lookup": {"type": "boolean"}}},
         },
         {
             "type": "echo.long",
@@ -93,6 +111,14 @@ MANIFEST = {
                     "text": {"type": "string"},
                 },
             },
+        },
+    ],
+    "requests": [
+        {
+            "type": "echo.lookup",
+            "description": "Спросить у бэкенда префикс для текста",
+            "schema": {"type": "object", "properties": {"text": {"type": "string"}}},
+            "response": {"type": "object", "properties": {"prefix": {"type": "string"}}, "required": ["prefix"]},
         },
     ],
 }
@@ -169,6 +195,20 @@ def event(type_, data, wait=30):
             last_event_error = str(err)
         print(f"событие {type_} не отправлено: {err}", file=sys.stderr, flush=True)
         return
+
+
+def lookup(text):
+    """Запрос к бэкенду echo.lookup: (префикс, None) или (None, текст ошибки)."""
+    try:
+        status, body = agent("POST", "/requests", {"type": "echo.lookup", "data": {"text": text}, "timeoutMs": 5000})
+    except OSError as e:
+        return None, f"агент недоступен: {e}"
+    if status != 200:
+        return None, f"HTTP {status} {(body or {}).get('code', '')}: {(body or {}).get('message', '')}"
+    prefix = ((body or {}).get("data") or {}).get("prefix")
+    if not isinstance(prefix, str):
+        return None, "бэкенд не прислал prefix"
+    return prefix, None
 
 
 def save_state():
@@ -435,7 +475,12 @@ class Handler(BaseHTTPRequestHandler):
         text = str(data.get("text", ""))
         if type_ == "echo.quick":
             count("echoed")
-            return self.reply(200, {"result": {"text": transform(text)}})
+            if not data.get("lookup"):
+                return self.reply(200, {"result": {"text": transform(text)}})
+            prefix, err = lookup(text)
+            if err:
+                return self.reply(503, {"message": "префикс от бэкенда не получен: " + err})
+            return self.reply(200, {"result": {"text": prefix + transform(text), "prefix": prefix}})
         if type_ != "echo.long":
             return self.reply(400, {"message": f"задачи {type_} нет: есть echo.quick и echo.long"})
         try:

@@ -5,6 +5,11 @@ import type {
   Hello,
   HelloWorker,
   LogLevel,
+  ManifestConfig,
+  ManifestEvent,
+  ManifestJob,
+  ManifestRequest,
+  ManifestRoute,
   Metrics,
   Status,
   WorkerStatus,
@@ -169,6 +174,43 @@ export interface AgentEvent {
   /** Когда случилось на узле, мс. */
   at: number;
   receivedAt: number;
+}
+
+/** Событие, data которого не подходит под events[].schema манифеста (опция validateEvents). */
+export interface InvalidEvent {
+  event: AgentEvent;
+  /** Что не так: «поле: замечание», не больше трёх. */
+  problems: string[];
+  /** reject — событие подтверждено агенту, но не передано onEvent и подпискам. */
+  rejected: boolean;
+}
+
+/** Запрос воркера к серверу (опция onWorkerRequest, §12). */
+export interface WorkerRequest {
+  /** id сообщения агента. */
+  id: string;
+  agentId: string;
+  worker: string;
+  /** Тип из manifest.requests воркера. */
+  type: string;
+  data?: unknown;
+  /** Агент (последнее известное состояние). */
+  agent: Agent;
+  /** Срок ответа, мс: после него агент уже не ждёт. */
+  timeoutMs: number;
+  /** Отмена: истёк срок или связь с агентом оборвалась. */
+  signal: AbortSignal;
+}
+
+/** Что умеет воркер — из его манифеста (Agents.capabilities). */
+export interface WorkerCapabilities {
+  version?: string;
+  description?: string;
+  configs: ManifestConfig[];
+  routes: ManifestRoute[];
+  events: ManifestEvent[];
+  jobs: ManifestJob[];
+  requests: ManifestRequest[];
 }
 
 /** Точка метрик. */

@@ -26,6 +26,7 @@ import {
 
 import { createApp } from "../src/app";
 import { History } from "../src/history";
+import { onWorkerRequest } from "../src/requests";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -181,6 +182,7 @@ export class Stand {
       statusIntervalMs: 1000,
       metricsIntervalMs: 3000,
       onEvent: this.history.addEvent,
+      onWorkerRequest,
       offlineGraceMs: 1000,
       releasesDir: this.opts.releasesDir,
       log: (msg, more) =>

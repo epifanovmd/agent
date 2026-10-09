@@ -12,6 +12,7 @@ import type {
   AuditAction,
   AuditEntry,
   ConfigStatus,
+  InvalidEvent,
   MetricsPoint,
 } from "../model/types";
 import type { LogEntry } from "../protocol/messages";
@@ -45,6 +46,7 @@ export interface ChangeEvent {
 export interface AgentsEvents {
   agent: [Agent];
   event: [AgentEvent];
+  invalidEvent: [InvalidEvent];
   metrics: [MetricsEvent];
   log: [LogEvent];
   config: [ConfigStatus];

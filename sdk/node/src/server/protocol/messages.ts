@@ -19,6 +19,7 @@ import {
   manifestConfigSchema,
   manifestEventSchema,
   manifestJobSchema,
+  manifestRequestSchema,
   manifestRouteSchema,
   metricsSchema,
   releaseArtifactSchema,
@@ -57,6 +58,9 @@ export type ManifestEvent = z.output<typeof manifestEventSchema>;
 
 /** Тип задачи воркера в манифесте: schema — JSON Schema поля data. */
 export type ManifestJob = z.output<typeof manifestJobSchema>;
+
+/** Тип запроса воркера к серверу в манифесте: schema — JSON Schema поля data. */
+export type ManifestRequest = z.output<typeof manifestRequestSchema>;
 
 /** Состояние задачи воркера (§12). */
 export type JobState = z.output<typeof jobStateSchema>;

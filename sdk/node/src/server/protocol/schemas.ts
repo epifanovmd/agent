@@ -108,12 +108,20 @@ export const manifestConfigSchema = z
   })
   .transform(compact);
 
-/** Маршрут воркера в манифесте: {name} в path — один сегмент пути. */
+/** JSON Schema из манифеста; не объект — нет схемы. */
+const manifestSchemaField = jsonObject.optional().catch(undefined);
+
+/**
+ * Маршрут воркера в манифесте: {name} в path — один сегмент пути; request — JSON Schema тела
+ * запроса, response — тела ответа 2xx (описание).
+ */
 export const manifestRouteSchema = z
   .object({
     method: z.string().regex(/^[A-Z]{1,16}$/),
     path: z.string().startsWith("/"),
     description,
+    request: manifestSchemaField,
+    response: manifestSchemaField,
   })
   .transform(compact);
 
@@ -125,6 +133,8 @@ export const manifestEventSchema = z
       "типы job.* зарезервированы для событий задач",
     ),
     description,
+    /** JSON Schema поля data. */
+    schema: manifestSchemaField,
   })
   .transform(compact);
 
@@ -133,7 +143,20 @@ export const manifestJobSchema = z
   .object({
     type: eventTypeSchema,
     description,
-    schema: jsonObject.optional().catch(undefined),
+    schema: manifestSchemaField,
+  })
+  .transform(compact);
+
+/**
+ * Тип запроса воркера к серверу в манифесте (§12): schema — JSON Schema поля data запроса,
+ * response — data ответа (описание).
+ */
+export const manifestRequestSchema = z
+  .object({
+    type: eventTypeSchema,
+    description,
+    schema: manifestSchemaField,
+    response: manifestSchemaField,
   })
   .transform(compact);
 
@@ -149,6 +172,7 @@ export const workerManifestSchema = z
     routes: manifestItems(manifestRouteSchema),
     events: manifestItems(manifestEventSchema),
     jobs: manifestItems(manifestJobSchema),
+    requests: manifestItems(manifestRequestSchema),
   })
   .transform(compact);
 
@@ -257,6 +281,14 @@ export const eventSchema = z.object({
   type: eventTypeSchema,
   at: z.number().optional().catch(undefined),
   data: z.unknown().optional(),
+});
+
+/** `request` (§12): запрос воркера к серверу; неверный срок — по умолчанию. */
+export const workerRequestSchema = z.object({
+  worker: nameSchema,
+  type: eventTypeSchema,
+  data: z.unknown().optional(),
+  timeoutMs: z.number().int().positive().optional().catch(undefined),
 });
 
 /** `config.applied` (§5). */

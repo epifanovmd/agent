@@ -24,6 +24,7 @@ import {
   releaseManifestSchema,
   rotateKeyResultSchema,
   statusSchema,
+  workerRequestSchema,
 } from "./schemas";
 
 /** Значение или причина отказа. */
@@ -170,6 +171,12 @@ export type EventData = z.output<typeof eventSchema>;
 
 export const parseEvent = (data: unknown): Parsed<EventData> =>
   parse(eventSchema, data, "event");
+
+/** request (§12): запрос воркера к серверу. */
+export type WorkerRequestData = z.output<typeof workerRequestSchema>;
+
+export const parseWorkerRequest = (data: unknown): Parsed<WorkerRequestData> =>
+  parse(workerRequestSchema, data, "request");
 
 /** config.applied (§5). */
 export type ConfigApplied = z.output<typeof configAppliedSchema>;

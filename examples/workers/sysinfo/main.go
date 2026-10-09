@@ -52,8 +52,14 @@ var manifest = map[string]any{
 			"additionalProperties": false,
 		},
 	}},
-	"routes": []any{map[string]any{"method": "GET", "path": "/info", "description": "Процесс, узел и баннер"}},
-	"events": []any{map[string]any{"type": "sys.started", "description": "Воркер запущен"}},
+	"routes": []any{map[string]any{"method": "GET", "path": "/info", "description": "Процесс, узел и баннер",
+		"response": map[string]any{"type": "object", "properties": map[string]any{
+			"pid": map[string]any{"type": "integer"}, "host": map[string]any{"type": "string"},
+			"version": map[string]any{"type": "string"}, "banner": map[string]any{"type": "string"},
+		}},
+	}},
+	"events": []any{map[string]any{"type": "sys.started", "description": "Воркер запущен",
+		"schema": map[string]any{"type": "object"}}},
 }
 
 type sysinfo struct {

@@ -1,12 +1,15 @@
 // Запросы к воркерам через агента (§7): fetch → fetch.head, fetch.chunk, fetch.end; отмена и
-// срок — fetch.cancel.
+// срок — fetch.cancel; тело — по схеме маршрута из манифеста (validateRequests).
 import { z } from "zod";
 
 import type { Context } from "../core/context";
 import { AgentsError, codeError, valid } from "../core/errors";
 import { agentsDefaults } from "../core/options";
 import type { PendingFetch, Session } from "../core/session";
+import { jsonSchemaProblems } from "../lib/json-schema";
 import { bounded } from "../lib/util";
+import { findRoute, workerManifest } from "../model/manifest";
+import { publicAgent } from "../model/public-agent";
 import { parse, parseFetchReply } from "../protocol/checks";
 import { type Envelope, MAX_FETCH_BODY, newId } from "../protocol/messages";
 import { messageIdSchema, nameSchema } from "../protocol/schemas";
@@ -60,6 +63,14 @@ export class Tunnel {
     if (init.signal?.aborted) throw codeError("CANCELLED", "запрос отменён");
     const ss = await this.ctx.localSession(agentId);
 
+    if (this.ctx.settings.validateRequests)
+      await this.validate(
+        agentId,
+        worker,
+        String(data.method),
+        path,
+        init.body,
+      );
     if (actor)
       this.ctx.audit(actor, "fetch", agentId, {
         worker,
@@ -69,7 +80,56 @@ export class Tunnel {
 
     return open(ss, data, timeoutMs, init.signal);
   }
+
+  /** Тело запроса по routes[].request манифеста: не JSON или не по схеме — REQUEST_INVALID. */
+  private async validate(
+    agentId: string,
+    worker: string,
+    method: string,
+    path: string,
+    body: FetchInit["body"],
+  ): Promise<void> {
+    const m = workerManifest(
+      publicAgent(await this.ctx.agent(agentId)),
+      worker,
+    );
+    const schema = findRoute(m, method, path)?.request;
+
+    if (!schema) return;
+    const what = `${worker} ${method} ${path.split("?")[0]}`;
+    let value: unknown = null;
+
+    try {
+      if (body !== undefined) value = JSON.parse(bodyText(body));
+    } catch {
+      throw codeError("REQUEST_INVALID", `${what}: тело — не JSON`);
+    }
+    let problems: string[];
+
+    try {
+      problems = jsonSchemaProblems(schema, value);
+    } catch (e) {
+      this.ctx.log("схема тела маршрута из манифеста воркера не применяется", {
+        agentId,
+        worker,
+        path,
+        err: String(e),
+      });
+
+      return;
+    }
+    if (problems.length)
+      throw codeError("REQUEST_INVALID", `${what}: ${problems.join("; ")}`);
+  }
 }
+
+/** Тело запроса текстом UTF-8. */
+const bodyText = (body: string | Uint8Array | ArrayBuffer): string =>
+  typeof body === "string"
+    ? body
+    : Buffer.from(
+        body instanceof ArrayBuffer ? new Uint8Array(body) : body,
+      ).toString("utf8");
 
 /** Ответ агента на fetch: передать ожидающему запросу сессии. */
 export const fetchReply = (ss: Session, env: Envelope): void => {

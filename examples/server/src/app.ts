@@ -207,6 +207,22 @@ const agentRoute = async (
     section === "workers" &&
     worker &&
     rest.length === 1 &&
+    rest[0] === "capabilities" &&
+    method === "GET"
+  ) {
+    const caps = await agents.capabilities(id, worker);
+
+    return caps
+      ? reply(caps)
+      : sendJSON(res, 404, {
+          code: "WORKER_UNKNOWN",
+          message: "воркер себя не описал (нет манифеста)",
+        });
+  }
+  if (
+    section === "workers" &&
+    worker &&
+    rest.length === 1 &&
     rest[0] === "supports" &&
     method === "GET"
   ) {

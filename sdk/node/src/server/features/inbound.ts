@@ -1,5 +1,6 @@
-// Приём сообщений агента после hello (§3, §6): ответы fetch, поток (status, metrics, log) с учётом
-// seq и важное (event, config.applied, action.result) с подтверждением по id.
+// Приём сообщений агента после hello (§3, §6): ответы fetch, запросы воркеров (request), поток
+// (status, metrics, log) с учётом seq и важное (event, config.applied, action.result) с
+// подтверждением по id.
 import type { Context } from "../core/context";
 import type { Session } from "../core/session";
 import { recheckAlerts } from "../model/alerts";
@@ -14,6 +15,7 @@ import {
 import {
   type Envelope,
   RELIABLE,
+  REQUEST,
   STREAM,
   type WorkerStatus,
 } from "../protocol/messages";
@@ -30,6 +32,8 @@ type ReliableHandler = (ss: Session, env: Envelope) => Promise<string>;
 export interface InboundDeps {
   reliable: Record<string, ReliableHandler>;
   fetchReply(ss: Session, env: Envelope): void;
+  /** Запрос воркера к серверу: ответ — отдельно, не задерживая остальные сообщения. */
+  workerRequest(ss: Session, env: Envelope): void;
   /** События config по изменившимся ключам. */
   configsChanged(agent: AgentRecord, keys: string[]): Promise<void>;
   /** Запись агента не за этой сессией — закрыть её. */
@@ -71,6 +75,7 @@ export class Inbound {
       return sendError(ss, undefined, "MESSAGE_INVALID", "нет type");
     if (type === "fetch.head" || type === "fetch.chunk" || type === "fetch.end")
       return this.deps.fetchReply(ss, env);
+    if (type === REQUEST) return this.deps.workerRequest(ss, env);
     if (STREAM.has(type)) return this.streamed(ss, env);
     if (RELIABLE.has(type)) return this.reliable(ss, env);
     sendError(

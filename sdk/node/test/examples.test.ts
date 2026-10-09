@@ -90,6 +90,7 @@ describe("образцы", () => {
     s = await startServer({
       releasesDir: releaseDir(),
       log: msg => logged.push(msg),
+      onWorkerRequest: () => sample("request.result").data.data,
     });
   });
   after(async () => {
@@ -319,6 +320,53 @@ describe("образцы", () => {
       status: 502,
       message: inv.data.error.message,
     });
+  });
+
+  it("fetch.end.route-undeclared и fetch.end.job-unknown — ошибки с кодом агента", async () => {
+    for (const [name, status] of [
+      ["fetch.end.route-undeclared", 404],
+      ["fetch.end.job-unknown", 409],
+    ] as const) {
+      const p = s.agents.fetch(creds.agentId, "report", "/reports/7", {
+        method: "DELETE",
+      });
+      const req = await fa.next("fetch");
+      const end = use(name);
+
+      end.re = req.id;
+      fa.send(end);
+      await assert.rejects(p, {
+        code: end.data.error.code,
+        status,
+        message: end.data.error.message,
+      });
+    }
+  });
+
+  it("request → request.result (onWorkerRequest); без обработчика — request.result.error", async () => {
+    const req = use("request");
+
+    fa.send(req);
+    same(
+      await fa.next("request.result", e => e.re === req.id),
+      "request.result",
+    );
+
+    const bare = await startServer({ log: () => {} });
+
+    try {
+      const c = await enroll(bare.url);
+      const fb = await FakeAgent.connect(bare.ws, c, { configs: {} });
+
+      fb.send(req);
+      same(
+        await fb.next("request.result", e => e.re === req.id),
+        "request.result.error",
+      );
+      await fb.close();
+    } finally {
+      await bare.close();
+    }
   });
 
   it("watch и watch.off", async () => {

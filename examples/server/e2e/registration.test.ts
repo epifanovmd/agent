@@ -72,7 +72,11 @@ describe("регистрация воркера", () => {
   it("манифест появился — воркер зарегистрирован", async () => {
     await writeFile(
       manifest,
-      JSON.stringify({ version: "1.0.0", events: [{ type: "bare.done" }] }),
+      JSON.stringify({
+        version: "1.0.0",
+        routes: [{ method: "POST", path: "/emit" }],
+        events: [{ type: "bare.done" }],
+      }),
     );
     const w = await waitFor("bare: running", async () => {
       const w = await s.worker("bare");

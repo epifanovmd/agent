@@ -10,6 +10,7 @@
 - [Что воркер обслуживает](#что-воркер-обслуживает)
 - [Манифест: что воркер умеет](#манифест-что-воркер-умеет)
 - [Что агент обслуживает для воркера](#что-агент-обслуживает-для-воркера)
+- [Запросы к бэкенду](#запросы-к-бэкенду)
 - [Python](#python)
 - [Node.js](#nodejs)
 - [Go](#go)
@@ -174,7 +175,7 @@ func main() {
 | `POST /cleanup`         | удаление агента с узла (`agent uninstall`)                                | убрать всё, что воркер создал на узле; `2xx` — готово                      |
 | `GET /manifest`         | обязательно: при регистрации после каждого запуска                        | что воркер умеет — [ниже](#манифест-что-воркер-умеет)                      |
 | `POST /jobs`, `/jobs/*` | `agents.runJob(...)` с бэкенда; обязательно, если в манифесте есть `jobs` | [ниже](#задачи)                                                            |
-| остальные пути          | `agents.fetch(...)` с бэкенда                                             | что угодно                                                                 |
+| маршруты из манифеста   | `agents.fetch(...)` с бэкенда; другие пути агент не пропускает            | что угодно                                                                 |
 
 - **Настройки.** Агент передаёт только ключи, объявленные в манифесте (`configs`), по одному и
   ждёт ответа (до 30 с). Отказ (не `2xx`) — бэкенд увидит ошибку с текстом ответа, агент
@@ -191,15 +192,17 @@ func main() {
 
 ## Манифест: что воркер умеет
 
-Манифест — ответ на `GET /manifest`: версия воркера, его ключи настроек (со схемой значения),
-маршруты, события и типы задач. Обязательно только `version`; ключи настроек и события, которыми воркер
-пользуется, нужно перечислить — агент сверяется с ними. Бэкенд видит манифест в
-`agent.workers[].manifest` и может:
+Манифест — ответ на `GET /manifest`: версия воркера, его ключи настроек, маршруты, события,
+типы задач и запросы к бэкенду — у каждого может быть схема. Обязательно только `version`, но всё,
+чем воркер пользуется, нужно перечислить: агент пропускает только объявленное. Бэкенд видит
+манифест в `agent.workers[].manifest` и может:
 
-- узнать, умеет ли воркер нужное, — помощник `supports`
+- узнать, что умеет воркер, — `agents.capabilities(agentId, worker)` и помощник `supports`
   ([sdk/README.md](../README.md#манифест-воркера));
-- проверить значение настройки по схеме до отправки агенту — опция `validateConfigs`
-  ([configs.md](configs.md#проверка-по-схеме)).
+- проверить значение по схеме до отправки — опции `validateConfigs`
+  ([configs.md](configs.md#проверка-по-схеме)), `validateJobs`, `validateRequests`
+  ([fetch.md](fetch.md#проверка-тела-по-схеме)) и `validateEvents`
+  ([observe.md](observe.md#проверка-data-по-схеме)).
 
 ```json
 {
@@ -217,24 +220,49 @@ func main() {
     }
   ],
   "routes": [
-    { "method": "POST", "path": "/echo", "description": "Текст с префиксом" },
+    {
+      "method": "POST",
+      "path": "/echo",
+      "description": "Текст с префиксом",
+      "request": { "type": "object", "properties": { "text": { "type": "string" } } },
+      "response": { "type": "object", "properties": { "text": { "type": "string" } } }
+    },
     { "method": "GET", "path": "/items/{id}", "description": "Один элемент" }
   ],
-  "events": [{ "type": "example.echoed", "description": "Текст отправлен" }],
+  "events": [
+    {
+      "type": "example.echoed",
+      "description": "Текст отправлен",
+      "schema": { "type": "object", "properties": { "text": { "type": "string" } } }
+    }
+  ],
   "jobs": [
     {
       "type": "example.report",
       "description": "Собрать отчёт",
       "schema": { "type": "object", "properties": { "days": { "type": "integer" } } }
     }
+  ],
+  "requests": [
+    {
+      "type": "example.lookup",
+      "description": "Спросить у бэкенда префикс",
+      "schema": { "type": "object", "properties": { "text": { "type": "string" } } },
+      "response": { "type": "object", "properties": { "prefix": { "type": "string" } } }
+    }
   ]
 }
 ```
 
-- Обязательно только `version` (от 1 до 64 символов). `schema` —
-  [JSON Schema](https://json-schema.org) значения ключа или `data` задачи (по умолчанию версия
-  2020-12; другую задаёт `$schema`). `{id}` в `path` — один любой сегмент пути. `jobs` — типы
-  задач ([ниже](#задачи)); маршруты `/jobs` в `routes` не перечисляют.
+- Обязательно только `version` (от 1 до 64 символов). Схемы — [JSON Schema](https://json-schema.org)
+  (по умолчанию версия 2020-12; другую задаёт `$schema`): `configs[].schema` — значение ключа;
+  `routes[].request` — тело запроса, `routes[].response` — тело ответа `2xx`;
+  `events[].schema` — `data` события; `jobs[].schema` — `data` задачи; `requests[].schema` —
+  `data` запроса к бэкенду, `requests[].response` — `data` ответа. `response` — описание для
+  людей и бэкенда: их никто не проверяет.
+- `{id}` в `path` — один любой непустой сегмент пути. `jobs` — типы задач ([ниже](#задачи));
+  маршруты `/jobs` в `routes` не перечисляют. `requests` — запросы воркера к бэкенду
+  ([ниже](#запросы-к-бэкенду)).
 - Агент спрашивает манифест после каждого запуска воркера (срок — 2 с) и держит его в памяти.
   Новая сборка с другим манифестом — бэкенд сразу получает новый `status`.
 - `version` манифеста бэкенд видит как версию воркера. У воркера из выпуска это версия сборки
@@ -243,16 +271,26 @@ func main() {
   не по правилу, метод не заглавными буквами, путь без `/` в начале — все пределы в
   [§16](../spec/README.md#16-пределы-и-сроки)) — воркер не зарегистрирован (`state: invalid`,
   [выше](#обязательный-минимум)).
-- **Что агент проверяет по манифесту.** Событие, типа которого нет в `events`, агент отклоняет:
-  `POST /events` отвечает `400 EVENT_UNDECLARED`, до бэкенда оно не доходит. Ключ настроек,
-  которого нет в `configs`, агент воркеру не передаёт: бэкенд видит ошибку `CONFIG_KEY_UNKNOWN`
-  ([configs.md](configs.md#статус-применения)); агент проверит ключ снова, когда воркер
-  зарегистрируется в следующий раз (например, после обновления). События задач (`job.progress`,
-  `job.done`, `job.failed`, `job.cancelled`) в `events` не перечисляют: агент принимает их, только
-  если в манифесте есть `jobs`; другие типы `job.*` заняты и отклоняются.
-- **Что агент не проверяет.** Значение настройки по `schema` проверяет бэкенд (опция
-  `validateConfigs`), а не агент; тип и `data` задачи — тоже бэкенд (`runJob`, опция
-  `validateJobs`). Маршруты агент не сверяет: запрос `agents.fetch(...)` уходит воркеру как есть.
+- **Что агент проверяет по манифесту** — строго, не обращаясь к воркеру:
+  - запрос `agents.fetch(...)` проходит, только если метод и путь подходят под один из `routes`
+    (параметры после `?` не учитываются, `{id}` — не `.` и не `..`); иначе бэкенд получает
+    `ROUTE_UNDECLARED`. Задачи (`/jobs`, `/jobs/{id}`, `/jobs/{id}/cancel`) проходят только у
+    воркера с `jobs`, а тип в `POST /jobs` — только из `jobs` (иначе `JOB_UNKNOWN`). `GET /manifest`
+    проходит всегда, служебные пути — никогда (`PATH_FORBIDDEN`);
+  - событие, типа которого нет в `events`, агент отклоняет: `POST /events` отвечает
+    `400 EVENT_UNDECLARED`, до бэкенда оно не доходит. События задач (`job.progress`, `job.done`,
+    `job.failed`, `job.cancelled`) в `events` не перечисляют: агент принимает их, только если в
+    манифесте есть `jobs`; другие типы `job.*` заняты и отклоняются;
+  - ключ настроек, которого нет в `configs`, агент воркеру не передаёт: бэкенд видит ошибку
+    `CONFIG_KEY_UNKNOWN` ([configs.md](configs.md#статус-применения)); агент проверит ключ снова,
+    когда воркер зарегистрируется в следующий раз (например, после обновления);
+  - запрос к бэкенду, типа которого нет в `requests`, — `400 REQUEST_UNDECLARED`.
+- **Что агент не проверяет.** Значения по схемам — это делает бэкенд (опции `validateConfigs`,
+  `validateJobs`, `validateRequests`, `validateEvents`), агент сверяет только имена, типы и пути.
+- **Проверку маршрутов можно выключить** для одного воркера — `routes: open` в его настройках в
+  `agent.yaml` ([ARCHITECTURE.md](../../docs/ARCHITECTURE.md#настройки)): агент пропускает любой
+  путь, кроме служебных, и не сверяет тип задачи. Это для воркера, который ещё не описал свои
+  маршруты; события, ключи и запросы к бэкенду проверяются и тогда.
 
 Python (обработчик из [примера ниже](#python)):
 
@@ -306,6 +344,7 @@ mux.HandleFunc("GET /manifest", func(w http.ResponseWriter, _ *http.Request) {
 | `POST /events`      | тело `{ type, data? }` → `202` после записи на диск; бэкенд получит событие и после обрыва связи; очередь полна — `503 OUTBOX_FULL`, не записано по другой причине — `500 INTERNAL`; типа нет в `manifest.events` (событие задачи без `jobs` в манифесте) — `400 EVENT_UNDECLARED` |
 | `GET /config/{key}` | `{ version, data }` — сохранённые настройки этого воркера; нет ключа — `404`                                                                                                                                                                                                       |
 | `GET /context`      | `{ agent: { id, name, version, labels }, online }` — `online`: есть ли связь с бэкендом                                                                                                                                                                                            |
+| `POST /requests`    | тело `{ type, data?, timeoutMs? }` → `200 { data? }` — ответ бэкенда ([ниже](#запросы-к-бэкенду))                                                                                                                                                                                  |
 
 Тип события — `^[a-z][a-z0-9._-]{0,63}$`, `data` — до 64 КБ. Агент добавляет имя воркера и время.
 Ошибки — JSON `{ code, message }`: неверное тело или тип — `400 MESSAGE_INVALID`, `data` больше
@@ -313,6 +352,85 @@ mux.HandleFunc("GET /manifest", func(w http.ResponseWriter, _ *http.Request) {
 
 Всё, что воркер пишет в stdout и stderr, агент сохраняет в журнале: бэкенд читает его через
 `agents.logs(agentId, { worker })` ([observe.md](observe.md#журнал)).
+
+## Запросы к бэкенду
+
+Иногда воркеру нужно что-то от бэкенда прямо сейчас: данные, решение, разрешение. Для этого —
+`POST /requests` на сокете агента: агент передаёт запрос бэкенду и возвращает его ответ.
+Формат — [§12](../spec/README.md#12-воркер), образцы — `agent.requests*` в
+[worker.json](../spec/examples/worker.json).
+
+1. Объявите тип запроса в манифесте — `requests: [{ type, description?, schema?, response? }]`.
+2. Воркер шлёт `POST /requests` с телом `{ type, data?, timeoutMs? }` (`data` — до 1 МБ, срок —
+   по умолчанию 30 с, не больше 5 мин) и ждёт ответа.
+3. Бэкенд отвечает в обработчике `onWorkerRequest` ([sdk/README.md](../README.md#настройки)):
+   то, что он вернул, воркер получит как `200 { data }`.
+
+| Ответ агента             | Когда                                                                       |
+| ------------------------ | --------------------------------------------------------------------------- |
+| `200 { data? }`          | бэкенд ответил                                                              |
+| `422 { code, message }`  | бэкенд отказал: код — его (`REQUEST_UNHANDLED` — у бэкенда нет обработчика) |
+| `400 REQUEST_UNDECLARED` | типа нет в `manifest.requests`                                              |
+| `400 MESSAGE_INVALID`    | тело не JSON или `type` не по правилу; `413 BODY_TOO_LARGE` — больше 1 МБ   |
+| `503 AGENT_OFFLINE`      | нет связи с бэкендом — сразу, без ожидания                                  |
+| `503 DISCONNECTED`       | связь оборвалась, пока ждали ответа                                         |
+| `504 TIMEOUT`            | бэкенд не ответил за `timeoutMs`                                            |
+| `503 BUSY`               | больше 64 запросов сразу                                                    |
+
+Запрос не хранится на диске и не повторяется сам: это не событие. Без связи или после
+`TIMEOUT` повторить — дело воркера (или работать без ответа: например, с прежним значением).
+Если ответ нужно получить гарантированно, а не сейчас, — пошлите событие, а бэкенд ответит
+настройкой или задачей.
+
+Python (функция `agent` — из [примера ниже](#python)):
+
+```python
+status, body = agent("POST", "/requests", {"type": "example.lookup", "data": {"text": "привет"}, "timeoutMs": 5000})
+if status == 200:
+    prefix = body["data"]["prefix"]
+else:
+    print("бэкенд не ответил:", status, body.get("code"), body.get("message"))
+```
+
+Node.js (функция `agent` — из [примера ниже](#nodejs)):
+
+```js
+const res = await agent("POST", "/requests", { type: "example.lookup", data: { text: "привет" } });
+if (res.status === 200) prefix = res.body.data.prefix;
+```
+
+Go (клиент `agent` — из [примера ниже](#go)):
+
+```go
+body, _ := json.Marshal(map[string]any{"type": "example.lookup", "data": map[string]string{"text": "привет"}})
+req, _ := http.NewRequest("POST", "http://agent/requests", bytes.NewReader(body))
+req.Header.Set("Authorization", "Bearer "+os.Getenv("AGENT_WORKER_TOKEN"))
+resp, err := agent.Do(req)
+if err == nil && resp.StatusCode == http.StatusOK {
+	var reply struct {
+		Data struct{ Prefix string } `json:"data"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&reply)
+}
+```
+
+Бэкенд:
+
+```ts
+const agents = new Agents({
+  enrollToken,
+  onWorkerRequest: async (req) => {
+    if (req.type === "example.lookup") return { prefix: `${req.agent.name}: ` };
+    throw new AgentsError("REQUEST_UNHANDLED", `нет ответа на ${req.type}`, 404);
+  },
+});
+```
+
+Запрос приходит в процесс бэкенда, с которым агент на связи, и обрабатывается там (с несколькими
+процессами — без пересылки). Ошибка обработчика уходит воркеру: у `AgentsError` — её код и текст,
+у другой — `REQUEST_FAILED`; ответ больше 4 МБ — `BODY_TOO_LARGE`. `req.signal` прерывается, когда
+истёк срок или оборвалась связь. С опцией `validateRequests` бэкенд сам отклоняет `data` не по
+`requests[].schema` — `REQUEST_INVALID`, обработчик не вызывается.
 
 ## Python
 

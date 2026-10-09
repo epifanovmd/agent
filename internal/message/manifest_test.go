@@ -53,6 +53,12 @@ func TestParseManifest(t *testing.T) {
 		"событие job.*":    `{"version":"1","events":[{"type":"job.done"}]}`,
 		"тип задачи":       `{"version":"1","jobs":[{"type":"Build"}]}`,
 		"схема задачи":     `{"version":"1","jobs":[{"type":"build","schema":[]}]}`,
+		"схема тела":       `{"version":"1","routes":[{"method":"GET","path":"/a","request":1}]}`,
+		"схема ответа":     `{"version":"1","routes":[{"method":"GET","path":"/a","response":"x"}]}`,
+		"схема события":    `{"version":"1","events":[{"type":"done","schema":true}]}`,
+		"тип запроса":      `{"version":"1","requests":[{"type":"Ask"}]}`,
+		"схема запроса":    `{"version":"1","requests":[{"type":"ask","schema":[]}]}`,
+		"ответ запроса":    `{"version":"1","requests":[{"type":"ask","response":1}]}`,
 		"больше предела":   `{"version":"1","description":"` + strings.Repeat("a", MaxManifestBytes) + `"}`,
 	} {
 		if _, err := ParseWorkerManifest([]byte(body)); err == nil {
@@ -83,5 +89,58 @@ func TestManifestJobEvents(t *testing.T) {
 	plain, _ := ParseWorkerManifest([]byte(`{"version":"1","events":[{"type":"item.done"}]}`))
 	if plain.DeclaresEvent(JobEventDone) {
 		t.Error("без jobs события задач не принимаются")
+	}
+}
+
+// Схемы маршрутов, событий и запросов к серверу передаются как есть, null —
+// то же, что их нет.
+func TestManifestSchemasAndRequests(t *testing.T) {
+	m, err := ParseWorkerManifest([]byte(`{"version":"1",
+		"routes":[{"method":"POST","path":"/items/{id}","request":{"type":"object"},"response":null}],
+		"events":[{"type":"item.done","schema":{"type":"object"}}],
+		"requests":[{"type":"item.lookup","schema":{"type":"object"},"response":{"type":"string"}},{"type":"item.other","schema":null}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(m.Routes[0].Request) != `{"type":"object"}` || m.Routes[0].Response != nil ||
+		string(m.Events[0].Schema) != `{"type":"object"}` || len(m.Requests) != 2 || m.Requests[1].Schema != nil ||
+		string(m.Requests[0].Response) != `{"type":"string"}` {
+		t.Fatalf("схемы: %+v", m)
+	}
+	if !m.DeclaresRequest("item.lookup") || m.DeclaresRequest("item.done") || !m.DeclaresRoute("POST", "/items/7") ||
+		m.DeclaresRoute("GET", "/items/7") || m.DeclaresJob("x") {
+		t.Fatal("DeclaresRequest / DeclaresRoute")
+	}
+	var none *WorkerManifest
+	if none.DeclaresRequest("item.lookup") || none.DeclaresRoute("POST", "/items/7") || none.DeclaresJob("x") {
+		t.Fatal("без манифеста ничего не объявлено")
+	}
+}
+
+// Шаблон маршрута: сегменты совпадают точно, {name} — один непустой сегмент,
+// кроме «.» и «..».
+func TestMatchRoute(t *testing.T) {
+	for _, c := range []struct {
+		template, path string
+		want           bool
+	}{
+		{"/echo", "/echo", true},
+		{"/echo", "/echo/", false},
+		{"/echo", "/Echo", false},
+		{"/echo", "/echo/x", false},
+		{"/", "/", true},
+		{"/reports/{id}/send", "/reports/7/send", true},
+		{"/reports/{id}/send", "/reports//send", false},
+		{"/reports/{id}/send", "/reports/../send", false},
+		{"/reports/{id}/send", "/reports/./send", false},
+		{"/reports/{id}/send", "/reports/a/b/send", false},
+		{"/reports/{id}", "/reports/{id}", true},
+		{"/a/{x}/{y}", "/a/1/2", true},
+		{"/a/{}", "/a/{}", true},
+		{"/a/{}", "/a/1", false},
+	} {
+		if got := MatchRoute(c.template, c.path); got != c.want {
+			t.Errorf("%s ~ %s: %v, ждали %v", c.template, c.path, got, c.want)
+		}
 	}
 }

@@ -21,6 +21,11 @@ export const MAX_CONFIG_BYTES = 4 * MB;
 export const MAX_FETCH_BODY = 4 * MB;
 /** Сообщение WebSocket — байт (§16). */
 export const MAX_MESSAGE_BYTES = 8 * MB;
+/** data ответа на запрос воркера — байт JSON (§16). */
+export const MAX_REQUEST_RESULT = 4 * MB;
+/** Срок запроса воркера к серверу, мс: по умолчанию и наибольший (§16). */
+export const REQUEST_TIMEOUT_MS = 30_000;
+export const MAX_REQUEST_TIMEOUT_MS = 300_000;
 
 /** Имя агента при регистрации — символов. */
 export const MAX_AGENT_NAME = 128;
@@ -55,6 +60,10 @@ export const JOB_EVENTS = [
 
 /** Задачи воркера (§12): POST /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel. */
 export const JOBS_PATH = "/jobs";
+
+/** Запрос агента (§12): сервер отвечает `request.result` с `re`. */
+export const REQUEST = "request";
+export const REQUEST_RESULT = "request.result";
 
 /** Важные сообщения агента: подтверждаются `ack {ids}` (§3). */
 export const RELIABLE = new Set([

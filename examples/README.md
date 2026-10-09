@@ -36,10 +36,12 @@ examples/
 | `echo`      | `POST /echo` — текст в верхнем регистре; `GET /stream?n=5` — ответ по частям; `GET /bytes?n=256` — двоичный ответ; задачи `POST /jobs`, `POST /hang` — см. ниже | `settings`: `{ prefix, upper }`; неверное значение — 400                                   | счётчики запросов и событий              |
 | `node-echo` | то же                                                                                                                                                           | то же                                                                                      | то же                                    |
 | `sysinfo`   | `GET /info` — процесс, версия Go, баннер                                                                                                                        | `banner`: `{ text }` (до 200 символов)                                                     | горутины, память, время работы           |
-| `netprobe`  | задача `netprobe.run` (`POST /jobs`) — проверить сейчас                                                                                                         | `targets`: `{ targets: [{ id, host, port?, method? }], intervalSec?, count?, timeoutMs? }` | итог последнего круга: `{ at, results }` |
+| `netprobe`  | `GET /results` — итог последнего круга; задача `netprobe.run` (`POST /jobs`) — проверить сейчас                                                                 | `targets`: `{ targets: [{ id, host, port?, method? }], intervalSec?, count?, timeoutMs? }` | итог последнего круга: `{ at, results }` |
 
 - **Задачи `POST /jobs`** ([sdk/docs/workers.md](../sdk/docs/workers.md#задачи)) у `echo` и
-  `node-echo`: `echo.quick { text }` — итог сразу (`200 { result: { text } }`); `echo.long
+  `node-echo`: `echo.quick { text, lookup? }` — итог сразу (`200 { result: { text } }`;
+  `lookup: true` — префикс воркер спрашивает у бэкенда запросом `echo.lookup`, сервер стенда
+  отвечает `<имя агента>: `); `echo.long
 { steps, delayMs, text? }` — долгая: сразу `202 { id }`, затем события `job.progress { jobId, id,
 progress, message }` и итог `job.done { jobId, id, result: { text } }`. Пока задача идёт,
   `GET /health` отвечает `busy: true` — агент откладывает замену воркера до её окончания (на
@@ -55,9 +57,10 @@ count?, timeoutMs? }`: проверка сейчас, итог — `{ at, result
 - **`POST /cleanup`** — уборка при удалении агента с узла: `echo` и `node-echo` удаляют свой файл
   `ECHO_STATE_FILE` (если задан — туда записывается применённая настройка), сбрасывают настройку и
   счётчики; `sysinfo` — баннер.
-- **`GET /manifest`** — все четыре воркера описывают себя: версия, ключ настроек со схемой
-  значения, маршруты, события, типы задач со схемой `data` ([API.md](API.md)). Без `GET /health` и
-  `GET /manifest` агент воркер не регистрирует (`state: invalid`).
+- **`GET /manifest`** — все четыре воркера описывают себя: версия, ключ настроек, маршруты, события,
+  типы задач и запросы к бэкенду (`echo.lookup`) — со схемами ([API.md](API.md)). Без `GET /health`
+  и `GET /manifest` агент воркер не регистрирует (`state: invalid`); маршрута не из манифеста агент
+  к воркеру не пропускает (`ROUTE_UNDECLARED`).
 - Метрики узла собирает встроенный воркер агента `sysmetrics` — в `agent.demo.yaml` его нет.
 
 ## Запуск
@@ -127,3 +130,4 @@ echo, node-echo, sysinfo и netprobe (у `registration.test.ts` — ещё `bare
 | `longwork.test.ts`     | долгая задача `echo.long` переживает перезапуск агента (SIGTERM и запуск): тот же процесс, все шаги и итог дошли; `worker.restart` во время задачи — сразу `deferred` (`pending: restart`), замена и событие `action` — после её окончания; `force` — сразу, а `echo` продолжает задачу с сохранённого шага                                                                                                   |
 | `detect.test.ts`       | обнаружение потери связи с настройками по умолчанию: упавший процесс воркера — новый `state` не позже 2 с; убитый агент (SIGKILL) — `offline` не позже 8 с, `lastSeenAt` — последняя весть                                                                                                                                                                                                                    |
 | `actions.test.ts`      | выпуск, подписанный тестовым ключом (`agent-release keygen`, `manifest`): кандидаты обновления, чужая подпись — отказ, обновление агента с перезапуском (тест перезапускает процесс, как служба) — работа `echo` при этом не прерывается; `worker.restart`; перезапуск зависшего воркера; смена ключа; отзыв и новая регистрация по токену                                                                    |
+| `strict.test.ts`       | строгие возможности: маршрут не из манифеста — `ROUTE_UNDECLARED`, тип задачи — `JOB_UNKNOWN` (от агента), тело не по схеме маршрута — `REQUEST_INVALID` (`validateRequests`); запрос воркера к бэкенду `echo.lookup` в задаче `echo.quick`; `waitEvent` — `echo.started` после перезапуска, `data` по схеме (`validateEvents: reject`); `capabilities`                                                       |

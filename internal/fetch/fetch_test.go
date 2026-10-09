@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,8 +24,28 @@ import (
 )
 
 type workers struct {
-	client  *http.Client
-	running bool
+	client   *http.Client
+	running  bool
+	open     bool
+	manifest *message.WorkerManifest
+	// calls — запросы, дошедшие до воркера: метод и путь.
+	mu    sync.Mutex
+	calls []string
+}
+
+// testManifest — маршруты тестового воркера и задачи example.build.
+var testManifest = &message.WorkerManifest{Version: "1", Routes: []message.WorkerManifestRoute{
+	{Method: "POST", Path: "/echo"}, {Method: "PUT", Path: "/echo"}, {Method: "GET", Path: "/big"},
+	{Method: "GET", Path: "/bin"}, {Method: "GET", Path: "/slow"}, {Method: "DELETE", Path: "/items/{id}"},
+}, Jobs: []message.WorkerManifestJob{{Type: "example.build"}}}
+
+func (w *workers) Manifest(string) *message.WorkerManifest { return w.manifest }
+func (w *workers) OpenRoutes(string) bool                  { return w.open }
+
+func (w *workers) called() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.calls)
 }
 
 func (w *workers) Has(name string) bool { return name == "echo" }
@@ -47,7 +68,14 @@ func testWorker(t *testing.T) *workers {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ws := &workers{running: true, manifest: testManifest}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		ws.mu.Lock()
+		ws.calls = append(ws.calls, r.Method+" "+r.URL.Path)
+		ws.mu.Unlock()
+		w.WriteHeader(http.StatusTeapot)
+	})
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		w.Header().Add("X-Multi", "a")
@@ -69,10 +97,11 @@ func testWorker(t *testing.T) *workers {
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
-	return &workers{running: true, client: &http.Client{Transport: &http.Transport{
+	ws.client = &http.Client{Transport: &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
-		}}}}
+		}}}
+	return ws
 }
 
 // session — соединение для тестов: собирает ответы.
@@ -311,5 +340,77 @@ func TestFetchTimeoutCancelDisconnectBusy(t *testing.T) {
 				t.Fatal("после разрыва ничего не досылается")
 			}
 		}
+	}
+}
+
+// Маршруты — только из манифеста (§7): необъявленный путь или метод —
+// ROUTE_UNDECLARED без обращения к воркеру; {name} — один сегмент, query не
+// учитывается; задачи — только у воркера с jobs, тип POST /jobs — из
+// манифеста (JOB_UNKNOWN); GET /manifest — всегда; routes: open — любой путь,
+// кроме служебных.
+func TestFetchRoutes(t *testing.T) {
+	w := testWorker(t)
+	tun := New(w, logx.Discard())
+	s := newSession()
+	job := func(typ string) string { return `{"type":"` + typ + `","jobId":"j1"}` }
+	cases := []struct {
+		id   string
+		f    message.Fetch
+		code string // "" — дошёл до воркера
+	}{
+		{"declared", message.Fetch{Method: "DELETE", Path: "/items/7?force=1"}, ""},
+		{"method", message.Fetch{Method: "GET", Path: "/items/7"}, message.CodeRouteUndeclared},
+		{"segments", message.Fetch{Method: "DELETE", Path: "/items/7/x"}, message.CodeRouteUndeclared},
+		{"dotdot", message.Fetch{Method: "DELETE", Path: "/items/.."}, message.CodeRouteUndeclared},
+		{"escaped-dotdot", message.Fetch{Method: "DELETE", Path: "/items/%2e%2e"}, message.CodeRouteUndeclared},
+		{"unknown", message.Fetch{Method: "GET", Path: "/hidden"}, message.CodeRouteUndeclared},
+		{"trailing", message.Fetch{Method: "POST", Path: "/echo/"}, message.CodeRouteUndeclared},
+		{"manifest", message.Fetch{Method: "GET", Path: "/manifest"}, ""},
+		{"job", message.Fetch{Method: "POST", Path: "/jobs", Body: job("example.build")}, ""},
+		{"job-unknown", message.Fetch{Method: "POST", Path: "/jobs", Body: job("example.other")}, message.CodeJobUnknown},
+		{"job-base64", message.Fetch{Method: "POST", Path: "/jobs", Encoding: "base64",
+			Body: base64.StdEncoding.EncodeToString([]byte(job("example.other")))}, message.CodeJobUnknown},
+		{"job-not-json", message.Fetch{Method: "POST", Path: "/jobs", Body: "build"}, message.CodeMessageInvalid},
+		{"job-status", message.Fetch{Method: "GET", Path: "/jobs/b81c"}, ""},
+		{"job-cancel", message.Fetch{Method: "POST", Path: "/jobs/b81c/cancel"}, ""},
+		{"job-other", message.Fetch{Method: "DELETE", Path: "/jobs/b81c"}, message.CodeRouteUndeclared},
+	}
+	for _, c := range cases {
+		tun.Handle(s, request(c.id, c.f))
+		r := s.wait(t, c.id)
+		got := ""
+		if e := endError(t, r[len(r)-1]); e != nil {
+			got = e.Code
+		}
+		if got != c.code || (c.code != "" && len(r) != 1) {
+			t.Errorf("%s: %q, ждали %q (%d сообщений)", c.id, got, c.code, len(r))
+		}
+	}
+	want := []string{"DELETE /items/7", "GET /manifest", "POST /jobs", "GET /jobs/b81c", "POST /jobs/b81c/cancel"}
+	if got := w.called(); !slices.Equal(got, want) {
+		t.Fatalf("до воркера дошли %v, ждали %v", got, want)
+	}
+
+	// Без jobs в манифесте задачи — необъявленный маршрут.
+	w.manifest = &message.WorkerManifest{Version: "1", Routes: testManifest.Routes}
+	tun.Handle(s, request("no-jobs", message.Fetch{Method: "POST", Path: "/jobs", Body: job("example.build")}))
+	if r := s.wait(t, "no-jobs"); endError(t, r[0]).Code != message.CodeRouteUndeclared {
+		t.Fatalf("задачи без jobs: %+v", r)
+	}
+
+	// routes: open — любой путь и тип задачи, служебные — по-прежнему нет.
+	w.open = true
+	for id, f := range map[string]message.Fetch{
+		"open-hidden": {Method: "GET", Path: "/hidden"},
+		"open-job":    {Method: "POST", Path: "/jobs", Body: job("example.other")},
+	} {
+		tun.Handle(s, request(id, f))
+		if r := s.wait(t, id); endError(t, r[len(r)-1]) != nil || r[0].Type != message.TypeFetchHead {
+			t.Errorf("%s: %+v", id, r)
+		}
+	}
+	tun.Handle(s, request("open-metrics", message.Fetch{Path: "/metrics"}))
+	if r := s.wait(t, "open-metrics"); endError(t, r[0]).Code != message.CodePathForbidden {
+		t.Fatalf("служебный путь при routes: open: %+v", r)
 	}
 }

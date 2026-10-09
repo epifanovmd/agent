@@ -15,12 +15,22 @@ import (
 // WorkerManifest — ответ GET /manifest воркера (§12): что воркер умеет.
 // Обязательно только Version.
 type WorkerManifest struct {
-	Version     string                 `json:"version,omitempty"`
-	Description string                 `json:"description,omitempty"`
-	Configs     []WorkerManifestConfig `json:"configs,omitempty"`
-	Routes      []WorkerManifestRoute  `json:"routes,omitempty"`
-	Events      []WorkerManifestEvent  `json:"events,omitempty"`
-	Jobs        []WorkerManifestJob    `json:"jobs,omitempty"`
+	Version     string                  `json:"version,omitempty"`
+	Description string                  `json:"description,omitempty"`
+	Configs     []WorkerManifestConfig  `json:"configs,omitempty"`
+	Routes      []WorkerManifestRoute   `json:"routes,omitempty"`
+	Events      []WorkerManifestEvent   `json:"events,omitempty"`
+	Jobs        []WorkerManifestJob     `json:"jobs,omitempty"`
+	Requests    []WorkerManifestRequest `json:"requests,omitempty"`
+}
+
+// WorkerManifestRequest — тип запроса воркера к серверу (§12); Schema — JSON
+// Schema поля data запроса, Response — data ответа.
+type WorkerManifestRequest struct {
+	Type        string          `json:"type"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Response    json.RawMessage `json:"response,omitempty"`
 }
 
 // WorkerManifestJob — тип задачи воркера (§12); Schema — JSON Schema поля data.
@@ -38,10 +48,13 @@ type WorkerManifestConfig struct {
 }
 
 // WorkerManifestRoute — маршрут для fetch; {name} в Path — один сегмент пути.
+// Request — JSON Schema тела запроса, Response — тела ответа 2xx.
 type WorkerManifestRoute struct {
-	Method      string `json:"method"`
-	Path        string `json:"path"`
-	Description string `json:"description,omitempty"`
+	Method      string          `json:"method"`
+	Path        string          `json:"path"`
+	Description string          `json:"description,omitempty"`
+	Request     json.RawMessage `json:"request,omitempty"`
+	Response    json.RawMessage `json:"response,omitempty"`
 }
 
 // DeclaresConfig — ключ key есть в Configs.
@@ -70,10 +83,56 @@ func IsJobEvent(typ string) bool {
 	return false
 }
 
-// WorkerManifestEvent — тип события, которое шлёт воркер.
+// WorkerManifestEvent — тип события, которое шлёт воркер; Schema — JSON Schema
+// поля data.
 type WorkerManifestEvent struct {
-	Type        string `json:"type"`
-	Description string `json:"description,omitempty"`
+	Type        string          `json:"type"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+}
+
+// DeclaresJob — тип задачи typ есть в Jobs.
+func (m *WorkerManifest) DeclaresJob(typ string) bool {
+	return m != nil && slices.ContainsFunc(m.Jobs, func(j WorkerManifestJob) bool { return j.Type == typ })
+}
+
+// DeclaresRequest — тип запроса к серверу typ есть в Requests.
+func (m *WorkerManifest) DeclaresRequest(typ string) bool {
+	return m != nil && slices.ContainsFunc(m.Requests, func(r WorkerManifestRequest) bool { return r.Type == typ })
+}
+
+// DeclaresRoute — маршрут method + path (путь без параметров, с раскрытыми
+// %XX) подходит под один из Routes (§7).
+func (m *WorkerManifest) DeclaresRoute(method, path string) bool {
+	return m != nil && slices.ContainsFunc(m.Routes, func(r WorkerManifestRoute) bool {
+		return r.Method == method && MatchRoute(r.Path, path)
+	})
+}
+
+// MatchRoute — путь подходит под шаблон маршрута: сегменты между «/»
+// совпадают, {name} — один любой непустой сегмент, кроме «.» и «..».
+func MatchRoute(template, path string) bool {
+	want, got := strings.Split(template, "/"), strings.Split(path, "/")
+	if len(want) != len(got) {
+		return false
+	}
+	for i, part := range want {
+		if isParam(part) {
+			if got[i] == "" || got[i] == "." || got[i] == ".." {
+				return false
+			}
+			continue
+		}
+		if part != got[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// isParam — сегмент шаблона {name}.
+func isParam(part string) bool {
+	return len(part) > 2 && part[0] == '{' && part[len(part)-1] == '}' && !strings.ContainsAny(part[1:len(part)-1], "{}")
 }
 
 // Пределы манифеста (§16).
@@ -98,14 +157,21 @@ func ParseWorkerManifest(raw []byte) (*WorkerManifest, error) {
 		return nil, fmt.Errorf("неверный JSON: %w", err)
 	}
 	for i := range m.Configs {
-		if string(bytes.TrimSpace(m.Configs[i].Schema)) == "null" {
-			m.Configs[i].Schema = nil
-		}
+		dropNull(&m.Configs[i].Schema)
 	}
 	for i := range m.Jobs {
-		if string(bytes.TrimSpace(m.Jobs[i].Schema)) == "null" {
-			m.Jobs[i].Schema = nil
-		}
+		dropNull(&m.Jobs[i].Schema)
+	}
+	for i := range m.Routes {
+		dropNull(&m.Routes[i].Request)
+		dropNull(&m.Routes[i].Response)
+	}
+	for i := range m.Events {
+		dropNull(&m.Events[i].Schema)
+	}
+	for i := range m.Requests {
+		dropNull(&m.Requests[i].Schema)
+		dropNull(&m.Requests[i].Response)
 	}
 	if err := m.Check(); err != nil {
 		return nil, err
@@ -133,6 +199,8 @@ func (m *WorkerManifest) Check() error {
 		return fmt.Errorf("events: больше %d", MaxManifestItems)
 	case len(m.Jobs) > MaxManifestItems:
 		return fmt.Errorf("jobs: больше %d", MaxManifestItems)
+	case len(m.Requests) > MaxManifestItems:
+		return fmt.Errorf("requests: больше %d", MaxManifestItems)
 	}
 	for i, c := range m.Configs {
 		at := fmt.Sprintf("configs[%d]", i)
@@ -142,8 +210,8 @@ func (m *WorkerManifest) Check() error {
 		if err := maxChars(at+".description", c.Description, MaxManifestText); err != nil {
 			return err
 		}
-		if len(c.Schema) > 0 && !isObject(c.Schema) {
-			return fmt.Errorf("%s.schema: нужен объект", at)
+		if err := schemaField(at+".schema", c.Schema); err != nil {
+			return err
 		}
 	}
 	for i, r := range m.Routes {
@@ -158,6 +226,12 @@ func (m *WorkerManifest) Check() error {
 		if err := maxChars(at+".description", r.Description, MaxManifestText); err != nil {
 			return err
 		}
+		if err := schemaField(at+".request", r.Request); err != nil {
+			return err
+		}
+		if err := schemaField(at+".response", r.Response); err != nil {
+			return err
+		}
 	}
 	for i, e := range m.Events {
 		at := fmt.Sprintf("events[%d]", i)
@@ -170,6 +244,9 @@ func (m *WorkerManifest) Check() error {
 		if err := maxChars(at+".description", e.Description, MaxManifestText); err != nil {
 			return err
 		}
+		if err := schemaField(at+".schema", e.Schema); err != nil {
+			return err
+		}
 	}
 	for i, j := range m.Jobs {
 		at := fmt.Sprintf("jobs[%d]", i)
@@ -179,11 +256,41 @@ func (m *WorkerManifest) Check() error {
 		if err := maxChars(at+".description", j.Description, MaxManifestText); err != nil {
 			return err
 		}
-		if len(j.Schema) > 0 && !isObject(j.Schema) {
-			return fmt.Errorf("%s.schema: нужен объект", at)
+		if err := schemaField(at+".schema", j.Schema); err != nil {
+			return err
+		}
+	}
+	for i, r := range m.Requests {
+		at := fmt.Sprintf("requests[%d]", i)
+		if !ValidEventType(r.Type) {
+			return fmt.Errorf("%s.type: %q не по правилу %s", at, r.Type, EventTypePattern)
+		}
+		if err := maxChars(at+".description", r.Description, MaxManifestText); err != nil {
+			return err
+		}
+		if err := schemaField(at+".schema", r.Schema); err != nil {
+			return err
+		}
+		if err := schemaField(at+".response", r.Response); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// schemaField — схема манифеста: нет или объект JSON.
+func schemaField(field string, raw json.RawMessage) error {
+	if len(raw) > 0 && !isObject(raw) {
+		return fmt.Errorf("%s: нужен объект", field)
+	}
+	return nil
+}
+
+// dropNull — схема null — то же, что её нет.
+func dropNull(raw *json.RawMessage) {
+	if string(bytes.TrimSpace(*raw)) == "null" {
+		*raw = nil
+	}
 }
 
 func maxChars(field, s string, limit int) error {

@@ -35,11 +35,20 @@ export {
   type PackageManager,
 } from "./features/install";
 export type { JobFiles, JobOptions, JobResult } from "./features/jobs";
-export type { WatchOptions, WatchRef } from "./features/observe";
+export type {
+  EventFilter,
+  EventHandler,
+  WaitEventOptions,
+  WatchOptions,
+  WatchRef,
+} from "./features/observe";
 export { RELAY_SECRET_HEADER } from "./features/relay";
 export type { FetchInit } from "./features/tunnel";
 export { shellQuote } from "./lib/shell";
 export {
+  capabilities,
+  declaresEvent,
+  findRoute,
   matchRoute,
   supports,
   type SupportsQuery,

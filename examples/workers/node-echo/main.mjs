@@ -5,15 +5,18 @@
 //   GET  /stream?n=5       ответ по частям: n строк с паузой
 //   GET  /bytes?n=256      двоичный ответ: n байт 0, 1, …, 255, 0, …
 //   POST /hang             «зависнуть»: GET /health больше не отвечает (агент перезапустит воркер)
-//   POST /jobs             задачи (§12): echo.quick {text} → 200 {result: {text}};
+//   POST /jobs             задачи (§12): echo.quick {text, lookup?} → 200 {result: {text}}
+//                          (lookup: true — префикс спросить у бэкенда, запрос echo.lookup);
 //                          echo.long {steps, delayMs, text?} → 202 {id}, события job.progress и
 //                          job.done; пока задача идёт, GET /health отвечает busy: true
 //   GET  /jobs/{id}        состояние задачи; POST /jobs/{id}/cancel — прервать (job.cancelled)
 //   PUT  /config/settings  {version, data: {"prefix", "upper"}}; неверное — 400 {message}
 //   DELETE /config/settings, GET /metrics, GET /health, POST /cleanup
-//   GET  /manifest         что воркер умеет: версия, ключ settings со схемой, маршруты, события
+//   GET  /manifest         что воркер умеет: версия, ключ settings, маршруты, события, задачи и
+//                          запросы к бэкенду — со схемами
 //
-// События — POST /events на AGENT_SOCKET с токеном AGENT_WORKER_TOKEN.
+// События — POST /events на AGENT_SOCKET с токеном AGENT_WORKER_TOKEN; запрос к бэкенду — POST
+// /requests туда же, ответ — когда бэкенд ответит.
 // ECHO_STATE_FILE (необязательно) — файл на узле с применённой настройкой: пример того, что воркер
 // создаёт на узле и убирает при POST /cleanup.
 import { createServer, request } from "node:http";
@@ -24,8 +27,9 @@ const VERSION = "1.0.0";
 const DEFAULTS = { prefix: "", upper: true };
 const MAX_PREFIX = 64;
 
-// Манифест (sdk/spec §12): по нему сервер знает, что умеет воркер, и может проверить настройку
-// по схеме до отправки агенту.
+// Манифест (sdk/spec §12): по нему агент пропускает к воркеру только объявленные маршруты, задачи,
+// события и запросы к бэкенду, а сервер может проверить настройку, тело запроса и data события по
+// схемам.
 const MANIFEST = {
   version: VERSION,
   description: "Эхо на Node.js: текст, потоковый и двоичный ответ, быстрые и долгие задачи",
@@ -41,17 +45,33 @@ const MANIFEST = {
     },
   ],
   routes: [
-    { method: "POST", path: "/echo", description: "Текст с префиксом" },
+    {
+      method: "POST",
+      path: "/echo",
+      description: "Текст с префиксом",
+      request: { type: "object", properties: { text: { type: "string" } } },
+      response: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+    },
     { method: "GET", path: "/stream", description: "Ответ по частям, ?n= строк" },
     { method: "GET", path: "/bytes", description: "Двоичный ответ, ?n= байт" },
     { method: "POST", path: "/hang", description: "Зависнуть: GET /health больше не отвечает" },
   ],
-  events: [{ type: "echo.started", description: "Воркер запущен" }],
+  events: [
+    {
+      type: "echo.started",
+      description: "Воркер запущен",
+      schema: {
+        type: "object",
+        properties: { version: { type: "string" }, pid: { type: "integer" } },
+        required: ["version", "pid"],
+      },
+    },
+  ],
   jobs: [
     {
       type: "echo.quick",
-      description: "Текст с префиксом — итог сразу",
-      schema: { type: "object", properties: { text: { type: "string" } } },
+      description: "Текст с префиксом — итог сразу; lookup: true — префикс от бэкенда",
+      schema: { type: "object", properties: { text: { type: "string" }, lookup: { type: "boolean" } } },
     },
     {
       type: "echo.long",
@@ -64,6 +84,14 @@ const MANIFEST = {
           text: { type: "string" },
         },
       },
+    },
+  ],
+  requests: [
+    {
+      type: "echo.lookup",
+      description: "Спросить у бэкенда префикс для текста",
+      schema: { type: "object", properties: { text: { type: "string" } } },
+      response: { type: "object", properties: { prefix: { type: "string" } }, required: ["prefix"] },
     },
   ],
 };
@@ -128,6 +156,14 @@ async function event(type, data) {
     lastEventError = e.message;
     console.error(`событие ${type} не отправлено: ${e.message}`);
   }
+}
+
+/** Запрос к бэкенду echo.lookup → префикс; ошибка — исключение с текстом. */
+async function lookup(text) {
+  const { status, body } = await agent("POST", "/requests", { type: "echo.lookup", data: { text }, timeoutMs: 5000 });
+  if (status !== 200) throw new Error(`HTTP ${status} ${body?.code ?? ""}: ${body?.message ?? ""}`);
+  if (typeof body?.data?.prefix !== "string") throw new Error("бэкенд не прислал prefix");
+  return body.data.prefix;
 }
 
 const transform = (text) => settings.prefix + (settings.upper ? text.toUpperCase() : text);
@@ -233,7 +269,13 @@ async function route(req, res) {
     const text = String(data?.text ?? "");
     if (type === "echo.quick") {
       counters.echoed++;
-      return json(res, 200, { result: { text: transform(text) } });
+      if (!data?.lookup) return json(res, 200, { result: { text: transform(text) } });
+      try {
+        const prefix = await lookup(text);
+        return json(res, 200, { result: { text: prefix + transform(text), prefix } });
+      } catch (e) {
+        return json(res, 503, { message: `префикс от бэкенда не получен: ${e.message}` });
+      }
     }
     if (type !== "echo.long") return json(res, 400, { message: `задачи ${type} нет: есть echo.quick и echo.long` });
     const steps = Number(data.steps ?? 5);

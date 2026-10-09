@@ -38,6 +38,7 @@ export const samples = (): Map<string, Sample & { file: string }> => {
     "observe",
     "actions",
     "events",
+    "requests",
     "worker",
   ]) {
     const all = JSON.parse(

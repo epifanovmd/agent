@@ -46,6 +46,11 @@ const HTTP_STATUS: Record<string, number> = {
   CONFIG_INVALID: 400,
   // Ключа нет в манифесте воркера: настройки не подходят к тому, что воркер умеет.
   CONFIG_KEY_UNKNOWN: 409,
+  // Маршрута нет в манифесте воркера (§7): у воркера нет такого метода.
+  ROUTE_UNDECLARED: 404,
+  JOB_UNKNOWN: 409,
+  EVENT_UNDECLARED: 409,
+  REQUEST_INVALID: 400,
 };
 
 /** Ошибка с кодом; статус — явный или по коду. */

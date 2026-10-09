@@ -32,6 +32,7 @@ import (
 	"github.com/epifanovmd/agent/internal/logx"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/outbox"
+	"github.com/epifanovmd/agent/internal/requests"
 	"github.com/epifanovmd/agent/internal/stream"
 	"github.com/epifanovmd/agent/internal/sysmetrics"
 	"github.com/epifanovmd/agent/internal/update"
@@ -67,6 +68,7 @@ type App struct {
 	workers *worker.Supervisor
 	configs *configs.Store
 	tunnel  *fetch.Tunnel
+	asks    *requests.Broker
 	runDir  string
 	update  update.Paths
 	pubKey  ed25519.PublicKey
@@ -157,6 +159,12 @@ func New(cfg config.Config, version string) (*App, error) {
 		return nil, err
 	}
 	a.tunnel = fetch.New(configWorkers{a.workers}, log)
+	a.asks = requests.New(func() requests.Session {
+		if s := a.link.Session(); s != nil {
+			return s
+		}
+		return nil
+	})
 	ok = true
 	return a, nil
 }
@@ -194,6 +202,12 @@ func (c configWorkers) ConfigRetry(name string) time.Duration {
 
 // Manifest — манифест воркера (ключи, которые ему можно передавать).
 func (c configWorkers) Manifest(name string) *message.WorkerManifest { return c.s.Manifest(name) }
+
+// OpenRoutes — fetch к воркеру без сверки с манифестом (routes: open).
+func (c configWorkers) OpenRoutes(name string) bool {
+	spec, _ := c.s.Spec(name)
+	return spec.OpenRoutes()
+}
 
 func (c configWorkers) Client(name string) (*http.Client, error) {
 	if !c.Has(name) {
@@ -351,6 +365,12 @@ func (a *App) OnMessage(s *link.Session, env message.Envelope) {
 		a.setWatch(w)
 	case message.TypeAction:
 		a.action(env)
+	case message.TypeRequestResult:
+		if err := a.asks.Result(env); errors.Is(err, requests.ErrUnexpected) {
+			a.log.Debug("request.result: запрос уже не ждёт ответа", "re", env.Re)
+		} else if err != nil {
+			a.log.Warn("request.result: неверное сообщение", "err", err)
+		}
 	case message.TypeWelcome:
 	default:
 		a.log.Warn("незнакомое сообщение сервера — пропущено", "type", env.Type)
@@ -419,6 +439,16 @@ func (s sockAgent) Event(e message.Event) error {
 // присланное сразу после запуска, ждёт итога первой проверки регистрации.
 func (s sockAgent) Declared(ctx context.Context, name, typ string) bool {
 	return s.a.workers.WaitManifest(ctx, name).DeclaresEvent(typ)
+}
+
+// DeclaredRequest — тип запроса к серверу объявлен в манифесте воркера (§12).
+func (s sockAgent) DeclaredRequest(ctx context.Context, name, typ string) bool {
+	return s.a.workers.WaitManifest(ctx, name).DeclaresRequest(typ)
+}
+
+// Request — запрос воркера к серверу в текущем соединении.
+func (s sockAgent) Request(ctx context.Context, name string, p message.RequestPost) (json.RawMessage, error) {
+	return s.a.asks.Do(ctx, name, p)
 }
 
 func (s sockAgent) Config(name, key string) (message.ConfigValue, bool) {

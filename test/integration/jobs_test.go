@@ -55,4 +55,18 @@ func TestJobs(t *testing.T) {
 	if err := s.server.Action("runJob", a.ID, nil, "plain", map[string]any{"type": "example.quick"}); errorCode(err) != "JOB_UNKNOWN" {
 		t.Fatalf("воркер без jobs: %v", err)
 	}
+
+	// Агент сам сверяет задачи с манифестом (§7): тип не из jobs — JOB_UNKNOWN, задачи у
+	// воркера без jobs — ROUTE_UNDECLARED; до воркера такие запросы не доходят.
+	post := testserver.FetchInit{Method: "POST", Headers: map[string]string{"Content-Type": "application/json"},
+		Body: `{"type":"example.none","jobId":"j-2"}`}
+	if _, err := s.server.Fetch(a.ID, "jobs", "/jobs", post); errorCode(err) != "JOB_UNKNOWN" {
+		t.Fatalf("fetch POST /jobs с типом не из манифеста: %v", err)
+	}
+	if _, err := s.server.Fetch(a.ID, "plain", "/jobs/w-j-1", testserver.FetchInit{}); errorCode(err) != "ROUTE_UNDECLARED" {
+		t.Fatalf("GET /jobs/{id} у воркера без jobs: %v", err)
+	}
+	if res := s.fetch(a.ID, "jobs", "/jobs/w-j-1/cancel", testserver.FetchInit{Method: "POST"}); res.Status != 404 {
+		t.Fatalf("POST /jobs/{id}/cancel доходит до воркера: %+v", res)
+	}
 }

@@ -9,7 +9,7 @@ const version = "1.0.0"
 const jobRun = "netprobe.run"
 
 // manifest — самоописание воркера (sdk/spec §12): ключ настроек со схемой по пределам Spec,
-// задача проверки.
+// маршрут итогов последнего круга, задача проверки.
 var manifest = map[string]any{
 	"version":     version,
 	"description": "Связность узла с целями: потери и время ответа по ICMP или TCP",
@@ -38,6 +38,11 @@ var manifest = map[string]any{
 				"timeoutMs":   map[string]any{"type": "integer", "minimum": minTimeoutMs, "maximum": maxTimeoutMs},
 			},
 		},
+	}},
+	"routes": []any{map[string]any{"method": "GET", "path": "/results", "description": "Итог последнего круга проверок",
+		"response": map[string]any{"type": "object", "properties": map[string]any{
+			"at": map[string]any{"type": "integer"}, "results": map[string]any{"type": "array"},
+		}},
 	}},
 	"jobs": []any{map[string]any{"type": jobRun,
 		"description": "Проверка сейчас: цели из настроек или из data {targets?, count?, timeoutMs?}",

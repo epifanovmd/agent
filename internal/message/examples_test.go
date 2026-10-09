@@ -123,15 +123,16 @@ func roundTrip(t *testing.T, what string, raw []byte, v any) {
 
 // Содержимое сообщений по направлению; nil — сообщение без data.
 var serverToAgent = map[string]func() any{
-	TypeWelcome:      func() any { return &Welcome{} },
-	TypeConfigPut:    func() any { return &ConfigPut{} },
-	TypeConfigDelete: func() any { return &ConfigDelete{} },
-	TypeFetch:        func() any { return &Fetch{} },
-	TypeFetchCancel:  nil,
-	TypeWatch:        func() any { return &Watch{} },
-	TypeAction:       func() any { return &Action{} },
-	TypeAck:          func() any { return &Ack{} },
-	TypeError:        func() any { return &Error{} },
+	TypeWelcome:       func() any { return &Welcome{} },
+	TypeConfigPut:     func() any { return &ConfigPut{} },
+	TypeConfigDelete:  func() any { return &ConfigDelete{} },
+	TypeFetch:         func() any { return &Fetch{} },
+	TypeFetchCancel:   nil,
+	TypeWatch:         func() any { return &Watch{} },
+	TypeAction:        func() any { return &Action{} },
+	TypeAck:           func() any { return &Ack{} },
+	TypeError:         func() any { return &Error{} },
+	TypeRequestResult: func() any { return &RequestResult{} },
 }
 
 var agentToServer = map[string]func() any{
@@ -146,6 +147,7 @@ var agentToServer = map[string]func() any{
 	TypeFetchEnd:      func() any { return &FetchEnd{} },
 	TypeActionResult:  func() any { return &ActionResult{} },
 	TypeActionDone:    func() any { return &ActionDone{} },
+	TypeRequest:       func() any { return &Request{} },
 }
 
 // Аргументы и итоги действий; nil — их нет.
@@ -238,6 +240,8 @@ func TestExamplesMessages(t *testing.T) {
 				checkClass(t, env)
 			} else if (env.Type == TypeFetch || env.Type == TypeAction) && env.ID == "" {
 				t.Fatalf("запрос %s без id", env.Type)
+			} else if env.Type == TypeRequestResult && (env.Re == "" || env.ID != "") {
+				t.Fatalf("ответ %s: нужен только re", env.Type)
 			}
 			switch env.Type {
 			case TypeAction:
@@ -262,6 +266,12 @@ func TestExamplesMessages(t *testing.T) {
 				if r.OK {
 					seenResults[act] = true
 					decodeResult(t, act, r.Result)
+				}
+			case TypeRequestResult:
+				var r RequestResult
+				_ = env.Decode(&r)
+				if r.OK == (r.Error != nil) || (!r.OK && len(r.Data) > 0) {
+					t.Fatalf("ok, data и error противоречат друг другу")
 				}
 			case TypeActionDone:
 				var d ActionDone
@@ -329,6 +339,10 @@ func checkClass(t *testing.T, env Envelope) {
 		if env.Re == "" || env.ID != "" || env.Seq != 0 {
 			t.Fatalf("ответ %s: нужен только re", env.Type)
 		}
+	case ClassRequest:
+		if env.ID == "" || env.Re != "" || env.Seq != 0 {
+			t.Fatalf("запрос %s: нужен только id", env.Type)
+		}
 	}
 }
 
@@ -353,6 +367,7 @@ var routes = []route{
 	{"worker", "agent", "POST", EventsPath, func() any { return &EventPost{} }, nil, errorInfo},
 	{"worker", "agent", "GET", ConfigPathPrefix, nil, func() any { return &ConfigValue{} }, errorInfo},
 	{"worker", "agent", "GET", ContextPath, nil, func() any { return &Context{} }, errorInfo},
+	{"worker", "agent", "POST", RequestsPath, func() any { return &RequestPost{} }, func() any { return &RequestReply{} }, errorInfo},
 }
 
 func errorInfo() any   { return &ErrorInfo{} }

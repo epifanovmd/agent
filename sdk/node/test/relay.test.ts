@@ -363,4 +363,29 @@ describe("пересылка между процессами (relay)", () => {
     assert.equal(relayed.length, 0);
     await sleep(10);
   });
+  it("запрос воркера приходит в процесс с сессией и обрабатывается там", async () => {
+    const handledBy: string[] = [];
+    const handler =
+      (name: string) => (req: { type: string; data?: unknown }) => {
+        handledBy.push(name);
+
+        return { by: name, echo: req.data };
+      };
+    const { c, fa, relayed } = await pair({
+      a: { onWorkerRequest: handler("a") },
+      b: { onWorkerRequest: handler("b") },
+    });
+
+    fa.send({
+      type: "request",
+      id: "q1",
+      data: { worker: "echo", type: "echo.lookup", data: { k: 1 } },
+    });
+    const res = await fa.next("request.result", e => e.re === "q1");
+
+    assert.deepEqual(res.data, { ok: true, data: { by: "a", echo: { k: 1 } } });
+    assert.deepEqual(handledBy, ["a"]);
+    assert.equal(relayed.length, 0);
+    assert.ok(c.agentId);
+  });
 });

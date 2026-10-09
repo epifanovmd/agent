@@ -1,10 +1,11 @@
 // Agents — серверная часть связи с агентами. Фасад: собирает части из features/ (регистрация и
-// ключи, сессии, приём сообщений, настройки, fetch, задачи, наблюдение, действия, выпуск,
-// пересылка между процессами) и передаёт им вызовы. Общее для частей — core/, данные — store/, HTTP и WebSocket — transport/.
+// ключи, сессии, приём сообщений, настройки, fetch, задачи, наблюдение и подписки на события,
+// запросы воркеров, действия, выпуск, пересылка между процессами) и передаёт им вызовы. Общее для частей — core/, данные — store/, HTTP и WebSocket — transport/.
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
 import { type AgentsEvents, createContext } from "./core/context";
+import { codeError } from "./core/errors";
 import {
   agentsDefaults,
   type AgentsOptions,
@@ -26,17 +27,28 @@ import { Enrollment } from "./features/enrollment";
 import { Inbound } from "./features/inbound";
 import { installCommand, type InstallOptions } from "./features/install";
 import { type JobOptions, type JobResult, Jobs } from "./features/jobs";
-import { Observe, type WatchOptions, type WatchRef } from "./features/observe";
+import {
+  type EventFilter,
+  type EventHandler,
+  Observe,
+  type WaitEventOptions,
+  type WatchOptions,
+  type WatchRef,
+} from "./features/observe";
 import { type Fetcher, Relay } from "./features/relay";
 import { Release } from "./features/release";
+import { Requests } from "./features/requests";
 import { type FetchInit, fetchReply, Tunnel } from "./features/tunnel";
+import { capabilities } from "./model/manifest";
 import { publicAgent } from "./model/public-agent";
 import type {
   Agent,
+  AgentEvent,
   Alert,
   ConfigRecord,
   ConfigStatus,
   UpdateCandidate,
+  WorkerCapabilities,
   WorkerUpdateCandidate,
 } from "./model/types";
 import {
@@ -119,6 +131,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
     unwatch(agentId: string, id: string): Promise<void>;
   };
   private readonly relay: Relay;
+  private readonly observe: Observe;
   private readonly releases: Release;
   private readonly transport: Transport;
   private readonly timer: NodeJS.Timeout;
@@ -149,6 +162,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
       workerUpdate: (a, name) => releases.workerUpdate(a, name),
       acceptKey: (agentId, hash) => enrollment.acceptKey(agentId, hash),
     });
+    const requests = new Requests(ctx);
     const inbound = new Inbound(ctx, {
       reliable: {
         event: (ss, env) => observe.event(ss, env),
@@ -157,6 +171,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
         "action.done": (ss, env) => actions.done(ss, env),
       },
       fetchReply,
+      workerRequest: (ss, env) => requests.handle(ss, env),
       configsChanged: (agent, keys) => configs.emitStatuses(agent, keys),
       dropForeign: (ss, a) => links.dropForeign(ss, a),
       statusSeen: (agentId, workers) => actions.pendingSeen(agentId, workers),
@@ -227,6 +242,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
     };
     this.actions = actions;
     this.relay = relay;
+    this.observe = observe;
     this.releases = releases;
 
     if (!opts.enrollToken && !opts.enroll)
@@ -303,6 +319,22 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return this.ops.enrollment.revoke("", agentId);
   }
 
+  /**
+   * Что умеет воркер агента — из его манифеста (последний status): маршруты, события, задачи,
+   * ключи настроек и запросы к серверу со схемами. Нет агента — AGENT_NOT_FOUND; воркер себя не
+   * описал (нет в status или нет манифеста) — undefined.
+   */
+  async capabilities(
+    agentId: string,
+    worker: string,
+  ): Promise<WorkerCapabilities | undefined> {
+    const a = await this.store.getAgent(agentId);
+
+    if (!a) throw codeError("AGENT_NOT_FOUND", "агент не найден");
+
+    return capabilities(publicAgent(a), worker);
+  }
+
   deleteAgent(agentId: string): Promise<void> {
     return this.ops.enrollment.remove("", agentId);
   }
@@ -313,7 +345,8 @@ export class Agents extends EventEmitter<AgentsEvents> {
    * HTTP-запрос к воркеру через агента (§7). Ответ — Response: status, headers, body (поток),
    * text(), json(), arrayBuffer(). Ошибка до ответа — AgentsError с кодом (AGENT_OFFLINE,
    * AGENT_ELSEWHERE, WORKER_UNKNOWN, WORKER_UNAVAILABLE, WORKER_INVALID, TIMEOUT, CANCELLED,
-   * PATH_FORBIDDEN, BODY_TOO_LARGE, BUSY, DISCONNECTED); после — ошибка чтения потока body с тем же AgentsError.
+   * PATH_FORBIDDEN, ROUTE_UNDECLARED, JOB_UNKNOWN, REQUEST_INVALID, BODY_TOO_LARGE, BUSY, DISCONNECTED);
+   * после — ошибка чтения потока body с тем же AgentsError.
    * Сессия агента в другом процессе — запрос уходит туда (опция relay), без relay — AGENT_ELSEWHERE.
    */
   fetch(
@@ -406,6 +439,33 @@ export class Agents extends EventEmitter<AgentsEvents> {
   /** Снять наблюдателя. */
   unwatch(agentId: string, id: string): Promise<void> {
     return this.watchers.unwatch(agentId, id);
+  }
+
+  /**
+   * Подписка на события типа type воркера worker (агента agentId или любого): handler — после
+   * onEvent и подтверждения, его ошибка только пишется в журнал. Итог — отписка. Агент известен и
+   * манифест есть — тип сверяется сразу (нет в events — EVENT_UNDECLARED, 409), иначе — по
+   * первому событию воркера (предупреждение в журнал). Видны события, принятые этим процессом.
+   */
+  subscribeEvents(
+    filter: EventFilter,
+    handler: EventHandler,
+  ): Promise<() => void> {
+    return this.observe.subscribe(filter, handler);
+  }
+
+  /**
+   * Первое событие type воркера worker агента agentId после вызова (match — своё условие, по
+   * data): не дождались за timeoutMs (по умолчанию 30 000) — TIMEOUT, отмена signal — CANCELLED.
+   * Событие, пришедшее до вызова, не попадает: начните ждать до действия, которое его вызовет.
+   */
+  waitEvent(
+    agentId: string,
+    worker: string,
+    type: string,
+    opts: WaitEventOptions = {},
+  ): Promise<AgentEvent> {
+    return this.observe.waitEvent(agentId, worker, type, opts);
   }
 
   // ── действия (§10) ──

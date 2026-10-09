@@ -8,10 +8,12 @@
 //     цели этого узла; неверные — 422 {message};
 //   - DELETE /config/targets — целей нет;
 //   - GET /metrics — итог последнего круга {at, results: […]};
+//   - GET /results — то же для сервера (маршрут из манифеста); кругов ещё не было — 404;
 //   - GET /health — {ok, info: {targets}};
 //   - POST /jobs {type: "netprobe.run", jobId, data: {targets?, count?, timeoutMs?}} — задача
 //     (sdk/spec §12, быстрая): проверка сейчас, итог сразу — 200 {result: {at, results}};
-//   - GET /manifest — что воркер умеет: версия, ключ targets со схемой, задача netprobe.run.
+//   - GET /manifest — что воркер умеет: версия, ключ targets со схемой, маршрут /results, задача
+//     netprobe.run.
 //
 // ICMP без прав root: «ping»-сокет (SOCK_DGRAM, IPPROTO_ICMP; на Linux — если группа процесса
 // входит в net.ipv4.ping_group_range), иначе системная команда ping, иначе TCP до порта цели.
@@ -114,6 +116,16 @@ func (n *netprobe) handler() http.Handler {
 		n.mu.Unlock()
 		if last == nil {
 			writeJSON(w, http.StatusOK, map[string]any{})
+			return
+		}
+		writeJSON(w, http.StatusOK, last)
+	})
+	mux.HandleFunc("GET /results", func(w http.ResponseWriter, _ *http.Request) {
+		n.mu.Lock()
+		last := n.last
+		n.mu.Unlock()
+		if last == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"message": "проверок ещё не было"})
 			return
 		}
 		writeJSON(w, http.StatusOK, last)

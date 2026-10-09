@@ -5,7 +5,9 @@
 //   RELEASES_DIR=dist/<VERSION> — каталог выпуска (обновления, install.sh);
 //   PUBLIC_KEY — ключ проверки выпуска (base64), вписывается в install.sh;
 //   PUBLIC_URL — адрес сервера для команды установки (по умолчанию — из запроса);
-//   VALIDATE_CONFIGS=1 — проверять настройки по схеме из манифеста воркера до отправки агенту.
+//   VALIDATE_CONFIGS=1 — проверять настройки по схеме из манифеста воркера до отправки агенту;
+//   VALIDATE_REQUESTS=1 — проверять тело запросов к воркерам и data запросов воркеров по схемам;
+//   VALIDATE_EVENTS=log|reject — проверять data событий по схемам (по умолчанию off).
 import { resolve } from "node:path";
 import { format } from "node:util";
 
@@ -13,6 +15,7 @@ import { Agents } from "agent-sdk/server";
 
 import { createApp } from "./app";
 import { History } from "./history";
+import { onWorkerRequest } from "./requests";
 
 const env = process.env;
 const port = Number(env.PORT ?? 8080);
@@ -32,12 +35,18 @@ const history = new History({
 const agents = new Agents({
   enrollToken,
   onEvent: history.addEvent,
+  onWorkerRequest,
   statusIntervalMs: interval(env.STATUS_INTERVAL_MS),
   metricsIntervalMs: interval(env.METRICS_INTERVAL_MS),
   releasesDir: env.RELEASES_DIR ? resolve(env.RELEASES_DIR) : undefined,
   publicKey: env.PUBLIC_KEY || undefined,
   baseUrl: env.PUBLIC_URL || undefined,
   validateConfigs: env.VALIDATE_CONFIGS === "1",
+  validateRequests: env.VALIDATE_REQUESTS === "1",
+  validateEvents:
+    env.VALIDATE_EVENTS === "log" || env.VALIDATE_EVENTS === "reject"
+      ? env.VALIDATE_EVENTS
+      : "off",
   log,
 });
 

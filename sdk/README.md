@@ -52,31 +52,34 @@ server.listen(8080);
 
 ### Настройки
 
-| Опция                    | По умолчанию                            | Что это                                                                                                                              |
-| ------------------------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `enrollToken`            | —                                       | токен регистрации агентов                                                                                                            |
-| `enroll(token, info)`    | —                                       | своя проверка: `false`, `null` или `undefined` — отказ, `true` или `{ labels?, name? }` — принять                                    |
-| `store`                  | `MemoryStore`                           | хранилище ([store.md](docs/store.md))                                                                                                |
-| `instanceId`             | случайный                               | имя копии бэкенда в `agent.session.instance`                                                                                         |
-| `relay(instanceId, req)` | —                                       | доставить вызов в копию с соединением агента ([connection](docs/connection.md#пересылка-вызовов-relay)); без неё — `AGENT_ELSEWHERE` |
-| `relaySecret`            | —                                       | общий секрет копий: заголовок `x-agents-relay-secret`, без него `handleRelay` — 401                                                  |
-| `statusIntervalMs`       | 30 000                                  | как часто агент шлёт `status`                                                                                                        |
-| `metricsIntervalMs`      | 10 000                                  | как часто агент шлёт метрики                                                                                                         |
-| `onEvent(event)`         | —                                       | обработчик событий воркеров; подтверждение агенту — после него ([observe](docs/observe.md#события-воркеров))                         |
-| `offlineGraceMs`         | 3000                                    | агент после обрыва ещё `online` столько                                                                                              |
-| `pingIntervalMs`         | 5000                                    | ping агенту; на два ping подряд нет pong — соединение закрывается                                                                    |
-| `offlineAfterMs`         | max(3 × statusIntervalMs, 30 с) + grace | без вестей дольше — `offline` (копия с соединением упала)                                                                            |
-| `actionTimeoutMs`        | 60 000                                  | срок итога действия                                                                                                                  |
-| `updateTimeoutMs`        | 300 000                                 | срок итога `updateAgent`, `updateWorker`                                                                                             |
-| `releasesDir`            | —                                       | каталог выпуска: manifest.json, сборки, install.sh                                                                                   |
-| `publicKey`              | —                                       | ключ проверки выпуска для install.sh                                                                                                 |
-| `baseUrl`                | из запроса                              | публичный адрес бэкенда для install.sh и `installCommand`                                                                            |
-| `enrollFailureLimit`     | 10                                      | неудачных регистраций с адреса за окно, дальше — 429 (`0` — без предела)                                                             |
-| `enrollFailureWindowMs`  | 60 000                                  | окно подсчёта неудачных регистраций                                                                                                  |
-| `trustProxy`             | `false`                                 | адрес клиента из `X-Forwarded-For`, адрес сервера — из `X-Forwarded-Host/Proto`                                                      |
-| `validateConfigs`        | `false`                                 | `setConfig` проверяет значение по схеме ключа из манифеста воркера ([configs](docs/configs.md#проверка-по-схеме))                    |
-| `validateJobs`           | `false`                                 | `runJob` проверяет `data` по схеме типа задачи из манифеста воркера ([workers](docs/workers.md#задачи))                              |
-| `log(msg, extra)`        | строки `agents: …` в stdout             | журнал SDK                                                                                                                           |
+| Опция                    | По умолчанию                            | Что это                                                                                                                                                    |
+| ------------------------ | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enrollToken`            | —                                       | токен регистрации агентов                                                                                                                                  |
+| `enroll(token, info)`    | —                                       | своя проверка: `false`, `null` или `undefined` — отказ, `true` или `{ labels?, name? }` — принять                                                          |
+| `store`                  | `MemoryStore`                           | хранилище ([store.md](docs/store.md))                                                                                                                      |
+| `instanceId`             | случайный                               | имя копии бэкенда в `agent.session.instance`                                                                                                               |
+| `relay(instanceId, req)` | —                                       | доставить вызов в копию с соединением агента ([connection](docs/connection.md#пересылка-вызовов-relay)); без неё — `AGENT_ELSEWHERE`                       |
+| `relaySecret`            | —                                       | общий секрет копий: заголовок `x-agents-relay-secret`, без него `handleRelay` — 401                                                                        |
+| `statusIntervalMs`       | 30 000                                  | как часто агент шлёт `status`                                                                                                                              |
+| `metricsIntervalMs`      | 10 000                                  | как часто агент шлёт метрики                                                                                                                               |
+| `onEvent(event)`         | —                                       | обработчик событий воркеров; подтверждение агенту — после него ([observe](docs/observe.md#события-воркеров))                                               |
+| `onWorkerRequest(req)`   | —                                       | ответ на запрос воркера к бэкенду: результат — `data` ответа, ошибка — отказ ([workers](docs/workers.md#запросы-к-бэкенду))                                |
+| `offlineGraceMs`         | 3000                                    | агент после обрыва ещё `online` столько                                                                                                                    |
+| `pingIntervalMs`         | 5000                                    | ping агенту; на два ping подряд нет pong — соединение закрывается                                                                                          |
+| `offlineAfterMs`         | max(3 × statusIntervalMs, 30 с) + grace | без вестей дольше — `offline` (копия с соединением упала)                                                                                                  |
+| `actionTimeoutMs`        | 60 000                                  | срок итога действия                                                                                                                                        |
+| `updateTimeoutMs`        | 300 000                                 | срок итога `updateAgent`, `updateWorker`                                                                                                                   |
+| `releasesDir`            | —                                       | каталог выпуска: manifest.json, сборки, install.sh                                                                                                         |
+| `publicKey`              | —                                       | ключ проверки выпуска для install.sh                                                                                                                       |
+| `baseUrl`                | из запроса                              | публичный адрес бэкенда для install.sh и `installCommand`                                                                                                  |
+| `enrollFailureLimit`     | 10                                      | неудачных регистраций с адреса за окно, дальше — 429 (`0` — без предела)                                                                                   |
+| `enrollFailureWindowMs`  | 60 000                                  | окно подсчёта неудачных регистраций                                                                                                                        |
+| `trustProxy`             | `false`                                 | адрес клиента из `X-Forwarded-For`, адрес сервера — из `X-Forwarded-Host/Proto`                                                                            |
+| `validateConfigs`        | `false`                                 | `setConfig` проверяет значение по схеме ключа из манифеста воркера ([configs](docs/configs.md#проверка-по-схеме))                                          |
+| `validateJobs`           | `false`                                 | `runJob` проверяет `data` по схеме типа задачи из манифеста воркера ([workers](docs/workers.md#задачи))                                                    |
+| `validateRequests`       | `false`                                 | тело `fetch` — по `routes[].request` ([fetch](docs/fetch.md#проверка-тела-по-схеме)), `data` запроса воркера — по `requests[].schema`                      |
+| `validateEvents`         | `"off"`                                 | `data` события — по `events[].schema`: `log` — журнал и `invalidEvent`, `reject` — ещё и не передавать ([observe](docs/observe.md#проверка-data-по-схеме)) |
+| `log(msg, extra)`        | строки `agents: …` в stdout             | журнал SDK                                                                                                                                                 |
 
 ### Методы
 
@@ -98,6 +101,9 @@ server.listen(8080);
 | `getConfig(id, worker, key)`, `listConfigs(id)`                                     | `ConfigRecord \| undefined`, `ConfigRecord[]`                     | там же                                                                    |
 | `deleteConfig(id, worker, key)`                                                     | `boolean` — ключ был                                              | там же                                                                    |
 | `configStatus(id, worker?)`                                                         | `ConfigStatus[]`                                                  | там же                                                                    |
+| `capabilities(id, worker)`                                                          | `WorkerCapabilities \| undefined` — что умеет воркер, со схемами  | [ниже](#манифест-воркера)                                                 |
+| `subscribeEvents({ agentId?, worker, type }, handler)`                              | `Promise<() => void>` — отписка                                   | [observe](docs/observe.md#подписки-subscribeevents-и-waitevent)           |
+| `waitEvent(id, worker, type, { match?, timeoutMs?, signal? })`                      | `AgentEvent` — первое подходящее событие после вызова             | там же                                                                    |
 | `watch(id, { id?, metricsIntervalMs?, logLevel?, ttlMs? })`, `unwatch(id, watchId)` | `{ id, until }`, `Promise<void>`                                  | [observe](docs/observe.md#наблюдение-watch)                               |
 | `listAlerts(agentId?)`                                                              | `Alert[]` — текущие проблемы                                      | [observe](docs/observe.md#проблемы)                                       |
 | `logs(id, { worker?, lines? })`                                                     | `LogEntry[]`                                                      | [observe](docs/observe.md#журнал)                                         |
@@ -118,14 +124,27 @@ true` — заменить сразу.
 
 ### Манифест воркера
 
-Воркер обязан описать себя манифестом — версия (обязательно), ключи настроек со схемой,
-маршруты, события ([workers](docs/workers.md#манифест-что-воркер-умеет)). Без корректного
-манифеста агент не регистрирует воркер (`state: invalid`). SDK принимает манифест от агента
-терпимо: неверные и незнакомые поля пропускаются. Бэкенд видит его в
-`agent.workers[].manifest` (`WorkerManifest`), а проверять удобно помощниками:
+Воркер обязан описать себя манифестом — версия (обязательно), ключи настроек, маршруты, события,
+задачи и запросы к бэкенду, со схемами ([workers](docs/workers.md#манифест-что-воркер-умеет)).
+Без корректного манифеста агент не регистрирует воркер (`state: invalid`), а с ним пропускает
+только объявленное: необъявленный маршрут — `ROUTE_UNDECLARED`, тип задачи — `JOB_UNKNOWN`
+([fetch](docs/fetch.md#только-объявленные-маршруты)). SDK принимает манифест от агента терпимо:
+неверные и незнакомые поля пропускаются. Бэкенд видит его в `agent.workers[].manifest`
+(`WorkerManifest`), по одному воркеру — `agents.capabilities(agentId, worker)`:
 
 ```ts
-import { matchRoute, supports, workerManifest } from "agent-sdk/server";
+const caps = await agents.capabilities(agentId, "echo"); // undefined — воркер себя не описал
+caps?.routes; // [{ method, path, description?, request?, response? }]
+caps?.events; // [{ type, description?, schema? }]
+caps?.jobs; // [{ type, description?, schema? }]
+caps?.configs; // [{ key, description?, schema? }]
+caps?.requests; // [{ type, description?, schema?, response? }] — запросы воркера к бэкенду
+```
+
+Проверять удобно помощниками:
+
+```ts
+import { declaresEvent, findRoute, matchRoute, supports, workerManifest } from "agent-sdk/server";
 
 const agent = await agents.getAgent(agentId);
 if (!agent) throw new Error("нет агента");
@@ -134,6 +153,8 @@ supports(agent, "echo", { route: { method: "POST", path: "/echo" } }); // true �
 supports(agent, "echo", { config: "settings", event: "echo.started" }); // все условия сразу
 workerManifest(agent, "echo"); // WorkerManifest | undefined
 matchRoute("/items/{id}", "/items/42?full=1"); // true: {id} — один сегмент, ?… не учитывается
+findRoute(workerManifest(agent, "echo"), "POST", "/echo"); // маршрут манифеста со схемами
+declaresEvent(workerManifest(agent, "echo"), "echo.started"); // агент примет это событие
 ```
 
 `supports` — `true`, если в манифесте воркера есть всё заданное: маршрут (метод без учёта
@@ -149,6 +170,7 @@ matchRoute("/items/{id}", "/items/42?full=1"); // true: {id} — один сег
 ```ts
 agents.on("agent", (a: Agent) => {}); // регистрация, подключение, отключение, status, отзыв
 agents.on("event", (e: AgentEvent) => {}); // событие воркера (после onEvent)
+agents.on("invalidEvent", (e: InvalidEvent) => {}); // data события не по схеме (validateEvents)
 agents.on("metrics", (m: MetricsEvent) => {}); // каждая точка метрик
 agents.on("log", ({ agentId, entries }: LogEvent) => {}); // журнал агента
 agents.on("config", (s: ConfigStatus) => {}); // статус ключа изменился; state: deleted — агент удалил ключ
@@ -174,7 +196,10 @@ agents.on("change", ({ agentId, reason }: ChangeEvent) => {}); // другим �
 | `AGENT_ELSEWHERE`      | 421      | соединение агента в другой копии бэкенда, а `relay` не задан                                                                                                                                                                                                                                                                                                                                  |
 | `RELAY_FAILED`         | 502      | `relay`: вызов не доставлен в копию с соединением                                                                                                                                                                                                                                                                                                                                             |
 | `UNAUTHORIZED`         | 401      | `handleRelay`: неверный `relaySecret`                                                                                                                                                                                                                                                                                                                                                         |
-| `JOB_UNKNOWN`          | 409      | `runJob`: типа задачи нет в `manifest.jobs` воркера                                                                                                                                                                                                                                                                                                                                           |
+| `JOB_UNKNOWN`          | 409      | `runJob` (и `fetch` `POST /jobs` — от агента): типа задачи нет в `manifest.jobs` воркера                                                                                                                                                                                                                                                                                                      |
+| `ROUTE_UNDECLARED`     | 404      | `fetch`: метода и пути нет в `routes` манифеста воркера ([fetch](docs/fetch.md#только-объявленные-маршруты))                                                                                                                                                                                                                                                                                  |
+| `REQUEST_INVALID`      | 400      | `validateRequests`: тело `fetch` не JSON или не по `routes[].request`                                                                                                                                                                                                                                                                                                                         |
+| `EVENT_UNDECLARED`     | 409      | `subscribeEvents`, `waitEvent`: типа события нет в манифесте воркера                                                                                                                                                                                                                                                                                                                          |
 | `JOB_INVALID`          | 400      | `validateJobs`: `data` не подходит под схему типа задачи                                                                                                                                                                                                                                                                                                                                      |
 | `JOB_REJECTED`         | 4xx, 502 | воркер отказал в задаче (его статус и `message`) или ответил не по §12                                                                                                                                                                                                                                                                                                                        |
 | `JOB_NOT_FOUND`        | 404      | `jobStatus`, `cancelJob`: у воркера нет задачи                                                                                                                                                                                                                                                                                                                                                |
@@ -243,6 +268,30 @@ interface AgentEvent {
   data?;
   at;
   receivedAt;
+}
+interface InvalidEvent {
+  event: AgentEvent;
+  problems: string[];
+  rejected; // validateEvents: "reject" — событие подтверждено, но дальше не передано
+}
+interface WorkerRequest {
+  id;
+  agentId;
+  worker;
+  type; // из manifest.requests
+  data?;
+  agent: Agent;
+  timeoutMs;
+  signal: AbortSignal; // истёк срок или оборвалась связь
+}
+interface WorkerCapabilities {
+  version?;
+  description?;
+  configs;
+  routes;
+  events;
+  jobs;
+  requests;
 }
 interface MetricsPoint {
   at;

@@ -33,7 +33,7 @@ func TestWorkerActions(t *testing.T) {
 		w, _ := b.Worker("w")
 		m := w.Manifest
 		return m != nil && w.Version == "0.1.0" && len(m.Configs) == 2 && string(m.Configs[0].Schema) == `{"type":"object"}` &&
-			len(m.Routes) == 1 && m.Routes[0].Path == "/echo" && len(m.Events) == 4
+			len(m.Routes) > 1 && m.Routes[0].Path == "/echo" && len(m.Events) == 4
 	})
 
 	pid := s.pid(a.ID, "w")

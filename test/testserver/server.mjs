@@ -18,6 +18,10 @@
 //   configEvents(agentId)            — события config (статусы ключей), по порядку
 //   alerts(agentId)                  — события alert, по порядку
 //   actions(agentId)                 — события action (итоги действий), по порядку
+//   workerRequests(agentId)          — запросы воркеров к серверу (onWorkerRequest), по порядку:
+//                                      example.ask — ответ {worker, echo: data, agent: имя};
+//                                      example.slow — ответа нет, пока не истечёт срок;
+//                                      example.deny — отказ EXAMPLE_DENIED
 //   fetch(agentId, worker, path, init) — запрос к воркеру; init.body — строка, init.bodyBase64 —
 //                                      двоичное тело, init.abortAfterMs — отменить запрос через
 //                                      столько мс; ответ — {status, headers, body, bodyBase64,
@@ -38,6 +42,7 @@ const kept = {
   configEvents: new Map(),
   alerts: new Map(),
   actions: new Map(),
+  workerRequests: new Map(),
 };
 const keep = (kind, agentId, items) => {
   const list = [...(kept[kind].get(agentId) ?? []), ...items];
@@ -49,9 +54,21 @@ const onEvent = (e) => {
   if (!(kept.events.get(e.agentId) ?? []).some((x) => x.id === e.id)) keep("events", e.agentId, [e]);
 };
 
+/** Запросы воркеров к серверу: сохранить и ответить по типу. */
+const onWorkerRequest = (req) => {
+  keep("workerRequests", req.agentId, [
+    { worker: req.worker, type: req.type, data: req.data, timeoutMs: req.timeoutMs },
+  ]);
+  if (req.type === "example.deny") throw new AgentsError("EXAMPLE_DENIED", "запрос отклонён", 403);
+  if (req.type === "example.slow")
+    return new Promise((resolve) => req.signal.addEventListener("abort", () => resolve(null)));
+  return { worker: req.worker, echo: req.data ?? null, agent: req.agent.name };
+};
+
 const agents = new Agents({
   ...options,
   onEvent,
+  onWorkerRequest,
   trustProxy: true,
   log: (msg, extra) => process.stderr.write(`${msg} ${extra ? JSON.stringify(extra) : ""}\n`),
 });
@@ -98,6 +115,7 @@ const own = {
   configEvents: (agentId) => kept.configEvents.get(agentId) ?? [],
   alerts: (agentId) => kept.alerts.get(agentId) ?? [],
   actions: (agentId) => kept.actions.get(agentId) ?? [],
+  workerRequests: (agentId) => kept.workerRequests.get(agentId) ?? [],
   async fetch(agentId, worker, path, init = {}) {
     const { bodyBase64, abortAfterMs, ...rest } = init;
     if (bodyBase64 !== undefined) rest.body = Buffer.from(bodyBase64, "base64");

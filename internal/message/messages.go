@@ -233,6 +233,21 @@ type DeferredResult struct {
 	Pending  string `json:"pending"`
 }
 
+// Request — запрос воркера к серверу (§12); id — в конверте, ответ — RequestResult с re.
+type Request struct {
+	Worker    string          `json:"worker"`
+	Type      string          `json:"type"`
+	Data      json.RawMessage `json:"data,omitempty"`
+	TimeoutMs int64           `json:"timeoutMs"`
+}
+
+// RequestResult — ответ сервера на запрос воркера: OK — Data, иначе Error.
+type RequestResult struct {
+	OK    bool            `json:"ok"`
+	Data  json.RawMessage `json:"data,omitempty"`
+	Error *ErrorInfo      `json:"error,omitempty"`
+}
+
 // ─── Аргументы и итоги действий (§10) ──────────────────────────────────
 
 // WorkerRestartArgs — args worker.restart; Force — не ждать, пока воркер занят.
@@ -306,8 +321,9 @@ const (
 
 // Пути сокета агента для воркера (GET /config/{key} — ConfigPathPrefix).
 const (
-	EventsPath  = "/events"
-	ContextPath = "/context"
+	EventsPath   = "/events"
+	ContextPath  = "/context"
+	RequestsPath = "/requests"
 )
 
 // ConfigValue — тело PUT /config/{key} воркеру и ответ GET /config/{key} агента.
@@ -333,6 +349,18 @@ type Health struct {
 // EventPost — тело POST /events.
 type EventPost struct {
 	Type string          `json:"type"`
+	Data json.RawMessage `json:"data,omitempty"`
+}
+
+// RequestPost — тело POST /requests: запрос воркера к серверу; TimeoutMs — 0 — по умолчанию.
+type RequestPost struct {
+	Type      string          `json:"type"`
+	Data      json.RawMessage `json:"data,omitempty"`
+	TimeoutMs int64           `json:"timeoutMs,omitempty"`
+}
+
+// RequestReply — ответ 200 на POST /requests: data ответа сервера.
+type RequestReply struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 

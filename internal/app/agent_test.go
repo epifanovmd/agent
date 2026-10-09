@@ -73,7 +73,9 @@ func echoWorker() {
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"sent":1}`) })
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"ok":true,"info":{"port":1}}`) })
 	mux.HandleFunc("GET /manifest", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"version":"1.0.0","configs":[{"key":"main"}],"events":[{"type":"example.done"}]}`)
+		fmt.Fprint(w, `{"version":"1.0.0","configs":[{"key":"main"}],"events":[{"type":"example.done"}],`+
+			`"routes":[{"method":"POST","path":"/echo"},{"method":"POST","path":"/emit"},{"method":"GET","path":"/ctx"},`+
+			`{"method":"POST","path":"/ask"}],"requests":[{"type":"example.ask"}]}`)
 	})
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -89,6 +91,18 @@ func echoWorker() {
 		}
 		resp.Body.Close()
 		w.WriteHeader(resp.StatusCode)
+	})
+	// /ask?type=… — запрос к серверу через сокет агента: статус и тело ответа агента.
+	mux.HandleFunc("POST /ask", func(w http.ResponseWriter, r *http.Request) {
+		typ := cmp.Or(r.URL.Query().Get("type"), "example.ask")
+		resp, err := toAgent("POST", message.RequestsPath, `{"type":"`+typ+`","data":{"q":1}}`)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
 	})
 	mux.HandleFunc("GET /ctx", func(w http.ResponseWriter, _ *http.Request) {
 		resp, err := toAgent("GET", message.ContextPath, "")
@@ -171,6 +185,14 @@ func (s *server) ws(w http.ResponseWriter, r *http.Request) {
 			s.conn = c
 			s.mu.Unlock()
 			s.send(message.MustNew(message.TypeWelcome, message.Welcome{ServerTime: 1, MetricsIntervalMs: 300, StatusIntervalMs: 60000}))
+		case env.Type == message.TypeRequest:
+			// Запрос воркера: ответ — его data и worker.
+			var q message.Request
+			_ = env.Decode(&q)
+			res := message.MustNew(message.TypeRequestResult, message.RequestResult{OK: true,
+				Data: json.RawMessage(fmt.Sprintf(`{"worker":%q,"echo":%s}`, q.Worker, q.Data))})
+			res.Re = env.ID
+			s.send(res)
 		case env.Seq > 0:
 			s.send(message.MustNew(message.TypeAck, message.Ack{Seq: env.Seq}))
 		case env.ID != "":
@@ -353,6 +375,18 @@ func TestAgent(t *testing.T) {
 	ev := decode[message.Event](s.wait("event", func(e message.Envelope) bool { return e.Type == message.TypeEvent }))
 	if ev.Worker != "echo" || ev.Type != "example.done" || ev.At == 0 || string(ev.Data) != `{"n":1}` {
 		t.Fatalf("event: %+v", ev)
+	}
+	// Запрос воркера к серверу (§12) и маршрут не из манифеста (§7).
+	r = s.fetch("f5", message.Fetch{Worker: "echo", Method: "POST", Path: "/ask"})
+	if decode[message.FetchHead](r[0]).Status != 200 || decode[message.FetchChunk](r[1]).Data != `{"data":{"worker":"echo","echo":{"q":1}}}`+"\n" {
+		t.Fatalf("запрос к серверу: %+v", r)
+	}
+	r = s.fetch("f6", message.Fetch{Worker: "echo", Method: "POST", Path: "/ask?type=example.other"})
+	if decode[message.FetchHead](r[0]).Status != 400 || !strings.Contains(decode[message.FetchChunk](r[1]).Data, message.CodeRequestUndeclared) {
+		t.Fatalf("необъявленный запрос: %+v", r)
+	}
+	if r := s.fetch("f7", message.Fetch{Worker: "echo", Method: "GET", Path: "/echo"}); decode[message.FetchEnd](r[0]).Error.Code != message.CodeRouteUndeclared {
+		t.Fatalf("необъявленный маршрут: %+v", r)
 	}
 	r = s.fetch("f4", message.Fetch{Worker: "echo", Method: "GET", Path: "/ctx"})
 	ctxBody := decode[message.Context](message.Envelope{Data: json.RawMessage(decode[message.FetchChunk](r[1]).Data)})

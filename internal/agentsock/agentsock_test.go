@@ -16,6 +16,7 @@ import (
 	"github.com/epifanovmd/agent/internal/logx"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/outbox"
+	"github.com/epifanovmd/agent/internal/requests"
 )
 
 type agent struct {
@@ -23,6 +24,24 @@ type agent struct {
 	events []message.Event
 	full   bool
 	broken bool
+	// asked — запросы к серверу; reqErr — ответ на них ошибкой.
+	asked  []message.RequestPost
+	reqErr error
+}
+
+// DeclaredRequest — у воркера report объявлен только report.recipients.
+func (a *agent) DeclaredRequest(_ context.Context, name, typ string) bool {
+	return name == "report" && typ == "report.recipients"
+}
+
+func (a *agent) Request(_ context.Context, name string, p message.RequestPost) (json.RawMessage, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.asked = append(a.asked, p)
+	if a.reqErr != nil {
+		return nil, a.reqErr
+	}
+	return json.RawMessage(`{"worker":"` + name + `","echo":` + string(p.Data) + `}`), nil
 }
 
 func (a *agent) ByToken(token string) (string, bool) {
@@ -155,5 +174,45 @@ func TestSocket(t *testing.T) {
 	}
 	if status, e, _ := call(t, c, "GET", "/nope", token, ""); status != 404 || e.Code != message.CodeNotFound {
 		t.Fatalf("нет пути: %d %+v", status, e)
+	}
+}
+
+// POST /requests (§12): объявленный тип — ответ сервера 200 {data}; не по
+// правилу, не JSON, больше 1 МБ, не из манифеста — отказ без запроса к
+// серверу; ошибка запроса (нет связи, отказ сервера) — её статус и код.
+func TestSocketRequests(t *testing.T) {
+	a := &agent{}
+	c, _ := client(t, a)
+	status, _, raw := call(t, c, "POST", "/requests", token, `{"type":"report.recipients","data":{"report":"daily"},"timeoutMs":5000}`)
+	var reply message.RequestReply
+	if status != 200 || json.Unmarshal(raw, &reply) != nil || string(reply.Data) != `{"worker":"report","echo":{"report":"daily"}}` {
+		t.Fatalf("запрос: %d %s", status, raw)
+	}
+	if len(a.asked) != 1 || a.asked[0].TimeoutMs != 5000 {
+		t.Fatalf("запрос к серверу: %+v", a.asked)
+	}
+	for body, want := range map[string]struct {
+		status int
+		code   string
+	}{
+		`{"type":"Report"}`:       {400, message.CodeMessageInvalid},
+		`не json`:                 {400, message.CodeMessageInvalid},
+		`{"type":"report.other"}`: {400, message.CodeRequestUndeclared},
+		`{"type":"report.recipients","data":"` + strings.Repeat("x", message.MaxRequestBytes) + `"}`: {413, message.CodeBodyTooLarge},
+	} {
+		if status, e, _ := call(t, c, "POST", "/requests", token, body); status != want.status || e.Code != want.code {
+			t.Errorf("%.40s: %d %+v", body, status, e)
+		}
+	}
+	if len(a.asked) != 1 {
+		t.Fatalf("отклонённые запросы не уходят серверу: %+v", a.asked)
+	}
+	a.reqErr = &requests.Error{Status: 503, Info: message.ErrorInfo{Code: message.CodeAgentOffline, Message: "нет связи"}}
+	if status, e, _ := call(t, c, "POST", "/requests", token, `{"type":"report.recipients"}`); status != 503 || e.Code != message.CodeAgentOffline {
+		t.Fatalf("без связи: %d %+v", status, e)
+	}
+	a.reqErr = &requests.Error{Status: 422, Info: message.ErrorInfo{Code: "REQUEST_INVALID", Message: "нет поля report"}}
+	if status, e, _ := call(t, c, "POST", "/requests", token, `{"type":"report.recipients"}`); status != 422 || e.Code != "REQUEST_INVALID" {
+		t.Fatalf("отказ сервера: %d %+v", status, e)
 	}
 }

@@ -136,6 +136,13 @@ func New(opts Options, handler Handler) *Link {
 	return l
 }
 
+// Session — открытое соединение (после welcome); nil — связи нет.
+func (l *Link) Session() *Session {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.session
+}
+
 // ServerURL — адрес сервера, с которым связь сейчас (или будет следующей).
 func (l *Link) ServerURL() string { return l.urls[int(l.cur.Load())%len(l.urls)] }
 

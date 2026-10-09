@@ -1,0 +1,45 @@
+{
+  "request": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "request",
+      "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "data": {
+        "worker": "report",
+        "type": "report.recipients",
+        "data": {
+          "report": "daily"
+        },
+        "timeoutMs": 10000
+      }
+    }
+  },
+  "request.result": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "request.result",
+      "re": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "data": {
+        "ok": true,
+        "data": ["ops@example.com"]
+      }
+    }
+  },
+  "request.result.error": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "request.result",
+      "re": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "data": {
+        "ok": false,
+        "error": {
+          "code": "REQUEST_UNHANDLED",
+          "message": "на сервере нет обработчика запросов воркеров"
+        }
+      }
+    }
+  }
+}

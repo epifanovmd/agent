@@ -11,6 +11,8 @@ const (
 	TypeAction       = "action"
 	TypeAck          = "ack"
 	TypeError        = "error"
+	// TypeRequestResult — ответ сервера на запрос воркера (§12).
+	TypeRequestResult = "request.result"
 )
 
 // Типы сообщений агент → сервер (§6).
@@ -27,6 +29,8 @@ const (
 	TypeActionResult  = "action.result"
 	// TypeActionDone — итог отложенной замены воркера (§10).
 	TypeActionDone = "action.done"
+	// TypeRequest — запрос воркера к серверу (§12).
+	TypeRequest = "request"
 )
 
 // Класс доставки сообщения агента (§3).
@@ -41,6 +45,8 @@ const (
 	ClassStream
 	// ClassReply — ответ на запрос в текущем соединении.
 	ClassReply
+	// ClassRequest — запрос агента серверу в текущем соединении: id, ответ — с re.
+	ClassRequest
 )
 
 // ClassOf — класс доставки сообщения агента по типу.
@@ -52,6 +58,8 @@ func ClassOf(typ string) Class {
 		return ClassStream
 	case TypeFetchHead, TypeFetchChunk, TypeFetchEnd:
 		return ClassReply
+	case TypeRequest:
+		return ClassRequest
 	}
 	return ClassControl
 }
@@ -95,6 +103,18 @@ const (
 	CodeConfigKeyUnknown = "CONFIG_KEY_UNKNOWN"
 	// CodeEventUndeclared — типа события нет в манифесте воркера (events, §12).
 	CodeEventUndeclared = "EVENT_UNDECLARED"
+	// CodeRouteUndeclared — маршрута fetch нет в манифесте воркера (routes, §7).
+	CodeRouteUndeclared = "ROUTE_UNDECLARED"
+	// CodeJobUnknown — типа задачи в POST /jobs нет в манифесте воркера (jobs, §7).
+	CodeJobUnknown = "JOB_UNKNOWN"
+	// CodeRequestUndeclared — типа запроса воркера нет в манифесте (requests, §12).
+	CodeRequestUndeclared = "REQUEST_UNDECLARED"
+	// CodeAgentOffline — у агента нет связи с сервером (запрос воркера, §12).
+	CodeAgentOffline = "AGENT_OFFLINE"
+	// Коды request.result, которые ставит сервер (SDK).
+	CodeRequestUnhandled = "REQUEST_UNHANDLED"
+	CodeRequestInvalid   = "REQUEST_INVALID"
+	CodeRequestFailed    = "REQUEST_FAILED"
 	// CodeInternal — сообщение не обработано из-за внутренней ошибки
 	// (сервер — `error`, агент — сокет агента, §15).
 	CodeInternal = "INTERNAL"
@@ -107,6 +127,8 @@ var Codes = []string{
 	CodePathForbidden, CodeBodyTooLarge, CodeBusy, CodeConfigRejected, CodeActionUnknown, CodeActionFailed,
 	CodeWorkerNotReleased, CodeUpdateNotVerified, CodeUpdateNotSupported, CodeUpdateFailed,
 	CodeWorkerInvalid, CodeConfigKeyUnknown, CodeEventUndeclared, CodeInternal,
+	CodeRouteUndeclared, CodeJobUnknown, CodeRequestUndeclared, CodeAgentOffline,
+	CodeRequestUnhandled, CodeRequestInvalid, CodeRequestFailed,
 }
 
 // Состояния воркера (WorkerStatus.State).

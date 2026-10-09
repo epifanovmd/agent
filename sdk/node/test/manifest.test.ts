@@ -122,6 +122,11 @@ describe("supports", () => {
     assert.equal(matchRoute("/items/{id}", "/items/42/x"), false);
     assert.equal(matchRoute("/items", "/items"), true);
     assert.equal(matchRoute("/items", "/other"), false);
+    // Как у агента: {name} — не «.» и не «..», %XX раскрываются.
+    assert.equal(matchRoute("/items/{id}", "/items/.."), false);
+    assert.equal(matchRoute("/items/{id}", "/items/%2e%2e"), false);
+    assert.equal(matchRoute("/items/{id}", "/items/."), false);
+    assert.equal(matchRoute("/items/{id}", "/items/%D1%8F"), true);
   });
 
   it("маршрут, ключ, событие — все заданные условия", () => {

@@ -1,6 +1,6 @@
 // Package agentsock — сокет агента для воркеров (§12): POST /events
-// (только типы из манифеста воркера),
-// GET /config/{key}, GET /context. Запрос — с токеном воркера
+// (только типы из манифеста воркера), POST /requests (запрос к серверу,
+// только типы из манифеста), GET /config/{key}, GET /context. Запрос — с токеном воркера
 // (Authorization: Bearer); по токену агент узнаёт, какой это воркер.
 package agentsock
 
@@ -18,6 +18,7 @@ import (
 
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/outbox"
+	"github.com/epifanovmd/agent/internal/requests"
 )
 
 // Agent — что сокет берёт у агента.
@@ -33,6 +34,11 @@ type Agent interface {
 	Config(worker, key string) (message.ConfigValue, bool)
 	// Context — ответ GET /context.
 	Context() message.Context
+	// DeclaredRequest — тип запроса к серверу объявлен в манифесте воркера.
+	DeclaredRequest(ctx context.Context, worker, typ string) bool
+	// Request — запрос воркера к серверу: data ответа; ошибка —
+	// *requests.Error или ошибка ctx.
+	Request(ctx context.Context, worker string, p message.RequestPost) (json.RawMessage, error)
 }
 
 // maxBody — тело запроса к сокету агента: data события и немного на конверт.
@@ -103,6 +109,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, v)
+	case r.URL.Path == message.RequestsPath && r.Method == http.MethodPost:
+		s.request(w, r, name)
 	case r.URL.Path == message.ContextPath && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, s.agent.Context())
 	default:
@@ -153,5 +161,47 @@ func (s *Server) event(w http.ResponseWriter, r *http.Request, name string) {
 		fail(w, http.StatusInternalServerError, message.CodeInternal, "outbox не записан: "+err.Error())
 	default:
 		w.WriteHeader(http.StatusAccepted)
+	}
+}
+
+// maxRequestBody — тело POST /requests.
+const maxRequestBody = message.MaxRequestBytes
+
+// request — POST /requests: запрос к серверу, ответ — когда он придёт.
+func (s *Server) request(w http.ResponseWriter, r *http.Request, name string) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
+	if err != nil {
+		fail(w, http.StatusBadRequest, message.CodeMessageInvalid, "тело не прочитано: "+err.Error())
+		return
+	}
+	if len(raw) > maxRequestBody {
+		fail(w, http.StatusRequestEntityTooLarge, message.CodeBodyTooLarge, "тело запроса больше 1 МБ")
+		return
+	}
+	var post message.RequestPost
+	if err := json.Unmarshal(raw, &post); err != nil {
+		fail(w, http.StatusBadRequest, message.CodeMessageInvalid, "тело — JSON {type, data?, timeoutMs?}: "+err.Error())
+		return
+	}
+	if !message.ValidEventType(post.Type) {
+		fail(w, http.StatusBadRequest, message.CodeMessageInvalid, "type: "+message.EventTypePattern)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), declaredWait)
+	declared := s.agent.DeclaredRequest(ctx, name, post.Type)
+	cancel()
+	if !declared {
+		fail(w, http.StatusBadRequest, message.CodeRequestUndeclared, "запроса "+post.Type+" нет в манифесте воркера (requests)")
+		return
+	}
+	data, err := s.agent.Request(r.Context(), name, post)
+	var re *requests.Error
+	switch {
+	case errors.As(err, &re):
+		fail(w, re.Status, re.Info.Code, re.Info.Message)
+	case err != nil:
+		// Воркер закрыл соединение: отвечать некому.
+	default:
+		writeJSON(w, http.StatusOK, message.RequestReply{Data: data})
 	}
 }

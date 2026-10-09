@@ -1,12 +1,14 @@
 // Package fetch — запрос сервера к воркеру (§7): HTTP по unix-сокету
 // воркера, ответ кусками fetch.head → fetch.chunk… → fetch.end в том же
-// соединении, сроки, отмена, пределы.
+// соединении, сроки, отмена, пределы; к воркеру проходят только маршруты и
+// задачи из его манифеста (routes: open — любой путь, кроме служебных).
 package fetch
 
 import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +29,10 @@ import (
 type Workers interface {
 	Has(name string) bool
 	Client(name string) (*http.Client, error)
+	// Manifest — манифест зарегистрированного воркера.
+	Manifest(name string) *message.WorkerManifest
+	// OpenRoutes — не сверять запросы с манифестом (routes: open).
+	OpenRoutes(name string) bool
 }
 
 // Session — соединение, в котором пришёл запрос: ответ уходит только в него.
@@ -183,6 +189,10 @@ func (t *Tunnel) run(ctx context.Context, s Session, id string, f message.Fetch,
 		end(message.CodeWorkerUnavailable, fmt.Sprintf("воркер %s не запущен", f.Worker))
 		return
 	}
+	if code, msg := t.allowed(f, body); code != "" {
+		end(code, msg)
+		return
+	}
 	req, err := http.NewRequestWithContext(ctx, f.Method, "http://worker"+f.Path, bytes.NewReader(body))
 	if err != nil {
 		end(message.CodeMessageInvalid, err.Error())
@@ -244,6 +254,53 @@ func (t *Tunnel) run(ctx context.Context, s Session, id string, f message.Fetch,
 			return
 		}
 	}
+}
+
+// allowed — запрос объявлен в манифесте воркера (§7): код и текст ошибки,
+// "" — запрос можно передать воркеру.
+func (t *Tunnel) allowed(f message.Fetch, body []byte) (string, string) {
+	if t.workers.OpenRoutes(f.Worker) {
+		return "", ""
+	}
+	u, err := url.Parse(f.Path)
+	if err != nil {
+		return message.CodeMessageInvalid, "path: " + err.Error()
+	}
+	p, m := u.Path, t.workers.Manifest(f.Worker)
+	switch {
+	case p == message.WorkerManifestPath && f.Method == http.MethodGet:
+		return "", ""
+	case p == message.JobsPath || strings.HasPrefix(p, message.JobsPath+"/"):
+		return jobsAllowed(f.Worker, m, f.Method, p, body)
+	case m.DeclaresRoute(f.Method, p):
+		return "", ""
+	}
+	return message.CodeRouteUndeclared, fmt.Sprintf("маршрута %s %s нет в манифесте воркера %s (routes)", f.Method, p, f.Worker)
+}
+
+// jobsAllowed — запросы задач (§12): только у воркера с jobs; в POST /jobs —
+// тип задачи из манифеста.
+func jobsAllowed(name string, m *message.WorkerManifest, method, p string, body []byte) (string, string) {
+	if m == nil || len(m.Jobs) == 0 {
+		return message.CodeRouteUndeclared, fmt.Sprintf("у воркера %s нет задач (jobs в манифесте): %s %s", name, method, p)
+	}
+	switch {
+	case method == http.MethodPost && p == message.JobsPath:
+		var job struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(body, &job); err != nil || job.Type == "" {
+			return message.CodeMessageInvalid, "тело POST /jobs — JSON {type, jobId, data?, files?}"
+		}
+		if !m.DeclaresJob(job.Type) {
+			return message.CodeJobUnknown, fmt.Sprintf("задачи %s нет в манифесте воркера %s (jobs)", job.Type, name)
+		}
+		return "", ""
+	case method == http.MethodGet && message.MatchRoute(message.JobsPath+"/{id}", p),
+		method == http.MethodPost && message.MatchRoute(message.JobsPath+"/{id}/cancel", p):
+		return "", ""
+	}
+	return message.CodeRouteUndeclared, fmt.Sprintf("у задач воркера %s нет маршрута %s %s", name, method, p)
 }
 
 // partialRune — сколько байт в конце b — начало символа UTF-8, которому не

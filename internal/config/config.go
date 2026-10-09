@@ -225,11 +225,24 @@ type Worker struct {
 	Lifecycle Lifecycle `yaml:"lifecycle"`
 	// Logs — файлы вывода воркера.
 	Logs Logs `yaml:"logs"`
+	// Routes — какие fetch агент пропускает к воркеру (§7): RoutesStrict (по
+	// умолчанию) — только по манифесту, RoutesOpen — любой путь, кроме
+	// служебных. Изменение применяется без перезапуска воркера.
+	Routes string `yaml:"routes"`
 	// ReleaseDir — <dataDir>/workers/<name>; заполняет Validate для release.
 	ReleaseDir string `yaml:"-"`
 	// Builtin — встроенный воркер агента (sysmetrics), в agent.yaml его нет.
 	Builtin bool `yaml:"-"`
 }
+
+// Значения Worker.Routes.
+const (
+	RoutesStrict = "strict"
+	RoutesOpen   = "open"
+)
+
+// OpenRoutes — агент не сверяет fetch с манифестом воркера (routes: open).
+func (w Worker) OpenRoutes() bool { return w.Routes == RoutesOpen }
 
 // Файлы воркера из выпуска в его каталоге ReleaseDir.
 const (
@@ -423,6 +436,9 @@ func (w *Worker) check(i int) []error {
 	l := w.Lifecycle
 	bad := func(field, format string, args ...any) {
 		errs = append(errs, fmt.Errorf("workers[%d].%s: "+format, append([]any{i, field}, args...)...))
+	}
+	if w.Routes != "" && w.Routes != RoutesStrict && w.Routes != RoutesOpen {
+		bad("routes", "strict | open, а не %q", w.Routes)
 	}
 	if l.OnAgentRestart != Keep && l.OnAgentRestart != RestartWorker {
 		bad("lifecycle.onAgentRestart", "keep | restart, а не %q", l.OnAgentRestart)
