@@ -5,8 +5,11 @@ package main
 // version — версия воркера.
 const version = "1.0.0"
 
+// jobRun — тип задачи «проверить сейчас».
+const jobRun = "netprobe.run"
+
 // manifest — самоописание воркера (sdk/spec §12): ключ настроек со схемой по пределам Spec,
-// маршрут проверки.
+// задача проверки.
 var manifest = map[string]any{
 	"version":     version,
 	"description": "Связность узла с целями: потери и время ответа по ICMP или TCP",
@@ -36,6 +39,12 @@ var manifest = map[string]any{
 			},
 		},
 	}},
-	"routes": []any{map[string]any{"method": "POST", "path": "/run",
-		"description": "Проверка сейчас: цели из настроек или из тела {targets?, count?, timeoutMs?}"}},
+	"jobs": []any{map[string]any{"type": jobRun,
+		"description": "Проверка сейчас: цели из настроек или из data {targets?, count?, timeoutMs?}",
+		"schema": map[string]any{"type": "object", "properties": map[string]any{
+			"targets":   map[string]any{"type": "array", "maxItems": maxTargets},
+			"count":     map[string]any{"type": "integer", "minimum": 1, "maximum": maxCount},
+			"timeoutMs": map[string]any{"type": "integer", "minimum": minTimeoutMs, "maximum": maxTimeoutMs},
+		}},
+	}},
 }

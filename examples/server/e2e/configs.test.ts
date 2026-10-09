@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
 import { after, before, describe, it } from "node:test";
 
-import type { AgentEvent, ConfigRecord, ConfigStatus } from "agent-sdk/server";
+import type { ConfigRecord, ConfigStatus } from "agent-sdk/server";
 
 import { run, Stand, waitFor } from "./stand";
 
@@ -120,11 +120,11 @@ describe("настройки и доставка", () => {
   });
 
   it("события при остановленном сервере доходят после восстановления", async () => {
-    const res = await s.fetchWorker("echo", "/work", {
-      method: "POST",
-      body: JSON.stringify({ steps: 4, delayMs: 300 }),
+    const { jobId } = await s.job("echo", {
+      type: "echo.long",
+      data: { steps: 4, delayMs: 300 },
+      timeoutMs: 1,
     });
-    const { id } = (await res.json()) as { id: string };
 
     await s.stopServer();
     // Без связи события ждут в outbox агента (видно в agent status --json).
@@ -147,18 +147,13 @@ describe("настройки и доставка", () => {
     );
     await s.startServer();
     const events = await waitFor("все события дошли", async () => {
-      const list = (
-        await s.api<AgentEvent[]>(
-          "GET",
-          `/api/events?agentId=${s.agentId}&worker=echo&limit=1000`,
-        )
-      ).filter(e => (e.data as { id?: string })?.id === id);
+      const list = await s.jobEvents("echo", jobId);
 
-      return list.some(e => e.type === "echo.done") && list;
+      return list.some(e => e.type === "job.done") && list;
     });
     const steps = events
-      .filter(e => e.type === "echo.progress")
-      .map(e => (e.data as { step: number }).step)
+      .filter(e => e.type === "job.progress")
+      .map(e => Math.round((e.data as { progress: number }).progress * 4))
       .sort();
 
     assert.deepEqual(steps, [1, 2, 3, 4], "каждый шаг — один раз");

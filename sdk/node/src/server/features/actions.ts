@@ -1,5 +1,7 @@
 // Встроенные действия (§10): отправка агенту, ожидание итога со сроком в памяти процесса, итог
-// action.result (в том числе новый ключ после agent.rotateKey) и событие action.
+// action.result (в том числе новый ключ после agent.rotateKey), отложенная замена занятого
+// воркера (action.result с deferred, итог — action.done) и событие action.
+import { LRUCache } from "lru-cache";
 import { z } from "zod";
 
 import type { Context } from "../core/context";
@@ -8,9 +10,12 @@ import type { Session } from "../core/session";
 import { bounded } from "../lib/util";
 import type { ActionName, ActionRecord, AgentRecord } from "../model/types";
 import {
+  type ActionDone,
   type ActionResult,
   parse,
+  parseActionDone,
   parseActionResult,
+  parseDeferred,
   parseLog,
   parseName,
   parseSecretHash,
@@ -44,12 +49,17 @@ export interface ActionOptions {
 
 /**
  * Параметры замены воркера (restartWorker, updateWorker). Пока воркер занят, агент откладывает
- * замену (status.workers[].pending) — итог ждёт её, а срок timeoutMs отсчитывается заново с
- * каждым status, где замена ещё ждёт.
+ * замену (status.workers[].pending) и сразу отвечает: вызов возвращает { deferred: true }, а
+ * фактический итог приходит событием action.
  */
 export interface WorkerActionOptions extends ActionOptions {
   /** Заменить сразу, не дожидаясь окончания работы воркера. */
   force?: boolean;
+  /**
+   * Ждать фактического итога и отложенной замены: срок timeoutMs отсчитывается заново с каждым
+   * status, где замена ещё ждёт.
+   */
+  wait?: boolean;
 }
 
 /** Итог обновления. */
@@ -57,6 +67,20 @@ export interface UpdateResult {
   version: string;
   previous?: string;
 }
+
+/** Замена отложена до окончания работы воркера; итог — событие action с тем же actionId. */
+export interface Deferred {
+  deferred: true;
+  pending: "restart" | "update";
+  actionId: string;
+}
+
+/** Итог restartWorker: воркер заменён или замена отложена. */
+export type RestartResult = { deferred: false } | Deferred;
+
+/** Итог updateWorker: воркер обновлён или замена отложена. */
+export type WorkerUpdateResult =
+  (UpdateResult & { deferred: false }) | Deferred;
 
 /** Что нужно действиям от других частей: аргументы обновлений и приём нового ключа. */
 export interface ActionDeps {
@@ -69,22 +93,37 @@ export interface ActionDeps {
   acceptKey(agentId: string, hash: string): Promise<boolean>;
 }
 
+/** Что отправлено: итог допишется к этому. */
+type Sent = Omit<ActionRecord, "status" | "finishedAt">;
+
 /** Действие этого процесса, ждущее итога. */
 interface Pending {
-  /** Что отправлено: итог допишется к этому. */
-  action: Omit<ActionRecord, "status" | "finishedAt">;
+  action: Sent;
   resolve: (a: ActionRecord) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
-  /** Срок заново (замена воркера ждёт, пока он занят); имя воркера — в action.args. */
+  /** Замена воркера: срок заново, пока она ждёт; имя воркера — в action.args. */
   rearm?: () => void;
+  /** Замена воркера отложена, а вызвавший ждёт action.done (wait). */
+  wait?: boolean;
 }
+
+/** Сколько отложенных замен и итогов action.done помнить. */
+const KEEP_DEFERRED = 10_000;
 
 export class Actions {
   private readonly ctx: Context;
   private readonly deps: ActionDeps;
   /** Действия этого процесса, ждущие итога: id → ожидающий. */
   private readonly pending = new Map<string, Pending>();
+  /** Отложенные замены этого процесса: id → что отправлено (для события action по action.done). */
+  private readonly deferred = new LRUCache<string, Sent>({
+    max: KEEP_DEFERRED,
+  });
+  /** Принятые action.done ("агент\nid"): повтор доставки не задваивает событие action. */
+  private readonly finishedDone = new LRUCache<string, true>({
+    max: KEEP_DEFERRED,
+  });
 
   constructor(ctx: Context, deps: ActionDeps) {
     this.ctx = ctx;
@@ -96,15 +135,18 @@ export class Actions {
     agentId: string,
     name: string,
     opts: WorkerActionOptions,
-  ): Promise<void> {
+  ): Promise<RestartResult> {
     valid(parseName("name", name));
-    await this.run(
+    const r = await this.run(
       actor,
       agentId,
       "worker.restart",
       withForce({ name }, opts),
       opts.timeoutMs ?? this.ctx.settings.actionTimeoutMs,
+      opts.wait,
     );
+
+    return deferredOf(r) ?? { deferred: false };
   }
 
   async updateWorker(
@@ -112,20 +154,22 @@ export class Actions {
     agentId: string,
     name: string,
     opts: WorkerActionOptions,
-  ): Promise<UpdateResult> {
+  ): Promise<WorkerUpdateResult> {
     valid(parseName("name", name));
     const args = await this.deps.workerUpdate(
       await this.ctx.agent(agentId),
       name,
     );
-
-    return (await this.run(
+    const r = await this.run(
       actor,
       agentId,
       "worker.update",
       withForce(args, opts),
       this.updateTimeout(opts),
-    )) as UpdateResult;
+      opts.wait,
+    );
+
+    return deferredOf(r) ?? { ...(r.result as UpdateResult), deferred: false };
   }
 
   async updateAgent(
@@ -135,13 +179,15 @@ export class Actions {
   ): Promise<UpdateResult> {
     const args = await this.deps.agentUpdate(await this.ctx.agent(agentId));
 
-    return (await this.run(
-      actor,
-      agentId,
-      "agent.update",
-      args,
-      this.updateTimeout(opts),
-    )) as UpdateResult;
+    return (
+      await this.run(
+        actor,
+        agentId,
+        "agent.update",
+        args,
+        this.updateTimeout(opts),
+      )
+    ).result as UpdateResult;
   }
 
   async rotateKey(
@@ -167,13 +213,15 @@ export class Actions {
       ...valid(parse(logsOptionsSchema, opts, "logs")),
     };
     const r = parseLog(
-      await this.run(
-        actor,
-        agentId,
-        "agent.logs",
-        args,
-        this.ctx.settings.actionTimeoutMs,
-      ),
+      (
+        await this.run(
+          actor,
+          agentId,
+          "agent.logs",
+          args,
+          this.ctx.settings.actionTimeoutMs,
+        )
+      ).result,
     );
 
     if (!r.ok) {
@@ -211,6 +259,13 @@ export class Actions {
     const fin = finished(w.action, d);
     let rotated = false;
 
+    if (fin.status === "done" && w.rearm && parseDeferred(d.result)) {
+      // Воркер занят: замена отложена, итог придёт в action.done.
+      this.deferred.set(fin.id, w.action);
+      if (w.wait) return (w.rearm(), "");
+
+      return (this.settle(fin), "");
+    }
     if (fin.status === "done" && fin.name === "agent.rotateKey") {
       const hash = parseSecretHash(d.result);
 
@@ -227,6 +282,34 @@ export class Actions {
     }
 
     return "";
+  }
+
+  /**
+   * Важное сообщение action.done: итог отложенной замены воркера — событие action (и итог
+   * ожидающему с wait). Замену мог отправить другой процесс или этот до перезапуска: тогда запись
+   * собирается из action.done (args — { name: воркер }, createdAt — время приёма).
+   */
+  done(ss: Session, env: Envelope): Promise<string> {
+    const p = parseActionDone(env);
+
+    if (!p.ok) return Promise.resolve(p.error);
+    const d = p.value;
+    const key = `${ss.agentId}\n${d.re}`;
+
+    if (this.finishedDone.has(key)) return Promise.resolve("");
+    this.finishedDone.set(key, true);
+    const w = this.pending.get(d.re);
+    const sent =
+      (w?.action.agentId === ss.agentId ? w.action : undefined) ??
+      this.deferred.get(d.re) ??
+      sentFromDone(ss.agentId, d);
+    const fin: ActionRecord = { ...finished(sent, d), deferred: true };
+
+    this.deferred.delete(d.re);
+    if (w?.action.agentId === ss.agentId) this.settle(fin);
+    this.ctx.emit("action", fin);
+
+    return Promise.resolve("");
   }
 
   /**
@@ -257,7 +340,8 @@ export class Actions {
 
   /**
    * Отправить действие и дождаться итога. Итог — важное сообщение: может прийти после
-   * переподключения агента к этому же процессу.
+   * переподключения агента к этому же процессу. wait — у отложенной замены воркера ждать
+   * action.done.
    */
   private async run(
     actor: string,
@@ -265,7 +349,8 @@ export class Actions {
     name: ActionName,
     args: Record<string, unknown> | undefined,
     timeoutMs: number,
-  ): Promise<unknown> {
+    wait = false,
+  ): Promise<ActionRecord> {
     const ss = await this.ctx.localSession(agentId);
     const action: Pending["action"] = {
       id: newId(),
@@ -290,6 +375,7 @@ export class Actions {
         resolve,
         reject,
         timer: setTimeout(expire, timeoutMs),
+        wait,
       };
 
       if (name === "worker.restart" || name === "worker.update")
@@ -314,7 +400,7 @@ export class Actions {
         409,
       );
 
-    return r.result;
+    return r;
   }
 
   /** Отдать итог ожидающему; уже отдан — false (повтор доставки). */
@@ -336,8 +422,32 @@ const withForce = (
   opts: WorkerActionOptions,
 ): Record<string, unknown> => (opts.force ? { ...args, force: true } : args);
 
+/** Замена отложена (итог action.result с deferred) — что вернуть вызвавшему. */
+const deferredOf = (r: ActionRecord): Deferred | undefined => {
+  const d = r.deferred ? undefined : parseDeferred(r.result);
+
+  return d && { deferred: true, pending: d.pending, actionId: r.id };
+};
+
+/** Запись действия, которое отправил не этот процесс, — по action.done. */
+const sentFromDone = (agentId: string, d: ActionDone): Sent => {
+  const s: Sent = {
+    id: d.re,
+    agentId,
+    name: d.name as ActionName,
+    createdAt: Date.now(),
+  };
+
+  if (d.worker) s.args = { name: d.worker };
+
+  return s;
+};
+
 /** Завершённая запись действия по итогу. */
-const finished = (rec: Pending["action"], d: ActionResult): ActionRecord => {
+const finished = (
+  rec: Sent,
+  d: Pick<ActionResult, "ok" | "result" | "error">,
+): ActionRecord => {
   const fin: ActionRecord = {
     ...rec,
     status: d.ok ? "done" : "failed",

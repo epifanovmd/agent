@@ -4,13 +4,18 @@ import type { z } from "zod";
 
 import type { Envelope, Hello, LogEntry, Status } from "./messages";
 import {
+  actionDoneSchema,
   actionResultSchema,
   configAppliedSchema,
+  deferredResultSchema,
   enrollSchema,
   eventSchema,
   eventTypeSchema,
   fetchReplySchemas,
   helloSchema,
+  jobEventSchema,
+  jobReplySchema,
+  jobStatusSchema,
   labelsSchema,
   logSchema,
   messageIdSchema,
@@ -177,6 +182,36 @@ export type ActionResult = z.output<typeof actionResultSchema>;
 
 export const parseActionResult = (env: Envelope): Parsed<ActionResult> =>
   parse(actionResultSchema, env, "action.result");
+
+/** action.done (§10): re — id действия, итог отложенной замены воркера. */
+export type ActionDone = z.output<typeof actionDoneSchema>;
+
+export const parseActionDone = (env: Envelope): Parsed<ActionDone> =>
+  parse(actionDoneSchema, env, "action.done");
+
+/** Итог замены, отложенной до окончания работы воркера; иначе — undefined. */
+export const parseDeferred = (
+  result: unknown,
+): z.output<typeof deferredResultSchema> | undefined =>
+  deferredResultSchema.safeParse(result).data;
+
+/** data события задачи (§12). */
+export type JobEventData = z.output<typeof jobEventSchema>;
+
+export const parseJobEvent = (data: unknown): JobEventData | undefined =>
+  jobEventSchema.safeParse(data).data;
+
+/** Ответ воркера на POST /jobs. */
+export const parseJobReply = (
+  body: unknown,
+): Parsed<z.output<typeof jobReplySchema>> =>
+  parse(jobReplySchema, body, "ответ POST /jobs");
+
+/** Ответ воркера на GET /jobs/{id} и POST /jobs/{id}/cancel. */
+export const parseJobStatus = (
+  body: unknown,
+): Parsed<z.output<typeof jobStatusSchema>> =>
+  parse(jobStatusSchema, body, "состояние задачи");
 
 /** Хеш нового секрета в итоге agent.rotateKey (64 шестнадцатеричных символа). */
 export const parseSecretHash = (result: unknown): string | undefined =>

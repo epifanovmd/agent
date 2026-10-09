@@ -6,6 +6,7 @@ import { z } from "zod";
 
 import {
   EVENT_TYPE_PATTERN,
+  JOB_EVENT_PREFIX,
   MAX_AGENT_NAME,
   MAX_LABEL,
   MAX_LABELS,
@@ -116,11 +117,23 @@ export const manifestRouteSchema = z
   })
   .transform(compact);
 
-/** Тип события воркера в манифесте. */
+/** Тип события воркера в манифесте; типы job.* зарезервированы для событий задач. */
 export const manifestEventSchema = z
+  .object({
+    type: eventTypeSchema.refine(
+      v => !v.startsWith(JOB_EVENT_PREFIX),
+      "типы job.* зарезервированы для событий задач",
+    ),
+    description,
+  })
+  .transform(compact);
+
+/** Тип задачи воркера в манифесте (§12): schema — JSON Schema поля data. */
+export const manifestJobSchema = z
   .object({
     type: eventTypeSchema,
     description,
+    schema: jsonObject.optional().catch(undefined),
   })
   .transform(compact);
 
@@ -135,6 +148,7 @@ export const workerManifestSchema = z
     configs: manifestItems(manifestConfigSchema),
     routes: manifestItems(manifestRouteSchema),
     events: manifestItems(manifestEventSchema),
+    jobs: manifestItems(manifestJobSchema),
   })
   .transform(compact);
 
@@ -265,6 +279,61 @@ export const actionResultSchema = z
     }),
   })
   .transform(({ re, data }) => ({ re, ...data }));
+
+/** `action.done` (§10) — сообщение целиком: re — id действия, итог отложенной замены воркера. */
+export const actionDoneSchema = z
+  .object({
+    re: z.string(),
+    data: z.object({
+      name: z.string(),
+      worker: z.string().catch(""),
+      ok: z.boolean(),
+      result: z.unknown().optional(),
+      error: errorAlways("ACTION_FAILED"),
+    }),
+  })
+  .transform(({ re, data }) => ({ re, ...data }));
+
+/** Итог worker.restart и worker.update, когда замена отложена: воркер занят. */
+export const deferredResultSchema = z.object({
+  deferred: z.literal(true),
+  pending: z.enum(["restart", "update"]),
+});
+
+/** Состояние задачи воркера (§12). */
+export const jobStateSchema = z.enum([
+  "running",
+  "done",
+  "failed",
+  "cancelled",
+]);
+
+/** Ответ воркера на `POST /jobs`: итог быстрой задачи (200) или id долгой (202). */
+export const jobReplySchema = z.object({
+  id: z.string().min(1).optional(),
+  result: z.unknown().optional(),
+});
+
+/** Ответ воркера на `GET /jobs/{id}` и `POST /jobs/{id}/cancel`. */
+export const jobStatusSchema = z
+  .looseObject({
+    id: z.string(),
+    state: jobStateSchema,
+    progress: z.number().optional().catch(undefined),
+    result: z.unknown().optional(),
+    error: errorInfoSchema.optional().catch(undefined),
+  })
+  .transform(compact);
+
+/** data событий задач (job.progress, job.done, job.failed, job.cancelled). */
+export const jobEventSchema = z.looseObject({
+  jobId: z.string().min(1),
+  id: z.string().optional().catch(undefined),
+  progress: z.number().optional().catch(undefined),
+  message: z.string().optional().catch(undefined),
+  result: z.unknown().optional(),
+  error: errorOr("JOB_FAILED").optional().catch(undefined),
+});
 
 /** Итог agent.rotateKey: хеш нового секрета (64 шестнадцатеричных символа). */
 export const rotateKeyResultSchema = z.object({

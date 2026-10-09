@@ -455,8 +455,28 @@ func (s *Supervisor) Status() []message.WorkerStatus {
 	return out
 }
 
+// deferredKey — ключ контекста: кому сообщить, что замена отложена.
+type deferredKey struct{}
+
+// WithDeferred — контекст замены (Restart, Update), в котором fn узнаёт, что
+// воркер занят и замена отложена до окончания его работы (pending —
+// message.PendingRestart или PendingUpdate). fn вызывается не больше раза,
+// до итога замены.
+func WithDeferred(ctx context.Context, fn func(pending string)) context.Context {
+	var once sync.Once
+	return context.WithValue(ctx, deferredKey{}, func(pending string) { once.Do(func() { fn(pending) }) })
+}
+
+// notifyDeferred — сообщить контексту замены, что она отложена.
+func notifyDeferred(ctx context.Context, pending string) {
+	if fn, ok := ctx.Value(deferredKey{}).(func(string)); ok {
+		fn(pending)
+	}
+}
+
 // Restart — worker.restart: остановить и запустить заново; итог — запуск.
-// Без force замена ждёт, пока воркер занят (§13).
+// Без force замена ждёт, пока воркер занят (§13); отсрочку видит контекст
+// WithDeferred.
 func (s *Supervisor) Restart(ctx context.Context, name string, force bool) error {
 	w := s.get(name)
 	if w == nil {
@@ -540,6 +560,7 @@ func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 			w.mu.Unlock()
 			w.opts().OnChange()
 			log.Info("воркер занят — замена отложена до окончания работы", "busyTimeout", life.Busy.Timeout.Std(), "message", h.Message)
+			notifyDeferred(ctx, kind)
 		} else if time.Now().After(deadline) {
 			log.Warn("воркер занят дольше busy.timeout — замена", "busyTimeout", life.Busy.Timeout.Std())
 			return false

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/epifanovmd/agent/internal/message"
@@ -64,6 +65,15 @@ func TestReleaseManifestWorkers(t *testing.T) {
 	} {
 		if err := manifest(bad); err == nil {
 			t.Errorf("%v: ожидалась ошибка", bad)
+		}
+	}
+}
+
+// Без команды и с неизвестной командой — понятная ошибка, а не паника.
+func TestRunUnknownCommand(t *testing.T) {
+	for _, args := range [][]string{nil, {"oops"}} {
+		if err := run(args); err == nil || !strings.Contains(err.Error(), "keygen | manifest") {
+			t.Fatalf("run(%q): %v", args, err)
 		}
 	}
 }

@@ -12,10 +12,13 @@ import {
   helloSchema,
   helloWorkerSchema,
   hostInfoSchema,
+  jobStateSchema,
+  jobStatusSchema,
   logEntrySchema,
   logLevelSchema,
   manifestConfigSchema,
   manifestEventSchema,
+  manifestJobSchema,
   manifestRouteSchema,
   metricsSchema,
   releaseArtifactSchema,
@@ -51,6 +54,15 @@ export type ManifestRoute = z.output<typeof manifestRouteSchema>;
 
 /** Тип события воркера в манифесте. */
 export type ManifestEvent = z.output<typeof manifestEventSchema>;
+
+/** Тип задачи воркера в манифесте: schema — JSON Schema поля data. */
+export type ManifestJob = z.output<typeof manifestJobSchema>;
+
+/** Состояние задачи воркера (§12). */
+export type JobState = z.output<typeof jobStateSchema>;
+
+/** Ответ воркера на `GET /jobs/{id}` и `POST /jobs/{id}/cancel` (§12). */
+export type JobStatus = z.output<typeof jobStatusSchema>;
 
 /** Манифест воркера — ответ `GET /manifest` (§12). */
 export type WorkerManifest = z.output<typeof workerManifestSchema>;

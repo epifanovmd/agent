@@ -20,6 +20,14 @@ type WorkerManifest struct {
 	Configs     []WorkerManifestConfig `json:"configs,omitempty"`
 	Routes      []WorkerManifestRoute  `json:"routes,omitempty"`
 	Events      []WorkerManifestEvent  `json:"events,omitempty"`
+	Jobs        []WorkerManifestJob    `json:"jobs,omitempty"`
+}
+
+// WorkerManifestJob — тип задачи воркера (§12); Schema — JSON Schema поля data.
+type WorkerManifestJob struct {
+	Type        string          `json:"type"`
+	Description string          `json:"description,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
 }
 
 // WorkerManifestConfig — ключ настроек; Schema — JSON Schema значения.
@@ -41,9 +49,25 @@ func (m *WorkerManifest) DeclaresConfig(key string) bool {
 	return m != nil && slices.ContainsFunc(m.Configs, func(c WorkerManifestConfig) bool { return c.Key == key })
 }
 
-// DeclaresEvent — тип события typ есть в Events.
+// DeclaresEvent — воркеру можно слать событие typ (§12): типы job.* — только
+// события задач и только при непустом Jobs, остальные — из Events.
 func (m *WorkerManifest) DeclaresEvent(typ string) bool {
-	return m != nil && slices.ContainsFunc(m.Events, func(e WorkerManifestEvent) bool { return e.Type == typ })
+	if m == nil {
+		return false
+	}
+	if strings.HasPrefix(typ, JobEventPrefix) {
+		return len(m.Jobs) > 0 && IsJobEvent(typ)
+	}
+	return slices.ContainsFunc(m.Events, func(e WorkerManifestEvent) bool { return e.Type == typ })
+}
+
+// IsJobEvent — typ — событие задачи (job.progress, job.done, job.failed, job.cancelled).
+func IsJobEvent(typ string) bool {
+	switch typ {
+	case JobEventProgress, JobEventDone, JobEventFailed, JobEventCancelled:
+		return true
+	}
+	return false
 }
 
 // WorkerManifestEvent — тип события, которое шлёт воркер.
@@ -78,6 +102,11 @@ func ParseWorkerManifest(raw []byte) (*WorkerManifest, error) {
 			m.Configs[i].Schema = nil
 		}
 	}
+	for i := range m.Jobs {
+		if string(bytes.TrimSpace(m.Jobs[i].Schema)) == "null" {
+			m.Jobs[i].Schema = nil
+		}
+	}
 	if err := m.Check(); err != nil {
 		return nil, err
 	}
@@ -102,6 +131,8 @@ func (m *WorkerManifest) Check() error {
 		return fmt.Errorf("routes: больше %d", MaxManifestItems)
 	case len(m.Events) > MaxManifestItems:
 		return fmt.Errorf("events: больше %d", MaxManifestItems)
+	case len(m.Jobs) > MaxManifestItems:
+		return fmt.Errorf("jobs: больше %d", MaxManifestItems)
 	}
 	for i, c := range m.Configs {
 		at := fmt.Sprintf("configs[%d]", i)
@@ -133,8 +164,23 @@ func (m *WorkerManifest) Check() error {
 		if !ValidEventType(e.Type) {
 			return fmt.Errorf("%s.type: %q не по правилу %s", at, e.Type, EventTypePattern)
 		}
+		if strings.HasPrefix(e.Type, JobEventPrefix) {
+			return fmt.Errorf("%s.type: типы %s* зарезервированы для событий задач", at, JobEventPrefix)
+		}
 		if err := maxChars(at+".description", e.Description, MaxManifestText); err != nil {
 			return err
+		}
+	}
+	for i, j := range m.Jobs {
+		at := fmt.Sprintf("jobs[%d]", i)
+		if !ValidEventType(j.Type) {
+			return fmt.Errorf("%s.type: %q не по правилу %s", at, j.Type, EventTypePattern)
+		}
+		if err := maxChars(at+".description", j.Description, MaxManifestText); err != nil {
+			return err
+		}
+		if len(j.Schema) > 0 && !isObject(j.Schema) {
+			return fmt.Errorf("%s.schema: нужен объект", at)
 		}
 	}
 	return nil

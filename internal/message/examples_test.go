@@ -145,6 +145,7 @@ var agentToServer = map[string]func() any{
 	TypeFetchChunk:    func() any { return &FetchChunk{} },
 	TypeFetchEnd:      func() any { return &FetchEnd{} },
 	TypeActionResult:  func() any { return &ActionResult{} },
+	TypeActionDone:    func() any { return &ActionDone{} },
 }
 
 // Аргументы и итоги действий; nil — их нет.
@@ -260,7 +261,23 @@ func TestExamplesMessages(t *testing.T) {
 				}
 				if r.OK {
 					seenResults[act] = true
-					decodeOptional(t, "result "+act, r.Result, actionResults[act])
+					decodeResult(t, act, r.Result)
+				}
+			case TypeActionDone:
+				var d ActionDone
+				_ = env.Decode(&d)
+				act := actionByID[env.Re]
+				if act == "" || act != d.Name {
+					t.Fatalf("action.done: нет образца action %s с id %s", d.Name, env.Re)
+				}
+				if act != ActionWorkerRestart && act != ActionWorkerUpdate {
+					t.Fatalf("action.done бывает только у замены воркера, а не у %s", act)
+				}
+				if d.OK == (d.Error != nil) {
+					t.Fatalf("ok и error противоречат друг другу")
+				}
+				if d.OK {
+					decodeOptional(t, "result "+act, d.Result, actionResults[act])
 				}
 			}
 		})
@@ -277,6 +294,24 @@ func TestExamplesMessages(t *testing.T) {
 			t.Errorf("нет образцов action и action.result для %s", act)
 		}
 	}
+}
+
+// decodeResult — итог действия: отложенная замена воркера ({deferred,
+// pending}) или итог по типу действия.
+func decodeResult(t *testing.T, act string, raw json.RawMessage) {
+	t.Helper()
+	var probe struct {
+		Deferred bool `json:"deferred"`
+	}
+	if (act == ActionWorkerRestart || act == ActionWorkerUpdate) && json.Unmarshal(raw, &probe) == nil && probe.Deferred {
+		var d DeferredResult
+		roundTrip(t, "result "+act, raw, &d)
+		if d.Pending != PendingRestart && d.Pending != PendingUpdate {
+			t.Fatalf("pending: %q", d.Pending)
+		}
+		return
+	}
+	decodeOptional(t, "result "+act, raw, actionResults[act])
 }
 
 func checkClass(t *testing.T, env Envelope) {
@@ -312,6 +347,9 @@ var routes = []route{
 	{"agent", "worker", "GET", HealthPath, nil, func() any { return &Health{} }, workerError},
 	{"agent", "worker", "POST", CleanupPath, nil, nil, workerError},
 	{"agent", "worker", "GET", WorkerManifestPath, nil, func() any { return &WorkerManifest{} }, workerError},
+	{"agent", "worker", "POST", JobsPath, func() any { return &JobRequest{} }, func() any { return &JobReply{} }, workerError},
+	{"agent", "worker", "GET", JobsPath + "/{id}", nil, func() any { return &JobStatus{} }, workerError},
+	{"agent", "worker", "POST", JobsPath + "/{id}/cancel", nil, func() any { return &JobStatus{} }, workerError},
 	{"worker", "agent", "POST", EventsPath, func() any { return &EventPost{} }, nil, errorInfo},
 	{"worker", "agent", "GET", ConfigPathPrefix, nil, func() any { return &ConfigValue{} }, errorInfo},
 	{"worker", "agent", "GET", ContextPath, nil, func() any { return &Context{} }, errorInfo},
@@ -331,11 +369,28 @@ func findRoute(s sample) (int, bool) {
 			}
 			continue
 		}
-		if s.Request.Path == r.path {
+		if matchPath(r.path, s.Request.Path) {
 			return i, true
 		}
 	}
 	return 0, false
+}
+
+// matchPath — путь подходит под шаблон: {id} — один непустой сегмент.
+func matchPath(template, path string) bool {
+	want, got := strings.Split(template, "/"), strings.Split(path, "/")
+	if len(want) != len(got) {
+		return false
+	}
+	for i, part := range want {
+		if part == "{id}" && got[i] != "" {
+			continue
+		}
+		if part != got[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // isText — тело-строка JSON: текст, а не объект.
@@ -403,7 +458,11 @@ func TestExamplesCodesAndNames(t *testing.T) {
 					t.Errorf("%s: неверное имя %s=%q", name, k, n)
 				}
 			}
-			for _, x := range v {
+			for k, x := range v {
+				// Коды ошибок задач (job.failed) — коды воркера, а не §15.
+				if typ, _ := v["type"].(string); k == "data" && strings.HasPrefix(typ, JobEventPrefix) {
+					continue
+				}
 				walk(name, x)
 			}
 		case []any:

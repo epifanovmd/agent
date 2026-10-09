@@ -134,15 +134,20 @@ func testWorker() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	// /manifest — версия: метка сборки или 0.1.0; все ключи и события, которые шлют тесты.
-	// Файл no-manifest в IT_STATE — манифеста нет (404): воркер не зарегистрирован.
+	// Файл no-manifest в IT_STATE — манифеста нет (404): воркер не зарегистрирован; файл
+	// jobs — манифест объявляет задачи example.quick и example.long.
 	mux.HandleFunc("GET /manifest", func(w http.ResponseWriter, r *http.Request) {
 		if _, err := os.Stat(filepath.Join(state, "no-manifest")); err == nil {
 			http.NotFound(w, r)
 			return
 		}
+		jobs := ""
+		if _, err := os.Stat(filepath.Join(state, "jobs")); err == nil {
+			jobs = `,"jobs":[{"type":"example.quick"},{"type":"example.long"}]`
+		}
 		fmt.Fprintf(w, `{"version":%q,"configs":[{"key":"main","schema":{"type":"object"}},{"key":"limits"}],`+
 			`"routes":[{"method":"POST","path":"/echo"}],"events":[{"type":"example.done"},{"type":"example.later"},`+
-			`{"type":"example.offline"},{"type":"example.progress"}]}`, cmp.Or(tag, "0.1.0"))
+			`{"type":"example.offline"},{"type":"example.progress"}]%s}`, cmp.Or(tag, "0.1.0"), jobs)
 	})
 	mux.HandleFunc("GET /build", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, tag) })
 	mux.HandleFunc("GET /pid", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, os.Getpid()) })
@@ -228,6 +233,36 @@ func testWorker() {
 			emit("example.done", fmt.Sprintf(`{"id":%q,"pid":%d}`, id, os.Getpid()))
 		}()
 		w.WriteHeader(http.StatusAccepted)
+	})
+	// /jobs — задачи (§12): example.quick — итог сразу (200), example.long — 202, затем
+	// job.progress и job.done через агента.
+	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
+		var req message.JobRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"message":"неверное тело"}`, http.StatusBadRequest)
+			return
+		}
+		switch req.Type {
+		case "example.quick":
+			fmt.Fprintf(w, `{"result":{"echo":%s}}`, cmp.Or(string(req.Data), "null"))
+		case "example.long":
+			id := "w-" + req.JobID
+			go func() {
+				for _, ev := range []message.EventPost{
+					{Type: message.JobEventProgress, Data: json.RawMessage(fmt.Sprintf(`{"jobId":%q,"id":%q,"progress":0.5}`, req.JobID, id))},
+					{Type: message.JobEventDone, Data: json.RawMessage(fmt.Sprintf(`{"jobId":%q,"id":%q,"result":{"pid":%d}}`, req.JobID, id, os.Getpid()))},
+				} {
+					time.Sleep(100 * time.Millisecond)
+					body, _ := json.Marshal(ev)
+					_, _, _ = agent(http.MethodPost, message.EventsPath, body)
+				}
+			}()
+			w.WriteHeader(http.StatusAccepted)
+			fmt.Fprintf(w, `{"id":%q}`, id)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"message":"нет задачи %s"}`, req.Type)
+		}
 	})
 	mux.HandleFunc("POST /hang", func(w http.ResponseWriter, _ *http.Request) {
 		hang.Store(true)

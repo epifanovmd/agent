@@ -4,7 +4,6 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 
 import type {
-  AgentEvent,
   AgentsError,
   ConfigStatus,
   LogEntry,
@@ -171,33 +170,81 @@ describe("связь и наблюдение", () => {
     });
   });
 
-  it("события: POST /work → echo.progress и echo.done", async () => {
+  it("задачи: echo.quick — итог сразу, echo.long — 202, события job.* и итог; состояние и отмена", async () => {
     for (const w of ECHOES) {
-      const res = await s.fetchWorker(w, "/work", {
-        method: "POST",
-        body: JSON.stringify({ steps: 3, delayMs: 100 }),
+      const quick = await s.job(w, {
+        type: "echo.quick",
+        data: { text: "привет" },
       });
 
-      assert.equal(res.status, 202);
-      const { id } = (await res.json()) as { id: string };
-      const mine = (e: AgentEvent) => (e.data as { id?: string })?.id === id;
-      const events = await waitFor(`${w}: echo.done`, async () => {
-        const list = (
-          await s.api<AgentEvent[]>(
-            "GET",
-            `/api/events?agentId=${s.agentId}&worker=${w}`,
-          )
-        ).filter(mine);
-
-        return list.some(e => e.type === "echo.done") && list;
+      assert.deepEqual(
+        [quick.state, quick.result],
+        ["done", { text: "ПРИВЕТ" }],
+      );
+      const long = await s.job(w, {
+        type: "echo.long",
+        data: { steps: 3, delayMs: 100 },
+        timeoutMs: 20_000,
       });
-      const steps = events
-        .filter(e => e.type === "echo.progress")
-        .map(e => (e.data as { step: number }).step)
-        .sort();
 
-      assert.deepEqual(steps, [1, 2, 3], w);
+      assert.equal(long.state, "done", w);
+      assert.ok(long.id, w);
+      assert.deepEqual(long.result, { text: "ГОТОВО: 3 ШАГОВ" });
+      const events = await s.jobEvents(w, long.jobId);
+
+      assert.deepEqual(
+        events.map(e => [e.type, (e.data as { progress?: number }).progress]),
+        [
+          ["job.progress", 1 / 3],
+          ["job.progress", 2 / 3],
+          ["job.progress", 1],
+          ["job.done", undefined],
+        ],
+        w,
+      );
+      // Не дождались итога — задача идёт; её состояние и отмена.
+      const slow = await s.job(w, {
+        type: "echo.long",
+        data: { steps: 50, delayMs: 200 },
+        timeoutMs: 1,
+      });
+
+      assert.equal(slow.state, "running", w);
+      const base = `/api/agents/${s.agentId}/workers/${w}/jobs/${slow.id}`;
+
+      assert.equal(
+        (await s.api<{ state: string }>("GET", base)).state,
+        "running",
+      );
+      assert.equal(
+        (await s.api<{ state: string }>("POST", `${base}/cancel`)).state,
+        "cancelled",
+      );
+      await waitFor(`${w}: job.cancelled`, async () =>
+        (await s.jobEvents(w, slow.jobId)).some(
+          e => e.type === "job.cancelled",
+        ),
+      );
     }
+    // Тип не из манифеста — JOB_UNKNOWN; netprobe.run — быстрая задача.
+    await assert.rejects(s.job("echo", { type: "echo.none" }), {
+      code: "JOB_UNKNOWN",
+    });
+    const probe = await s.job("netprobe", {
+      type: "netprobe.run",
+      data: {
+        targets: [
+          { id: "self", host: "127.0.0.1", port: s.port, method: "tcp" },
+        ],
+        count: 1,
+      },
+    });
+
+    assert.equal(
+      (probe.result as { results: { id: string; received: number }[] })
+        .results[0].received,
+      1,
+    );
   });
 
   describe("метрики и журнал", () => {

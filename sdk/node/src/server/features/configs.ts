@@ -143,7 +143,10 @@ export class Configs {
     return "";
   }
 
-  /** События config по ключам "воркер/ключ", у которых изменился итог. */
+  /**
+   * События config по ключам "воркер/ключ", у которых изменился итог; ключ пропал и у сервера, и
+   * у агента — событие с state: deleted.
+   */
   async emitStatuses(agent: AgentRecord, keys: string[]): Promise<void> {
     if (!keys.length || !this.ctx.listens("config")) return;
     const desired = await this.ctx.store
@@ -155,8 +158,13 @@ export class Configs {
       const d = desired.find(c => c.worker === worker && c.key === key);
       const r = agent.configs[worker]?.[key];
 
-      if (d || r)
-        this.ctx.emit("config", configStatus(agent.id, worker, key, d, r));
+      // Ни желаемого, ни у агента: агент подтвердил удаление (ключа нет в status).
+      this.ctx.emit(
+        "config",
+        d || r
+          ? configStatus(agent.id, worker, key, d, r)
+          : { agentId: agent.id, worker, key, version: null, state: "deleted" },
+      );
     }
   }
 

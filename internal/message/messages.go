@@ -215,6 +215,24 @@ type ActionResult struct {
 	Error  *ErrorInfo      `json:"error,omitempty"`
 }
 
+// ActionDone — итог отложенной замены воркера (§10); id действия — Re
+// конверта, Result — как у ActionResult без отсрочки.
+type ActionDone struct {
+	Name   string          `json:"name"`
+	Worker string          `json:"worker"`
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *ErrorInfo      `json:"error,omitempty"`
+}
+
+// DeferredResult — итог worker.restart и worker.update, когда воркер занят:
+// замена отложена (Pending — PendingRestart | PendingUpdate), фактический
+// итог придёт в action.done.
+type DeferredResult struct {
+	Deferred bool   `json:"deferred"`
+	Pending  string `json:"pending"`
+}
+
 // ─── Аргументы и итоги действий (§10) ──────────────────────────────────
 
 // WorkerRestartArgs — args worker.restart; Force — не ждать, пока воркер занят.
@@ -276,7 +294,9 @@ const (
 )
 
 // Пути воркера, которые вызывает агент; ConfigPathPrefix + ключ.
+// JobsPath — задачи воркера (§12): их вызывает сервер через fetch.
 const (
+	JobsPath           = "/jobs"
 	ConfigPathPrefix   = "/config/"
 	MetricsPath        = "/metrics"
 	HealthPath         = "/health"
@@ -314,6 +334,38 @@ type Health struct {
 type EventPost struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data,omitempty"`
+}
+
+// JobRequest — тело POST /jobs (§12).
+type JobRequest struct {
+	Type  string          `json:"type"`
+	JobID string          `json:"jobId"`
+	Data  json.RawMessage `json:"data,omitempty"`
+	Files *JobFiles       `json:"files,omitempty"`
+}
+
+// JobFiles — файлы задачи по ссылкам: воркер сам скачивает входные и
+// загружает выходные.
+type JobFiles struct {
+	Inputs  map[string]string `json:"inputs,omitempty"`
+	Outputs map[string]string `json:"outputs,omitempty"`
+}
+
+// JobReply — ответ на POST /jobs: Result — итог быстрой задачи (200), ID —
+// долгая задача начата (202).
+type JobReply struct {
+	ID     string          `json:"id,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+}
+
+// JobStatus — ответ GET /jobs/{id} и POST /jobs/{id}/cancel; Progress — от
+// 0 до 1.
+type JobStatus struct {
+	ID       string          `json:"id"`
+	State    string          `json:"state"`
+	Progress *float64        `json:"progress,omitempty"`
+	Result   json.RawMessage `json:"result,omitempty"`
+	Error    *ErrorInfo      `json:"error,omitempty"`
 }
 
 // Context — ответ GET /context; Online — есть ли связь с сервером.

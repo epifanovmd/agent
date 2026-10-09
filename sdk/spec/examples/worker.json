@@ -262,6 +262,26 @@
             "type": "report.sent",
             "description": "Отчёт отправлен"
           }
+        ],
+        "jobs": [
+          {
+            "type": "report.build",
+            "description": "Собрать отчёт за период",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "days": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          {
+            "type": "report.check",
+            "description": "Проверить источник отчётов"
+          }
         ]
       }
     }
@@ -303,6 +323,130 @@
     },
     "response": {
       "status": 204
+    }
+  },
+  "worker.jobs.quick": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "POST",
+      "path": "/jobs",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "report.check",
+        "jobId": "job-6e29"
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "result": {
+          "reachable": true
+        }
+      }
+    }
+  },
+  "worker.jobs.long": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "POST",
+      "path": "/jobs",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "report.build",
+        "jobId": "job-7f3a",
+        "data": {
+          "days": 30
+        },
+        "files": {
+          "inputs": {
+            "source": "https://storage.example.com/in/source.csv?sig=example"
+          },
+          "outputs": {
+            "report": "https://storage.example.com/out/report.pdf?sig=example"
+          }
+        }
+      }
+    },
+    "response": {
+      "status": 202,
+      "body": {
+        "id": "b81c"
+      }
+    }
+  },
+  "worker.jobs.rejected": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "POST",
+      "path": "/jobs",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "report.build",
+        "jobId": "job-7f40",
+        "data": {
+          "days": 0
+        }
+      }
+    },
+    "response": {
+      "status": 400,
+      "body": {
+        "message": "days: должно быть не меньше 1"
+      }
+    }
+  },
+  "worker.jobs.status": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "GET",
+      "path": "/jobs/b81c"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "id": "b81c",
+        "state": "running",
+        "progress": 0.4
+      }
+    }
+  },
+  "worker.jobs.status.missing": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "GET",
+      "path": "/jobs/zz00"
+    },
+    "response": {
+      "status": 404,
+      "body": {
+        "message": "нет такой задачи"
+      }
+    }
+  },
+  "worker.jobs.cancel": {
+    "from": "agent",
+    "to": "worker",
+    "request": {
+      "method": "POST",
+      "path": "/jobs/b81c/cancel"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "id": "b81c",
+        "state": "cancelled"
+      }
     }
   },
   "agent.events": {
@@ -367,6 +511,30 @@
         "code": "EVENT_UNDECLARED",
         "message": "события report.lost нет в манифесте воркера (events)"
       }
+    }
+  },
+  "agent.events.job": {
+    "from": "worker",
+    "to": "agent",
+    "request": {
+      "method": "POST",
+      "path": "/events",
+      "headers": {
+        "authorization": "Bearer worker-token-example",
+        "content-type": "application/json"
+      },
+      "body": {
+        "type": "job.progress",
+        "data": {
+          "jobId": "job-7f3a",
+          "id": "b81c",
+          "progress": 0.4,
+          "message": "собрано 40 из 100"
+        }
+      }
+    },
+    "response": {
+      "status": 202
     }
   },
   "agent.config": {

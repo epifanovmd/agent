@@ -260,8 +260,8 @@ func TestEchoPacket(t *testing.T) {
 	}
 }
 
-// Настройки и POST /run: настройки задают цели и запускают круг; /run без targets — цели
-// настроек (итог — и для GET /metrics), с targets — разовая проверка.
+// Настройки и задача netprobe.run: настройки задают цели и запускают круг; задача без targets —
+// цели настроек (итог — и для GET /metrics), с targets — разовая проверка.
 func TestNetprobe(t *testing.T) {
 	p := newProber(methods{dial: func(context.Context, string, time.Duration) error { return nil }})
 	p.gap = 0
@@ -300,7 +300,8 @@ func TestNetprobe(t *testing.T) {
 	}
 }
 
-// HTTP воркера: PUT /config/targets, GET /health, GET /metrics, GET /manifest, служебные ошибки.
+// HTTP воркера: PUT /config/targets, GET /health, GET /metrics, GET /manifest, POST /jobs,
+// служебные ошибки.
 func TestHandler(t *testing.T) {
 	p := newProber(methods{dial: func(context.Context, string, time.Duration) error { return nil }})
 	p.gap = 0
@@ -365,7 +366,25 @@ func TestHandler(t *testing.T) {
 	// Манифест проходит проверку агента.
 	m, err := message.ParseWorkerManifest(raw)
 	if err != nil || m.Version != version || m.Configs[0].Key != configKey || len(m.Configs[0].Schema) == 0 ||
-		m.Routes[0].Path != "/run" {
+		len(m.Jobs) != 1 || m.Jobs[0].Type != jobRun || len(m.Jobs[0].Schema) == 0 {
 		t.Fatalf("манифест: %+v %v", m, err)
+	}
+
+	// Задача netprobe.run — итог сразу; другой тип — 400.
+	job := func(body string) (int, string) {
+		resp, err := http.Post(srv.URL+"/jobs", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(raw)
+	}
+	if code, body := job(`{"type":"netprobe.run","jobId":"j1","data":{"count":1}}`); code != http.StatusOK ||
+		!strings.Contains(body, `"result":{"at":`) {
+		t.Fatalf("netprobe.run: %d %s", code, body)
+	}
+	if code, _ := job(`{"type":"netprobe.other","jobId":"j2"}`); code != http.StatusBadRequest {
+		t.Fatalf("незнакомая задача: %d", code)
 	}
 }

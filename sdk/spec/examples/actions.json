@@ -142,5 +142,68 @@
         }
       }
     }
+  },
+  "action.result.deferred": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.result",
+      "id": "8f90a1b2c3d4e5f60718293a4b5c6d7e",
+      "re": "d4e5f60718293a4b5c6d7e8f90a1b2c3",
+      "data": { "ok": true, "result": { "deferred": true, "pending": "restart" } }
+    }
+  },
+  "action.done": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.done",
+      "id": "90a1b2c3d4e5f60718293a4b5c6d7e8f",
+      "re": "d4e5f60718293a4b5c6d7e8f90a1b2c3",
+      "data": { "name": "worker.restart", "worker": "echo", "ok": true }
+    }
+  },
+  "action.result.worker.update.deferred": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.result",
+      "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "re": "e5f60718293a4b5c6d7e8f90a1b2c3d4",
+      "data": { "ok": true, "result": { "deferred": true, "pending": "update" } }
+    }
+  },
+  "action.done.worker.update": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.done",
+      "id": "b2c3d4e5f60718293a4b5c6d7e8f90a1",
+      "re": "e5f60718293a4b5c6d7e8f90a1b2c3d4",
+      "data": {
+        "name": "worker.update",
+        "worker": "report",
+        "ok": true,
+        "result": { "version": "1.5.0", "previous": "1.4.0" }
+      }
+    }
+  },
+  "action.done.error": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "action.done",
+      "id": "c3d4e5f60718293a4b5c6d7e8f90a1b2",
+      "re": "e5f60718293a4b5c6d7e8f90a1b2c3d4",
+      "data": {
+        "name": "worker.update",
+        "worker": "report",
+        "ok": false,
+        "error": {
+          "code": "UPDATE_FAILED",
+          "message": "новая сборка не ответила ok на GET /health за минуту; возвращена 1.4.0"
+        }
+      }
+    }
   }
 }

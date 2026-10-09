@@ -10,7 +10,6 @@ import { after, before, describe, it } from "node:test";
 
 import {
   type Agent,
-  type AgentEvent,
   LINK_PATH,
   type LogEntry,
   type UpdateCandidate,
@@ -129,11 +128,11 @@ describe("действия и выпуск", () => {
       const echoPid = async () =>
         (await s.worker("echo"))?.health?.info?.pid as number | undefined;
       const pid = await echoPid();
-      const work = await s.fetchWorker("echo", "/work", {
-        method: "POST",
-        body: JSON.stringify({ steps: 15, delayMs: 400 }),
+      const { jobId } = await s.job("echo", {
+        type: "echo.long",
+        data: { steps: 15, delayMs: 400 },
+        timeoutMs: 1,
       });
-      const { id } = (await work.json()) as { id: string };
       const result = await s.api("POST", `/api/agents/${s.agentId}/update`);
 
       assert.deepEqual(result, { version: NEXT_VERSION, previous: VERSION });
@@ -156,23 +155,18 @@ describe("действия и выпуск", () => {
       await s.waitWorkers();
       assert.equal(await echoPid(), pid, "echo пережил обновление агента");
       const finished = await waitFor(
-        "работа echo закончена",
+        "задача echo закончена",
         async () => {
-          const list = (
-            await s.api<AgentEvent[]>(
-              "GET",
-              `/api/events?agentId=${s.agentId}&worker=echo&limit=10000`,
-            )
-          ).filter(e => (e.data as { id?: string })?.id === id);
+          const list = await s.jobEvents("echo", jobId);
 
-          return list.some(e => e.type === "echo.done") && list;
+          return list.some(e => e.type === "job.done") && list;
         },
         60_000,
       );
       const steps = new Set(
         finished
-          .filter(e => e.type === "echo.progress")
-          .map(e => (e.data as { step: number }).step),
+          .filter(e => e.type === "job.progress")
+          .map(e => (e.data as { progress: number }).progress),
       );
 
       assert.equal(steps.size, 15, "все шаги дошли");

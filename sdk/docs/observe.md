@@ -34,7 +34,7 @@ agents.on("agent", (a) => ui.update(a)); // подключение, отключ
 - `health` — последний ответ воркера на `GET /health`: `{ ok, busy?, message?, info? }`; нет поля —
   подходящего ответа ещё не было; `busy: true` — воркер ведёт долгую работу;
 - `pending` — `restart` или `update`: замена воркера ждёт, пока он занят
-  ([workers.md](workers.md#долгая-работа)); нет поля — не ждёт;
+  ([workers.md](workers.md#замена-занятого-воркера)); нет поля — не ждёт;
 - `configs` — что у агента на диске по каждому ключу и чем кончилось применение
   ([configs.md](configs.md#статус-применения));
 - `sysmetrics` — встроенный воркер агента (`builtin: true`), собирает метрики узла.
@@ -68,16 +68,16 @@ const a = await agents.getAgent(agentId); // a?.metrics — последняя �
 const w = await agents.watch(agentId, { metricsIntervalMs: 1000, logLevel: "debug", ttlMs: 60_000 });
 // { id, until } — продлевать повтором с тем же id, пока страница открыта
 await agents.watch(agentId, { id: w.id, metricsIntervalMs: 1000, logLevel: "debug", ttlMs: 60_000 });
-agents.unwatch(agentId, w.id); // страницу закрыли
+await agents.unwatch(agentId, w.id); // страницу закрыли
 ```
 
-Зрителей может быть много: `Agents` хранит их в памяти процесса и сводит в один `watch` —
+Зрителей может быть много: `Agents` хранит их в памяти копии бэкенда и сводит в один `watch` —
 частота самая высокая, уровень журнала самый подробный, срок самый поздний. Изменилась сводка
 (пришёл, ушёл или истёк зритель) — агент получает новый `watch`; зрителей нет — `watch {}`.
 Частота — не чаще раза в секунду; `ttlMs` — по умолчанию минута, не больше суток. Зритель
-действует, пока агент на связи с этим процессом: зритель, заведённый до подключения, агент
-получит сразу после `welcome`; при нескольких процессах вызывайте `watch` там же, где `fetch`
-([connection.md](connection.md#несколько-процессов-бэкенда)).
+действует, пока агент на связи с этой копией: зритель, заведённый до подключения, агент
+получит сразу после `welcome`. Агент на связи с другой копией — `watch` и `unwatch` уходят туда
+(опция `relay`, [connection.md](connection.md#несколько-копий-бэкенда)).
 
 ## Журнал
 
@@ -97,8 +97,8 @@ const entries = await agents.logs(agentId, { worker: "echo", lines: 200 }); // �
 
 `lines` — по умолчанию 200, не больше 5000; агент отдаёт их из памяти (`log.buffer` его настроек).
 Срок ответа — `actionTimeoutMs`. Ответ агента не по формату — `AgentsError` с кодом
-`MESSAGE_INVALID` (502) и запись в журнал (`log`). Как и другие действия, `logs` работает в процессе, у которого
-соединение агента.
+`MESSAGE_INVALID` (502) и запись в журнал (`log`). Как и другие действия, `logs` выполняется в
+копии бэкенда, у которой соединение агента (из другой — с пересылкой `relay`).
 
 ## События воркеров
 
@@ -146,7 +146,7 @@ agents.on("event", (e) => ui.push(e)); // после onEvent — для живы
 
 | `type`            | Когда начинается                                   | Когда заканчивается                |
 | ----------------- | -------------------------------------------------- | ---------------------------------- |
-| `offline`         | агент без связи дольше `offlineGraceMs`            | агент подключился                  |
+| `offline`         | агент без связи дольше `offlineGraceMs` (3 с)      | агент подключился                  |
 | `workerDown`      | воркер в `backoff` или `stopped`                   | воркер снова `running`             |
 | `workerInvalid`   | воркер в `invalid`; причина — в `message`          | воркер зарегистрирован (`running`) |
 | `workerUnhealthy` | воркер работает, но `health.ok: false`             | `health.ok: true`                  |
@@ -164,16 +164,20 @@ const now = await agents.listAlerts(); // текущие у всех агент�
 
 Итог действия (`restartWorker`, `updateWorker`, `updateAgent`, `rotateKey`, `logs`) —
 результат промиса вызова: он ждёт `action.result` от агента или срока (`TIMEOUT`). Замена
-занятого воркера (`restartWorker`, `updateWorker`) ждёт окончания его работы — итог приходит
-после замены; пока `status` показывает `pending`, срок `timeoutMs` отсчитывается заново, а
-`{ force: true }` заменяет сразу. Тот же итог
-выходит событием `action`; кто что сделал (`by(actor)`) — событием `audit`.
+занятого воркера (`restartWorker`, `updateWorker`) откладывается до окончания его работы: вызов
+сразу возвращает `{ deferred: true, pending, actionId }`, а итог замены приходит позже событием
+`action` с тем же `id` и `deferred: true` ([workers.md](workers.md#замена-занятого-воркера)).
+`{ wait: true }` — ждать итога в вызове (пока `status` показывает `pending`, срок `timeoutMs`
+отсчитывается заново), `{ force: true }` — заменить сразу. Тот же итог выходит событием
+`action`; кто что сделал (`by(actor)`) — событием `audit`.
 
 ```ts
-agents.on("action", (a) => save(a)); // { id, agentId, name, args?, actor?, status: "done" | "failed", result?, error?, createdAt, finishedAt }
+agents.on("action", (a) => save(a)); // { id, agentId, name, args?, actor?, status: "done" | "failed", result?, error?, createdAt, finishedAt, deferred? }
 agents.on("audit", (e) => save(e)); // { at, actor, action, agentId, details? }
 ```
 
-Ожидание итога живёт в памяти процесса, который отправил действие. Если агент переподключится к
-другому процессу и пришлёт итог туда, тот подтвердит его агенту и пропустит, а вызвавший
-получит `TIMEOUT`.
+Ожидание итога живёт в памяти копии бэкенда, которая отправила действие. Если агент
+переподключится к другой копии и пришлёт `action.result` туда, та подтвердит его агенту и
+пропустит, а вызвавший получит `TIMEOUT`. Итог отложенной замены (`action.done`) выходит событием
+`action` в той копии, куда он пришёл, — даже если замену отправила другая (тогда `args` —
+`{ name: <воркер> }`, `createdAt` — время приёма).

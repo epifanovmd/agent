@@ -487,7 +487,7 @@ workers:
 		t.Fatalf("умолчания: %+v %+v", plain.Lifecycle, plain.Logs)
 	}
 	if def.OnAgentRestart != Keep || def.OnAgentStop != Keep || def.Restart != RestartFailure || !def.BusyWait() ||
-		def.Busy.Timeout.Std() != 24*time.Hour || def.HealthInterval() != 10*time.Second || def.HealthFailures() != 3 ||
+		def.Busy.Timeout.Std() != 24*time.Hour || def.HealthInterval() != 5*time.Second || def.HealthFailures() != 3 ||
 		def.StartTimeout.Std() != time.Minute || def.Backoff.Max.Std() != 30*time.Second || DefaultLogs().MaxSize != 10<<20 {
 		t.Fatalf("значения по умолчанию: %+v", def)
 	}

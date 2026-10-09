@@ -44,7 +44,24 @@ export const NAME_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 /** Тип события. */
 export const EVENT_TYPE_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
 
+/** События задач воркера (§12): типы с этим началом зарезервированы. */
+export const JOB_EVENT_PREFIX = "job.";
+export const JOB_EVENTS = [
+  "job.progress",
+  "job.done",
+  "job.failed",
+  "job.cancelled",
+] as const;
+
+/** Задачи воркера (§12): POST /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel. */
+export const JOBS_PATH = "/jobs";
+
 /** Важные сообщения агента: подтверждаются `ack {ids}` (§3). */
-export const RELIABLE = new Set(["event", "config.applied", "action.result"]);
+export const RELIABLE = new Set([
+  "event",
+  "config.applied",
+  "action.result",
+  "action.done",
+]);
 /** Поток агента: подтверждается `ack {seq}` (§3). */
 export const STREAM = new Set(["status", "metrics", "log"]);

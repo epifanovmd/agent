@@ -12,11 +12,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/internal/worker"
 )
 
 // actions — встроенные действия, которые выполняются сейчас (по id).
@@ -52,36 +54,71 @@ func (a *App) action(env message.Envelope) {
 		}()
 		var act message.Action
 		var result any
+		// deferred — замена занятого воркера отложена: action.result уже ушёл
+		// ({deferred, pending}), итог — action.done (§10).
+		var deferred atomic.Bool
+		ctx := worker.WithDeferred(context.Background(), func(pending string) {
+			deferred.Store(true)
+			a.log.Info("воркер занят — замена отложена, итог придёт в action.done", "action", act.Name, "id", env.ID)
+			a.actionResult(env.ID, message.DeferredResult{Deferred: true, Pending: pending}, nil)
+		})
 		err := env.Decode(&act)
 		if err != nil {
 			err = message.NewError(message.CodeMessageInvalid, err.Error())
 		} else {
 			a.log.Info("действие сервера", "action", act.Name, "id", env.ID)
-			result, err = a.runAction(context.Background(), env.ID, act)
+			result, err = a.runAction(ctx, env.ID, act)
 		}
-		if errors.Is(err, errDeferred) {
-			return
+		switch {
+		case errors.Is(err, errDeferred):
+		case deferred.Load():
+			a.actionDone(env.ID, act, result, err)
+		default:
+			a.actionResult(env.ID, result, err)
 		}
-		a.actionResult(env.ID, result, err)
 	}()
 }
 
-// actionResult — action.result с re = id действия (важное сообщение).
-func (a *App) actionResult(id string, result any, err error) {
-	res := message.ActionResult{OK: err == nil}
+// outcome — ok, result и error итога действия.
+func (a *App) outcome(id string, result any, err error) (bool, json.RawMessage, *message.ErrorInfo) {
 	if err != nil {
 		var ei *message.ErrorInfo
 		if !errors.As(err, &ei) {
 			ei = message.NewError(message.CodeActionFailed, err.Error())
 		}
-		res.Error = ei
 		a.log.Warn("действие не выполнено", "id", id, "code", ei.Code, "err", ei.Message)
-	} else if result != nil {
-		raw, merr := json.Marshal(result)
-		if merr == nil {
-			res.Result = raw
-		}
+		return false, nil, ei
 	}
+	if result == nil {
+		return true, nil, nil
+	}
+	raw, merr := json.Marshal(result)
+	if merr != nil {
+		return true, nil, nil
+	}
+	return true, raw, nil
+}
+
+// actionDone — action.done с re = id действия: итог отложенной замены
+// воркера (важное сообщение).
+func (a *App) actionDone(id string, act message.Action, result any, err error) {
+	var args struct {
+		Name string `json:"name"`
+	}
+	_ = json.Unmarshal(act.Args, &args)
+	done := message.ActionDone{Name: act.Name, Worker: args.Name}
+	done.OK, done.Result, done.Error = a.outcome(id, result, err)
+	env := message.MustNew(message.TypeActionDone, done)
+	env.Re = id
+	if err := a.link.Important(env); err != nil {
+		a.log.Error("action.done не записан в outbox", "err", err)
+	}
+}
+
+// actionResult — action.result с re = id действия (важное сообщение).
+func (a *App) actionResult(id string, result any, err error) {
+	var res message.ActionResult
+	res.OK, res.Result, res.Error = a.outcome(id, result, err)
 	env := message.MustNew(message.TypeActionResult, res)
 	env.Re = id
 	if err := a.link.Important(env); err != nil {

@@ -343,8 +343,16 @@ func (s *Server) Watch(agentID string, opts WatchOptions) WatchRef {
 	return ref
 }
 
+// Actions — итоги действий агента (событие action), по порядку прихода.
+func (s *Server) Actions(agentID string) []ActionRecord {
+	s.t.Helper()
+	var list []ActionRecord
+	s.Must("actions", &list, agentID)
+	return list
+}
+
 // Action — встроенное действие методом Agents (restartWorker, updateWorker, updateAgent,
-// rotateKey) или agentLogs с аргументами после agentId; итог — в out.
+// rotateKey), agentLogs или runJob с аргументами после agentId; итог — в out.
 func (s *Server) Action(method, agentID string, out any, args ...any) error {
 	return s.Call(method, out, append([]any{agentID}, args...)...)
 }

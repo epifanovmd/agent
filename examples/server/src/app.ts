@@ -177,19 +177,23 @@ const agentRoute = async (
 
   if (section === "workers" && worker && rest[0] === "fetch")
     return proxy(as, call, id, worker, rest.slice(1));
+  if (section === "workers" && worker && rest[0] === "jobs")
+    return jobsRoute(as, call, id, worker, rest.slice(1));
   if (
     section === "workers" &&
     worker &&
     rest.length === 1 &&
     method === "POST"
   ) {
-    // Тело { force: true } — заменить сразу, не дожидаясь окончания работы воркера.
-    const force = (await readJSON(req))?.force === true;
+    // Тело { force: true } — заменить сразу, не дожидаясь окончания работы воркера;
+    // { wait: true } — ждать итога и отложенной замены.
+    const body = await readJSON(req);
+    const opts = { force: body?.force === true, wait: body?.wait === true };
 
     if (rest[0] === "restart")
-      return (await as.restartWorker(id, worker, { force }), reply({}));
+      return reply(await as.restartWorker(id, worker, opts));
     if (rest[0] === "update")
-      return reply(await as.updateWorker(id, worker, { force }));
+      return reply(await as.updateWorker(id, worker, opts));
   }
   if (section === "configs" && worker && rest.length === 1) {
     if (method === "PUT")
@@ -257,6 +261,42 @@ const agentRoute = async (
     default:
       return notFound(res);
   }
+};
+
+/**
+ * Задачи воркера: POST …/jobs { type, jobId?, data?, files?, timeoutMs? } — runJob; GET
+ * …/jobs/{jobId} — состояние; POST …/jobs/{jobId}/cancel — прервать. Закрыли запрос — ожидание
+ * итога прерывается, задаче уходит отмена.
+ */
+const jobsRoute = async (
+  as: Actor,
+  call: Call,
+  id: string,
+  worker: string,
+  rest: string[],
+): Promise<void> => {
+  const { method, req, res } = call;
+  const reply = (body: unknown) => sendJSON(res, 200, body);
+
+  if (method === "POST" && rest.length === 0) {
+    const abort = new AbortController();
+
+    res.on("close", () => {
+      if (!res.writableFinished) abort.abort();
+    });
+
+    return reply(
+      await as.runJob(id, worker, {
+        ...(await readJSON(req)),
+        signal: abort.signal,
+      }),
+    );
+  }
+  if (method === "GET" && rest.length === 1)
+    return reply(await as.jobStatus(id, worker, rest[0]));
+  if (method === "POST" && rest.length === 2 && rest[1] === "cancel")
+    return reply(await as.cancelJob(id, worker, rest[0]));
+  notFound(res);
 };
 
 /**
@@ -350,6 +390,6 @@ const watch = async (agents: Agents, call: Call, id: string): Promise<void> => {
     agents.off("metrics", onMetrics);
     agents.off("log", onLog);
     agents.off("event", onEvent);
-    agents.unwatch(id, watchId);
+    void agents.unwatch(id, watchId).catch(() => {});
   });
 };

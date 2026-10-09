@@ -28,13 +28,13 @@ const (
 	MaxFetchTimeout     = 10 * time.Minute
 	WorkerStartTimeout  = 60 * time.Second
 	UpdateHealthTimeout = time.Minute
-	HealthInterval      = 10 * time.Second
+	HealthInterval      = 5 * time.Second
 	HealthMisses        = 3
 	MinWatchInterval    = time.Second
 	ConfigRetry         = 25 * time.Second
 	LogBatchInterval    = time.Second
 	HelloTimeout        = 10 * time.Second
 	WelcomeTimeout      = 15 * time.Second
-	PingInterval        = 20 * time.Second
-	PongTimeout         = 10 * time.Second
+	PingInterval        = 10 * time.Second
+	PongTimeout         = 5 * time.Second
 )

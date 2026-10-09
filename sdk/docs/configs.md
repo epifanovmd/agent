@@ -62,7 +62,7 @@ await agents.setConfig(agentId, "echo", "settings", { prefix: 5, extra: 1 });
   присылает новее, а ключи, которых у бэкенда нет, удаляет (`config.delete`). Хранилище бэкенда
   — источник правды: пустой Store удалит все настройки на агенте.
 - Агент на связи с другим процессом — после `refresh(agentId)` в том процессе
-  ([connection.md](connection.md#несколько-процессов-бэкенда)), иначе — при следующем
+  ([connection.md](connection.md#несколько-копий-бэкенда)), иначе — при следующем
   подключении.
 
 Агент сохраняет значение и вызывает у воркера `PUT /config/{key}` с телом `{ version, data }`
@@ -99,6 +99,7 @@ const list = await agents.configStatus(agentId); // или (agentId, "report") �
 | `applied`  | воркер применил желаемую версию                               |
 | `failed`   | не применено: причина — код в `error` (ниже)                  |
 | `deleting` | удаляется на агенте                                           |
+| `deleted`  | агент удалил ключ (только в событии `config`, ниже)           |
 
 Коды в `error` при `state: failed`:
 
@@ -119,6 +120,10 @@ const list = await agents.configStatus(agentId); // или (agentId, "report") �
 ```ts
 agents.on("config", (s) => ui.push(s.agentId, s)); // ConfigStatus
 ```
+
+Удаление ключа даёт два события: `deleting` — сразу после `deleteConfig`, `deleted` — когда агент
+подтвердил удаление (ключа больше нет в `status.workers[].configs`; `version: null`). После
+`deleted` ключа нет и в `configStatus`.
 
 Отказ — ещё и проблема `configFailed` ([observe.md](observe.md#проблемы)); заканчивается, когда
 воркер применит версию.

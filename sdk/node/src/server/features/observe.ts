@@ -44,9 +44,12 @@ export class Observe {
   private readonly watchers = new Map<string, Map<string, Watcher>>();
   /** Обработанные события ("агент\nid"): повтор доставки подтверждается без обработки. */
   private readonly seen = new LRUCache<string, true>({ max: SEEN_EVENTS });
+  /** После обработчика бэкенда: события задач — ожидающим runJob. */
+  private readonly handled: (e: AgentEvent) => void;
 
-  constructor(ctx: Context) {
+  constructor(ctx: Context, handled: (e: AgentEvent) => void = () => {}) {
     this.ctx = ctx;
+    this.handled = handled;
   }
 
   /**
@@ -72,6 +75,7 @@ export class Observe {
   }
 
   unwatch(agentId: string, id: string): void {
+    valid(parse(messageIdSchema, id, "id"));
     const mine = this.watchers.get(agentId);
 
     if (!mine?.delete(id)) return;
@@ -107,8 +111,9 @@ export class Observe {
   }
 
   /**
-   * Важное сообщение event: обработчик onEvent, затем событие event; ошибка обработчика — без
-   * подтверждения (агент пришлёт снова). Непустой результат — причина отказа.
+   * Важное сообщение event: обработчик onEvent, затем ожидающие задач (runJob) и событие event;
+   * ошибка обработчика — без подтверждения (агент пришлёт снова). Непустой результат — причина
+   * отказа.
    */
   async event(ss: Session, env: Envelope): Promise<string> {
     const p = parseEvent(env.data);
@@ -131,6 +136,7 @@ export class Observe {
     if (d.data !== undefined) e.data = d.data;
     await this.ctx.settings.onEvent?.(e);
     this.seen.set(seenKey, true);
+    this.handled(e);
     this.ctx.emit("event", e);
 
     return "";

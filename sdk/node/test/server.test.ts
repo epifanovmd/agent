@@ -11,6 +11,7 @@ import WebSocket from "ws";
 
 import {
   type ActionRecord,
+  type Agent,
   agentsDefaults,
   type AlertEvent,
   type ConfigStatus,
@@ -237,6 +238,53 @@ describe("связь", () => {
         ["offline", false],
       ],
     );
+  });
+
+  it("по умолчанию: offline через 3 с после обрыва, lastSeenAt — последняя весть", async () => {
+    const s = await server();
+    const c = await enroll(s.url);
+    const fa = await FakeAgent.connect(s.ws, c);
+    const seen: Agent[] = [];
+
+    s.agents.on("agent", a => seen.push(a));
+    const closedAt = Date.now();
+
+    fa.ws.terminate();
+    await until(() => seen.some(a => !a.online), 5000);
+    const offline = seen.find(a => !a.online)!;
+    const after = Date.now() - closedAt;
+
+    assert.ok(after >= 2900 && after < 4500, `offline через ${after} мс`);
+    assert.ok(
+      offline.lastSeenAt! <= closedAt && closedAt - offline.lastSeenAt! < 1000,
+      "lastSeenAt — последняя весть до обрыва",
+    );
+  });
+
+  it("нет pong на два ping — соединение закрывается, агент offline с lastSeenAt", async () => {
+    const s = await server({ pingIntervalMs: 100, offlineGraceMs: 100 });
+    const c = await enroll(s.url);
+    const fa = await FakeAgent.connect(s.ws, c, {}, { autoPong: false });
+    const connectedAt = Date.now();
+    const seen: Agent[] = [];
+
+    s.agents.on("agent", a => seen.push(a));
+    await fa.closed;
+    const closedIn = Date.now() - connectedAt;
+
+    assert.ok(closedIn >= 200 && closedIn < 1500, `закрыто через ${closedIn}`);
+    await until(() => seen.some(a => !a.online));
+    const offline = seen.find(a => !a.online)!;
+
+    assert.ok(offline.lastSeenAt! >= connectedAt - 50);
+    assert.ok(offline.lastSeenAt! < connectedAt + 200);
+
+    // С pong соединение живёт.
+    const live = await FakeAgent.connect(s.ws, c);
+
+    await sleep(600);
+    assert.equal(live.ws.readyState, WebSocket.OPEN);
+    await live.close();
   });
 });
 
@@ -568,9 +616,24 @@ describe("настройки", () => {
       key: "main",
     });
     assert.equal((await s.agents.configStatus(c.agentId))[0].state, "deleting");
+    assert.equal(events.at(-1)?.state, "deleting");
+    // Агент подтвердил удаление: ключа нет в status — событие deleted.
     fa.stream("status", status({}));
     await fa.ackSeq(3);
     assert.deepEqual(await s.agents.configStatus(c.agentId), []);
+    assert.deepEqual(events.at(-1), {
+      agentId: c.agentId,
+      worker: "echo",
+      key: "main",
+      version: null,
+      state: "deleted",
+    });
+    // Повторный status без ключа — без нового события.
+    const count = events.length;
+
+    fa.stream("status", status({}));
+    await fa.ackSeq(4);
+    assert.equal(events.length, count);
     assert.equal(await s.agents.deleteConfig(c.agentId, "echo", "main"), false);
     // После удаления версия всё равно растёт.
     assert.equal(
@@ -815,10 +878,13 @@ describe("смена ключа", () => {
     await assert.rejects(FakeAgent.open(s.ws, c), /HTTP 401/);
   });
 
-  it("замена занятого воркера: force в args; пока status показывает pending — срок заново", async () => {
+  it("замена занятого воркера: force в args; отсрочка — сразу { deferred }, итог — action.done и событие action", async () => {
     const s = await server();
     const c = await enroll(s.url);
     const fa = await FakeAgent.connect(s.ws, c);
+    const acts: ActionRecord[] = [];
+
+    s.agents.on("action", a => acts.push(a));
     const forced = s.agents.restartWorker(c.agentId, "echo", { force: true });
     const act = await fa.next("action");
 
@@ -832,12 +898,66 @@ describe("смена ключа", () => {
       re: act.id,
       data: { ok: true },
     });
-    await forced;
+    assert.deepEqual(await forced, { deferred: false });
 
-    const p = s.agents.restartWorker(c.agentId, "echo", { timeoutMs: 300 });
+    // Воркер занят: агент сразу отвечает deferred, итог — action.done.
+    const p = s.agents.restartWorker(c.agentId, "echo");
+    const waiting = await fa.next("action");
+
+    fa.send({
+      type: "action.result",
+      id: "f2",
+      re: waiting.id,
+      data: { ok: true, result: { deferred: true, pending: "restart" } },
+    });
+    assert.deepEqual(await p, {
+      deferred: true,
+      pending: "restart",
+      actionId: waiting.id,
+    });
+    assert.equal(acts.length, 1, "событие action — только по итогу");
+    fa.send({
+      type: "action.done",
+      id: "f3",
+      re: waiting.id,
+      data: { name: "worker.restart", worker: "echo", ok: true },
+    });
+    await fa.ackOf("f3");
+    // Повтор доставки не задваивает событие.
+    fa.send({
+      type: "action.done",
+      id: "f3",
+      re: waiting.id,
+      data: { name: "worker.restart", worker: "echo", ok: true },
+    });
+    await fa.ackOf("f3");
+    assert.deepEqual(
+      acts.map(a => [a.id, a.status, a.deferred, a.args]),
+      [
+        [act.id, "done", undefined, { name: "echo", force: true }],
+        [waiting.id, "done", true, { name: "echo" }],
+      ],
+    );
+    await fa.close();
+  });
+
+  it("wait: ждать action.done; пока status показывает pending — срок заново; отказ — ошибка", async () => {
+    const s = await server();
+    const c = await enroll(s.url);
+    const fa = await FakeAgent.connect(s.ws, c);
+    const p = s.agents.restartWorker(c.agentId, "echo", {
+      wait: true,
+      timeoutMs: 300,
+    });
     const waiting = await fa.next("action");
 
     assert.deepEqual(waiting.data.args, { name: "echo" });
+    fa.send({
+      type: "action.result",
+      id: "w1",
+      re: waiting.id,
+      data: { ok: true, result: { deferred: true, pending: "restart" } },
+    });
     const pending = {
       name: "echo",
       state: "running",
@@ -850,16 +970,38 @@ describe("смена ключа", () => {
       await sleep(150);
     }
     fa.send({
-      type: "action.result",
-      id: "f2",
+      type: "action.done",
+      id: "w2",
       re: waiting.id,
-      data: { ok: true },
+      data: { name: "worker.restart", worker: "echo", ok: true },
     });
-    await p;
+    assert.deepEqual(await p, { deferred: false });
     const a = await s.agents.getAgent(c.agentId);
 
     assert.equal(a?.status?.workers[0]?.pending, "restart");
-    assert.equal(a?.status?.workers[0]?.health?.busy, true);
+
+    // Отказ отложенной замены — AgentsError с кодом из action.done.
+    const q = s.agents.restartWorker(c.agentId, "echo", { wait: true });
+    const next = await fa.next("action");
+
+    fa.send({
+      type: "action.result",
+      id: "w3",
+      re: next.id,
+      data: { ok: true, result: { deferred: true, pending: "restart" } },
+    });
+    fa.send({
+      type: "action.done",
+      id: "w4",
+      re: next.id,
+      data: {
+        name: "worker.restart",
+        worker: "echo",
+        ok: false,
+        error: { code: "ACTION_FAILED", message: "не запустился" },
+      },
+    });
+    await assert.rejects(q, { code: "ACTION_FAILED" });
     await fa.close();
   });
 
@@ -982,7 +1124,7 @@ describe("выпуск", () => {
       re: act.id,
       data: { ok: true, result: { version: "1.10.0" } },
     });
-    assert.deepEqual(await p, { version: "1.10.0" });
+    assert.deepEqual(await p, { version: "1.10.0", deferred: false });
     await assert.rejects(s.agents.updateWorker(c.agentId, "echo"), {
       code: "WORKER_NOT_RELEASED",
       status: 409,

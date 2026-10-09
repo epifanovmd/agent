@@ -135,7 +135,7 @@ export interface ConfigRecord {
 }
 
 export type ConfigState =
-  "pending" | "applying" | "applied" | "failed" | "deleting";
+  "pending" | "applying" | "applied" | "failed" | "deleting" | "deleted";
 
 /** Статус ключа настроек: желаемая, доставленная, применённая версия. */
 export interface ConfigStatus {
@@ -150,7 +150,8 @@ export interface ConfigStatus {
   applied?: number;
   /**
    * pending — агенту ещё не доставлено; applying — доставлено, применяется; applied — применена
-   * желаемая версия; failed — воркер отказал (error); deleting — удаляется.
+   * желаемая версия; failed — воркер отказал (error); deleting — удаляется; deleted — агент
+   * подтвердил удаление (только в событии config).
    */
   state: ConfigState;
   error?: ErrorInfo;
@@ -195,6 +196,8 @@ export interface ActionRecord {
   error?: ErrorInfo;
   createdAt: number;
   finishedAt: number;
+  /** Итог отложенной замены воркера (пришёл в action.done). */
+  deferred?: true;
 }
 
 /** Агент, которого можно обновить до версии выпуска. */

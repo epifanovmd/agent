@@ -146,17 +146,21 @@ previous}}`. Итог приходит уже в новом соединении
 ```ts
 const list = await agents.workerUpdateCandidates();
 // [{ agentId, agentName, online, worker, current, target, os, arch }]
-for (const c of list) await agents.updateWorker(c.agentId, c.worker); // → { version, previous }
+for (const c of list) await agents.updateWorker(c.agentId, c.worker);
+// → { version, previous, deferred: false } — обновлён;
+//   { deferred: true, pending: "update", actionId } — воркер занят, итог — событие action
 await agents.updateWorker(agentId, "report", { force: true }); // не ждать окончания работы воркера
+await agents.updateWorker(agentId, "report", { wait: true }); // ждать итога и отложенной замены
 ```
 
 Кандидаты — воркеры с `release: true`, чья версия отличается от новейшей сборки этого воркера в
 манифесте под ОС и процессор агента. Переустановить ту же версию можно. Воркер не из выпуска —
 `WORKER_NOT_RELEASED`, нет сборки — `UPDATE_NOT_AVAILABLE`. Аудит — `worker.update`.
 
-**Агент** скачивает и проверяет сборку; если воркер занят (`GET /health` → `busy: true`), ждёт
-окончания его работы (в `status` — `pending: "update"`, не дольше `lifecycle.busy.timeout`;
-`force: true` — не ждёт), останавливает прежний процесс, запускает новый и ждёт `ok: true` на
+**Агент** скачивает и проверяет сборку; если воркер занят (`GET /health` → `busy: true`), сразу
+отвечает, что замена отложена, и ждёт окончания его работы (в `status` — `pending: "update"`, не
+дольше `lifecycle.busy.timeout`; `force: true` — не ждёт; итог — событие `action` с
+`deferred: true`), останавливает прежний процесс, запускает новый и ждёт `ok: true` на
 `GET /health` до минуты (`lifecycle.updateHealthyTimeout`). Не дождался — возвращает прежнюю сборку, итог —
 `UPDATE_FAILED`. Уже обновляется — `BUSY`. Добавить или удалить воркер бэкенд не может — это
 решает `agent.yaml`.

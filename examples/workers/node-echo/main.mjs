@@ -5,8 +5,10 @@
 //   GET  /stream?n=5       ответ по частям: n строк с паузой
 //   GET  /bytes?n=256      двоичный ответ: n байт 0, 1, …, 255, 0, …
 //   POST /hang             «зависнуть»: GET /health больше не отвечает (агент перезапустит воркер)
-//   POST /work             {"steps", "delayMs"} → 202 {"id"}; события echo.progress и echo.done;
-//                          пока работа идёт, GET /health отвечает busy: true
+//   POST /jobs             задачи (§12): echo.quick {text} → 200 {result: {text}};
+//                          echo.long {steps, delayMs, text?} → 202 {id}, события job.progress и
+//                          job.done; пока задача идёт, GET /health отвечает busy: true
+//   GET  /jobs/{id}        состояние задачи; POST /jobs/{id}/cancel — прервать (job.cancelled)
 //   PUT  /config/settings  {version, data: {"prefix", "upper"}}; неверное — 400 {message}
 //   DELETE /config/settings, GET /metrics, GET /health, POST /cleanup
 //   GET  /manifest         что воркер умеет: версия, ключ settings со схемой, маршруты, события
@@ -26,7 +28,7 @@ const MAX_PREFIX = 64;
 // по схеме до отправки агенту.
 const MANIFEST = {
   version: VERSION,
-  description: "Эхо на Node.js: текст, потоковый и двоичный ответ, долгая работа с событиями",
+  description: "Эхо на Node.js: текст, потоковый и двоичный ответ, быстрые и долгие задачи",
   configs: [
     {
       key: "settings",
@@ -42,22 +44,44 @@ const MANIFEST = {
     { method: "POST", path: "/echo", description: "Текст с префиксом" },
     { method: "GET", path: "/stream", description: "Ответ по частям, ?n= строк" },
     { method: "GET", path: "/bytes", description: "Двоичный ответ, ?n= байт" },
-    { method: "POST", path: "/work", description: "Долгая работа: события echo.progress и echo.done" },
     { method: "POST", path: "/hang", description: "Зависнуть: GET /health больше не отвечает" },
   ],
-  events: [
-    { type: "echo.started", description: "Воркер запущен" },
-    { type: "echo.progress", description: "Шаг долгой работы: {id, step, of}" },
-    { type: "echo.done", description: "Долгая работа закончена: {id, text}" },
+  events: [{ type: "echo.started", description: "Воркер запущен" }],
+  jobs: [
+    {
+      type: "echo.quick",
+      description: "Текст с префиксом — итог сразу",
+      schema: { type: "object", properties: { text: { type: "string" } } },
+    },
+    {
+      type: "echo.long",
+      description: "Долгая задача: шаги с паузой, ход — job.progress, итог — job.done",
+      schema: {
+        type: "object",
+        properties: {
+          steps: { type: "integer", minimum: 1, maximum: 100 },
+          delayMs: { type: "integer", minimum: 0, maximum: 10_000 },
+          text: { type: "string" },
+        },
+      },
+    },
   ],
 };
 let settings = { ...DEFAULTS };
 let settingsVersion = 0;
-const counters = { requests: 0, echoed: 0, streamed: 0, works: 0, events: 0, eventErrors: 0 };
+const counters = { requests: 0, echoed: 0, streamed: 0, jobs: 0, events: 0, eventErrors: 0 };
 let lastEventError = "";
 let hung = false;
-// Сколько долгих работ идёт: пока есть хоть одна — busy (агент не заменяет воркер).
-let running = 0;
+// Долгие задачи: id → {id, jobId, steps, step, state, result?}; пока идёт хоть одна — busy
+// (агент не заменяет воркер).
+const jobs = new Map();
+const running = () => [...jobs.values()].filter((j) => j.state === "running").length;
+const jobStatus = (j) => ({
+  id: j.id,
+  state: j.state,
+  progress: j.step / j.steps,
+  ...(j.result ? { result: j.result } : {}),
+});
 const STATE_FILE = process.env.ECHO_STATE_FILE ?? "";
 
 /** Применённая настройка — в ECHO_STATE_FILE (если задан). */
@@ -142,8 +166,8 @@ async function route(req, res) {
       res,
       200,
       lastEventError
-        ? { ok: false, busy: running > 0, message: `события не доходят: ${lastEventError}`, info }
-        : { ok: true, busy: running > 0, message: running ? `идёт работ: ${running}` : "работаю", info },
+        ? { ok: false, busy: running() > 0, message: `события не доходят: ${lastEventError}`, info }
+        : { ok: true, busy: running() > 0, message: running() ? `идёт задач: ${running()}` : "работаю", info },
     );
   }
   if (method === "GET" && path === "/manifest") return json(res, 200, MANIFEST);
@@ -204,27 +228,51 @@ async function route(req, res) {
     res.writeHead(200, { "content-type": "application/octet-stream", "content-length": n });
     return res.end(raw);
   }
-  if (method === "POST" && path === "/work") {
-    const body = (await readJSON(req)) ?? {};
-    const steps = Number(body.steps ?? 5);
-    const delayMs = Number(body.delayMs ?? 500);
+  if (method === "POST" && path === "/jobs") {
+    const { type, jobId = "", data = {} } = (await readJSON(req)) ?? {};
+    const text = String(data?.text ?? "");
+    if (type === "echo.quick") {
+      counters.echoed++;
+      return json(res, 200, { result: { text: transform(text) } });
+    }
+    if (type !== "echo.long") return json(res, 400, { message: `задачи ${type} нет: есть echo.quick и echo.long` });
+    const steps = Number(data.steps ?? 5);
+    const delayMs = Number(data.delayMs ?? 500);
     if (!(steps >= 1 && steps <= 100) || !(delayMs >= 0 && delayMs <= 10_000))
       return json(res, 400, { message: "steps — от 1 до 100, delayMs — до 10000" });
-    const id = randomUUID().slice(0, 12);
-    counters.works++;
-    running++;
+    // Повтор с тем же jobId — та же задача.
+    const same = jobId && [...jobs.values()].find((j) => j.jobId === jobId);
+    if (same) return json(res, 202, { id: same.id });
+    const job = { id: randomUUID().slice(0, 12), jobId, steps, step: 0, state: "running" };
+    jobs.set(job.id, job);
+    counters.jobs++;
+    const ids = { jobId, id: job.id };
     void (async () => {
-      try {
-        for (let step = 1; step <= steps; step++) {
-          await sleep(delayMs);
-          await event("echo.progress", { id, step, of: steps });
-        }
-        await event("echo.done", { id, text: transform(`готово: ${steps} шагов`) });
-      } finally {
-        running--;
+      while (job.state === "running" && job.step < steps) {
+        await sleep(delayMs);
+        if (job.state !== "running") return;
+        job.step++;
+        await event("job.progress", { ...ids, progress: job.step / steps, message: `шаг ${job.step} из ${steps}` });
       }
+      if (job.state !== "running") return;
+      job.state = "done";
+      job.result = { text: transform(text || `готово: ${steps} шагов`) };
+      await event("job.done", { ...ids, result: job.result });
     })();
-    return json(res, 202, { id, steps });
+    return json(res, 202, { id: job.id });
+  }
+  const jobPath = /^\/jobs\/([^/]+)(\/cancel)?$/.exec(path);
+  if (jobPath) {
+    const job = jobs.get(jobPath[1]);
+    if (!job) return json(res, 404, { message: "нет такой задачи" });
+    if (method === "GET" && !jobPath[2]) return json(res, 200, jobStatus(job));
+    if (method === "POST" && jobPath[2]) {
+      if (job.state === "running") {
+        job.state = "cancelled";
+        await event("job.cancelled", { jobId: job.jobId, id: job.id });
+      }
+      return json(res, 200, jobStatus(job));
+    }
   }
   json(res, 404, { message: "нет маршрута" });
 }

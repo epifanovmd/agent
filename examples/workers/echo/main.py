@@ -6,12 +6,14 @@ HTTP-сервис на unix-сокете AGENT_WORKER_SOCKET (sdk/spec §12):
   GET  /stream?n=5      ответ по частям: n строк с паузой (потоковый ответ fetch)
   GET  /bytes?n=256     двоичный ответ: n байт 0, 1, …, 255, 0, …
   POST /hang            «зависнуть»: GET /health больше не отвечает (агент перезапустит воркер)
-  POST /work            {"steps": 5, "delayMs": 500} → 202 {"id"}; дальше события
-                        echo.progress {id, step, of} и echo.done {id, text} через агента;
-                        пока работа идёт, GET /health отвечает busy: true (агент не заменяет
-                        воркер до её окончания)
-  GET  /work/{id}       ход работы: {id, step, of, state}; state — running | done | cancelled
-  POST /work/{id}/cancel  прервать работу (событие echo.cancelled)
+  POST /jobs            задачи (§12): {"type", "jobId", "data"}
+                          echo.quick {"text"} → 200 {"result": {"text"}} — итог сразу;
+                          echo.long {"steps": 5, "delayMs": 500, "text"?} → 202 {"id"}; дальше события
+                          job.progress {jobId, id, progress, message} и job.done {jobId, id, result}
+                          через агента; пока задача идёт, GET /health отвечает busy: true (агент не
+                          заменяет воркер до её окончания)
+  GET  /jobs/{id}       состояние: {id, state, progress, result?}; state — running | done | cancelled
+  POST /jobs/{id}/cancel  прервать задачу (событие job.cancelled)
   PUT  /config/settings {version, data: {"prefix": "…", "upper": true}}; неверное — 400 {message}
   DELETE /config/settings  вернуть значения по умолчанию
   GET  /metrics         счётчики
@@ -22,8 +24,8 @@ HTTP-сервис на unix-сокете AGENT_WORKER_SOCKET (sdk/spec §12):
 ECHO_STATE_FILE (необязательно) — файл на узле, куда echo записывает применённую настройку:
 пример того, что воркер создаёт на узле и убирает при POST /cleanup.
 
-ECHO_WORK_DIR (необязательно) — каталог, где echo хранит ход каждой работы (<id>.json) после
-каждого шага: запущенный заново воркер продолжает незаконченные работы с сохранённого шага.
+ECHO_JOBS_DIR (необязательно) — каталог, где echo хранит ход каждой долгой задачи (<id>.json)
+после каждого шага: запущенный заново воркер продолжает незаконченные задачи с сохранённого шага.
 
 События уходят агенту: POST /events на AGENT_SOCKET с заголовком
 Authorization: Bearer $AGENT_WORKER_TOKEN. Запускает воркер агент (agent.yaml → workers).
@@ -50,7 +52,7 @@ MAX_PREFIX = 64
 # по схеме до отправки агенту.
 MANIFEST = {
     "version": VERSION,
-    "description": "Эхо: текст, потоковый и двоичный ответ, долгая работа с событиями",
+    "description": "Эхо: текст, потоковый и двоичный ответ, быстрые и долгие задачи",
     "configs": [
         {
             "key": "settings",
@@ -69,29 +71,42 @@ MANIFEST = {
         {"method": "POST", "path": "/echo", "description": "Текст с префиксом"},
         {"method": "GET", "path": "/stream", "description": "Ответ по частям, ?n= строк"},
         {"method": "GET", "path": "/bytes", "description": "Двоичный ответ, ?n= байт"},
-        {"method": "POST", "path": "/work", "description": "Долгая работа: события echo.progress и echo.done"},
-        {"method": "GET", "path": "/work/{id}", "description": "Ход работы"},
-        {"method": "POST", "path": "/work/{id}/cancel", "description": "Прервать работу"},
         {"method": "POST", "path": "/hang", "description": "Зависнуть: GET /health больше не отвечает"},
     ],
     "events": [
         {"type": "echo.started", "description": "Воркер запущен"},
-        {"type": "echo.progress", "description": "Шаг долгой работы: {id, step, of}"},
-        {"type": "echo.done", "description": "Долгая работа закончена: {id, text}"},
-        {"type": "echo.cancelled", "description": "Долгая работа прервана: {id, step}"},
+    ],
+    "jobs": [
+        {
+            "type": "echo.quick",
+            "description": "Текст с префиксом — итог сразу",
+            "schema": {"type": "object", "properties": {"text": {"type": "string"}}},
+        },
+        {
+            "type": "echo.long",
+            "description": "Долгая задача: шаги с паузой, ход — job.progress, итог — job.done",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "steps": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "delayMs": {"type": "integer", "minimum": 0, "maximum": 10000},
+                    "text": {"type": "string"},
+                },
+            },
+        },
     ],
 }
 
 lock = threading.Lock()
 settings = dict(DEFAULTS)
 settings_version = 0
-counters = {"requests": 0, "echoed": 0, "streamed": 0, "works": 0, "worksRunning": 0, "events": 0, "eventErrors": 0}
+counters = {"requests": 0, "echoed": 0, "streamed": 0, "jobs": 0, "jobsRunning": 0, "events": 0, "eventErrors": 0}
 last_event_error = ""
 hung = threading.Event()
 STATE_FILE = os.environ.get("ECHO_STATE_FILE", "")
-WORK_DIR = os.environ.get("ECHO_WORK_DIR", "")
-# Работы: id → {id, steps, delay, step, state}; незаконченные — в WORK_DIR.
-works = {}
+JOBS_DIR = os.environ.get("ECHO_JOBS_DIR", "")
+# Долгие задачи: id → {id, jobId, steps, delay, text, step, state}; ход — в JOBS_DIR.
+jobs = {}
 
 
 def count(name, delta=1):
@@ -192,43 +207,54 @@ def validate(data):
     return None
 
 
-def save_work(job):
-    """Ход работы — на диск (ECHO_WORK_DIR) атомарно: после перезапуска работа продолжится."""
-    if not WORK_DIR:
+def save_job(job):
+    """Ход задачи — на диск (ECHO_JOBS_DIR) атомарно: после перезапуска задача продолжится."""
+    if not JOBS_DIR:
         return
-    os.makedirs(WORK_DIR, exist_ok=True)
-    path = os.path.join(WORK_DIR, job["id"] + ".json")
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    path = os.path.join(JOBS_DIR, job["id"] + ".json")
+    with lock:
+        raw = json.dumps(job)
     with open(path + ".tmp", "w", encoding="utf-8") as f:
-        json.dump(job, f)
+        f.write(raw)
     os.replace(path + ".tmp", path)
 
 
-def load_works():
-    """Незаконченные работы прошлого запуска — продолжить с сохранённого шага."""
-    if not WORK_DIR or not os.path.isdir(WORK_DIR):
+def load_jobs():
+    """Незаконченные задачи прошлого запуска — продолжить с сохранённого шага."""
+    if not JOBS_DIR or not os.path.isdir(JOBS_DIR):
         return
-    for name in sorted(os.listdir(WORK_DIR)):
+    for name in sorted(os.listdir(JOBS_DIR)):
         if not name.endswith(".json"):
             continue
         try:
-            with open(os.path.join(WORK_DIR, name), encoding="utf-8") as f:
+            with open(os.path.join(JOBS_DIR, name), encoding="utf-8") as f:
                 job = json.load(f)
         except (OSError, ValueError):
             continue
         with lock:
-            works[job["id"]] = job
+            jobs[job["id"]] = job
         if job.get("state") == "running":
-            print(f"работа {job['id']}: продолжаю с шага {job['step']} из {job['steps']}", flush=True)
-            start_work(job)
+            print(f"задача {job['id']}: продолжаю с шага {job['step']} из {job['steps']}", flush=True)
+            start_job(job)
 
 
-def start_work(job):
-    count("worksRunning")
-    threading.Thread(target=work, args=(job,), daemon=True).start()
+def job_status(job):
+    """Состояние задачи для GET /jobs/{id} (под lock)."""
+    body = {"id": job["id"], "state": job["state"], "progress": job["step"] / job["steps"]}
+    if job["state"] == "done":
+        body["result"] = {"text": job["result"]}
+    return body
 
 
-def work(job):
-    """«Долгая работа»: событие на каждый шаг (ход — на диск) и итог."""
+def start_job(job):
+    count("jobsRunning")
+    threading.Thread(target=run_job, args=(job,), daemon=True).start()
+
+
+def run_job(job):
+    """Долгая задача: событие job.progress на каждый шаг (ход — на диск) и итог job.done."""
+    ids = {"jobId": job["jobId"], "id": job["id"]}
     try:
         while True:
             with lock:
@@ -239,18 +265,21 @@ def work(job):
                 if job["state"] != "running":
                     break
                 job["step"] += 1
-                step = job["step"]
-            save_work(job)
-            event("echo.progress", {"id": job["id"], "step": step, "of": job["steps"]})
+                step, steps = job["step"], job["steps"]
+            save_job(job)
+            event("job.progress", {**ids, "progress": step / steps, "message": f"шаг {step} из {steps}"})
+        text = transform(job["text"] or f"готово: {job['steps']} шагов")
         with lock:
             finished = job["state"] == "running"
             if finished:
                 job["state"] = "done"
+                job["result"] = text
+        result = {"text": text}
         if finished:
-            save_work(job)
-            event("echo.done", {"id": job["id"], "text": transform(f"готово: {job['steps']} шагов")})
+            save_job(job)
+            event("job.done", {**ids, "result": result})
     finally:
-        count("worksRunning", -1)
+        count("jobsRunning", -1)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -285,11 +314,11 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(60)
             with lock:
                 err, s, v = last_event_error, dict(settings), settings_version
-                running = [j for j in works.values() if j["state"] == "running"]
+                running = [j for j in jobs.values() if j["state"] == "running"]
             info = {"version": VERSION, "pid": os.getpid(), "settingsVersion": v, "prefix": s["prefix"]}
             message = "работаю"
             if running:
-                message = "идёт работа: " + ", ".join(f"{j['id']} — шаг {j['step']} из {j['steps']}" for j in running)
+                message = "идёт задача: " + ", ".join(f"{j['id']} — шаг {j['step']} из {j['steps']}" for j in running)
             if err:
                 return self.reply(200, {"ok": False, "busy": bool(running), "message": "события не доходят: " + err, "info": info})
             return self.reply(200, {"ok": True, "busy": bool(running), "message": message, "info": info})
@@ -299,13 +328,12 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 metrics = {**counters, "settingsVersion": settings_version}
             return self.reply(200, metrics)
-        if path.startswith("/work/"):
+        if path.startswith("/jobs/"):
             with lock:
-                job = works.get(path[len("/work/"):])
-                body = None if job is None else {k: job[k] for k in ("id", "step", "steps", "state")}
+                job = jobs.get(path[len("/jobs/"):])
+                body = None if job is None else job_status(job)
             if body is None:
-                return self.reply(404, {"message": "нет такой работы"})
-            body["of"] = body.pop("steps")
+                return self.reply(404, {"message": "нет такой задачи"})
             return self.reply(200, body)
         if path == "/stream":
             return self.stream(query)
@@ -354,12 +382,12 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 settings, settings_version = dict(DEFAULTS), 0
                 for k in counters:
-                    if k != "worksRunning":
+                    if k != "jobsRunning":
                         counters[k] = 0
             remove_state()
-            if WORK_DIR and os.path.isdir(WORK_DIR):
-                for name in os.listdir(WORK_DIR):
-                    os.unlink(os.path.join(WORK_DIR, name))
+            if JOBS_DIR and os.path.isdir(JOBS_DIR):
+                for name in os.listdir(JOBS_DIR):
+                    os.unlink(os.path.join(JOBS_DIR, name))
             return self.reply(204)
         if path == "/hang":
             hung.set()
@@ -375,35 +403,61 @@ class Handler(BaseHTTPRequestHandler):
                 text = raw.decode(errors="replace")
             count("echoed")
             return self.reply(200, {"text": transform(str(text))})
-        if path == "/work":
-            count("requests")
-            try:
-                body = self.json_body() or {}
-                steps = int(body.get("steps", 5))
-                delay = int(body.get("delayMs", 500)) / 1000
-            except (ValueError, TypeError, AttributeError):
-                return self.reply(400, {"message": "тело: {steps, delayMs} — числа"})
-            if not 1 <= steps <= 100 or not 0 <= delay <= 10:
-                return self.reply(400, {"message": "steps — от 1 до 100, delayMs — до 10000"})
-            job = {"id": uuid.uuid4().hex[:12], "steps": steps, "delay": delay, "step": 0, "state": "running"}
+        if path == "/jobs":
+            return self.post_job()
+        if path.startswith("/jobs/") and path.endswith("/cancel"):
+            job_id = path[len("/jobs/"):-len("/cancel")]
             with lock:
-                works[job["id"]] = job
-            count("works")
-            save_work(job)
-            start_work(job)
-            return self.reply(202, {"id": job["id"], "steps": steps})
-        if path.startswith("/work/") and path.endswith("/cancel"):
-            job_id = path[len("/work/"):-len("/cancel")]
-            with lock:
-                job = works.get(job_id)
-                if job is not None and job["state"] == "running":
+                job = jobs.get(job_id)
+                cancelled = job is not None and job["state"] == "running"
+                if cancelled:
                     job["state"] = "cancelled"
             if job is None:
-                return self.reply(404, {"message": "нет такой работы"})
-            save_work(job)
-            event("echo.cancelled", {"id": job_id, "step": job["step"]})
-            return self.reply(200, {"id": job_id, "state": job["state"]})
+                return self.reply(404, {"message": "нет такой задачи"})
+            if cancelled:
+                save_job(job)
+                event("job.cancelled", {"jobId": job["jobId"], "id": job_id})
+            with lock:
+                body = job_status(job)
+            return self.reply(200, body)
         self.reply(404, {"message": "нет маршрута"})
+
+    def post_job(self):
+        """POST /jobs: echo.quick — итог сразу (200), echo.long — 202 {id} и события job.*."""
+        count("requests")
+        try:
+            body = self.json_body() or {}
+            type_, job_id, data = body.get("type"), str(body.get("jobId") or ""), body.get("data") or {}
+            if not isinstance(data, dict):
+                raise TypeError
+        except (ValueError, TypeError, AttributeError):
+            return self.reply(400, {"message": "тело: {type, jobId, data}, data — объект"})
+        text = str(data.get("text", ""))
+        if type_ == "echo.quick":
+            count("echoed")
+            return self.reply(200, {"result": {"text": transform(text)}})
+        if type_ != "echo.long":
+            return self.reply(400, {"message": f"задачи {type_} нет: есть echo.quick и echo.long"})
+        try:
+            steps = int(data.get("steps", 5))
+            delay = int(data.get("delayMs", 500)) / 1000
+        except (ValueError, TypeError):
+            return self.reply(400, {"message": "steps и delayMs — числа"})
+        if not 1 <= steps <= 100 or not 0 <= delay <= 10:
+            return self.reply(400, {"message": "steps — от 1 до 100, delayMs — до 10000"})
+        with lock:
+            # Повтор с тем же jobId — та же задача.
+            same = next((j for j in jobs.values() if job_id and j["jobId"] == job_id), None)
+            if same is None:
+                job = {"id": uuid.uuid4().hex[:12], "jobId": job_id, "steps": steps, "delay": delay,
+                       "text": text, "step": 0, "state": "running"}
+                jobs[job["id"]] = job
+        if same is not None:
+            return self.reply(202, {"id": same["id"]})
+        count("jobs")
+        save_job(job)
+        start_job(job)
+        return self.reply(202, {"id": job["id"]})
 
     def do_PUT(self):
         global settings, settings_version
@@ -475,7 +529,7 @@ def main():
         os.unlink(path)
     server = Server(path, Handler)
     threading.Thread(target=hello, daemon=True).start()
-    load_works()
+    load_jobs()
     # SIGTERM — остановка: созданное на узле не убирается (это делает только POST /cleanup).
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown).start())
     server.serve_forever()

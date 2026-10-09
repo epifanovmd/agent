@@ -136,8 +136,12 @@ func (s *Server) event(w http.ResponseWriter, r *http.Request, name string) {
 	ctx, cancel := context.WithTimeout(r.Context(), declaredWait)
 	defer cancel()
 	if !s.agent.Declared(ctx, name, post.Type) {
-		fail(w, http.StatusBadRequest, message.CodeEventUndeclared,
-			"события "+post.Type+" нет в манифесте воркера (events)")
+		text := "события " + post.Type + " нет в манифесте воркера (events)"
+		if strings.HasPrefix(post.Type, message.JobEventPrefix) {
+			text = "событие " + post.Type + ": события задач принимаются, только если манифест воркера объявляет jobs" +
+				" (типы — job.progress, job.done, job.failed, job.cancelled)"
+		}
+		fail(w, http.StatusBadRequest, message.CodeEventUndeclared, text)
 		return
 	}
 	err = s.agent.Event(message.Event{Worker: name, Type: post.Type, Data: post.Data, At: time.Now().UnixMilli()})

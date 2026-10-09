@@ -1,6 +1,6 @@
 // Agents — серверная часть связи с агентами. Фасад: собирает части из features/ (регистрация и
-// ключи, сессии, приём сообщений, настройки, fetch, наблюдение, действия, выпуск) и передаёт им
-// вызовы. Общее для частей — core/, данные — store/, HTTP и WebSocket — transport/.
+// ключи, сессии, приём сообщений, настройки, fetch, задачи, наблюдение, действия, выпуск,
+// пересылка между процессами) и передаёт им вызовы. Общее для частей — core/, данные — store/, HTTP и WebSocket — transport/.
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
@@ -15,15 +15,19 @@ import {
   type ActionOptions,
   Actions,
   type LogsOptions,
+  type RestartResult,
   type UpdateResult,
   type WorkerActionOptions,
+  type WorkerUpdateResult,
 } from "./features/actions";
 import { Configs } from "./features/configs";
 import { Connections } from "./features/connections";
 import { Enrollment } from "./features/enrollment";
 import { Inbound } from "./features/inbound";
 import { installCommand, type InstallOptions } from "./features/install";
+import { type JobOptions, type JobResult, Jobs } from "./features/jobs";
 import { Observe, type WatchOptions, type WatchRef } from "./features/observe";
+import { type Fetcher, Relay } from "./features/relay";
 import { Release } from "./features/release";
 import { type FetchInit, fetchReply, Tunnel } from "./features/tunnel";
 import { publicAgent } from "./model/public-agent";
@@ -36,6 +40,7 @@ import type {
   WorkerUpdateCandidate,
 } from "./model/types";
 import {
+  type JobStatus,
   type LogEntry,
   newId,
   type ReleaseManifest,
@@ -44,15 +49,63 @@ import { MemoryStore } from "./store/memory";
 import type { Store } from "./store/store";
 import { Transport } from "./transport/transport";
 
-/** Части, которые изменяют что-то от имени actor (общие для Agents и Actor). */
+/**
+ * Вызовы от имени actor (общие для Agents и Actor). Вызовы, которым нужна сессия агента, при
+ * опции relay уходят в процесс с сессией (features/relay.ts).
+ */
 interface Operations {
   enrollment: Enrollment;
-  tunnel: Tunnel;
   configs: Configs;
-  actions: Actions;
+  fetch(
+    actor: string,
+    agentId: string,
+    worker: string,
+    path: string,
+    init: FetchInit,
+  ): Promise<Response>;
+  restartWorker(
+    actor: string,
+    agentId: string,
+    name: string,
+    opts: WorkerActionOptions,
+  ): Promise<RestartResult>;
+  updateWorker(
+    actor: string,
+    agentId: string,
+    name: string,
+    opts: WorkerActionOptions,
+  ): Promise<WorkerUpdateResult>;
+  updateAgent(
+    actor: string,
+    agentId: string,
+    opts: ActionOptions,
+  ): Promise<UpdateResult>;
+  rotateKey(actor: string, agentId: string, opts: ActionOptions): Promise<void>;
+  logs(actor: string, agentId: string, opts: LogsOptions): Promise<LogEntry[]>;
+  runJob(
+    actor: string,
+    agentId: string,
+    worker: string,
+    opts: JobOptions,
+  ): Promise<JobResult>;
+  jobStatus(
+    actor: string,
+    agentId: string,
+    worker: string,
+    id: string,
+  ): Promise<JobStatus>;
+  cancelJob(
+    actor: string,
+    agentId: string,
+    worker: string,
+    id: string,
+  ): Promise<JobStatus>;
 }
 
 const operations = new WeakMap<Agents, Operations>();
+
+/** Параметры вызова из пересылки (JSON): нет — пустые. */
+const opt = <T>(o: unknown): T => (o ?? {}) as T;
 
 export class Agents extends EventEmitter<AgentsEvents> {
   readonly store: Store;
@@ -60,7 +113,12 @@ export class Agents extends EventEmitter<AgentsEvents> {
   private readonly settings: Settings;
   private readonly ops: Operations;
   private readonly links: Connections;
-  private readonly observe: Observe;
+  private readonly actions: Actions;
+  private readonly watchers: {
+    watch(agentId: string, opts: WatchOptions): Promise<WatchRef>;
+    unwatch(agentId: string, id: string): Promise<void>;
+  };
+  private readonly relay: Relay;
   private readonly releases: Release;
   private readonly transport: Transport;
   private readonly timer: NodeJS.Timeout;
@@ -73,7 +131,8 @@ export class Agents extends EventEmitter<AgentsEvents> {
     const ctx = createContext(this, this.store, this.settings, this.instanceId);
 
     const configs = new Configs(ctx);
-    const observe = new Observe(ctx);
+    const jobs = new Jobs(ctx);
+    const observe = new Observe(ctx, e => jobs.event(e));
     const releases = new Release(ctx);
     const links = new Connections(ctx, {
       known: (ss, c) => configs.known(ss, c),
@@ -95,15 +154,44 @@ export class Agents extends EventEmitter<AgentsEvents> {
         event: (ss, env) => observe.event(ss, env),
         "config.applied": (ss, env) => configs.applied(ss, env),
         "action.result": (ss, env) => actions.result(ss, env),
+        "action.done": (ss, env) => actions.done(ss, env),
       },
       fetchReply,
       configsChanged: (agent, keys) => configs.emitStatuses(agent, keys),
       dropForeign: (ss, a) => links.dropForeign(ss, a),
       statusSeen: (agentId, workers) => actions.pendingSeen(agentId, workers),
     });
+    const tunnel = new Tunnel(ctx);
+    const localFetch: Fetcher = (actor, agentId, worker, path, init) =>
+      tunnel.fetch(actor, agentId, worker, path, init);
+    // Вызовы в этом процессе (и пересланные сюда из других) — без пересылки дальше.
+    const relay = new Relay(ctx, localFetch, {
+      restartWorker: (actor, agentId, [name, o]) =>
+        actions.restartWorker(actor, agentId, String(name), opt(o)),
+      updateWorker: (actor, agentId, [name, o]) =>
+        actions.updateWorker(actor, agentId, String(name), opt(o)),
+      updateAgent: (actor, agentId, [o]) =>
+        actions.updateAgent(actor, agentId, opt(o)),
+      rotateKey: (actor, agentId, [o]) =>
+        actions.rotateKey(actor, agentId, opt(o)),
+      logs: (actor, agentId, [o]) => actions.logs(actor, agentId, opt(o)),
+      watch: (_actor, agentId, [o]) => observe.watch(agentId, opt(o)),
+      unwatch: async (_actor, agentId, [id]) =>
+        observe.unwatch(agentId, String(id)),
+      runJob: (actor, agentId, [worker, o], signal) =>
+        jobs.run(
+          actor,
+          agentId,
+          String(worker),
+          { ...opt<JobOptions>(o), signal },
+          localFetch,
+        ),
+    });
+    const fetch = relay.fetch;
 
     this.transport = new Transport({
       settings: this.settings,
+      pingIntervalMs: this.settings.pingIntervalMs,
       manifest: () => releases.manifest(),
       enroll: (body, remote) => enrollment.enroll(body, remote),
       authenticate: header => enrollment.authenticate(header),
@@ -111,10 +199,34 @@ export class Agents extends EventEmitter<AgentsEvents> {
       process: (ss, env) => inbound.process(ss, env),
       closed: ss => links.closed(ss),
     });
-    this.ops = { enrollment, tunnel: new Tunnel(ctx), configs, actions };
+    this.ops = {
+      enrollment,
+      configs,
+      fetch,
+      restartWorker: (actor, agentId, name, o) =>
+        relay.run("restartWorker", actor, agentId, [name, o]),
+      updateWorker: (actor, agentId, name, o) =>
+        relay.run("updateWorker", actor, agentId, [name, o]),
+      updateAgent: (actor, agentId, o) =>
+        relay.run("updateAgent", actor, agentId, [o]),
+      rotateKey: (actor, agentId, o) =>
+        relay.run("rotateKey", actor, agentId, [o]),
+      logs: (actor, agentId, o) => relay.run("logs", actor, agentId, [o]),
+      runJob: (actor, agentId, worker, { signal, ...o }) =>
+        relay.run("runJob", actor, agentId, [worker, o], signal),
+      jobStatus: (actor, agentId, worker, id) =>
+        jobs.status(actor, agentId, worker, id, fetch),
+      cancelJob: (actor, agentId, worker, id) =>
+        jobs.cancel(actor, agentId, worker, id, fetch),
+    };
     operations.set(this, this.ops);
     this.links = links;
-    this.observe = observe;
+    this.watchers = {
+      watch: (agentId, o) => relay.run("watch", "", agentId, [o]),
+      unwatch: (agentId, id) => relay.run("unwatch", "", agentId, [id]),
+    };
+    this.actions = actions;
+    this.relay = relay;
     this.releases = releases;
 
     if (!opts.enrollToken && !opts.enroll)
@@ -143,10 +255,18 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return this.transport.handle(req, res);
   }
 
+  /**
+   * Принять вызов, пересланный другим процессом (опция relay): выполнить его здесь и ответить
+   * (fetch — потоком). Вызывающему маршрут доверяет: закройте его сетью или relaySecret.
+   */
+  handleRelay(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    return this.relay.handle(req, res);
+  }
+
   /** Остановить: соединения закрываются кодом 1012 (агенты сразу подключатся снова). */
   async close(): Promise<void> {
     clearInterval(this.timer);
-    this.ops.actions.close();
+    this.actions.close();
     const offline = this.links.close();
 
     this.transport.close();
@@ -194,7 +314,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
    * text(), json(), arrayBuffer(). Ошибка до ответа — AgentsError с кодом (AGENT_OFFLINE,
    * AGENT_ELSEWHERE, WORKER_UNKNOWN, WORKER_UNAVAILABLE, WORKER_INVALID, TIMEOUT, CANCELLED,
    * PATH_FORBIDDEN, BODY_TOO_LARGE, BUSY, DISCONNECTED); после — ошибка чтения потока body с тем же AgentsError.
-   * Работает в процессе, у которого сессия агента.
+   * Сессия агента в другом процессе — запрос уходит туда (опция relay), без relay — AGENT_ELSEWHERE.
    */
   fetch(
     agentId: string,
@@ -202,7 +322,33 @@ export class Agents extends EventEmitter<AgentsEvents> {
     path: string,
     init: FetchInit = {},
   ): Promise<Response> {
-    return this.ops.tunnel.fetch("", agentId, worker, path, init);
+    return this.ops.fetch("", agentId, worker, path, init);
+  }
+
+  // ── задачи воркера (§12) ──
+
+  /**
+   * Задача воркеру: POST /jobs. Быстрая (200) — итог сразу; долгая (202) — ждать события
+   * job.done, job.failed или job.cancelled не дольше timeoutMs (по умолчанию 30 с), не дождались —
+   * state: running. Тип нет в manifest.jobs — JOB_UNKNOWN; data не по схеме (validateJobs) —
+   * JOB_INVALID; отказ воркера — JOB_REJECTED. События задач доходят и до onEvent.
+   */
+  runJob(
+    agentId: string,
+    worker: string,
+    opts: JobOptions,
+  ): Promise<JobResult> {
+    return this.ops.runJob("", agentId, worker, opts);
+  }
+
+  /** Состояние задачи воркера (GET /jobs/{id}); нет задачи — JOB_NOT_FOUND. */
+  jobStatus(agentId: string, worker: string, id: string): Promise<JobStatus> {
+    return this.ops.jobStatus("", agentId, worker, id);
+  }
+
+  /** Прервать долгую задачу (POST /jobs/{id}/cancel); нет задачи — JOB_NOT_FOUND. */
+  cancelJob(agentId: string, worker: string, id: string): Promise<JobStatus> {
+    return this.ops.cancelJob("", agentId, worker, id);
   }
 
   // ── настройки ──
@@ -250,38 +396,43 @@ export class Agents extends EventEmitter<AgentsEvents> {
   /**
    * Наблюдатель: пока он есть, агент присылает метрики чаще и журнал подробнее (§9). Повтор с тем
    * же id продлевает и заменяет параметры. Наблюдатели сводятся в один watch. Живут в памяти
-   * этого процесса и действуют, пока агент на связи с ним.
+   * процесса с сессией агента (опция relay — туда и уходят) и действуют, пока агент на связи с
+   * ним.
    */
   watch(agentId: string, opts: WatchOptions = {}): Promise<WatchRef> {
-    return this.observe.watch(agentId, opts);
+    return this.watchers.watch(agentId, opts);
   }
 
   /** Снять наблюдателя. */
-  unwatch(agentId: string, id: string): void {
-    this.observe.unwatch(agentId, id);
+  unwatch(agentId: string, id: string): Promise<void> {
+    return this.watchers.unwatch(agentId, id);
   }
 
   // ── действия (§10) ──
 
-  /** Перезапустить воркер; пока он занят (health.busy), замена ждёт — или force: сразу. */
+  /**
+   * Перезапустить воркер. Свободен — итог после запуска ({ deferred: false }); занят
+   * (health.busy) — замена отложена, сразу { deferred: true, pending, actionId }, итог — событие
+   * action. force — сразу, wait — ждать итога и отложенной замены.
+   */
   restartWorker(
     agentId: string,
     name: string,
     opts: WorkerActionOptions = {},
-  ): Promise<void> {
-    return this.ops.actions.restartWorker("", agentId, name, opts);
+  ): Promise<RestartResult> {
+    return this.ops.restartWorker("", agentId, name, opts);
   }
 
   /**
-   * Обновить воркер из выпуска до сборки в manifest.json; итог — { version, previous }. Пока
-   * воркер занят (health.busy), замена ждёт — или force: сразу.
+   * Обновить воркер из выпуска до сборки в manifest.json; итог — { version, previous }. Занят
+   * (health.busy) — как у restartWorker: { deferred: true, … } и событие action.
    */
   updateWorker(
     agentId: string,
     name: string,
     opts: WorkerActionOptions = {},
-  ): Promise<UpdateResult> {
-    return this.ops.actions.updateWorker("", agentId, name, opts);
+  ): Promise<WorkerUpdateResult> {
+    return this.ops.updateWorker("", agentId, name, opts);
   }
 
   /** Обновить агента до версии выпуска; итог — после запуска новой версии. */
@@ -289,17 +440,17 @@ export class Agents extends EventEmitter<AgentsEvents> {
     agentId: string,
     opts: ActionOptions = {},
   ): Promise<UpdateResult> {
-    return this.ops.actions.updateAgent("", agentId, opts);
+    return this.ops.updateAgent("", agentId, opts);
   }
 
   /** Сменить ключ агента: он переподключится с новым секретом. */
   rotateKey(agentId: string, opts: ActionOptions = {}): Promise<void> {
-    return this.ops.actions.rotateKey("", agentId, opts);
+    return this.ops.rotateKey("", agentId, opts);
   }
 
   /** Последние строки журнала агента или воркера. */
   logs(agentId: string, opts: LogsOptions = {}): Promise<LogEntry[]> {
-    return this.ops.actions.logs("", agentId, opts);
+    return this.ops.logs("", agentId, opts);
   }
 
   // ── выпуск ──
@@ -362,7 +513,20 @@ export class Actor {
     path: string,
     init: FetchInit = {},
   ): Promise<Response> {
-    return this.ops.tunnel.fetch(this.actor, agentId, worker, path, init);
+    return this.ops.fetch(this.actor, agentId, worker, path, init);
+  }
+  runJob(
+    agentId: string,
+    worker: string,
+    opts: JobOptions,
+  ): Promise<JobResult> {
+    return this.ops.runJob(this.actor, agentId, worker, opts);
+  }
+  jobStatus(agentId: string, worker: string, id: string): Promise<JobStatus> {
+    return this.ops.jobStatus(this.actor, agentId, worker, id);
+  }
+  cancelJob(agentId: string, worker: string, id: string): Promise<JobStatus> {
+    return this.ops.cancelJob(this.actor, agentId, worker, id);
   }
   setConfig(
     agentId: string,
@@ -379,26 +543,26 @@ export class Actor {
     agentId: string,
     name: string,
     opts: WorkerActionOptions = {},
-  ): Promise<void> {
-    return this.ops.actions.restartWorker(this.actor, agentId, name, opts);
+  ): Promise<RestartResult> {
+    return this.ops.restartWorker(this.actor, agentId, name, opts);
   }
   updateWorker(
     agentId: string,
     name: string,
     opts: WorkerActionOptions = {},
-  ): Promise<UpdateResult> {
-    return this.ops.actions.updateWorker(this.actor, agentId, name, opts);
+  ): Promise<WorkerUpdateResult> {
+    return this.ops.updateWorker(this.actor, agentId, name, opts);
   }
   updateAgent(
     agentId: string,
     opts: ActionOptions = {},
   ): Promise<UpdateResult> {
-    return this.ops.actions.updateAgent(this.actor, agentId, opts);
+    return this.ops.updateAgent(this.actor, agentId, opts);
   }
   rotateKey(agentId: string, opts: ActionOptions = {}): Promise<void> {
-    return this.ops.actions.rotateKey(this.actor, agentId, opts);
+    return this.ops.rotateKey(this.actor, agentId, opts);
   }
   logs(agentId: string, opts: LogsOptions = {}): Promise<LogEntry[]> {
-    return this.ops.actions.logs(this.actor, agentId, opts);
+    return this.ops.logs(this.actor, agentId, opts);
   }
 }

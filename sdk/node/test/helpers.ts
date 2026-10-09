@@ -4,7 +4,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 
-import WebSocket from "ws";
+import WebSocket, { type ClientOptions } from "ws";
 
 import { Agents, type AgentsOptions, type Envelope } from "../src/server/index";
 
@@ -58,6 +58,9 @@ export const sample = (name: string): Envelope => {
   return structuredClone(s.message);
 };
 
+/** Маршрут пересылки вызовов между процессами (handleRelay). */
+export const RELAY_PATH = "/internal/agents/relay";
+
 export interface TestServer {
   agents: Agents;
   url: string;
@@ -75,6 +78,8 @@ export const startServer = async (
     ...opts,
   });
   const server = createServer(async (req, res) => {
+    if (req.method === "POST" && req.url === RELAY_PATH)
+      return agents.handleRelay(req, res);
     if (await agents.handle(req, res)) return;
     res.writeHead(404).end();
   });
@@ -149,9 +154,11 @@ export class FakeAgent {
     wsUrl: string,
     creds: Creds,
     protocol = "agent.v2",
+    opts: ClientOptions = {},
   ): Promise<FakeAgent> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(wsUrl, protocol, {
+        ...opts,
         headers: { authorization: `Agent ${creds.agentId}.${creds.secret}` },
       });
       const fa = new FakeAgent(ws);
@@ -169,8 +176,9 @@ export class FakeAgent {
     wsUrl: string,
     creds: Creds,
     hello: Record<string, unknown> = {},
+    opts: ClientOptions = {},
   ): Promise<FakeAgent> {
-    const fa = await FakeAgent.open(wsUrl, creds);
+    const fa = await FakeAgent.open(wsUrl, creds, "agent.v2", opts);
     const h = sample("hello");
 
     h.data = { ...h.data, ...hello };

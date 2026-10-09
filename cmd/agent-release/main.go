@@ -23,18 +23,25 @@ import (
 )
 
 func main() {
-	var err error
-	switch cmd := strings.Join(os.Args[1:2], ""); cmd {
-	case "keygen":
-		err = keygen()
-	case "manifest":
-		err = manifest(os.Args[2:])
-	default:
-		err = fmt.Errorf("неизвестная команда %q (keygen | manifest)", cmd)
-	}
-	if err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "agent-release:", err)
 		os.Exit(1)
+	}
+}
+
+// run — команда утилиты по аргументам (без имени программы).
+func run(args []string) error {
+	cmd := ""
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+	switch cmd {
+	case "keygen":
+		return keygen()
+	case "manifest":
+		return manifest(args[1:])
+	default:
+		return fmt.Errorf("неизвестная команда %q (keygen | manifest)", cmd)
 	}
 }
 

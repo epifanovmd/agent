@@ -9,8 +9,9 @@
 //   - DELETE /config/targets — целей нет;
 //   - GET /metrics — итог последнего круга {at, results: […]};
 //   - GET /health — {ok, info: {targets}};
-//   - POST /run {targets?, count?, timeoutMs?} — проверка сейчас (запрос сервера fetch), итог — {at, results};
-//   - GET /manifest — что воркер умеет: версия, ключ targets со схемой, маршрут /run.
+//   - POST /jobs {type: "netprobe.run", jobId, data: {targets?, count?, timeoutMs?}} — задача
+//     (sdk/spec §12, быстрая): проверка сейчас, итог сразу — 200 {result: {at, results}};
+//   - GET /manifest — что воркер умеет: версия, ключ targets со схемой, задача netprobe.run.
 //
 // ICMP без прав root: «ping»-сокет (SOCK_DGRAM, IPPROTO_ICMP; на Linux — если группа процесса
 // входит в net.ipv4.ping_group_range), иначе системная команда ping, иначе TCP до порта цели.
@@ -127,18 +128,25 @@ func (n *netprobe) handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "info": map[string]int{"targets": targets}})
 	})
-	mux.HandleFunc("POST /run", func(w http.ResponseWriter, r *http.Request) {
-		raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
+		var job struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&job); err != nil {
+			reject(w, http.StatusBadRequest, err)
+			return
+		}
+		if job.Type != jobRun {
+			reject(w, http.StatusBadRequest, fmt.Errorf("задачи %q нет: есть %s", job.Type, jobRun))
+			return
+		}
+		rep, err := n.run(r.Context(), job.Data)
 		if err != nil {
 			reject(w, http.StatusBadRequest, err)
 			return
 		}
-		rep, err := n.run(r.Context(), raw)
-		if err != nil {
-			reject(w, http.StatusBadRequest, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, rep)
+		writeJSON(w, http.StatusOK, map[string]any{"result": rep})
 	})
 	return mux
 }
@@ -208,7 +216,7 @@ func (n *netprobe) loop(ctx context.Context) {
 	}
 }
 
-// run — POST /run: проверка сейчас. Без targets — цели из настроек (итог становится и
+// run — задача netprobe.run: проверка сейчас. Без targets — цели из настроек (итог становится и
 // последним для GET /metrics), с targets — разовая проверка этих целей (count и timeoutMs — из
 // тела или настроек).
 func (n *netprobe) run(ctx context.Context, raw []byte) (Report, error) {

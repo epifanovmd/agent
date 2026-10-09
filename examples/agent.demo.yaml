@@ -20,7 +20,7 @@ telemetry:
   metrics:
     [cpu, load, memory, swap, disk, diskio, network, interfaces, conntrack, sockets, processes, uptime, temperatures]
 workers:
-  # Python, только стандартная библиотека: POST /echo, GET /stream, GET /bytes, POST /work
+  # Python, только стандартная библиотека: POST /echo, GET /stream, GET /bytes, задачи POST /jobs
   # (долгая работа: события, busy в health, ход — на диске), POST /hang, настройка settings,
   # метрики, health, cleanup.
   - name: echo
@@ -28,7 +28,7 @@ workers:
     dir: ${DEMO_ROOT}
     env:
       PYTHONUNBUFFERED: "1"
-      ECHO_WORK_DIR: ${DEMO_ROOT}/.dev/demo-agent-${DEMO_AGENT}/echo-work
+      ECHO_JOBS_DIR: ${DEMO_ROOT}/.dev/demo-agent-${DEMO_AGENT}/echo-jobs
     # Жизнь воркера: остальное — по умолчанию (перезапуск и остановка агента его не прерывают,
     # замена ждёт окончания работы до 24 ч). Здесь — короче для стенда.
     lifecycle:

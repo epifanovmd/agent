@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 
-import type { AgentEvent, Envelope } from "../src/server/index";
+import type { ActionRecord, AgentEvent, Envelope } from "../src/server/index";
 import {
   type Creds,
   enroll,
@@ -358,20 +358,82 @@ describe("образцы", () => {
       "action.worker.restart",
       () => s.agents.restartWorker(creds.agentId, "echo"),
       "action.result.worker.restart",
-      v => assert.equal(v, undefined),
+      v => assert.deepEqual(v, { deferred: false }),
     );
     await run(
       "action.worker.restart.force",
       () => s.agents.restartWorker(creds.agentId, "echo", { force: true }),
       "action.result.worker.restart",
-      v => assert.equal(v, undefined),
+      v => assert.deepEqual(v, { deferred: false }),
     );
     await run(
       "action.worker.update",
       () => s.agents.updateWorker(creds.agentId, "report"),
       "action.result.worker.update",
       v =>
-        assert.deepEqual(v, sample("action.result.worker.update").data.result),
+        assert.deepEqual(v, {
+          ...sample("action.result.worker.update").data.result,
+          deferred: false,
+        }),
+    );
+
+    // Воркер занят: action.result с deferred сразу, итог — action.done и событие action.
+    const acts: ActionRecord[] = [];
+
+    s.agents.on("action", a => acts.push(a));
+    const deferred = async (
+      call: () => Promise<unknown>,
+      result: string,
+      done: string,
+    ) => {
+      const p = call();
+      const act = await fa.next("action");
+      const r = use(result);
+
+      r.re = act.id;
+      fa.send(r);
+      await fa.ackOf(r.id!);
+      assert.deepEqual(await p, {
+        ...r.data.result,
+        actionId: act.id,
+      });
+      const d = use(done);
+
+      d.re = act.id;
+      fa.send(d);
+      await fa.ackOf(d.id!);
+
+      return acts.find(a => a.id === act.id)!;
+    };
+    const restarted = await deferred(
+      () => s.agents.restartWorker(creds.agentId, "echo"),
+      "action.result.deferred",
+      "action.done",
+    );
+
+    assert.deepEqual(
+      [restarted.name, restarted.status, restarted.deferred],
+      ["worker.restart", "done", true],
+    );
+    const updated = await deferred(
+      () => s.agents.updateWorker(creds.agentId, "report"),
+      "action.result.worker.update.deferred",
+      "action.done.worker.update",
+    );
+
+    assert.deepEqual(
+      updated.result,
+      sample("action.done.worker.update").data.result,
+    );
+    const failed = await deferred(
+      () => s.agents.updateWorker(creds.agentId, "report"),
+      "action.result.worker.update.deferred",
+      "action.done.error",
+    );
+
+    assert.deepEqual(
+      [failed.status, failed.error],
+      ["failed", sample("action.done.error").data.error],
     );
     await run(
       "action.agent.update",
@@ -426,6 +488,123 @@ describe("образцы", () => {
     const rec = await s.agents.store.getAgent(creds.agentId);
 
     assert.equal(rec?.pendingSecretHash, rr.data.result.secretHash);
+  });
+
+  it("задачи: runJob — POST /jobs, итог по событиям job.*", async () => {
+    const all = samples();
+    const long = all.get("worker.jobs.long")!.request!.body as {
+      type: string;
+      jobId: string;
+      data: unknown;
+      files: Record<string, Record<string, string>>;
+    };
+
+    // Прежнее соединение закрыто сменой ключа: агент с задачами — свой.
+    const jc = await enroll(s.url, { name: "node-03" });
+    const fj = await FakeAgent.connect(s.ws, jc, { configs: {} });
+
+    fj.stream(
+      "status",
+      {
+        workers: [
+          {
+            name: "report",
+            state: "running",
+            manifest: all.get("worker.manifest")!.response!.body,
+          },
+        ],
+      },
+      1,
+    );
+    await fj.ackSeq(1);
+    /** Ответ агента на fetch: заголовок, тело JSON, конец. */
+    const reply = (re: string, status: number, body: unknown) => {
+      fj.send({
+        type: "fetch.head",
+        re,
+        data: { status, headers: { "content-type": "application/json" } },
+      });
+      fj.send({
+        type: "fetch.chunk",
+        re,
+        data: { data: JSON.stringify(body), encoding: "utf8" },
+      });
+      fj.send({ type: "fetch.end", re, data: {} });
+    };
+    const event = (name: string) => {
+      const e = use(name);
+
+      fj.send(e);
+
+      return fj.ackOf(e.id!);
+    };
+
+    // Долгая задача: 202, затем job.progress и job.done.
+    const p = s.agents.runJob(jc.agentId, "report", {
+      type: long.type,
+      jobId: long.jobId,
+      data: long.data,
+      files: long.files,
+    });
+    const req = await fj.next("fetch");
+
+    assert.deepEqual(
+      [req.data.method, req.data.path, JSON.parse(req.data.body)],
+      ["POST", "/jobs", long],
+    );
+    reply(req.id!, 202, all.get("worker.jobs.long")!.response!.body);
+    await event("event.job.progress");
+    await event("event.job.done");
+    assert.deepEqual(await p, {
+      jobId: long.jobId,
+      id: "b81c",
+      state: "done",
+      result: sample("event.job.done").data.data.result,
+    });
+
+    // Итог пришёл раньше ответа 202 — всё равно дошёл.
+    const failed = sample("event.job.failed").data.data;
+    const f = s.agents.runJob(jc.agentId, "report", {
+      type: "report.build",
+      jobId: failed.jobId,
+    });
+    const freq = await fj.next("fetch");
+
+    await event("event.job.failed");
+    reply(freq.id!, 202, { id: failed.id });
+    assert.deepEqual(await f, {
+      jobId: failed.jobId,
+      id: failed.id,
+      state: "failed",
+      error: failed.error,
+    });
+
+    const cancelled = sample("event.job.cancelled").data.data;
+    const c = s.agents.runJob(jc.agentId, "report", {
+      type: "report.build",
+      jobId: cancelled.jobId,
+    });
+
+    reply((await fj.next("fetch")).id!, 202, { id: cancelled.id });
+    await event("event.job.cancelled");
+    assert.deepEqual(await c, { ...cancelled, state: "cancelled" });
+
+    // Быстрая задача — итог сразу; типа нет в манифесте — JOB_UNKNOWN.
+    const quick = all.get("worker.jobs.quick")!;
+    const q = s.agents.runJob(jc.agentId, "report", {
+      type: "report.check",
+    });
+
+    reply((await fj.next("fetch")).id!, 200, quick.response!.body);
+    assert.deepEqual(
+      (await q).result,
+      (quick.response!.body as { result: unknown }).result,
+    );
+    await assert.rejects(
+      s.agents.runJob(jc.agentId, "report", { type: "report.unknown" }),
+      { code: "JOB_UNKNOWN", status: 409 },
+    );
+    await fj.close();
   });
 
   it("незнакомый тип — error UNKNOWN_TYPE", async () => {

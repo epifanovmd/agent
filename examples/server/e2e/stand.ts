@@ -17,8 +17,10 @@ import { promisify } from "node:util";
 
 import {
   type Agent,
+  type AgentEvent,
   Agents,
   type AgentsOptions,
+  type JobResult,
   MemoryStore,
 } from "agent-sdk/server";
 
@@ -157,9 +159,9 @@ export class Stand {
     return join(this.dir, "data");
   }
 
-  /** Каталог, где echo хранит ход долгих работ. */
-  get workDir(): string {
-    return join(this.dir, "echo-work");
+  /** Каталог, где echo хранит ход долгих задач. */
+  get jobsDir(): string {
+    return join(this.dir, "echo-jobs");
   }
 
   /** Файл, куда echo (или node-echo) записывает применённую настройку. */
@@ -245,6 +247,25 @@ export class Stand {
       { ...rest, headers },
     );
   };
+
+  /** Задача воркеру через API стенда (runJob): { type, jobId?, data?, timeoutMs? }. */
+  job = (worker: string, body: Record<string, unknown>): Promise<JobResult> =>
+    this.api<JobResult>(
+      "POST",
+      `/api/agents/${this.agentId}/workers/${worker}/jobs`,
+      body,
+    );
+
+  /** События задачи jobId воркера (job.*), по порядку прихода. */
+  jobEvents = async (worker: string, jobId: string): Promise<AgentEvent[]> =>
+    (
+      await this.api<AgentEvent[]>(
+        "GET",
+        `/api/events?agentId=${this.agentId}&worker=${worker}&limit=10000`,
+      )
+    )
+      .filter(e => (e.data as { jobId?: string })?.jobId === jobId)
+      .reverse();
 
   /** POST /echo воркера → текст ответа. */
   echo = async (worker: string, text: string): Promise<string> => {
@@ -332,7 +353,7 @@ export class Stand {
           command: ["python3", join(ROOT, "examples/workers/echo/main.py")],
           env: {
             PYTHONUNBUFFERED: "1",
-            ECHO_WORK_DIR: this.workDir,
+            ECHO_JOBS_DIR: this.jobsDir,
             ...echoEnv("echo"),
           },
           // GET /health чаще обычного: busy и зависание видны быстрее.
@@ -410,6 +431,19 @@ export class Stand {
 
     await exited;
     clearTimeout(timer);
+    this.proc = undefined;
+  };
+
+  /** Убить процесс агента (SIGKILL) без перезапуска: связь обрывается без закрытия. */
+  killAgent = async (): Promise<void> => {
+    const proc = this.proc;
+
+    this.stopping = true;
+    if (!proc || proc.exitCode !== null) return;
+    const exited = new Promise(ok => proc.once("exit", ok));
+
+    proc.kill("SIGKILL");
+    await exited;
     this.proc = undefined;
   };
 

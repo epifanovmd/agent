@@ -17,6 +17,7 @@
 //   metrics(agentId)                 — все принятые точки метрик (событие metrics), по порядку
 //   configEvents(agentId)            — события config (статусы ключей), по порядку
 //   alerts(agentId)                  — события alert, по порядку
+//   actions(agentId)                 — события action (итоги действий), по порядку
 //   fetch(agentId, worker, path, init) — запрос к воркеру; init.body — строка, init.bodyBase64 —
 //                                      двоичное тело, init.abortAfterMs — отменить запрос через
 //                                      столько мс; ответ — {status, headers, body, bodyBase64,
@@ -30,7 +31,14 @@ const options = JSON.parse(process.argv[2] ?? "{}");
 
 /** Сколько записей каждого вида держит сервер (последние). */
 const KEEP = 10_000;
-const kept = { events: new Map(), logs: new Map(), metrics: new Map(), configEvents: new Map(), alerts: new Map() };
+const kept = {
+  events: new Map(),
+  logs: new Map(),
+  metrics: new Map(),
+  configEvents: new Map(),
+  alerts: new Map(),
+  actions: new Map(),
+};
 const keep = (kind, agentId, items) => {
   const list = [...(kept[kind].get(agentId) ?? []), ...items];
   kept[kind].set(agentId, list.slice(-KEEP));
@@ -51,6 +59,7 @@ agents.on("log", (e) => keep("logs", e.agentId, e.entries));
 agents.on("metrics", (m) => keep("metrics", m.agentId, [m]));
 agents.on("config", (c) => keep("configEvents", c.agentId, [c]));
 agents.on("alert", (a) => keep("alerts", a.agentId, [a]));
+agents.on("action", (a) => keep("actions", a.agentId, [a]));
 
 /** Методы Agents, доступные тестам. */
 const methods = new Set([
@@ -73,6 +82,9 @@ const methods = new Set([
   "updateCandidates",
   "workerUpdateCandidates",
   "installCommand",
+  "runJob",
+  "jobStatus",
+  "cancelJob",
 ]);
 
 /** Свои методы теста. */
@@ -85,6 +97,7 @@ const own = {
   metrics: (agentId) => kept.metrics.get(agentId) ?? [],
   configEvents: (agentId) => kept.configEvents.get(agentId) ?? [],
   alerts: (agentId) => kept.alerts.get(agentId) ?? [],
+  actions: (agentId) => kept.actions.get(agentId) ?? [],
   async fetch(agentId, worker, path, init = {}) {
     const { bodyBase64, abortAfterMs, ...rest } = init;
     if (bodyBase64 !== undefined) rest.body = Buffer.from(bodyBase64, "base64");

@@ -111,13 +111,12 @@ export class Connections {
       this.ctx.sessions.delete(ss.agentId);
       const graceMs = this.ctx.settings.offlineGraceMs;
 
-      if (graceMs <= 0 || this.stopped)
-        return this.goOffline(ss.agentId, ss.id);
+      if (graceMs <= 0 || this.stopped) return this.goOffline(ss);
       clearTimeout(this.grace.get(ss.agentId));
       const timer = setTimeout(() => {
         this.grace.delete(ss.agentId);
         void this.ctx
-          .lock(ss.agentId, () => this.goOffline(ss.agentId, ss.id))
+          .lock(ss.agentId, () => this.goOffline(ss))
           .catch(e =>
             this.ctx.log("отметка offline не удалась", { err: String(e) }),
           );
@@ -197,9 +196,7 @@ export class Connections {
 
     this.ctx.sessions.clear();
     for (const ss of open) ss.close(Close.Restart, "сервер перезапускается");
-    await Promise.all(
-      open.map(ss => this.goOffline(ss.agentId, ss.id).catch(() => {})),
-    );
+    await Promise.all(open.map(ss => this.goOffline(ss).catch(() => {})));
   }
 
   private cancelGrace(agentId: string): void {
@@ -207,15 +204,19 @@ export class Connections {
     this.grace.delete(agentId);
   }
 
-  /** Offline, если запись всё ещё за этой сессией (агент не подключился к другому процессу). */
-  private async goOffline(agentId: string, sessionId: string): Promise<void> {
-    if (this.ctx.sessions.has(agentId)) return;
-    await this.markOffline(agentId, a => a.session?.id === sessionId);
+  /**
+   * Offline, если запись всё ещё за этой сессией (агент не подключился к другому процессу);
+   * lastSeenAt — последняя весть сессии (сообщение или pong).
+   */
+  private async goOffline(ss: Session): Promise<void> {
+    if (this.ctx.sessions.has(ss.agentId)) return;
+    await this.markOffline(ss.agentId, a => a.session?.id === ss.id, ss.seenAt);
   }
 
   private async markOffline(
     agentId: string,
     when: (a: AgentRecord) => boolean,
+    seenAt = 0,
   ): Promise<void> {
     const now = Date.now();
     let started: Alert | undefined;
@@ -223,6 +224,7 @@ export class Connections {
       started = undefined;
       if (!a.online || a.revoked || !when(a)) return false;
       a.online = false;
+      a.lastSeenAt = Math.max(a.lastSeenAt ?? 0, seenAt);
       delete a.session;
       started = raiseOffline(a, now);
 

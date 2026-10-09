@@ -200,6 +200,11 @@ describe("манифест в hello и status", () => {
         { method: "GET", path: "/b" },
       ],
       events: "не список",
+      jobs: [
+        { type: "report.build", schema: { type: "object" } },
+        { type: "Bad" },
+        { type: "report.check", schema: [] },
+      ],
     });
     const echo = (await s.agents.getAgent(c.agentId))?.workers[0];
 
@@ -207,6 +212,10 @@ describe("манифест в hello и status", () => {
       version: "1.0.0",
       configs: [{ key: "ok" }],
       routes: [{ method: "GET", path: "/b" }],
+      jobs: [
+        { type: "report.build", schema: { type: "object" } },
+        { type: "report.check" },
+      ],
     });
     fa.stream("status", {
       workers: [{ name: "echo", state: "running", manifest: "манифест" }],
@@ -217,6 +226,19 @@ describe("манифест в hello и status", () => {
 
     assert.equal(a?.status?.workers[0].state, "running");
     assert.equal(a?.status?.workers[0].manifest, undefined);
+  });
+
+  it("события job.* в events пропускаются: они зарезервированы для задач", async () => {
+    const s = await server();
+    const { c } = await connect(s, {
+      version: "1.0.0",
+      events: [{ type: "job.done" }, { type: "report.sent" }],
+    });
+
+    assert.deepEqual(
+      (await s.agents.getAgent(c.agentId))?.workers[0].manifest?.events,
+      [{ type: "report.sent" }],
+    );
   });
 
   it("образцы hello и status: манифест принят как есть", async () => {

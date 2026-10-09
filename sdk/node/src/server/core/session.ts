@@ -21,6 +21,8 @@ export class Session {
   reason = "";
   /** Получен hello и отправлен welcome. */
   welcomed = false;
+  /** Последняя весть от агента (сообщение или pong), мс. */
+  seenAt = Date.now();
   /** Запросы fetch этой сессии: id → ожидающий. */
   readonly fetches = new Map<string, PendingFetch>();
   /** Версии настроек, известные агенту: "воркер/ключ" → версия (из hello и отправленных config.put). */

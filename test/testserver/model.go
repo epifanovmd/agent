@@ -78,6 +78,8 @@ const (
 	ConfigApplied  = "applied"
 	ConfigFailed   = "failed"
 	ConfigDeleting = "deleting"
+	// ConfigDeleted — агент подтвердил удаление ключа (только в событии config).
+	ConfigDeleted = "deleted"
 )
 
 // ConfigStatus — статус ключа настроек: желаемая, доставленная и применённая версии.
@@ -133,3 +135,32 @@ type WatchRef struct {
 
 // UpdateResult — итог updateWorker и updateAgent.
 type UpdateResult = message.UpdateResult
+
+// ReplaceResult — итог restartWorker и updateWorker: Deferred — замена отложена, пока воркер
+// занят (итог — событие action с ActionID).
+type ReplaceResult struct {
+	Deferred bool   `json:"deferred"`
+	Pending  string `json:"pending,omitempty"`
+	ActionID string `json:"actionId,omitempty"`
+	Version  string `json:"version,omitempty"`
+}
+
+// ActionRecord — итог действия (событие action); Deferred — пришёл в action.done.
+type ActionRecord struct {
+	ID       string             `json:"id"`
+	Name     string             `json:"name"`
+	Status   string             `json:"status"`
+	Deferred bool               `json:"deferred,omitempty"`
+	Result   json.RawMessage    `json:"result,omitempty"`
+	Error    *message.ErrorInfo `json:"error,omitempty"`
+}
+
+// JobResult — итог runJob.
+type JobResult struct {
+	JobID    string             `json:"jobId"`
+	ID       string             `json:"id,omitempty"`
+	State    string             `json:"state"`
+	Progress *float64           `json:"progress,omitempty"`
+	Result   json.RawMessage    `json:"result,omitempty"`
+	Error    *message.ErrorInfo `json:"error,omitempty"`
+}

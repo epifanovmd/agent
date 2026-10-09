@@ -10,28 +10,31 @@
 Ошибки — `{ code, message }` со статусом из `AgentsError` ([sdk/README.md](../sdk/README.md#ошибки));
 нет агента — `404 AGENT_NOT_FOUND`, нет такого маршрута API — `404 NOT_FOUND`.
 
-| Метод  | Путь                                                | Что                                                                                                          |
-| ------ | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| GET    | `/api/agents`                                       | `Agent[]`                                                                                                    |
-| GET    | `/api/agents/:id`                                   | `Agent`; манифест воркера — `workers[].manifest`                                                             |
-| DELETE | `/api/agents/:id`                                   | удалить запись агента и всё его → `{}`                                                                       |
-| POST   | `/api/agents/:id/revoke`                            | отозвать → `Agent`                                                                                           |
-| POST   | `/api/agents/:id/rotate-key`                        | сменить ключ (`agent.rotateKey`) → `{}`                                                                      |
-| POST   | `/api/agents/:id/update`                            | обновить агента до версии выпуска (`agent.update`) → `{ version, previous }`                                 |
-| GET    | `/api/agents/:id/actions?limit=`                    | итоги встроенных действий агента, новые первыми (`limit` — по умолчанию 50) → `ActionRecord[]`               |
-| GET    | `/api/agents/:id/configs`                           | `{ configs: ConfigRecord[], status: ConfigStatus[] }` — значения и статус применения                         |
-| PUT    | `/api/agents/:id/configs/:worker/:key`              | задать: тело — значение (любой JSON) → `ConfigRecord` с новой `version`                                      |
-| DELETE | `/api/agents/:id/configs/:worker/:key`              | удалить ключ на сервере и у агента → `{ deleted }`                                                           |
-| GET    | `/api/agents/:id/metrics?since=&limit=`             | история метрик `MetricsPoint[]` по времени; `since` — строго позже, мс; `limit` — последние                  |
-| GET    | `/api/agents/:id/logs?worker=&lines=`               | последние строки журнала агента или воркера с узла (`agent.logs`) → `LogEntry[]`                             |
-| GET    | `/api/agents/:id/watch?logLevel=`                   | поток Server-Sent Events, см. ниже                                                                           |
-| \*     | `/api/agents/:id/workers/:worker/fetch/<путь>?<…>`  | запрос к воркеру, см. ниже                                                                                   |
-| POST   | `/api/agents/:id/workers/:worker/restart`           | перезапустить воркер (`worker.restart`) → `{}`; тело `{ force: true }` — не ждать, пока воркер занят         |
-| POST   | `/api/agents/:id/workers/:worker/update`            | обновить воркер из выпуска (`worker.update`) → `{ version, previous }`; тело `{ force: true }` — так же      |
-| GET    | `/api/agents/:id/workers/:worker/supports?…`        | есть ли в манифесте воркера маршрут (`method`, `path`), ключ (`config`), событие (`event`) → `{ supported }` |
-| GET    | `/api/events?agentId=&worker=&type=&before=&limit=` | события воркеров, новые первыми (`limit` — по умолчанию 100); `before` — `receivedAt` последнего на странице |
-| GET    | `/api/alerts?agentId=`                              | текущие проблемы `Alert[]`                                                                                   |
-| GET    | `/api/releases`                                     | `{ release, candidates, workerCandidates, installCommand }` — выпуск, кого можно обновить, команда установки |
+| Метод  | Путь                                                 | Что                                                                                                                                                                                                                    |
+| ------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/api/agents`                                        | `Agent[]`                                                                                                                                                                                                              |
+| GET    | `/api/agents/:id`                                    | `Agent`; манифест воркера — `workers[].manifest`                                                                                                                                                                       |
+| DELETE | `/api/agents/:id`                                    | удалить запись агента и всё его → `{}`                                                                                                                                                                                 |
+| POST   | `/api/agents/:id/revoke`                             | отозвать → `Agent`                                                                                                                                                                                                     |
+| POST   | `/api/agents/:id/rotate-key`                         | сменить ключ (`agent.rotateKey`) → `{}`                                                                                                                                                                                |
+| POST   | `/api/agents/:id/update`                             | обновить агента до версии выпуска (`agent.update`) → `{ version, previous }`                                                                                                                                           |
+| GET    | `/api/agents/:id/actions?limit=`                     | итоги встроенных действий агента, новые первыми (`limit` — по умолчанию 50) → `ActionRecord[]`                                                                                                                         |
+| GET    | `/api/agents/:id/configs`                            | `{ configs: ConfigRecord[], status: ConfigStatus[] }` — значения и статус применения                                                                                                                                   |
+| PUT    | `/api/agents/:id/configs/:worker/:key`               | задать: тело — значение (любой JSON) → `ConfigRecord` с новой `version`                                                                                                                                                |
+| DELETE | `/api/agents/:id/configs/:worker/:key`               | удалить ключ на сервере и у агента → `{ deleted }`                                                                                                                                                                     |
+| GET    | `/api/agents/:id/metrics?since=&limit=`              | история метрик `MetricsPoint[]` по времени; `since` — строго позже, мс; `limit` — последние                                                                                                                            |
+| GET    | `/api/agents/:id/logs?worker=&lines=`                | последние строки журнала агента или воркера с узла (`agent.logs`) → `LogEntry[]`                                                                                                                                       |
+| GET    | `/api/agents/:id/watch?logLevel=`                    | поток Server-Sent Events, см. ниже                                                                                                                                                                                     |
+| \*     | `/api/agents/:id/workers/:worker/fetch/<путь>?<…>`   | запрос к воркеру, см. ниже                                                                                                                                                                                             |
+| POST   | `/api/agents/:id/workers/:worker/restart`            | перезапустить воркер (`worker.restart`) → `{ deferred: false }`; воркер занят — сразу `{ deferred: true, pending, actionId }`, итог — в `…/actions`; тело `{ force: true }` — не ждать, `{ wait: true }` — ждать итога |
+| POST   | `/api/agents/:id/workers/:worker/update`             | обновить воркер из выпуска (`worker.update`) → `{ version, previous, deferred: false }` или, как выше, `{ deferred: true, … }`; тело — так же                                                                          |
+| POST   | `/api/agents/:id/workers/:worker/jobs`               | задача воркеру (`runJob`): тело `{ type, jobId?, data?, files?, timeoutMs? }` → `{ jobId, id?, state, progress?, result?, error? }`                                                                                    |
+| GET    | `/api/agents/:id/workers/:worker/jobs/:jobId`        | состояние задачи (`jobStatus`) → `{ id, state, progress?, result?, error? }`                                                                                                                                           |
+| POST   | `/api/agents/:id/workers/:worker/jobs/:jobId/cancel` | прервать задачу (`cancelJob`) → `{ id, state }`                                                                                                                                                                        |
+| GET    | `/api/agents/:id/workers/:worker/supports?…`         | есть ли в манифесте воркера маршрут (`method`, `path`), ключ (`config`), событие (`event`) → `{ supported }`                                                                                                           |
+| GET    | `/api/events?agentId=&worker=&type=&before=&limit=`  | события воркеров, новые первыми (`limit` — по умолчанию 100); `before` — `receivedAt` последнего на странице                                                                                                           |
+| GET    | `/api/alerts?agentId=`                               | текущие проблемы `Alert[]`                                                                                                                                                                                             |
+| GET    | `/api/releases`                                      | `{ release, candidates, workerCandidates, installCommand }` — выпуск, кого можно обновить, команда установки                                                                                                           |
 
 **Манифест.** Воркеры-примеры описывают себя (`GET /manifest`): агент передаёт манифест в
 `status`, и он виден в `GET /api/agents/:id` — `workers[].manifest` с версией, ключами настроек
@@ -54,6 +57,16 @@ curl 'localhost:8080/api/agents/<id>/workers/echo/supports?method=POST&path=/ech
 ```bash
 curl -X POST localhost:8080/api/agents/<id>/workers/echo/fetch/echo -d '{"text":"привет"}'
 curl -N localhost:8080/api/agents/<id>/workers/echo/fetch/stream?n=5
+```
+
+**Задачи** ([sdk/docs/workers.md](../sdk/docs/workers.md#задачи)): тип — из манифеста воркера
+(нет — `409 JOB_UNKNOWN`); долгая задача, не закончившаяся за `timeoutMs` (по умолчанию 30 с), —
+`state: running`, её события `job.*` — в `/api/events`.
+
+```bash
+curl -X POST localhost:8080/api/agents/<id>/workers/echo/jobs -d '{"type":"echo.quick","data":{"text":"привет"}}'
+curl -X POST localhost:8080/api/agents/<id>/workers/echo/jobs -d '{"type":"echo.long","data":{"steps":10},"timeoutMs":1}'
+curl localhost:8080/api/agents/<id>/workers/echo/jobs/<id задачи>
 ```
 
 **Поток `watch`** (`text/event-stream`): пока он открыт, сервер держит наблюдателя

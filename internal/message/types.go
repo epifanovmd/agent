@@ -25,6 +25,8 @@ const (
 	TypeFetchChunk    = "fetch.chunk"
 	TypeFetchEnd      = "fetch.end"
 	TypeActionResult  = "action.result"
+	// TypeActionDone — итог отложенной замены воркера (§10).
+	TypeActionDone = "action.done"
 )
 
 // Класс доставки сообщения агента (§3).
@@ -44,7 +46,7 @@ const (
 // ClassOf — класс доставки сообщения агента по типу.
 func ClassOf(typ string) Class {
 	switch typ {
-	case TypeEvent, TypeConfigApplied, TypeActionResult:
+	case TypeEvent, TypeConfigApplied, TypeActionResult, TypeActionDone:
 		return ClassImportant
 	case TypeStatus, TypeMetrics, TypeLog:
 		return ClassStream
@@ -122,6 +124,24 @@ const (
 const (
 	PendingRestart = "restart"
 	PendingUpdate  = "update"
+)
+
+// События задач воркера (§12): принимаются, только если манифест объявляет
+// jobs; другие типы с префиксом JobEventPrefix зарезервированы.
+const (
+	JobEventPrefix    = "job."
+	JobEventProgress  = "job.progress"
+	JobEventDone      = "job.done"
+	JobEventFailed    = "job.failed"
+	JobEventCancelled = "job.cancelled"
+)
+
+// Состояния задачи воркера (JobStatus.State).
+const (
+	JobRunning   = "running"
+	JobDone      = "done"
+	JobFailed    = "failed"
+	JobCancelled = "cancelled"
 )
 
 // Уровни лога (LogEntry.Level, Watch.LogLevel).

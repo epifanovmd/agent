@@ -204,15 +204,20 @@ func TestAdoptRejectsReusedPID(t *testing.T) {
 	}
 }
 
-// restartAsync — worker.restart в фоне; итог — в канале.
+// restartAsync — worker.restart в фоне; итог — в канале, отсрочка (pending) — в deferred.
 func restartAsync(h *harness, name string, force bool) chan error {
-	done := make(chan error, 1)
+	done, _ := restartDeferred(h, name, force)
+	return done
+}
+
+func restartDeferred(h *harness, name string, force bool) (chan error, chan string) {
+	done, deferred := make(chan error, 1), make(chan string, 2)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		done <- h.sup.Restart(ctx, name, force)
+		done <- h.sup.Restart(WithDeferred(ctx, func(p string) { deferred <- p }), name, force)
 	}()
-	return done
+	return done, deferred
 }
 
 // busy: замена ждёт, пока воркер занят (status pending: restart), и идёт,
@@ -227,11 +232,19 @@ func TestBusyDefersReplace(t *testing.T) {
 	<-h.started
 	pid := h.pid(t, "echo")
 
-	done := restartAsync(h, "echo", false)
+	done, deferred := restartDeferred(h, "echo", false)
 	eventually(t, "замена ждёт", func() bool {
 		st := h.status("echo")
 		return st.Pending == message.PendingRestart && st.Health != nil && st.Health.Busy
 	})
+	select {
+	case p := <-deferred:
+		if p != message.PendingRestart {
+			t.Fatalf("отсрочка: %q", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("контекст замены не узнал об отсрочке")
+	}
 	time.Sleep(300 * time.Millisecond)
 	if h.pid(t, "echo") != pid {
 		t.Fatal("занятый воркер заменён")
@@ -248,8 +261,12 @@ func TestBusyDefersReplace(t *testing.T) {
 	_ = os.WriteFile(busy, nil, 0o600)
 	eventually(t, "занят", func() bool { st := h.status("echo"); return st.Health != nil && st.Health.Busy })
 	pid = h.pid(t, "echo")
-	if err := <-restartAsync(h, "echo", true); err != nil || h.pid(t, "echo") == pid {
+	forced, forcedDeferred := restartDeferred(h, "echo", true)
+	if err := <-forced; err != nil || h.pid(t, "echo") == pid {
 		t.Fatalf("force: %v", err)
+	}
+	if len(forcedDeferred) != 0 || len(deferred) != 0 {
+		t.Fatal("force не откладывается; об отсрочке сообщается один раз")
 	}
 
 	// busy.timeout — дольше не ждать.

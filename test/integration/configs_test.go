@@ -108,6 +108,11 @@ func TestConfigs(t *testing.T) {
 		_, ok := w.Configs["limits"]
 		return !ok
 	})
+	eventually(t, "событие config: удаление подтверждено агентом", func() bool {
+		return slices.ContainsFunc(s.server.ConfigEvents(a.ID), func(c testserver.ConfigStatus) bool {
+			return c.Key == "limits" && c.State == testserver.ConfigDeleted && c.Version == nil
+		})
+	})
 
 	// Воркера нет в настройках агента.
 	unknown := s.server.SetConfig(a.ID, "nope", "main", 1)

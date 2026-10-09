@@ -22,15 +22,18 @@ import { envelopeSchema } from "../protocol/schemas";
 import { baseUrl, clientAddress, readJSON, sendJSON } from "./http";
 import { type ReleaseSource, serveRelease } from "./releases";
 
-/** Сроки транспорта (§16); тесты уменьшают. */
+/** Сроки транспорта (§16); тесты уменьшают. Частота ping — опция pingIntervalMs. */
 export const transportDefaults = {
   helloTimeoutMs: 10_000,
-  pingIntervalMs: 20_000,
-  pongTimeoutMs: 10_000,
 };
+
+/** Сколько ping подряд без pong — соединение закрывается. */
+const MISSED_PONGS = 2;
 
 /** Что транспорт передаёт дальше. */
 export interface TransportHost extends ReleaseSource {
+  /** Частота ping агенту, мс (опция pingIntervalMs). */
+  readonly pingIntervalMs: number;
   /** Регистрация: функция чтения тела и адрес клиента → ключ агента. */
   enroll(body: () => Promise<unknown>, remote: string): Promise<unknown>;
   authenticate(header: string | undefined): Promise<AgentRecord | undefined>;
@@ -159,22 +162,22 @@ export class Transport {
       () => !greeted && ss.close(Close.Invalid, "нет hello"),
       transportDefaults.helloTimeoutMs,
     );
-    let pongTimer: NodeJS.Timeout | undefined;
+    // ping раз в pingIntervalMs; на MISSED_PONGS ping подряд нет pong — обрыв без закрытия
+    // (сеть пропала, узел выключен): соединение закрывается, агент уходит в offline.
+    let missed = 0;
     const ping = setInterval(() => {
-      if (pongTimer) return;
+      if (missed >= MISSED_PONGS) return ws.terminate();
+      missed += 1;
       ws.ping();
-      pongTimer = setTimeout(
-        () => ws.terminate(),
-        transportDefaults.pongTimeoutMs,
-      );
-    }, transportDefaults.pingIntervalMs);
+    }, this.host.pingIntervalMs);
 
     ws.on("pong", () => {
-      clearTimeout(pongTimer);
-      pongTimer = undefined;
+      missed = 0;
+      ss.seenAt = Date.now();
     });
 
     ws.on("message", (raw, binary) => {
+      ss.seenAt = Date.now();
       let parsed: unknown;
 
       try {
@@ -201,7 +204,6 @@ export class Transport {
     ws.on("close", () => {
       this.sockets.delete(ws);
       clearTimeout(helloTimer);
-      clearTimeout(pongTimer);
       clearInterval(ping);
       void ss.serial(() => this.host.closed(ss));
     });

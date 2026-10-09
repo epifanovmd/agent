@@ -50,10 +50,38 @@ func TestParseManifest(t *testing.T) {
 		"маршрутов много":  `{"version":"1","routes":[` + strings.Join(routes, ",") + `]}`,
 		"тип события":      `{"version":"1","events":[{"type":"Done"}]}`,
 		"описание события": `{"version":"1","events":[{"type":"done","description":"` + long + `"}]}`,
+		"событие job.*":    `{"version":"1","events":[{"type":"job.done"}]}`,
+		"тип задачи":       `{"version":"1","jobs":[{"type":"Build"}]}`,
+		"схема задачи":     `{"version":"1","jobs":[{"type":"build","schema":[]}]}`,
 		"больше предела":   `{"version":"1","description":"` + strings.Repeat("a", MaxManifestBytes) + `"}`,
 	} {
 		if _, err := ParseWorkerManifest([]byte(body)); err == nil {
 			t.Errorf("%s: ждали ошибку", name)
 		}
+	}
+}
+
+// События задач (job.*) принимаются, только если манифест объявляет jobs, и
+// только стандартные; объявлять их в events не нужно.
+func TestManifestJobEvents(t *testing.T) {
+	m, err := ParseWorkerManifest([]byte(`{"version":"1","events":[{"type":"item.done"}],
+		"jobs":[{"type":"item.build","schema":{"type":"object"}},{"type":"item.check","schema":null}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Jobs) != 2 || m.Jobs[1].Schema != nil {
+		t.Fatalf("jobs: %+v", m.Jobs)
+	}
+	for _, typ := range []string{JobEventProgress, JobEventDone, JobEventFailed, JobEventCancelled, "item.done"} {
+		if !m.DeclaresEvent(typ) {
+			t.Errorf("%s: ждали, что событие принимается", typ)
+		}
+	}
+	if m.DeclaresEvent("job.other") {
+		t.Error("job.other зарезервирован")
+	}
+	plain, _ := ParseWorkerManifest([]byte(`{"version":"1","events":[{"type":"item.done"}]}`))
+	if plain.DeclaresEvent(JobEventDone) {
+		t.Error("без jobs события задач не принимаются")
 	}
 }

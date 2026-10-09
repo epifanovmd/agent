@@ -12,5 +12,65 @@
         "at": 1791380005000
       }
     }
+  },
+  "event.job.progress": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "event",
+      "id": "d4e5f60718293a4b5c6d7e8f90a1b2c4",
+      "data": {
+        "worker": "report",
+        "type": "job.progress",
+        "data": { "jobId": "job-7f3a", "id": "b81c", "progress": 0.4, "message": "собрано 40 из 100" },
+        "at": 1791380006000
+      }
+    }
+  },
+  "event.job.done": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "event",
+      "id": "e5f60718293a4b5c6d7e8f90a1b2c3d5",
+      "data": {
+        "worker": "report",
+        "type": "job.done",
+        "data": { "jobId": "job-7f3a", "id": "b81c", "result": { "items": 100 } },
+        "at": 1791380009000
+      }
+    }
+  },
+  "event.job.failed": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "event",
+      "id": "f60718293a4b5c6d7e8f90a1b2c3d4e6",
+      "data": {
+        "worker": "report",
+        "type": "job.failed",
+        "data": {
+          "jobId": "job-8c1d",
+          "id": "c92d",
+          "error": { "code": "example.source-unavailable", "message": "источник не ответил" }
+        },
+        "at": 1791380010000
+      }
+    }
+  },
+  "event.job.cancelled": {
+    "from": "agent",
+    "to": "server",
+    "message": {
+      "type": "event",
+      "id": "0718293a4b5c6d7e8f90a1b2c3d4e5f8",
+      "data": {
+        "worker": "report",
+        "type": "job.cancelled",
+        "data": { "jobId": "job-9d2e", "id": "d03e" },
+        "at": 1791380011000
+      }
+    }
   }
 }

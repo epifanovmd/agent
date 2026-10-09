@@ -51,31 +51,34 @@ describe("манифест воркеров", () => {
       assert.equal(w.manifest?.configs?.[0].key, keys[name], name);
       assert.equal(typeof w.manifest?.configs?.[0].schema, "object", name);
     }
-    const routes = ["POST /echo", "GET /stream", "GET /bytes", "POST /work"];
-    const events = ["echo.started", "echo.progress", "echo.done"];
-    // echo ещё отдаёт ход работы и прерывает её.
-    const extra = {
-      echo: {
-        routes: ["GET /work/{id}", "POST /work/{id}/cancel", "POST /hang"],
-        events: ["echo.cancelled"],
-      },
-      "node-echo": { routes: ["POST /hang"], events: [] },
-    };
+    const routes = ["POST /echo", "GET /stream", "GET /bytes", "POST /hang"];
 
-    for (const [name, more] of Object.entries(extra)) {
+    for (const name of ["echo", "node-echo"]) {
       const m = a.workers.find(x => x.name === name)!.manifest!;
 
       assert.deepEqual(
         m.routes?.map(r => `${r.method} ${r.path}`),
-        [...routes, ...more.routes],
+        routes,
         name,
       );
       assert.deepEqual(
         m.events?.map(e => e.type),
-        [...events, ...more.events],
+        ["echo.started"],
         name,
       );
+      assert.deepEqual(
+        m.jobs?.map(j => j.type),
+        ["echo.quick", "echo.long"],
+        name,
+      );
+      assert.equal(typeof m.jobs?.[1].schema, "object", name);
     }
+    assert.deepEqual(
+      a.workers
+        .find(x => x.name === "netprobe")
+        ?.manifest?.jobs?.map(j => j.type),
+      ["netprobe.run"],
+    );
     // Встроенный sysmetrics тоже отвечает GET /manifest: версия — версия агента.
     assert.equal(
       a.workers.find(w => w.name === "sysmetrics")?.manifest?.version,
@@ -91,7 +94,7 @@ describe("манифест воркеров", () => {
     );
     assert.equal(await supported("echo", "method=GET&path=/echo"), false);
     assert.equal(
-      await supported("echo", "config=settings&event=echo.done"),
+      await supported("echo", "config=settings&event=echo.started"),
       true,
     );
     assert.equal(await supported("sysinfo", "method=GET&path=/info"), true);

@@ -120,8 +120,9 @@ workers:
 	}
 }
 
-// worker.restart во время долгой работы ждёт её окончания (status.workers[].pending:
-// restart), итог — после замены; force — сразу.
+// worker.restart во время долгой работы: агент сразу отвечает «отложено» (pending: restart в
+// status), замена — после окончания работы, её итог — action.done (событие action); force —
+// сразу.
 func TestRestartWaitsForBusy(t *testing.T) {
 	t.Parallel()
 	s := newStand(t)
@@ -138,8 +139,13 @@ func TestRestartWaitsForBusy(t *testing.T) {
 		w, _ := b.Worker("w")
 		return w.Health != nil && w.Health.Busy
 	})
-	done := make(chan error, 1)
-	go func() { done <- s.server.Action("restartWorker", a.ID, nil, "w") }()
+	var res testserver.ReplaceResult
+	if err := s.server.Action("restartWorker", a.ID, &res, "w"); err != nil {
+		t.Fatal(err)
+	}
+	if !res.Deferred || res.Pending != message.PendingRestart || res.ActionID == "" {
+		t.Fatalf("restartWorker занятого воркера: %+v", res)
+	}
 	eventually(t, "замена ждёт", func() bool {
 		b, _ := s.server.Agent(agentName)
 		w, _ := b.Worker("w")
@@ -148,8 +154,18 @@ func TestRestartWaitsForBusy(t *testing.T) {
 	if got := s.pid(a.ID, "w"); got != pid {
 		t.Fatal("занятый воркер заменён")
 	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	var done testserver.ActionRecord
+	eventually(t, "итог отложенной замены — action.done", func() bool {
+		for _, r := range s.server.Actions(a.ID) {
+			if r.ID == res.ActionID {
+				done = r
+				return true
+			}
+		}
+		return false
+	})
+	if done.Status != "done" || !done.Deferred || done.Name != message.ActionWorkerRestart {
+		t.Fatalf("итог: %+v", done)
 	}
 	b, _ := s.server.Agent(agentName)
 	if _, _, finished := progress(b, "a"); !finished {
@@ -160,6 +176,23 @@ func TestRestartWaitsForBusy(t *testing.T) {
 		t.Fatal("после окончания работы воркер не заменён")
 	}
 
+	// wait — вызов ждёт итога отложенной замены.
+	s.fetch(a.ID, "w", "/work?id=c&steps=4&ms=250", testserver.FetchInit{Method: "POST"})
+	eventually(t, "воркер занят", func() bool {
+		b, _ := s.server.Agent(agentName)
+		w, _ := b.Worker("w")
+		return w.Health != nil && w.Health.Busy
+	})
+	res = testserver.ReplaceResult{}
+	if err := s.server.Action("restartWorker", a.ID, &res, "w", map[string]any{"wait": true}); err != nil || res.Deferred {
+		t.Fatalf("wait: %+v %v", res, err)
+	}
+	b, _ = s.server.Agent(agentName)
+	if _, _, finished := progress(b, "c"); !finished || s.pid(a.ID, "w") == next {
+		t.Fatal("wait: итог — после окончания работы и замены")
+	}
+	next = s.pid(a.ID, "w")
+
 	// force — не ждать.
 	s.fetch(a.ID, "w", "/work?id=b&steps=40&ms=250", testserver.FetchInit{Method: "POST"})
 	eventually(t, "воркер занят", func() bool {
@@ -168,8 +201,9 @@ func TestRestartWaitsForBusy(t *testing.T) {
 		return w.Health != nil && w.Health.Busy
 	})
 	began := time.Now()
-	if err := s.server.Action("restartWorker", a.ID, nil, "w", map[string]any{"force": true}); err != nil {
-		t.Fatal(err)
+	res = testserver.ReplaceResult{}
+	if err := s.server.Action("restartWorker", a.ID, &res, "w", map[string]any{"force": true}); err != nil || res.Deferred {
+		t.Fatalf("force: %+v %v", res, err)
 	}
 	if time.Since(began) > 8*time.Second || s.pid(a.ID, "w") == next {
 		t.Fatalf("force: замена через %s", time.Since(began))
