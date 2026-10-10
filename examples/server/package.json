@@ -1,6 +1,6 @@
 {
   "name": "example-server",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "Сервер стенда на agent-sdk/server: HTTP API над Agents и сквозные тесты с настоящим агентом",
   "type": "module",

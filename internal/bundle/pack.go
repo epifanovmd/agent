@@ -277,7 +277,7 @@ func binary(ctx context.Context, o Options, cfg config.Config, p Platform, dst s
 	}
 	if len(o.Keys) == 0 {
 		o.Warn("ключей проверки подписи нет — у программы агента под " + p.String() + " сверена только контрольная сумма")
-	} else if err := o.Keys.Verify(update.Local(update.AgentName, rel.Version, rel.SHA256), rel.Signature); err != nil {
+	} else if err := o.Keys.Verify(update.Build{Name: update.AgentName, Version: rel.Version, OS: p.OS, Arch: p.Arch, SHA256: rel.SHA256}, rel.Signature); err != nil {
 		return err
 	}
 	return download(ctx, o, rel.URL, dst, rel.SHA256)

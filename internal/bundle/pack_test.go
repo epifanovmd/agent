@@ -152,3 +152,48 @@ func TestPack(t *testing.T) {
 		t.Fatal("файл настроек вне папки — ошибка")
 	}
 }
+
+// Программа агента под чужую платформу — из каталога сборок агента: подпись сверяется для её
+// платформы, а не для платформы этой машины.
+func TestPackOtherPlatform(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	other := Platform{"linux", "amd64"}
+	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
+		other = Platform{"linux", "arm64"}
+	}
+	body := []byte("agent for " + other.String())
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+	signature := update.Sign(priv, update.Build{Name: update.AgentName, Version: "1.2.0", OS: other.OS, Arch: other.Arch, SHA256: hash})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/download/v1.2.0/manifest.json":
+			_ = json.NewEncoder(w).Encode(message.Manifest{Version: "1.2.0", Artifacts: []message.Artifact{
+				{OS: other.OS, Arch: other.Arch, File: "agent-" + other.OS + "-" + other.Arch, SHA256: hash, Signature: signature},
+			}})
+		case "/download/v1.2.0/agent-" + other.OS + "-" + other.Arch:
+			_, _ = w.Write(body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte("update: { releases: "+srv.URL+" }\n"), 0o644)
+	self := filepath.Join(t.TempDir(), "agent-self")
+	_ = os.WriteFile(self, []byte("this machine"), 0o755)
+	archives, err := Pack(context.Background(), Options{
+		Config: filepath.Join(dir, "agent.yaml"), Out: t.TempDir(), Platforms: []Platform{other},
+		Version: "1.2.0", Self: self, Keys: update.Keys{pub}, Client: http.DefaultClient, Warn: func(string) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := filepath.Join(t.TempDir(), "x")
+	if err := update.Extract(archives[0], x); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(x, Dir, Binary)); string(got) != string(body) {
+		t.Fatalf("программа под %s: %q", other, got)
+	}
+}
