@@ -96,6 +96,7 @@ func (a *App) Reload(next config.Config) {
 // — выход для перезапуска менеджером службы (ErrRestart; воркеры — по
 // lifecycle.onAgentRestart), SIGHUP — перечитать настройки из path.
 func (a *App) Serve(path string) error {
+	a.configPath = path
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sig := make(chan os.Signal, 4)

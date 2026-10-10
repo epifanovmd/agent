@@ -290,6 +290,16 @@ type pendingUpdate struct {
 
 const pendingUpdateFile = "agent-update.json"
 
+// restartable — запустится ли агент после перезапуска: его файл настроек на месте и
+// читается. Нет — обновление не начинается: агент с новой версией не стартовал бы, а
+// откатить её без менеджера службы некому.
+func (a *App) restartable() error {
+	if _, err := config.Load(a.configPath); err != nil {
+		return fmt.Errorf("после перезапуска агент не запустится — настройки %s не читаются: %w", a.configPath, err)
+	}
+	return nil
+}
+
 // agentUpdate — agent.update (§11): скачать, проверить, заменить файл и
 // перезапуститься; итог отправит новая версия после welcome.
 func (a *App) agentUpdate(ctx context.Context, id string, args message.AgentUpdateArgs) (any, error) {
@@ -304,6 +314,9 @@ func (a *App) agentUpdate(ctx context.Context, id string, args message.AgentUpda
 	}
 	if args.Version == a.version {
 		return message.UpdateResult{Version: a.version, Previous: a.version}, nil
+	}
+	if err := a.restartable(); err != nil {
+		return nil, message.NewError(message.CodeUpdateFailed, err.Error())
 	}
 	var rel update.Release
 	var auth string

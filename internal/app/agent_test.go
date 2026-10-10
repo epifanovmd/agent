@@ -641,3 +641,39 @@ func TestUpdateKeysFromConfig(t *testing.T) {
 		t.Fatalf("ключи: %d", len(a.keys))
 	}
 }
+
+// agent.update при недоступном файле настроек — отказ до скачивания: после
+// перезапуска агент с этими настройками не запустился бы, а откатить некому.
+func TestAgentUpdateRefusedWithoutConfig(t *testing.T) {
+	key, _, _ := ed25519.GenerateKey(nil)
+	dir := t.TempDir()
+	path := dir + "/agent.yaml"
+	if err := os.WriteFile(path, []byte("server:\n  url: http://127.0.0.1:1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Server.URL = "http://127.0.0.1:1"
+	cfg.DataDir = t.TempDir()
+	cfg.Log.Level = "error"
+	cfg.Update.PublicKeys = []string{base64.StdEncoding.EncodeToString(key)}
+	a, err := New(cfg, "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	a.configPath = path
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.agentUpdate(context.Background(), "u1", message.AgentUpdateArgs{
+		Version: "9.9.9",
+		URL:     "https://example.invalid/agent-linux-amd64",
+	})
+	var me *message.ErrorInfo
+	if !errors.As(err, &me) || me.Code != message.CodeUpdateFailed || !strings.Contains(me.Message, "agent.yaml") {
+		t.Fatalf("ожидался UPDATE_FAILED с путём настроек, а не %v", err)
+	}
+	if _, err := os.Stat(cfg.DataDir + "/" + pendingUpdateFile); !os.IsNotExist(err) {
+		t.Fatalf("обновление не начиналось — отметки быть не должно: %v", err)
+	}
+}

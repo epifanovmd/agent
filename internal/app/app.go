@@ -48,12 +48,15 @@ var ErrRestart = errors.New("agent: перезапуск")
 
 // App — агент.
 type App struct {
-	cfgMu    sync.Mutex
-	cfg      config.Config
-	reloadMu sync.Mutex
-	version  string
-	bootID   string
-	started  time.Time
+	cfgMu sync.Mutex
+	cfg   config.Config
+	// configPath — файл настроек, с которым агент запущен ("" — только окружение):
+	// с ним же он стартует после перезапуска.
+	configPath string
+	reloadMu   sync.Mutex
+	version    string
+	bootID     string
+	started    time.Time
 
 	log     *slog.Logger
 	logCtl  *logx.Control
