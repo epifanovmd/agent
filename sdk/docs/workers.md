@@ -786,7 +786,7 @@ workers:
     from: agent # сборка из релиза агента той же версии
 ```
 
-Быстрее всего — заготовка на Python `agent worker new <имя>`: база `agent_worker.py`
+Быстрее всего — заготовка `agent worker new <имя> [--lang python|go]`: база `agent_worker.py` или `agent_worker.go`
 берёт на себя сокет, здоровье, манифест, настройки, задачи, события и запросы, а воркер —
 класс-наследник с одним только своим кодом
 ([docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#папка-агента)).

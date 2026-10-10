@@ -99,7 +99,7 @@ agent/
 ### 3. Добавьте воркер
 
 ```bash
-agent/agent worker new report
+agent/agent worker new report            # или --lang go
 ```
 
 Команда создаёт `agent/workers/report/`: базу `agent_worker.py` (весь протокол агента — здоровье,
@@ -291,7 +291,7 @@ workers:
 | `agent install [--env ИМЯ] [флаги]`      | поставить службой systemd: из архива, из папки или по флагам               |
 | `agent upgrade [--check] [--version X]`  | поставить новую версию агента (подпись проверяется)                        |
 | `agent keygen`                           | ключи подписи сборок воркеров проекта                                      |
-| `agent worker new ИМЯ`                   | воркер из заготовки на Python: база и класс-наследник, строка в настройках |
+| `agent worker new ИМЯ [--lang go]`       | воркер из заготовки (Python или Go): база и наследник, строка в настройках |
 | `agent worker sync`, `agent worker list` | обновить базы воркеров; воркеры: откуда каждый, версия                     |
 | `agent logs [-f]`, `agent restart`       | журнал службы; перезапуск агента (воркеры работают дальше)                 |
 | `agent stop-workers`, `agent cleanup`    | остановить оставшиеся воркеры; уборка воркеров перед удалением             |

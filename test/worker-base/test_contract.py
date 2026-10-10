@@ -22,7 +22,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TEMPLATES = os.path.join(ROOT, "internal", "scaffold", "worker")
+TEMPLATES = os.path.join(ROOT, "internal", "scaffold", "worker", "python")
 
 
 class UnixConnection(http.client.HTTPConnection):

@@ -1,0 +1,979 @@
+// agent-worker-base: 1
+//
+// База воркера агента на Go (≥ 1.22, только стандартная библиотека).
+//
+// Не правьте этот файл: его создаёт и обновляет `agent worker new` / `agent worker sync`.
+// Свой код — в типе, который встраивает базу (worker.go):
+//
+//	type Report struct {
+//		*Worker
+//		settings *Config
+//	}
+//
+//	func main() {
+//		w := &Report{Worker: NewWorker()}
+//		w.Description = "Отчёты"
+//		w.settings = w.Config("settings", Object, map[string]any{"limit": 10}, "")
+//		w.Event("report.sent", Object, "")
+//		w.Route("POST", "/reports/{id}/send", RouteOpts{}, w.send)
+//		w.Job("report.build", JobOpts{}, w.build)
+//		Run(w)
+//	}
+//
+//	func (w *Report) send(rw http.ResponseWriter, r *http.Request) {
+//		_ = w.Emit("report.sent", map[string]any{"id": r.PathValue("id")})
+//		JSON(rw, http.StatusOK, map[string]any{"ok": true})
+//	}
+//
+//	func (w *Report) build(j *Job) (any, error) {
+//		if err := j.Progress(0.5, "половина"); err != nil {
+//			return nil, err
+//		}
+//		return map[string]any{"done": true}, nil
+//	}
+//
+// Маршрут — обычный http.HandlerFunc ({name} в пути — r.PathValue("name"); ответ по частям —
+// rw.(http.Flusher)); JSON и Error — помощники ответа. Задача — func(*Job) (any, error):
+// итог — значение, отказ — *JobError, отмена — ошибка ErrCancelled (её вернут Progress, Sleep и
+// Check).
+//
+// Необязательные методы типа воркера (база вызывает их, если они есть): Health() Health,
+// Metrics() map[string]any, ValidateConfig(key, data) error, OnConfig(key, data),
+// Cleanup() bool, PrepareJob(type, data, files) error, OnStart().
+//
+// База сама обслуживает GET /health (busy, пока идут долгие задачи), GET /manifest (из
+// объявлений и файла VERSION рядом с программой), PUT и DELETE /config/{key}, GET /metrics,
+// POST /cleanup, POST /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel; события задач (job.progress,
+// job.done, job.failed, job.cancelled) уходят агенту сами. Контракт — sdk/spec §12 агента.
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// Object — схема «любой объект» для объявлений.
+var Object = map[string]any{"type": "object"}
+
+// ErrCancelled — задачу отменили (POST /jobs/{id}/cancel): верните её из обработчика задачи.
+var ErrCancelled = errors.New("задача отменена")
+
+// JobError — задача не выполнена: job.failed { error: { code, message } }.
+type JobError struct{ Code, Message string }
+
+func (e *JobError) Error() string { return e.Message }
+
+// HTTPError — отказ с кодом ответа (например, из PrepareJob или ValidateConfig).
+type HTTPError struct {
+	Status  int
+	Message string
+}
+
+func (e *HTTPError) Error() string { return e.Message }
+
+// RequestError — запрос к бэкенду не выполнен: Rejected — бэкенд отказал (422), иначе нет связи
+// или срок вышел (повторить можно).
+type RequestError struct {
+	Code, Message string
+	Rejected      bool
+}
+
+func (e *RequestError) Error() string { return e.Code + ": " + e.Message }
+
+// Health — ответ GET /health; Busy база выставит сама, пока идут долгие задачи.
+type Health struct {
+	OK      bool   `json:"ok"`
+	Busy    *bool  `json:"busy,omitempty"`
+	Message string `json:"message,omitempty"`
+	Info    any    `json:"info,omitempty"`
+}
+
+// JobFiles — files задачи: ссылки на входные (GET) и выходные (PUT) файлы.
+type JobFiles struct {
+	Inputs  map[string]string `json:"inputs,omitempty"`
+	Outputs map[string]string `json:"outputs,omitempty"`
+}
+
+// RouteOpts — описание маршрута для манифеста: схемы тела запроса и ответа.
+type RouteOpts struct {
+	Description       string
+	Request, Response any
+}
+
+// JobOpts — тип задачи: Quick — итог сразу (200), иначе долгая (202, ход — событиями);
+// Resumable — после перезапуска воркера задача продолжается (нужен WORKER_STATE_DIR).
+type JobOpts struct {
+	Description string
+	Schema      any
+	Quick       bool
+	Resumable   bool
+}
+
+// JobFunc — обработчик задачи.
+type JobFunc func(j *Job) (any, error)
+
+// Config — ключ настроек: значение — Value, до первой настройки — значение по умолчанию.
+type Config struct {
+	Key, Description string
+	Schema           any
+	mu               sync.Mutex
+	def, value       json.RawMessage
+	version          int64
+}
+
+// Value — текущее значение в v.
+func (c *Config) Value(v any) error {
+	c.mu.Lock()
+	raw := c.value
+	c.mu.Unlock()
+	if len(raw) == 0 {
+		raw = []byte("null")
+	}
+	return json.Unmarshal(raw, v)
+}
+
+// Raw — текущее значение как есть.
+func (c *Config) Raw() json.RawMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value
+}
+
+// Version — версия текущего значения (0 — по умолчанию).
+func (c *Config) Version() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.version
+}
+
+// Job — задача: данные, файлы, ход, отмена, сохранённое состояние.
+type Job struct {
+	ID, JobID, Type string
+	Data            json.RawMessage
+	Files           JobFiles
+
+	w         *Worker
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	state     string
+	progress  float64
+	result    any
+	errInfo   *JobError
+	saved     json.RawMessage
+	forgotten bool
+}
+
+// Decode — data задачи в v.
+func (j *Job) Decode(v any) error {
+	if len(j.Data) == 0 {
+		return nil
+	}
+	return json.Unmarshal(j.Data, v)
+}
+
+// Context — отменяется, когда задачу отменили.
+func (j *Job) Context() context.Context { return j.ctx }
+
+// Cancelled — задачу отменили.
+func (j *Job) Cancelled() bool { return j.ctx.Err() != nil }
+
+// Check — ErrCancelled, если задачу отменили.
+func (j *Job) Check() error {
+	if j.Cancelled() {
+		return ErrCancelled
+	}
+	return nil
+}
+
+// Sleep — пауза, которую прерывает отмена (ErrCancelled).
+func (j *Job) Sleep(d time.Duration) error {
+	select {
+	case <-j.ctx.Done():
+		return ErrCancelled
+	case <-time.After(d):
+		return nil
+	}
+}
+
+// Progress — ход: доля 0…1 и пояснение → событие job.progress.
+func (j *Job) Progress(value float64, message string) error {
+	if err := j.Check(); err != nil {
+		return err
+	}
+	value = max(0, min(1, value))
+	j.mu.Lock()
+	j.progress = value
+	j.mu.Unlock()
+	return j.w.jobEvent("job.progress", j, map[string]any{"progress": value, "message": message})
+}
+
+// Save — запомнить состояние задачи на диске: перезапущенный воркер продолжит с Restore.
+func (j *Job) Save(state any) error {
+	raw, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	j.mu.Lock()
+	j.saved = raw
+	j.mu.Unlock()
+	return j.w.persist(j)
+}
+
+// Restore — сохранённое состояние в v; false — его нет (задача только началась).
+func (j *Job) Restore(v any) bool {
+	j.mu.Lock()
+	raw := j.saved
+	j.mu.Unlock()
+	return len(raw) > 0 && json.Unmarshal(raw, v) == nil
+}
+
+func (j *Job) view() map[string]any {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := map[string]any{"id": j.ID, "state": j.state, "progress": j.progress}
+	if j.result != nil {
+		out["result"] = j.result
+	}
+	if j.errInfo != nil {
+		out["error"] = map[string]string{"code": j.errInfo.Code, "message": j.errInfo.Message}
+	}
+	return out
+}
+
+type jobSpec struct {
+	opts    JobOpts
+	handler JobFunc
+}
+
+type typeDecl struct {
+	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
+	Schema      any    `json:"schema,omitempty"`
+	Response    any    `json:"response,omitempty"`
+}
+
+type routeDecl struct {
+	Method      string `json:"method"`
+	Path        string `json:"path"`
+	Description string `json:"description,omitempty"`
+	Request     any    `json:"request,omitempty"`
+	Response    any    `json:"response,omitempty"`
+}
+
+// Worker — база воркера: объявления, сокет, протокол агента.
+type Worker struct {
+	// Description — что делает воркер (в манифесте).
+	Description string
+	// Version — версия воркера; пусто — AGENT_WORKER_VERSION или файл VERSION рядом с программой.
+	Version string
+	// StateDir — каталог состояния долгих задач (Resumable); пусто — WORKER_STATE_DIR.
+	StateDir string
+	// LogRequests — строка в журнал на каждый запрос (кроме health, metrics, manifest).
+	LogRequests bool
+	// Name — имя воркера (AGENT_WORKER).
+	Name string
+
+	self     any
+	mux      *http.ServeMux
+	routes   []routeDecl
+	configs  []*Config
+	events   []typeDecl
+	requests []typeDecl
+	jobs     map[string]*jobSpec
+	jobOrder []string
+
+	mu       sync.Mutex
+	live     map[string]*Job
+	byJobID  map[string]string
+	counters map[string]int64
+}
+
+// NewWorker — база воркера для встраивания.
+func NewWorker() *Worker {
+	return &Worker{
+		mux: http.NewServeMux(), jobs: map[string]*jobSpec{}, live: map[string]*Job{}, byJobID: map[string]string{},
+		counters: map[string]int64{"requests": 0, "jobsDone": 0, "jobsFailed": 0, "jobsCancelled": 0},
+	}
+}
+
+func (w *Worker) base() *Worker { return w }
+
+// Config — ключ настроек со схемой значения и значением по умолчанию.
+func (w *Worker) Config(key string, schema, def any, description string) *Config {
+	raw, _ := json.Marshal(def)
+	c := &Config{Key: key, Description: description, Schema: schema, def: raw, value: raw}
+	w.configs = append(w.configs, c)
+	return c
+}
+
+// Event — тип события, которое воркер шлёт бэкенду (Emit), и схема его data.
+func (w *Worker) Event(typ string, schema any, description string) {
+	w.events = append(w.events, typeDecl{Type: typ, Schema: schema, Description: description})
+}
+
+// Request — тип запроса воркера к бэкенду (Ask): схемы data и ответа.
+func (w *Worker) Request(typ string, schema, response any, description string) {
+	w.requests = append(w.requests, typeDecl{Type: typ, Schema: schema, Response: response, Description: description})
+}
+
+// Route — маршрут для запросов бэкенда (agents.fetch): {name} в path — один сегмент.
+func (w *Worker) Route(method, path string, opts RouteOpts, h http.HandlerFunc) {
+	w.routes = append(w.routes, routeDecl{Method: strings.ToUpper(method), Path: path, Description: opts.Description,
+		Request: opts.Request, Response: opts.Response})
+	w.mux.HandleFunc(strings.ToUpper(method)+" "+path, h)
+}
+
+// Job — тип задачи (agents.runJob).
+func (w *Worker) Job(typ string, opts JobOpts, h JobFunc) {
+	if _, ok := w.jobs[typ]; !ok {
+		w.jobOrder = append(w.jobOrder, typ)
+	}
+	w.jobs[typ] = &jobSpec{opts: opts, handler: h}
+}
+
+// Emit — событие бэкенду; агент хранит его, пока бэкенд не подтвердит.
+func (w *Worker) Emit(typ string, data any) error {
+	body := map[string]any{"type": typ}
+	if data != nil {
+		body["data"] = data
+	}
+	return w.agentRetry(http.MethodPost, "/events", body)
+}
+
+// Ask — запрос к бэкенду → data ответа; отказ и недоступность — *RequestError.
+func (w *Worker) Ask(typ string, data any, timeout time.Duration) (json.RawMessage, error) {
+	body := map[string]any{"type": typ}
+	if data != nil {
+		body["data"] = data
+	}
+	if timeout > 0 {
+		body["timeoutMs"] = timeout.Milliseconds()
+	} else {
+		timeout = 30 * time.Second
+	}
+	status, raw, err := w.AgentCall(http.MethodPost, "/requests", body, timeout+5*time.Second)
+	if err != nil {
+		return nil, &RequestError{Code: "AGENT_UNAVAILABLE", Message: err.Error()}
+	}
+	var out struct {
+		Data          json.RawMessage `json:"data"`
+		Code, Message string
+	}
+	_ = json.Unmarshal(raw, &out)
+	if status == http.StatusOK {
+		return out.Data, nil
+	}
+	return nil, &RequestError{Code: cmpOr(out.Code, fmt.Sprint(status)), Message: out.Message, Rejected: status == http.StatusUnprocessableEntity}
+}
+
+// AgentContext — кто агент и есть ли связь (GET /context).
+func (w *Worker) AgentContext() (map[string]any, error) {
+	_, raw, err := w.AgentCall(http.MethodGet, "/context", nil, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]any{}
+	return out, json.Unmarshal(raw, &out)
+}
+
+// AgentCall — запрос к сокету агента как есть: статус и тело, без повторов.
+func (w *Worker) AgentCall(method, path string, body any, timeout time.Duration) (int, json.RawMessage, error) {
+	client := &http.Client{Timeout: timeout, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", os.Getenv("AGENT_SOCKET"))
+		},
+	}}
+	var rd io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, err
+		}
+		rd = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, "http://agent"+path, rd)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("AGENT_WORKER_TOKEN"))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, raw, err
+}
+
+// Log — строка в журнал воркера (stdout → журнал агента, уровень info).
+func (w *Worker) Log(message string, kv ...any) {
+	if len(kv) > 0 {
+		message += " " + strings.TrimSpace(fmt.Sprintln(kv...))
+	}
+	fmt.Println(message)
+}
+
+// JSON — ответ JSON со статусом.
+func JSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	_ = json.NewEncoder(rw).Encode(v)
+}
+
+// ReadJSON — тело запроса JSON в v.
+func ReadJSON(r *http.Request, v any) error {
+	return json.NewDecoder(r.Body).Decode(v)
+}
+
+// Error — ответ { message } со статусом.
+func Error(rw http.ResponseWriter, status int, message string) {
+	JSON(rw, status, map[string]string{"message": message})
+}
+
+// Run — воркер self (тип со встроенной базой) слушает AGENT_WORKER_SOCKET до SIGTERM.
+func Run(self interface{ base() *Worker }) {
+	w := self.base()
+	w.self = self
+	if w.Name == "" {
+		w.Name = os.Getenv("AGENT_WORKER")
+	}
+	if w.Version == "" {
+		w.Version = readVersion()
+	}
+	if w.StateDir == "" {
+		w.StateDir = os.Getenv("WORKER_STATE_DIR")
+	}
+	path := os.Getenv("AGENT_WORKER_SOCKET")
+	if path == "" {
+		fmt.Fprintln(os.Stderr, "нет AGENT_WORKER_SOCKET — воркер запускает агент")
+		os.Exit(2)
+	}
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "сокет воркера:", err)
+		os.Exit(1)
+	}
+	srv := &http.Server{Handler: w}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown)
+	}()
+	go w.resume()
+	if s, ok := self.(interface{ OnStart() }); ok {
+		go s.OnStart()
+	}
+	w.Log(fmt.Sprintf("воркер %s %s слушает %s", w.Name, w.Version, path))
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// readVersion — AGENT_WORKER_VERSION, файл VERSION рядом с программой или в текущем каталоге.
+func readVersion() string {
+	if v := os.Getenv("AGENT_WORKER_VERSION"); v != "" {
+		return v
+	}
+	var dirs []string
+	if exe, err := os.Executable(); err == nil {
+		dirs = append(dirs, filepath.Dir(exe))
+	}
+	dirs = append(dirs, ".")
+	for _, dir := range dirs {
+		if raw, err := os.ReadFile(filepath.Join(dir, "VERSION")); err == nil && strings.TrimSpace(string(raw)) != "" {
+			return strings.TrimSpace(string(raw))
+		}
+	}
+	return "0.0.0"
+}
+
+func cmpOr(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+func (w *Worker) manifest() map[string]any {
+	m := map[string]any{"version": w.Version}
+	if w.Description != "" {
+		m["description"] = w.Description
+	}
+	if len(w.configs) > 0 {
+		var list []map[string]any
+		for _, c := range w.configs {
+			item := map[string]any{"key": c.Key}
+			if c.Schema != nil {
+				item["schema"] = c.Schema
+			}
+			if c.Description != "" {
+				item["description"] = c.Description
+			}
+			list = append(list, item)
+		}
+		m["configs"] = list
+	}
+	if len(w.routes) > 0 {
+		m["routes"] = w.routes
+	}
+	if len(w.events) > 0 {
+		m["events"] = w.events
+	}
+	if len(w.jobOrder) > 0 {
+		var list []typeDecl
+		for _, t := range w.jobOrder {
+			o := w.jobs[t].opts
+			list = append(list, typeDecl{Type: t, Schema: o.Schema, Description: o.Description})
+		}
+		m["jobs"] = list
+	}
+	if len(w.requests) > 0 {
+		m["requests"] = w.requests
+	}
+	return m
+}
+
+func (w *Worker) count(name string) {
+	w.mu.Lock()
+	w.counters[name]++
+	w.mu.Unlock()
+}
+
+func (w *Worker) busy() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, j := range w.live {
+		j.mu.Lock()
+		running := j.state == "running"
+		j.mu.Unlock()
+		if running {
+			return true
+		}
+	}
+	return false
+}
+
+// statusWriter — запоминает статус ответа для журнала запросов.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusWriter) WriteHeader(code int) { s.status = code; s.ResponseWriter.WriteHeader(code) }
+func (s *statusWriter) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+var reConfig = regexp.MustCompile(`^/config/([^/]+)$`)
+
+// ServeHTTP — служебные пути протокола, иначе маршруты воркера.
+func (w *Worker) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: rw, status: http.StatusOK}
+	w.count("requests")
+	w.serve(sw, r)
+	switch r.URL.Path {
+	case "/health", "/metrics", "/manifest":
+	default:
+		if w.LogRequests {
+			w.Log(fmt.Sprintf("%s %s %d", r.Method, r.URL.RequestURI(), sw.status))
+		}
+	}
+}
+
+func (w *Worker) serve(rw http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	switch {
+	case r.Method == http.MethodGet && path == "/health":
+		h := Health{OK: true}
+		if s, ok := w.self.(interface{ Health() Health }); ok {
+			h = s.Health()
+		}
+		if h.Busy == nil && w.busy() {
+			busy := true
+			h.Busy = &busy
+		}
+		JSON(rw, http.StatusOK, h)
+	case r.Method == http.MethodGet && path == "/manifest":
+		JSON(rw, http.StatusOK, w.manifest())
+	case r.Method == http.MethodGet && path == "/metrics":
+		out := map[string]any{}
+		w.mu.Lock()
+		for k, v := range w.counters {
+			out[k] = v
+		}
+		running := 0
+		for _, j := range w.live {
+			j.mu.Lock()
+			if j.state == "running" {
+				running++
+			}
+			j.mu.Unlock()
+		}
+		w.mu.Unlock()
+		out["jobsRunning"] = running
+		if s, ok := w.self.(interface{ Metrics() map[string]any }); ok {
+			for k, v := range s.Metrics() {
+				out[k] = v
+			}
+		}
+		JSON(rw, http.StatusOK, out)
+	case r.Method == http.MethodPost && path == "/cleanup":
+		w.cleanup(rw)
+	case reConfig.MatchString(path):
+		w.config(rw, r, reConfig.FindStringSubmatch(path)[1])
+	case path == "/jobs" || strings.HasPrefix(path, "/jobs/"):
+		w.jobRoute(rw, r)
+	default:
+		w.mux.ServeHTTP(rw, r)
+	}
+}
+
+func (w *Worker) cleanup(rw http.ResponseWriter) {
+	cleaned := false
+	if s, ok := w.self.(interface{ Cleanup() bool }); ok {
+		cleaned = s.Cleanup()
+	}
+	// Агента удаляют: идущие задачи останавливаются и больше ничего не сохраняют.
+	w.mu.Lock()
+	for _, j := range w.live {
+		j.mu.Lock()
+		j.forgotten = true
+		j.mu.Unlock()
+		j.cancel()
+	}
+	if w.StateDir != "" {
+		dir := filepath.Join(w.StateDir, "jobs")
+		if entries, err := os.ReadDir(dir); err == nil {
+			for _, e := range entries {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+			}
+			cleaned = true
+		}
+	}
+	w.mu.Unlock()
+	if !cleaned {
+		Error(rw, http.StatusNotFound, "убирать нечего")
+		return
+	}
+	rw.WriteHeader(http.StatusNoContent)
+}
+
+func (w *Worker) config(rw http.ResponseWriter, r *http.Request, key string) {
+	var c *Config
+	for _, item := range w.configs {
+		if item.Key == key {
+			c = item
+		}
+	}
+	if c == nil {
+		Error(rw, http.StatusNotFound, fmt.Sprintf("ключ настроек %q не объявлен", key))
+		return
+	}
+	notify := func(data json.RawMessage) {
+		if s, ok := w.self.(interface{ OnConfig(string, json.RawMessage) }); ok {
+			s.OnConfig(key, data)
+		}
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		c.mu.Lock()
+		c.value, c.version = c.def, 0
+		c.mu.Unlock()
+		notify(c.def)
+		rw.WriteHeader(http.StatusNoContent)
+	case http.MethodPut:
+		var body struct {
+			Version int64           `json:"version"`
+			Data    json.RawMessage `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			Error(rw, http.StatusBadRequest, "тело — не JSON")
+			return
+		}
+		if s, ok := w.self.(interface {
+			ValidateConfig(string, json.RawMessage) error
+		}); ok {
+			if err := s.ValidateConfig(key, body.Data); err != nil {
+				Error(rw, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		c.mu.Lock()
+		c.value, c.version = body.Data, body.Version
+		c.mu.Unlock()
+		notify(body.Data)
+		rw.WriteHeader(http.StatusNoContent)
+	default:
+		Error(rw, http.StatusMethodNotAllowed, "PUT или DELETE")
+	}
+}
+
+func newID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func (w *Worker) newJob(id, jobID, typ string, data json.RawMessage, files JobFiles) *Job {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Job{ID: id, JobID: jobID, Type: typ, Data: data, Files: files, w: w, ctx: ctx, cancel: cancel, state: "running"}
+}
+
+func (w *Worker) jobRoute(rw http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost && r.URL.Path == "/jobs" {
+		var body struct {
+			Type  string          `json:"type"`
+			JobID string          `json:"jobId"`
+			Data  json.RawMessage `json:"data"`
+			Files JobFiles        `json:"files"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			Error(rw, http.StatusBadRequest, "тело — не JSON")
+			return
+		}
+		spec, ok := w.jobs[body.Type]
+		if !ok {
+			Error(rw, http.StatusBadRequest, fmt.Sprintf("неизвестный тип задачи %q", body.Type))
+			return
+		}
+		if body.JobID == "" {
+			body.JobID = newID()
+		}
+		w.mu.Lock()
+		known, seen := w.byJobID[body.JobID]
+		w.mu.Unlock()
+		if seen {
+			JSON(rw, http.StatusAccepted, map[string]string{"id": known})
+			return
+		}
+		if s, ok := w.self.(interface {
+			PrepareJob(string, json.RawMessage, JobFiles) error
+		}); ok {
+			if err := s.PrepareJob(body.Type, body.Data, body.Files); err != nil {
+				status := http.StatusBadRequest
+				var he *HTTPError
+				if errors.As(err, &he) {
+					status = he.Status
+				}
+				Error(rw, status, err.Error())
+				return
+			}
+		}
+		j := w.newJob(newID(), body.JobID, body.Type, body.Data, body.Files)
+		if spec.opts.Quick {
+			result, err := spec.handler(j)
+			var je *JobError
+			var he *HTTPError
+			switch {
+			case errors.As(err, &he):
+				Error(rw, he.Status, he.Message)
+			case errors.As(err, &je):
+				JSON(rw, http.StatusUnprocessableEntity, map[string]string{"code": je.Code, "message": je.Message})
+			case err != nil:
+				Error(rw, http.StatusInternalServerError, err.Error())
+			default:
+				out := map[string]any{}
+				if result != nil {
+					out["result"] = result
+				}
+				JSON(rw, http.StatusOK, out)
+			}
+			return
+		}
+		if spec.opts.Resumable {
+			_ = w.persist(j)
+		}
+		w.start(j, spec.handler)
+		JSON(rw, http.StatusAccepted, map[string]string{"id": j.ID})
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/jobs/")
+	id, action, _ := strings.Cut(rest, "/")
+	w.mu.Lock()
+	j := w.live[id]
+	w.mu.Unlock()
+	if j == nil || (action != "" && action != "cancel") {
+		Error(rw, http.StatusNotFound, "нет задачи")
+		return
+	}
+	if action == "cancel" {
+		if r.Method != http.MethodPost {
+			Error(rw, http.StatusMethodNotAllowed, "POST")
+			return
+		}
+		j.cancel()
+		w.finish(j, "cancelled", nil, nil)
+		JSON(rw, http.StatusOK, map[string]any{"id": j.ID, "state": j.view()["state"]})
+		return
+	}
+	JSON(rw, http.StatusOK, j.view())
+}
+
+func (w *Worker) start(j *Job, h JobFunc) {
+	w.mu.Lock()
+	w.live[j.ID] = j
+	w.byJobID[j.JobID] = j.ID
+	w.mu.Unlock()
+	go func() {
+		result, err := h(j)
+		var je *JobError
+		switch {
+		case errors.Is(err, ErrCancelled) || j.Cancelled():
+			w.finish(j, "cancelled", nil, nil)
+		case errors.As(err, &je):
+			w.finish(j, "failed", nil, je)
+		case err != nil:
+			w.finish(j, "failed", nil, &JobError{Code: "JOB_FAILED", Message: err.Error()})
+		default:
+			w.finish(j, "done", result, nil)
+		}
+	}()
+}
+
+// finish — итог задачи; у задачи он один (повторный — пропускается).
+func (w *Worker) finish(j *Job, state string, result any, je *JobError) {
+	j.mu.Lock()
+	if j.state != "running" {
+		j.mu.Unlock()
+		return
+	}
+	j.state, j.result, j.errInfo = state, result, je
+	j.mu.Unlock()
+	defer w.forget(j)
+	switch state {
+	case "done":
+		w.count("jobsDone")
+		_ = w.jobEvent("job.done", j, map[string]any{"result": result})
+	case "cancelled":
+		w.count("jobsCancelled")
+		_ = w.jobEvent("job.cancelled", j, nil)
+	default:
+		w.count("jobsFailed")
+		_ = w.jobEvent("job.failed", j, map[string]any{"error": map[string]string{"code": je.Code, "message": je.Message}})
+	}
+}
+
+func (w *Worker) jobEvent(typ string, j *Job, data map[string]any) error {
+	payload := map[string]any{"jobId": j.JobID, "id": j.ID}
+	for k, v := range data {
+		if v != nil && v != "" {
+			payload[k] = v
+		}
+	}
+	return w.agentRetry(http.MethodPost, "/events", map[string]any{"type": typ, "data": payload})
+}
+
+// agentRetry — важное агенту: повторять, пока агент перезапускается или очередь полна.
+func (w *Worker) agentRetry(method, path string, body any) error {
+	delay := 500 * time.Millisecond
+	for range 60 {
+		status, raw, err := w.AgentCall(method, path, body, 10*time.Second)
+		switch {
+		case err == nil && status < 300:
+			return nil
+		case err == nil && status != http.StatusServiceUnavailable && status != http.StatusBadGateway:
+			return fmt.Errorf("%s %s: %d %s", method, path, status, raw)
+		}
+		time.Sleep(delay)
+		delay = min(delay*2, 10*time.Second)
+	}
+	return fmt.Errorf("%s %s: агент недоступен", method, path)
+}
+
+type savedJob struct {
+	ID    string          `json:"id"`
+	JobID string          `json:"jobId"`
+	Type  string          `json:"type"`
+	Data  json.RawMessage `json:"data,omitempty"`
+	Files JobFiles        `json:"files"`
+	Saved json.RawMessage `json:"saved,omitempty"`
+}
+
+// persist — задача на диск (WORKER_STATE_DIR); не вперемешку с уборкой.
+func (w *Worker) persist(j *Job) error {
+	if w.StateDir == "" {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	j.mu.Lock()
+	forgotten, saved := j.forgotten, j.saved
+	j.mu.Unlock()
+	if forgotten {
+		return nil
+	}
+	dir := filepath.Join(w.StateDir, "jobs")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	raw, _ := json.Marshal(savedJob{ID: j.ID, JobID: j.JobID, Type: j.Type, Data: j.Data, Files: j.Files, Saved: saved})
+	path := filepath.Join(dir, j.ID+".json")
+	if err := os.WriteFile(path+".new", raw, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(path+".new", path)
+}
+
+func (w *Worker) forget(j *Job) {
+	if w.StateDir != "" {
+		_ = os.Remove(filepath.Join(w.StateDir, "jobs", j.ID+".json"))
+	}
+}
+
+// resume — незаконченные задачи прежнего запуска: Resumable — продолжить, иначе — job.failed.
+func (w *Worker) resume() {
+	if w.StateDir == "" {
+		return
+	}
+	dir := filepath.Join(w.StateDir, "jobs")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	sort.Slice(entries, func(a, b int) bool { return entries[a].Name() < entries[b].Name() })
+	for _, e := range entries {
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		var s savedJob
+		if json.Unmarshal(raw, &s) != nil {
+			continue
+		}
+		j := w.newJob(s.ID, s.JobID, s.Type, s.Data, s.Files)
+		j.saved = s.Saved
+		spec, ok := w.jobs[s.Type]
+		if ok && spec.opts.Resumable {
+			w.Log("задача продолжается после перезапуска", s.ID, s.Type)
+			w.start(j, spec.handler)
+			continue
+		}
+		w.finish(j, "failed", nil, &JobError{Code: "JOB_LOST", Message: "воркер перезапустился"})
+	}
+}

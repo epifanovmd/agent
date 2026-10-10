@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/epifanovmd/agent/internal/message"
@@ -195,5 +196,77 @@ func TestPackOtherPlatform(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(x, Dir, Binary)); string(got) != string(body) {
 		t.Fatalf("программа под %s: %q", other, got)
+	}
+}
+
+// Воркер с build (программа под платформу, например на Go): в архив — итог build под
+// платформу архива, а не исходники; .packignore у воркера без build — исключения.
+func TestPackBuildAndIgnore(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"agent.yaml":             "workers:\n  - path: workers/gow\n  - path: workers/py\n",
+		"workers/gow/VERSION":    "2.0.0\n",
+		"workers/gow/main.go":    "package main\n",
+		"workers/gow/build":      "#!/bin/sh\nset -e\nprintf '#!/bin/sh\\necho %s/%s\\n' \"$GOOS\" \"$GOARCH\" > \"$OUT/run\"\nchmod +x \"$OUT/run\"\n",
+		"workers/py/VERSION":     "1.0.0\n",
+		"workers/py/run":         "#!/bin/sh\n",
+		"workers/py/main.py":     "print()\n",
+		"workers/py/tests/t.py":  "x\n",
+		"workers/py/notes.tmp":   "x\n",
+		"workers/py/.packignore": "# только для разработки\ntests/\n*.tmp\n",
+	}
+	for name, body := range files {
+		p := filepath.Join(dir, name)
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		mode := os.FileMode(0o644)
+		if filepath.Base(name) == "build" || filepath.Base(name) == "run" {
+			mode = 0o755
+		}
+		_ = os.WriteFile(p, []byte(body), mode)
+	}
+	self := filepath.Join(t.TempDir(), "agent-self")
+	_ = os.WriteFile(self, []byte("agent"), 0o755)
+	archives, err := Pack(context.Background(), Options{Config: filepath.Join(dir, "agent.yaml"), Out: t.TempDir(),
+		Platforms: []Platform{{runtime.GOOS, runtime.GOARCH}}, Version: "1.3.0", Self: self, Client: http.DefaultClient, Warn: func(string) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := filepath.Join(t.TempDir(), "x")
+	if err := update.Extract(archives[0], x); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(x, Dir)
+	run, _ := os.ReadFile(filepath.Join(root, "workers/gow/run"))
+	if !strings.Contains(string(run), runtime.GOOS+"/"+runtime.GOARCH) {
+		t.Fatalf("run — не итог build под платформу: %q", run)
+	}
+	for _, gone := range []string{"workers/gow/main.go", "workers/gow/build", "workers/py/tests", "workers/py/notes.tmp", "workers/py/.packignore"} {
+		if _, err := os.Stat(filepath.Join(root, gone)); err == nil {
+			t.Errorf("лишнее в архиве: %s", gone)
+		}
+	}
+	if v, _ := os.ReadFile(filepath.Join(root, "workers/gow/VERSION")); strings.TrimSpace(string(v)) != "2.0.0" {
+		t.Fatalf("VERSION сборки: %q", v)
+	}
+	var m message.Manifest
+	raw, _ := os.ReadFile(filepath.Join(root, "release/manifest.json"))
+	_ = json.Unmarshal(raw, &m)
+	gow := m.Worker("gow", runtime.GOOS, runtime.GOARCH)
+	if gow == nil || gow.Version != "2.0.0" {
+		t.Fatalf("сборка gow: %+v", m)
+	}
+	y := filepath.Join(t.TempDir(), "y")
+	if err := update.Extract(filepath.Join(root, ReleaseDir, gow.File), y); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(y, "run")); err != nil {
+		t.Fatal("в сборке gow нет run")
+	}
+
+	// build упал — понятная ошибка с его выводом.
+	_ = os.WriteFile(filepath.Join(dir, "workers/gow/build"), []byte("#!/bin/sh\necho сломано >&2\nexit 3\n"), 0o755)
+	if _, err := Pack(context.Background(), Options{Config: filepath.Join(dir, "agent.yaml"), Out: t.TempDir(),
+		Platforms: []Platform{{runtime.GOOS, runtime.GOARCH}}, Version: "1.3.0", Self: self, Client: http.DefaultClient, Warn: func(string) {}}); err == nil || !strings.Contains(err.Error(), "сломано") {
+		t.Fatalf("ошибка build: %v", err)
 	}
 }

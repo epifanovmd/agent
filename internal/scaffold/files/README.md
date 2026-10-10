@@ -16,7 +16,7 @@
 ## Команды
 
 ```bash
-./agent worker new report     # новый воркер из заготовки (Python)
+./agent worker new report     # новый воркер из заготовки (--lang python|go)
 ./agent worker list            # воркеры: откуда каждый, версия
 ./agent run                    # запустить на этой машине (Ctrl+C — остановить)
 ./agent config check           # что получилось из настроек и откуда каждое значение

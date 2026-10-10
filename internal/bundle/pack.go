@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -207,11 +208,18 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 			if err != nil {
 				return fmt.Errorf("воркер %s: %w", w.Name, err)
 			}
-			if err := copyDir(w.Path, filepath.Join(stage, rel)); err != nil {
+			src, skip := w.Path, releases.ReadIgnore(w.Path)
+			if isExecutable(filepath.Join(w.Path, "build")) {
+				if src, err = buildWorker(ctx, w.Path, filepath.Join(tmp, "build-"+w.Name), version, p); err != nil {
+					return fmt.Errorf("воркер %s: %w", w.Name, err)
+				}
+				skip = nil
+			}
+			if err := copyDir(src, filepath.Join(stage, rel), skip); err != nil {
 				return err
 			}
 			file := fmt.Sprintf("%s-%s-%s-%s.tar.gz", w.Name, version, p.OS, p.Arch)
-			hash, err := releases.TarDir(w.Path, filepath.Join(release, file), "")
+			hash, err := releases.TarDirSkip(src, filepath.Join(release, file), "", skip)
 			if err != nil {
 				return fmt.Errorf("воркер %s: %w", w.Name, err)
 			}
@@ -352,13 +360,44 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
-// copyDir — каталог src в dst: файлы с правами, ссылки — ссылками.
-func copyDir(src, dst string) error {
+// isExecutable — обычный файл с правом запуска.
+func isExecutable(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular() && st.Mode().Perm()&0o111 != 0
+}
+
+// buildWorker — сборка воркера под платформу p: его build запускается в папке воркера с
+// GOOS, GOARCH (и AGENT_OS, AGENT_ARCH) и OUT — каталогом итога; в OUT должен появиться
+// исполняемый run, VERSION кладётся сюда же. Вернёт OUT.
+func buildWorker(ctx context.Context, dir, out, version string, p Platform) (string, error) {
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, filepath.Join(dir, "build"))
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOOS="+p.OS, "GOARCH="+p.Arch, "AGENT_OS="+p.OS, "AGENT_ARCH="+p.Arch, "OUT="+out)
+	if raw, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("build под %s: %v\n%s", p, err, strings.TrimSpace(string(raw)))
+	}
+	if !isExecutable(filepath.Join(out, "run")) {
+		return "", fmt.Errorf("build под %s не оставил исполняемый $OUT/run", p)
+	}
+	return out, os.WriteFile(filepath.Join(out, "VERSION"), []byte(version+"\n"), 0o644)
+}
+
+// copyDir — каталог src в dst без путей skip: файлы с правами, ссылки — ссылками.
+func copyDir(src, dst string, skip releases.Skip) error {
 	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		rel, _ := filepath.Rel(src, p)
+		if rel != "." && skip != nil && skip(filepath.ToSlash(rel), info.IsDir()) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		target := filepath.Join(dst, rel)
 		switch {
 		case info.IsDir():

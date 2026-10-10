@@ -1,0 +1,75 @@
+// Воркер {{.Name}}: свой код — здесь, база (agent_worker.go) — от `agent worker new`, не правьте её.
+// На своей машине — ./run (собирает из исходников), на узле — программа из архива agent pack
+// (собирает ./build). Версия — файл VERSION.
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+)
+
+// {{.Class}} — воркер: база встроена, здесь — только его поведение.
+type {{.Class}} struct {
+	*Worker
+	settings *Config
+}
+
+type {{.Class}}Settings struct {
+	Greeting string `json:"greeting"`
+}
+
+func main() {
+	w := &{{.Class}}{Worker: NewWorker()}
+	w.Description = "{{.Name}}: что делает воркер"
+
+	// Ключ настроек: бэкенд задаёт его agents.setConfig(id, "{{.Name}}", "settings", {...}).
+	w.settings = w.Config("settings", Object, {{.Class}}Settings{Greeting: "привет"}, "")
+
+	// Событие, которое воркер шлёт бэкенду (w.Emit), и схема его data.
+	w.Event("{{.Name}}.greeted", map[string]any{"type": "object", "properties": map[string]any{"name": map[string]any{"type": "string"}}}, "")
+
+	// Маршрут для agents.fetch(id, "{{.Name}}", "/hello", { method: "POST", body: ... }).
+	w.Route("POST", "/hello", RouteOpts{Description: "Поздороваться", Request: Object}, w.hello)
+
+	// Долгая задача: agents.runJob(id, "{{.Name}}", { type: "{{.Name}}.count", data: { to: 5 } }).
+	w.Job("{{.Name}}.count", JobOpts{Description: "Посчитать до to, по шагу в секунду", Schema: Object}, w.count)
+
+	Run(w)
+}
+
+func (w *{{.Class}}) hello(rw http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	_ = ReadJSON(r, &body)
+	if body.Name == "" {
+		body.Name = "мир"
+	}
+	var s {{.Class}}Settings
+	_ = w.settings.Value(&s)
+	_ = w.Emit("{{.Name}}.greeted", map[string]any{"name": body.Name})
+	JSON(rw, http.StatusOK, map[string]string{"text": fmt.Sprintf("%s, %s", s.Greeting, body.Name)})
+}
+
+func (w *{{.Class}}) count(j *Job) (any, error) {
+	var data struct {
+		To int `json:"to"`
+	}
+	data.To = 5
+	if err := j.Decode(&data); err != nil {
+		return nil, &JobError{Code: "BAD_INPUT", Message: err.Error()}
+	}
+	if data.To < 1 {
+		return nil, &JobError{Code: "BAD_INPUT", Message: "to — не меньше 1"}
+	}
+	for i := range data.To {
+		if err := j.Progress(float64(i)/float64(data.To), fmt.Sprintf("шаг %d из %d", i+1, data.To)); err != nil {
+			return nil, err
+		}
+		if err := j.Sleep(time.Second); err != nil {
+			return nil, err
+		}
+	}
+	return map[string]int{"counted": data.To}, nil
+}

@@ -18,11 +18,51 @@ import (
 //go:embed worker
 var workerFiles embed.FS
 
-// Файлы заготовки воркера (Python): база и файл воркера с классом-наследником.
-const (
-	BaseFile = "agent_worker.py"
-	MainFile = "worker.py"
-)
+// Lang — язык заготовки воркера: база (не правится, её обновляет sync) и файл воркера.
+type Lang struct {
+	Name, Base, Main string
+	files            []langFile
+}
+
+// langFile — файл заготовки: шаблон, имя в папке воркера, подставлять ли имя, права.
+type langFile struct {
+	from, to string
+	template bool
+	perm     os.FileMode
+	// noModule — только если у папки агента ещё нет go.mod (воркер — свой модуль).
+	noModule bool
+}
+
+// Langs — языки agent worker new; первый — по умолчанию.
+var Langs = []Lang{
+	{Name: "python", Base: "agent_worker.py", Main: "worker.py", files: []langFile{
+		{from: "agent_worker.py", to: "agent_worker.py", perm: 0o644},
+		{from: "worker.py", to: "worker.py", template: true, perm: 0o644},
+		{from: "run", to: "run", perm: 0o755},
+	}},
+	{Name: "go", Base: "agent_worker.go", Main: "worker.go", files: []langFile{
+		{from: "agent_worker.go.tmpl", to: "agent_worker.go", perm: 0o644},
+		{from: "worker.go.tmpl", to: "worker.go", template: true, perm: 0o644},
+		{from: "run", to: "run", perm: 0o755},
+		{from: "build", to: "build", perm: 0o755},
+		{from: "gitignore", to: ".gitignore", perm: 0o644},
+		{from: "go.mod.tmpl", to: "go.mod", template: true, perm: 0o644, noModule: true},
+	}},
+}
+
+// LangByName — язык заготовки по имени.
+func LangByName(name string) (Lang, error) {
+	for _, l := range Langs {
+		if l.Name == name {
+			return l, nil
+		}
+	}
+	names := make([]string, len(Langs))
+	for i, l := range Langs {
+		names[i] = l.Name
+	}
+	return Lang{}, fmt.Errorf("--lang %q — %s", name, strings.Join(names, " | "))
+}
 
 // reBase — строка версии базы в её файле.
 var reBase = regexp.MustCompile(`agent-worker-base: (\d+)`)
@@ -34,15 +74,25 @@ type WorkerOptions struct {
 	// Config — файл настроек, куда дописать воркер ("" — не дописывать).
 	Config string
 	Name   string
-	Force  bool
+	// Lang — язык заготовки ("" — первый из Langs).
+	Lang  string
+	Force bool
 }
 
-// NewWorker — воркер из заготовки: workers/<имя>/ с базой (agent_worker.py), файлом воркера
-// (класс-наследник базы), run и VERSION; в файле настроек — `- path: workers/<имя>`.
+// NewWorker — воркер из заготовки: workers/<имя>/ с базой (agent_worker.*), файлом воркера
+// (наследник базы), run и VERSION (у Go — ещё build и go.mod); в файле настроек —
+// `- path: workers/<имя>`.
 // Вернёт созданные файлы и дописан ли воркер в настройки.
 func NewWorker(o WorkerOptions) ([]string, bool, error) {
 	if !message.ValidName(o.Name) {
 		return nil, false, fmt.Errorf("имя воркера %q — строчная латиница, цифры и «-», первая — буква, до 32 символов", o.Name)
+	}
+	if o.Lang == "" {
+		o.Lang = Langs[0].Name
+	}
+	lang, err := LangByName(o.Lang)
+	if err != nil {
+		return nil, false, err
 	}
 	dir := filepath.Join(o.Root, "workers", o.Name)
 	if _, err := os.Stat(dir); err == nil && !o.Force {
@@ -53,17 +103,17 @@ func NewWorker(o WorkerOptions) ([]string, bool, error) {
 	}
 	data := struct{ Name, Class string }{o.Name, className(o.Name)}
 	var created []string
-	for _, f := range []struct {
-		name     string
-		template bool
-		perm     os.FileMode
-	}{{BaseFile, false, 0o644}, {MainFile, true, 0o644}, {"run", false, 0o755}} {
-		raw, err := workerFiles.ReadFile("worker/" + f.name)
+	_, rootModule := os.Stat(filepath.Join(o.Root, "go.mod"))
+	for _, f := range lang.files {
+		if f.noModule && rootModule == nil {
+			continue
+		}
+		raw, err := workerFiles.ReadFile("worker/" + lang.Name + "/" + f.from)
 		if err != nil {
 			return nil, false, err
 		}
 		if f.template {
-			t, err := template.New(f.name).Parse(string(raw))
+			t, err := template.New(f.from).Parse(string(raw))
 			if err != nil {
 				return nil, false, err
 			}
@@ -73,10 +123,10 @@ func NewWorker(o WorkerOptions) ([]string, bool, error) {
 			}
 			raw = b.Bytes()
 		}
-		if err := writeFile(filepath.Join(dir, f.name), raw, f.perm); err != nil {
+		if err := writeFile(filepath.Join(dir, f.to), raw, f.perm); err != nil {
 			return nil, false, err
 		}
-		created = append(created, filepath.Join("workers", o.Name, f.name))
+		created = append(created, filepath.Join("workers", o.Name, f.to))
 	}
 	if err := writeFile(filepath.Join(dir, "VERSION"), []byte("0.1.0\n"), 0o644); err != nil {
 		return nil, false, err
@@ -134,9 +184,9 @@ func addWorker(file, path string) (bool, error) {
 	return true, writeFile(file, []byte(text), 0o644)
 }
 
-// BaseVersion — версия базы воркера в этой программе (из её файла).
-func BaseVersion() int {
-	raw, _ := workerFiles.ReadFile("worker/" + BaseFile)
+// BaseVersion — версия базы воркера языка lang в этой программе (из её файла).
+func BaseVersion(lang Lang) int {
+	raw, _ := workerFiles.ReadFile("worker/" + lang.Name + "/" + lang.files[0].from)
 	return baseVersion(raw)
 }
 
@@ -154,7 +204,7 @@ type Synced struct {
 	From, To int
 }
 
-// SyncBases — обновить базы воркеров папки агента (workers/*/agent_worker.py) до версии
+// SyncBases — обновить базы воркеров папки агента (workers/*/agent_worker.*) до версии
 // этой программы. Базы новее — не трогает (их сделал более новый агент).
 func SyncBases(root string) ([]Synced, error) {
 	var out []Synced
@@ -169,20 +219,22 @@ func SyncBases(root string) ([]Synced, error) {
 		if !d.IsDir() {
 			continue
 		}
-		path := filepath.Join(root, "workers", d.Name(), BaseFile)
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			continue
+		for _, lang := range Langs {
+			path := filepath.Join(root, "workers", d.Name(), lang.Base)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			want, _ := workerFiles.ReadFile("worker/" + lang.Name + "/" + lang.files[0].from)
+			have, next := baseVersion(raw), baseVersion(want)
+			if have == 0 || have > next || bytes.Equal(raw, want) {
+				continue
+			}
+			if err := writeFile(path, want, 0o644); err != nil {
+				return out, err
+			}
+			out = append(out, Synced{File: filepath.Join("workers", d.Name(), lang.Base), From: have, To: next})
 		}
-		want, _ := workerFiles.ReadFile("worker/" + BaseFile)
-		have, next := baseVersion(raw), baseVersion(want)
-		if have == 0 || have > next || bytes.Equal(raw, want) {
-			continue
-		}
-		if err := writeFile(path, want, 0o644); err != nil {
-			return out, err
-		}
-		out = append(out, Synced{File: filepath.Join("workers", d.Name(), BaseFile), From: have, To: next})
 	}
 	return out, nil
 }

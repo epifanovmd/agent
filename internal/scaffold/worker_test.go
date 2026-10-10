@@ -17,22 +17,28 @@ func TestNewWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(dir, "agent.yaml")
-	for _, name := range []string{"report", "report-builder"} {
-		created, added, err := NewWorker(WorkerOptions{Root: dir, Config: cfgPath, Name: name})
-		if err != nil || !added || len(created) != 4 {
+	for _, c := range []struct{ name, lang, class string }{
+		{"report", "python", "class Report(Worker)"},
+		{"report-builder", "go", "type ReportBuilder struct"},
+	} {
+		name := c.name
+		lang, _ := LangByName(c.lang)
+		created, added, err := NewWorker(WorkerOptions{Root: dir, Config: cfgPath, Name: name, Lang: c.lang})
+		want := map[string]int{"python": 4, "go": 7}[c.lang]
+		if err != nil || !added || len(created) != want {
 			t.Fatalf("%s: %v %v %v", name, created, added, err)
 		}
-		main, _ := os.ReadFile(filepath.Join(dir, "workers", name, MainFile))
-		if !strings.Contains(string(main), "class "+className(name)+"(Worker)") || strings.Contains(string(main), "{{") {
+		main, _ := os.ReadFile(filepath.Join(dir, "workers", name, lang.Main))
+		if !strings.Contains(string(main), c.class) || strings.Contains(string(main), "{{") {
 			t.Fatalf("%s: заготовка не заполнена:\n%s", name, main)
 		}
 		if st, _ := os.Stat(filepath.Join(dir, "workers", name, "run")); st == nil || st.Mode().Perm()&0o100 == 0 {
 			t.Fatalf("%s: run не исполняемый", name)
 		}
-		if _, _, err := NewWorker(WorkerOptions{Root: dir, Config: cfgPath, Name: name}); err == nil {
+		if _, _, err := NewWorker(WorkerOptions{Root: dir, Config: cfgPath, Name: name, Lang: c.lang}); err == nil {
 			t.Fatalf("%s: повторно без --force — ошибка", name)
 		}
-		if _, added, _ := NewWorker(WorkerOptions{Root: dir, Config: cfgPath, Name: name, Force: true}); added {
+		if _, added, _ := NewWorker(WorkerOptions{Root: dir, Config: cfgPath, Name: name, Lang: c.lang, Force: true}); added {
 			t.Fatalf("%s: строка в agent.yaml дважды", name)
 		}
 	}
@@ -44,8 +50,15 @@ func TestNewWorker(t *testing.T) {
 	if len(cfg.Workers) != 2 || cfg.Workers[0].Name != "report-builder" || cfg.Workers[1].Name != "report" {
 		t.Fatalf("воркеры: %+v", cfg.Workers)
 	}
-	if _, _, err := NewWorker(WorkerOptions{Root: dir, Name: "Bad"}); err == nil {
-		t.Error("неверное имя — ошибка")
+	for _, bad := range []WorkerOptions{{Root: dir, Name: "Bad"}, {Root: dir, Name: "ok", Lang: "ruby"}} {
+		if _, _, err := NewWorker(bad); err == nil {
+			t.Errorf("%+v: нет ошибки", bad)
+		}
+	}
+	// У папки агента уже свой go.mod — воркер на Go входит в него, своего go.mod нет.
+	_ = os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example\n"), 0o644)
+	if created, _, err := NewWorker(WorkerOptions{Root: dir, Name: "inner", Lang: "go"}); err != nil || len(created) != 6 {
+		t.Fatalf("воркер в модуле папки: %v %v", created, err)
 	}
 	if className("report-builder") != "ReportBuilder" || className("x") != "X" {
 		t.Fatal("className")
@@ -79,20 +92,22 @@ func TestSyncBases(t *testing.T) {
 		_ = os.MkdirAll(filepath.Dir(p), 0o755)
 		_ = os.WriteFile(p, []byte(body), 0o644)
 	}
-	write("old", BaseFile, "# agent-worker-base: 0\n")
-	write("newer", BaseFile, "# agent-worker-base: 999\n")
-	write("own", BaseFile, "# своя библиотека\n")
+	py, gol := Langs[0], Langs[1]
+	write("old", py.Base, "# agent-worker-base: 0\n")
+	write("newer", py.Base, "# agent-worker-base: 999\n")
+	write("own", py.Base, "# своя библиотека\n")
+	write("gold", gol.Base, "// agent-worker-base: 1\npackage main\n")
 	got, err := SyncBases(dir)
-	if err != nil || len(got) != 0 {
-		// версия 0 — не база из заготовки (её нет в строке) — не трогаем
+	if err != nil || len(got) != 1 || got[0].File != filepath.Join("workers", "gold", gol.Base) {
+		// версия 0 — не база из заготовки — не трогаем; Go-база старого содержимого — обновляется
 		t.Fatalf("%+v %v", got, err)
 	}
-	write("old", BaseFile, "# agent-worker-base: 1\nold body\n")
+	write("old", py.Base, "# agent-worker-base: 1\nold body\n")
 	got, err = SyncBases(dir)
-	if err != nil || len(got) != 1 || got[0].File != filepath.Join("workers", "old", BaseFile) || got[0].To != BaseVersion() {
+	if err != nil || len(got) != 1 || got[0].File != filepath.Join("workers", "old", py.Base) || got[0].To != BaseVersion(py) {
 		t.Fatalf("%+v %v", got, err)
 	}
-	if raw, _ := os.ReadFile(filepath.Join(dir, "workers", "newer", BaseFile)); string(raw) != "# agent-worker-base: 999\n" {
+	if raw, _ := os.ReadFile(filepath.Join(dir, "workers", "newer", py.Base)); string(raw) != "# agent-worker-base: 999\n" {
 		t.Fatal("новую базу тронули")
 	}
 }

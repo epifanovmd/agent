@@ -16,7 +16,7 @@ import (
 // workerCmd — agent worker new | sync | list: воркеры папки агента.
 func workerCmd(args []string) error {
 	if len(args) == 0 {
-		return errors.New("agent worker new ИМЯ | agent worker sync | agent worker list")
+		return errors.New("agent worker new ИМЯ [--lang python|go] | agent worker sync | agent worker list")
 	}
 	switch args[0] {
 	case "new":
@@ -67,6 +67,7 @@ func parseWithName(set *flag.FlagSet, args []string) (string, error) {
 func workerNew(args []string) error {
 	set := flag.NewFlagSet("worker new", flag.ContinueOnError)
 	t := configFlag(set)
+	lang := set.String("lang", scaffold.Langs[0].Name, "язык заготовки: python | go")
 	force := set.Bool("force", false, "перезаписать папку воркера, если она уже есть")
 	name, err := parseWithName(set, args)
 	if err != nil {
@@ -81,11 +82,11 @@ func workerNew(args []string) error {
 	if !isFile(target) {
 		target = cfgPath
 	}
-	created, added, err := scaffold.NewWorker(scaffold.WorkerOptions{Root: root, Config: target, Name: name, Force: *force})
+	created, added, err := scaffold.NewWorker(scaffold.WorkerOptions{Root: root, Config: target, Name: name, Lang: *lang, Force: *force})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Воркер %s:\n", name)
+	fmt.Printf("Воркер %s (%s):\n", name, *lang)
 	for _, f := range created {
 		fmt.Println("  " + f)
 	}
@@ -94,7 +95,11 @@ func workerNew(args []string) error {
 	} else {
 		fmt.Printf("В %s он уже был.\n", config.ShortPath(target))
 	}
-	fmt.Printf("\nСвой код — workers/%s/%s (база %s — не править: agent worker sync обновит её).\n", name, scaffold.MainFile, scaffold.BaseFile)
+	l, _ := scaffold.LangByName(*lang)
+	fmt.Printf("\nСвой код — workers/%s/%s (база %s — не править: agent worker sync обновит её).\n", name, l.Main, l.Base)
+	if l.Name == "go" {
+		fmt.Println("Нужен Go ≥ 1.22: ./run собирает воркер из исходников, ./build — под платформу узла (agent pack).")
+	}
 	fmt.Println("Запустить: agent run; версия воркера — файл VERSION.")
 	return nil
 }

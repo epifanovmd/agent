@@ -17,10 +17,16 @@ import (
 // skipped — служебные файлы, которые в архив не попадают.
 var skipped = map[string]bool{"__pycache__": true, ".DS_Store": true, ".git": true}
 
+// Skip — пропустить ли путь rel (от корня каталога, через «/») при упаковке.
+type Skip func(rel string, dir bool) bool
+
 // TarDir — каталог src в архив dst (.tar.gz): содержимое — под prefix ("" —
 // в корне архива), права файлов сохраняются, ссылки — ссылками, время записей
 // одно и то же (одинаковое содержимое — одинаковый архив). Вернёт sha256 (hex).
-func TarDir(src, dst, prefix string) (string, error) {
+func TarDir(src, dst, prefix string) (string, error) { return TarDirSkip(src, dst, prefix, nil) }
+
+// TarDirSkip — как TarDir, без путей, для которых skip — true.
+func TarDirSkip(src, dst, prefix string, skip Skip) (string, error) {
 	f, err := os.Create(dst)
 	if err != nil {
 		return "", err
@@ -42,6 +48,12 @@ func TarDir(src, dst, prefix string) (string, error) {
 		rel, err := filepath.Rel(src, p)
 		if err != nil || rel == "." {
 			return err
+		}
+		if skip != nil && skip(filepath.ToSlash(rel), d.IsDir()) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		name := path.Join(prefix, filepath.ToSlash(rel))
 		info, err := d.Info()
@@ -89,4 +101,40 @@ func TarDir(src, dst, prefix string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// IgnoreFile — список исключений папки воркера: строка — шаблон (filepath.Match) пути от
+// папки или имени; «/» в конце — только каталоги; # — пояснение.
+const IgnoreFile = ".packignore"
+
+// ReadIgnore — исключения из IgnoreFile в каталоге dir (нет файла — ничего не исключается,
+// кроме самого файла).
+func ReadIgnore(dir string) Skip {
+	var patterns []string
+	if raw, err := os.ReadFile(filepath.Join(dir, IgnoreFile)); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+				patterns = append(patterns, line)
+			}
+		}
+	}
+	return func(rel string, dir bool) bool {
+		if rel == IgnoreFile {
+			return true
+		}
+		for _, p := range patterns {
+			onlyDir := strings.HasSuffix(p, "/")
+			p = strings.Trim(strings.TrimSuffix(p, "/"), "/")
+			if onlyDir && !dir {
+				continue
+			}
+			if ok, _ := path.Match(p, rel); ok {
+				return true
+			}
+			if ok, _ := path.Match(p, path.Base(rel)); ok && !strings.Contains(p, "/") {
+				return true
+			}
+		}
+		return false
+	}
 }

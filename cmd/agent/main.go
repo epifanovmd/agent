@@ -91,7 +91,8 @@ const usage = `agent — агент для узлов: связь с серве�
                                  архив папки агента для узла: программа под его платформу, настройки,
                                  воркеры и их сборки; на узле — tar xzf …, sudo ./agent install
   agent keygen                   ключи подписи сборок воркеров (AGENT_SIGNING_KEY для agent pack)
-  agent worker new ИМЯ           воркер из заготовки на Python: база agent_worker.py и класс-наследник,
+  agent worker new ИМЯ [--lang python|go]
+                                 воркер из заготовки: база agent_worker.* и наследник (класс или тип),
                                  run, VERSION; строка в agent.yaml
   agent worker sync              обновить базы воркеров папки до версии этой программы
   agent worker list              воркеры из настроек: откуда каждый, версия, где лежит

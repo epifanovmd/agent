@@ -1,0 +1,5 @@
+#!/bin/sh
+# agent pack: программа воркера под платформу узла — GOOS и GOARCH задаёт pack, итог — $OUT/run.
+set -e
+cd "$(dirname "$0")"
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$OUT/run" .

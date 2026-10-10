@@ -1,0 +1,7 @@
+#!/bin/sh
+# Воркер из исходников (agent run на своей машине): собрать и запустить, нужен Go.
+# На узле run — сама программа из архива agent pack (её собирает ./build).
+set -e
+cd "$(dirname "$0")"
+go build -o .bin/worker .
+exec ./.bin/worker
