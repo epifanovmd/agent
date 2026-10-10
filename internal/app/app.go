@@ -82,6 +82,9 @@ type App struct {
 	lastErr   string
 	lastErrAt time.Time
 
+	// latest — новая версия агента из последней проверки (nil — нет).
+	latest atomic.Pointer[message.AgentUpdateInfo]
+
 	restart atomic.Bool
 	cancel  context.CancelFunc
 	lock    *Lock
@@ -245,6 +248,8 @@ func (a *App) Run(ctx context.Context) error {
 		_ = heartbeat{path: filepath.Join(cfg.DataDir, StatusFile), snapshot: a.snapshot}.run(ctx)
 	})
 	run(a.workers.Run)
+	run(func(ctx context.Context) { a.fetchAgentWorkers(ctx, cfg) })
+	run(a.checkLoop)
 	run(a.configs.Run)
 	run(a.metricsLoop)
 	run(a.statusLoop)
@@ -306,7 +311,7 @@ func (a *App) recordError(err error) {
 func (a *App) Hello() message.Hello {
 	cfg := a.config()
 	h := message.Hello{
-		Agent:   message.HelloAgent{Version: a.version, BootID: a.bootID, StartedAt: a.started.UnixMilli()},
+		Agent:   message.HelloAgent{Version: a.version, BootID: a.bootID, StartedAt: a.started.UnixMilli(), Update: a.latest.Load()},
 		Host:    a.auth.host,
 		Labels:  cfg.Labels,
 		Configs: a.configs.Versions(),

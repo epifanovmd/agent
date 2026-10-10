@@ -52,6 +52,15 @@
       }
     }
   },
+  "action.agent.update.release": {
+    "from": "server",
+    "to": "agent",
+    "message": {
+      "type": "action",
+      "id": "f60718293a4b5c6d7e8f90a1b2c3d4e6",
+      "data": { "name": "agent.update", "args": { "version": "1.1.0" } }
+    }
+  },
   "action.agent.rotateKey": {
     "from": "server",
     "to": "agent",

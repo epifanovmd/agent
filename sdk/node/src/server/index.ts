@@ -26,6 +26,7 @@ export type {
   Deferred,
   LogsOptions,
   RestartResult,
+  UpdateAgentOptions,
   UpdateResult,
   WorkerActionOptions,
   WorkerUpdateResult,

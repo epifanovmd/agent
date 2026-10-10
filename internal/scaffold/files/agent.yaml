@@ -1,0 +1,23 @@
+# Настройки агента на этой машине: ./agent run читает этот файл сам.
+# Боевые узлы — agent.prod.yaml поверх него (./agent run --env prod, pack, install).
+# ${ИМЯ} и переменные AGENT_* берутся из окружения, а если их там нет — из .env рядом.
+# Что получилось и откуда каждое значение: ./agent config check
+# Все ключи: https://github.com/epifanovmd/agent/blob/main/docs/ARCHITECTURE.md#настройки
+
+envFiles: [.env]
+
+# Адрес бэкенда и токен регистрации — в .env: AGENT_SERVER_URL, AGENT_ENROLL_TOKEN.
+
+# Данные агента (ключ, очередь сообщений, сборки воркеров) — в папке .data рядом.
+dataDir: .data
+
+# Здесь агент не обновляет себя по команде сервера: новую версию ставит ./agent upgrade.
+update:
+  mode: disabled
+
+# Воркеры. Свой воркер — папка в workers/ с исполняемым run: агент запускает его в этой папке.
+# Новый из заготовки (база + класс-наследник, строка здесь) — ./agent worker new <имя>.
+workers:
+  # - path: workers/example   # воркер из папки (имя — имя папки)
+  # - name: netprobe          # проверка сети между узлами — сборка из релиза агента
+  #   from: agent

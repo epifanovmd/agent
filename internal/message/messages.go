@@ -45,6 +45,16 @@ type HelloAgent struct {
 	Version   string `json:"version"`
 	BootID    string `json:"bootId"`
 	StartedAt int64  `json:"startedAt"`
+	// Update — новая версия агента, которую он нашёл сам (§11); nil — не
+	// проверял или новее нет.
+	Update *AgentUpdateInfo `json:"update,omitempty"`
+}
+
+// AgentUpdateInfo — новая версия агента в его каталоге сборок (§11).
+type AgentUpdateInfo struct {
+	Latest string `json:"latest"`
+	// CheckedAt — время проверки, мс.
+	CheckedAt int64 `json:"checkedAt"`
 }
 
 // Host — платформа узла.
@@ -131,6 +141,8 @@ func (e *Error) Error() string { return e.Code + ": " + e.Message }
 type Status struct {
 	Workers []WorkerStatus `json:"workers"`
 	Outbox  int            `json:"outbox"`
+	// Update — как HelloAgent.Update.
+	Update *AgentUpdateInfo `json:"update,omitempty"`
 }
 
 type WorkerStatus struct {
@@ -271,11 +283,13 @@ type WorkerUpdateArgs struct {
 	Force bool `json:"force,omitempty"`
 }
 
+// AgentUpdateArgs — args agent.update; URL пусто — сборка версии Version из
+// каталога сборок агента (§11), с подписью из его manifest.json.
 type AgentUpdateArgs struct {
 	Version   string `json:"version"`
-	URL       string `json:"url"`
-	SHA256    string `json:"sha256"`
-	Signature string `json:"signature"`
+	URL       string `json:"url,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	Signature string `json:"signature,omitempty"`
 }
 
 // AgentLogsArgs — args agent.logs; Worker пусто — журнал агента.

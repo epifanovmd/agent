@@ -18,6 +18,12 @@ const (
 	LinuxDataDir    = "/var/lib/agent"
 )
 
+// FileName — файл настроек в папке агента.
+const FileName = "agent.yaml"
+
+// EnvConfigName — файл настроек окружения env (--env prod → agent.prod.yaml).
+func EnvConfigName(env string) string { return "agent." + env + ".yaml" }
+
 // EnvFileName — файл переменных окружения рядом с файлом настроек (agent.env):
 // токен регистрации и ключ проверки подписи сборок. Его читает служба systemd, а
 // agent config check / status / cleanup — сами.
@@ -51,18 +57,29 @@ func DefaultDataDir() string {
 }
 
 // ResolvePath — какой файл настроек читать: флаг -config, иначе AGENT_CONFIG,
-// иначе DefaultPath, если файл есть. Пусто — без файла (только окружение).
-func ResolvePath(flagValue string) string {
+// иначе первый существующий из local (agent.yaml в папке агента), иначе
+// DefaultPath, если файл есть. Пусто — без файла (только окружение).
+func ResolvePath(flagValue string, local ...string) string {
 	if flagValue != "" {
 		return flagValue
 	}
 	if v := os.Getenv("AGENT_CONFIG"); v != "" {
 		return v
 	}
+	for _, p := range local {
+		if isRegular(p) {
+			return p
+		}
+	}
 	if p := DefaultPath(); exists(p) {
 		return p
 	}
 	return ""
+}
+
+func isRegular(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular()
 }
 
 func exists(path string) bool {

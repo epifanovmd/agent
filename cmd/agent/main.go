@@ -1,26 +1,36 @@
 // Агент: держит связь с сервером, запускает воркеры и следит за ними,
 // передаёт им настройки и запросы, собирает метрики узла, обновляется сам.
 //
-//	agent [run] [-config agent.yaml]   работа (по умолчанию); SIGHUP — перечитать настройки,
+//	agent [run] [-config ФАЙЛ | --env ИМЯ]   работа (по умолчанию); SIGHUP — перечитать настройки,
 //	                                   SIGUSR1 — перезапуск, SIGTERM/SIGINT — остановка
 //	agent restart                      перезапустить работающего агента (воркеры — по lifecycle.onAgentRestart)
 //	agent stop-workers                 остановить воркеры, оставшиеся работать после остановки агента
 //	agent install --server URL --token ТОКЕН [флаги]   поставить службой systemd (Linux, root)
 //	agent uninstall [--purge]          удалить службу (с --purge — настройки и данные)
 //	                                   --instance ИМЯ у install, uninstall, status, logs, restart,
-//	                                   stop-workers, cleanup, config check — экземпляр агента на узле
-//	agent init [--server URL] [--token ТОКЕН]   создать файл настроек с пояснениями
+//	                                   stop-workers, cleanup, config check — экземпляр агента на узле;
+//	                                   --env ИМЯ у run, status, restart, stop-workers, cleanup,
+//	                                   config check — файл agent.ИМЯ.yaml папки агента
+//	agent init [ПАПКА] [--server URL] [--token ТОКЕН]   папка агента: программа, настройки, воркеры
+//	                                   (-config ФАЙЛ — один файл настроек с пояснениями)
 //	agent config check                 проверить настройки и показать итоговые значения
 //	agent status [--json]              работает ли агент, связь, воркеры (код выхода 0 — работает)
 //	agent logs [-f] [-n N]             лог службы (journalctl)
 //	agent cleanup                      уборка воркеров перед удалением агента (без сервера; её вызывает uninstall)
+//	agent upgrade [--check] [--version X]   поставить новую версию агента из каталога сборок
+//	agent pack [--env ИМЯ] [--platform linux/amd64,…]   архив папки агента для узла
+//	agent keygen                       ключи подписи сборок воркеров проекта
+//	agent worker new|sync|list         воркеры папки агента: заготовка, обновление базы, список
 //	agent version                      версия
 //	agent boot-guard BINARY            откат версии, не дошедшей до связи (ExecStartPre)
 //	agent sysmetrics                   встроенный воркер метрик узла (агент запускает его сам)
 //
-// Файл настроек — -config, иначе --instance ИМЯ (/etc/agent-ИМЯ/agent.yaml),
-// иначе AGENT_CONFIG, иначе экземпляр, чья это программа (/opt/agent-ИМЯ/bin/agent),
-// иначе /etc/agent/agent.yaml (на macOS ~/.agent/agent.yaml), если он есть.
+// Файл настроек — -config, иначе --env ИМЯ (agent.ИМЯ.yaml папки агента), иначе
+// --instance ИМЯ (/etc/agent-ИМЯ/agent.yaml), иначе AGENT_CONFIG, иначе экземпляр,
+// чья это программа (/opt/agent-ИМЯ/bin/agent), иначе agent.yaml папки агента
+// (рядом с программой, затем в текущем каталоге), иначе /etc/agent/agent.yaml
+// (на macOS ~/.agent/agent.yaml), если он есть. Файл может опираться на другой
+// (extends) и брать значения из файлов переменных (envFiles).
 //
 // Ключи подписи и манифест сборок — отдельная программа cmd/agent-release.
 //
@@ -35,12 +45,15 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
 	"github.com/epifanovmd/agent/internal/app"
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/install"
+	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/sysmetrics"
 	"github.com/epifanovmd/agent/internal/update"
 )
@@ -58,26 +71,42 @@ var errQuiet = errors.New("")
 const usage = `agent — агент для узлов: связь с сервером, воркеры, их настройки, метрики, обновление.
 
 Команды:
-  agent run [-config ФАЙЛ]       работать (по умолчанию)
+  agent run [-config ФАЙЛ | --env ИМЯ]
+                                 работать (по умолчанию)
   agent install --server URL --token ТОКЕН [флаги]
                                  поставить службой systemd (Linux, sudo); флаги — agent install -h
   agent uninstall [--purge]      удалить службу; --purge — ещё настройки и данные
-  agent init [--server URL] [--token ТОКЕН] [--name ИМЯ] [-config ФАЙЛ] [--force]
-                                 создать файл настроек с пояснениями
-  agent config check [-config ФАЙЛ]
-                                 проверить настройки и показать итоговые значения
+  agent init [ПАПКА] [--server URL] [--token ТОКЕН] [--force]
+                                 папка агента: программа, agent.yaml (эта машина), agent.prod.yaml
+                                 (боевые узлы), образцы .env, workers/, README.md;
+                                 -config ФАЙЛ [--name ИМЯ] [--data-dir КАТАЛОГ] — один файл настроек
+  agent config check [-config ФАЙЛ | --env ИМЯ]
+                                 проверить настройки и показать итоговые значения и откуда они
   agent status [--json]          работает ли агент, связь, воркеры, последняя ошибка
   agent logs [-f] [-n N]         лог службы
   agent restart                  перезапустить агента; воркеры работают дальше (lifecycle.onAgentRestart)
   agent stop-workers             остановить воркеры, оставшиеся после остановки агента (агент не работает)
   agent cleanup                  воркеры убирают за собой (перед удалением агента)
+  agent pack [--env ИМЯ | -config ФАЙЛ] [--platform linux/amd64,linux/arm64] [--out КАТАЛОГ] [--with-env]
+                                 архив папки агента для узла: программа под его платформу, настройки,
+                                 воркеры и их сборки; на узле — tar xzf …, sudo ./agent install
+  agent keygen                   ключи подписи сборок воркеров (AGENT_SIGNING_KEY для agent pack)
+  agent worker new ИМЯ           воркер из заготовки на Python: база agent_worker.py и класс-наследник,
+                                 run, VERSION; строка в agent.yaml
+  agent worker sync              обновить базы воркеров папки до версии этой программы
+  agent worker list              воркеры из настроек: откуда каждый, версия, где лежит
+  agent upgrade [--check] [--version X] [--force]
+                                 поставить новую версию агента (подпись проверяется); --check — только узнать
   agent version                  версия
 
 Несколько агентов на узле: agent install --instance ИМЯ — экземпляр со своими путями
 (/etc/agent-ИМЯ, /var/lib/agent-ИМЯ, /opt/agent-ИМЯ, служба agent-ИМЯ); остальные команды
 с --instance ИМЯ (или через ссылку agent-ИМЯ) работают с ним.
 
-Файл настроек: -config, иначе --instance, иначе AGENT_CONFIG, иначе %s (если есть).
+Файл настроек: -config, иначе --env ИМЯ (agent.ИМЯ.yaml папки агента), иначе --instance,
+иначе AGENT_CONFIG, иначе agent.yaml рядом с программой или в текущем каталоге, иначе %s
+(если есть). Файл может опираться на другой (extends: agent.yaml) и брать значения ${ИМЯ}
+из файлов переменных (envFiles: [.env]).
 `
 
 func main() {
@@ -108,6 +137,14 @@ func main() {
 		err = restartCmd(args)
 	case "stop-workers":
 		err = stopWorkersCmd(args)
+	case "upgrade":
+		err = upgradeCmd(args)
+	case "pack":
+		err = packCmd(args)
+	case "keygen":
+		err = keygenCmd(args)
+	case "worker":
+		err = workerCmd(args)
 	case "version":
 		fmt.Println(version)
 	case "boot-guard":
@@ -133,13 +170,14 @@ func main() {
 	}
 }
 
-// target — чей агент: флаги -config и --instance у команды.
-type target struct{ config, instance *string }
+// target — чей агент: флаги -config, --env и --instance у команды.
+type target struct{ config, env, instance *string }
 
-// configFlag — флаги -config (он же --config) и --instance у команды.
+// configFlag — флаги -config (он же --config), --env и --instance у команды.
 func configFlag(fs *flag.FlagSet) target {
 	return target{
-		config:   fs.String("config", "", "файл настроек (AGENT_CONFIG; по умолчанию "+config.DefaultPath()+", если есть)"),
+		config:   fs.String("config", "", "файл настроек (AGENT_CONFIG; по умолчанию agent.yaml рядом с программой или в текущем каталоге, иначе "+config.DefaultPath()+", если есть)"),
+		env:      fs.String("env", "", "окружение папки агента: --env prod — файл agent.prod.yaml рядом с программой или в текущем каталоге"),
 		instance: fs.String("instance", "", "экземпляр агента на узле (agent install --instance ИМЯ): его файл настроек и служба"),
 	}
 }
@@ -148,7 +186,7 @@ func configFlag(fs *flag.FlagSet) target {
 // (/opt/agent-ИМЯ/bin/agent, в том числе по ссылке agent-ИМЯ), иначе по умолчанию.
 func (t target) layout() (install.Paths, error) {
 	name := *t.instance
-	if name == "" && *t.config == "" && os.Getenv("AGENT_CONFIG") == "" {
+	if name == "" && *t.config == "" && *t.env == "" && os.Getenv("AGENT_CONFIG") == "" {
 		name = selfInstance()
 	}
 	if err := install.CheckInstance(name); err != nil {
@@ -157,11 +195,21 @@ func (t target) layout() (install.Paths, error) {
 	return install.Layout(name), nil
 }
 
-// path — файл настроек: -config, --instance (или экземпляр программы),
-// AGENT_CONFIG, файл по умолчанию. -config и --instance — что-то одно.
+// path — файл настроек: -config, --env (файл окружения в папке агента),
+// --instance (или экземпляр программы), AGENT_CONFIG, agent.yaml в папке
+// агента, файл по умолчанию. -config, --env и --instance — что-то одно.
 func (t target) path() (string, error) {
-	if *t.config != "" && *t.instance != "" {
-		return "", errors.New("-config и --instance — что-то одно")
+	set := 0
+	for _, v := range []string{*t.config, *t.env, *t.instance} {
+		if v != "" {
+			set++
+		}
+	}
+	if set > 1 {
+		return "", errors.New("-config, --env и --instance — что-то одно")
+	}
+	if *t.env != "" {
+		return envConfig(*t.env, localDirs())
 	}
 	l, err := t.layout()
 	if err != nil {
@@ -170,7 +218,55 @@ func (t target) path() (string, error) {
 	if l.Instance != "" {
 		return l.ConfigFile, nil
 	}
-	return config.ResolvePath(*t.config), nil
+	var local []string
+	for _, dir := range localDirs() {
+		local = append(local, filepath.Join(dir, config.FileName))
+	}
+	return config.ResolvePath(*t.config, local...), nil
+}
+
+// envConfig — файл настроек окружения env в одном из каталогов dirs.
+func envConfig(env string, dirs []string) (string, error) {
+	if !message.ValidName(env) {
+		return "", fmt.Errorf("--env: имя окружения — строчная латиница, цифры и «-», первая — буква, а не %q", env)
+	}
+	name := config.EnvConfigName(env)
+	for _, dir := range dirs {
+		if p := filepath.Join(dir, name); isFile(p) {
+			return p, nil
+		}
+	}
+	if len(dirs) == 0 {
+		return "", fmt.Errorf("--env: у агента, поставленного службой, нет папки агента — его настройки в %s", install.Layout(selfInstance()).ConfigFile)
+	}
+	return "", fmt.Errorf("--env %s: нет %s (искал в %s)", env, name, strings.Join(dirs, ", "))
+}
+
+// localDirs — папка агента: каталог программы, затем текущий. У программы,
+// поставленной службой (/opt/agent…/bin), папки нет — её настройки в /etc.
+func localDirs() []string {
+	var dirs []string
+	if exe, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = real
+		}
+		if _, ok := install.InstanceOf(exe); ok || exe == install.Binary {
+			return nil
+		}
+		dirs = append(dirs, filepath.Dir(exe))
+	}
+	if wd, err := os.Getwd(); err == nil && !slices.Contains(dirs, wd) {
+		dirs = append(dirs, wd)
+	}
+	return dirs
+}
+
+// warning — замечание к файлу настроек path: с именем файла, если в замечании его нет.
+func warning(path string, p config.Problem) string {
+	if p.File != "" {
+		return p.String()
+	}
+	return config.ShortPath(path) + ": " + p.String()
 }
 
 // selfInstance — экземпляр, которому принадлежит запущенная программа ("" — нет).
@@ -202,13 +298,13 @@ func run(args []string) error {
 	}
 	if path != "" {
 		for _, p := range config.Unknown(path) {
-			fmt.Fprintf(os.Stderr, "agent: предупреждение: %s: %s\n", path, p)
+			fmt.Fprintf(os.Stderr, "agent: предупреждение: %s\n", warning(path, p))
 		}
 	}
 	cfg, err := config.Load(path)
 	if err != nil {
 		if path == "" {
-			return fmt.Errorf("%w\nфайла настроек нет (%s): создайте его — agent init --server URL --token ТОКЕН — или задайте AGENT_SERVER_URL", err, config.DefaultPath())
+			return fmt.Errorf("%w\nфайла настроек нет (ни agent.yaml рядом с программой или в текущем каталоге, ни %s): создайте его — agent init --server URL --token ТОКЕН — или задайте AGENT_SERVER_URL", err, config.DefaultPath())
 		}
 		return err
 	}

@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/logx"
@@ -77,6 +78,13 @@ func (a *App) Reload(next config.Config) {
 	}
 	a.log.Info("настройки перечитаны и применены", "log", diff.Log, "telemetry", diff.Telemetry,
 		"workers", diff.Workers, "hello", diff.Hello || diff.Workers)
+	if diff.Workers {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			a.fetchAgentWorkers(ctx, next)
+		}()
+	}
 	if diff.Hello || diff.Workers {
 		// hello несёт имя, метки и список воркеров: серверу нужен новый.
 		a.link.Reconnect()

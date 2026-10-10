@@ -119,28 +119,36 @@ Server(path, Handler).serve_forever()
 
 ## Шаг 3. Агент
 
-Агент на своей машине собирается из исходников: `make build` в корне репозитория кладёт его в
-`dist/1.0.0/agent-<os>-<arch>` под эту машину (например, `agent-darwin-arm64`). Go ставить не
-нужно — сборка идёт в контейнере, нужен Docker. Рядом с `echo.py` положите настройки агента:
+Скачайте агента под свою машину и разверните папку агента — программа, настройки и воркеры в
+одном месте:
+
+```bash
+curl -fLo agent "https://github.com/epifanovmd/agent/releases/latest/download/agent-$(uname -s | tr A-Z a-z)-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+chmod +x agent
+./agent init agent --server http://127.0.0.1:8080 --token demo-token
+```
+
+Положите воркер в папку агента — `agent/workers/echo/`: `echo.py`, исполняемый `run` и `VERSION`:
+
+```bash
+mkdir -p agent/workers/echo && mv echo.py agent/workers/echo/
+printf '#!/bin/sh\nexec python3 "$(dirname "$0")/echo.py"\n' > agent/workers/echo/run
+chmod +x agent/workers/echo/run && echo 1.0.0 > agent/workers/echo/VERSION
+```
 
 ```yaml
-# agent.yaml
-server:
-  url: http://127.0.0.1:8080
-name: dev-01
-dataDir: ./.agent-data
+# agent/agent.yaml
 workers:
-  - name: echo
-    command: ["python3", "./echo.py"]
+  - path: workers/echo
 ```
 
 ```bash
-cp <репозиторий>/dist/1.0.0/agent-darwin-arm64 ./agent   # сборка под эту машину
-AGENT_ENROLL_TOKEN=demo-token ./agent run -config agent.yaml
+agent/agent run
 ```
 
-Агент регистрируется по токену, сохраняет свой ключ в `dataDir`, подключается и запускает
-воркер. Все настройки агента — [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md). Готовый
+Агент регистрируется по токену из `agent/.env`, сохраняет свой ключ в `agent/.data`, подключается
+и запускает воркер. Собрать агента из исходников — `make build` в корне репозитория (Go не нужен,
+сборка идёт в контейнере). Все настройки агента — [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md). Готовый
 стенд со сквозными тестами — [examples/README.md](../../examples/README.md).
 
 ## Шаг 4. Работа с воркером
@@ -163,7 +171,14 @@ console.log(await agents.configStatus(agent.id, "echo")); // [{ key: "main", ver
 
 ## Шаг 5. Настоящий узел
 
-Бэкенд собирает команду установки, её выполняют на узле (SSH, cloud-init, Ansible):
+Папка агента переносится на узел архивом — программа под платформу узла, настройки, воркеры:
+
+```bash
+agent/agent pack --env prod   # agent/agent-prod-<версия>-linux-amd64.tar.gz и …-linux-arm64.tar.gz
+# на узле: tar xzf agent-prod-…-linux-amd64.tar.gz && cd agent && sudo ./agent install --token demo-token
+```
+
+Или бэкенд собирает команду установки, её выполняют на узле (SSH, cloud-init, Ansible):
 
 ```ts
 agents.installCommand({ token: "demo-token", name: "node-01", baseUrl: "https://api.example.com" });

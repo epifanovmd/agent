@@ -83,7 +83,7 @@ while [ "$n" -gt 0 ]; do
   esac
 done
 
-[ "$(uname -s)" = Linux ] || die "установка службой — только Linux с systemd; на других системах: agent init, затем agent run"
+[ "$(uname -s)" = Linux ] || die "установка службой — только Linux с systemd; на других системах: agent init (папка агента), затем agent run"
 [ "$(id -u)" -eq 0 ] || die "нужны права root (sudo)"
 
 SERVER="${SERVER%/}"

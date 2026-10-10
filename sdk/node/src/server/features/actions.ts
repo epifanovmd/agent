@@ -5,7 +5,7 @@ import { LRUCache } from "lru-cache";
 import { z } from "zod";
 
 import type { Context } from "../core/context";
-import { codeError, valid } from "../core/errors";
+import { codeError, invalid, valid } from "../core/errors";
 import type { Session } from "../core/session";
 import { bounded } from "../lib/util";
 import type { ActionName, ActionRecord, AgentRecord } from "../model/types";
@@ -45,6 +45,16 @@ export type LogsOptions = z.input<typeof logsOptionsSchema>;
 export interface ActionOptions {
   /** Срок ответа, мс. */
   timeoutMs?: number;
+}
+
+/** Параметры updateAgent. */
+export interface UpdateAgentOptions extends ActionOptions {
+  /**
+   * Версия из каталога сборок агента (релизы агента на GitHub или его `update.releases`): агент
+   * сам берёт сборку под свою платформу и сверяет подпись (§10). Без неё — сборка с сервера
+   * (`releasesDir`, `agentReleases`).
+   */
+  version?: string;
 }
 
 /**
@@ -175,9 +185,16 @@ export class Actions {
   async updateAgent(
     actor: string,
     agentId: string,
-    opts: ActionOptions,
+    opts: UpdateAgentOptions,
   ): Promise<UpdateResult> {
-    const args = await this.deps.agentUpdate(await this.ctx.agent(agentId));
+    if (
+      opts.version !== undefined &&
+      !/^v?\d+(\.\d+)*([-+].*)?$/.test(opts.version)
+    )
+      throw invalid(`version: "${opts.version}" — нужна версия вида 1.2.0`);
+    const args = opts.version
+      ? { version: opts.version.replace(/^v/, "") }
+      : await this.deps.agentUpdate(await this.ctx.agent(agentId));
 
     return (
       await this.run(

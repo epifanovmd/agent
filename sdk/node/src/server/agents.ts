@@ -17,6 +17,7 @@ import {
   Actions,
   type LogsOptions,
   type RestartResult,
+  type UpdateAgentOptions,
   type UpdateResult,
   type WorkerActionOptions,
   type WorkerUpdateResult,
@@ -86,7 +87,7 @@ interface Operations {
   updateAgent(
     actor: string,
     agentId: string,
-    opts: ActionOptions,
+    opts: UpdateAgentOptions,
   ): Promise<UpdateResult>;
   rotateKey(actor: string, agentId: string, opts: ActionOptions): Promise<void>;
   logs(actor: string, agentId: string, opts: LogsOptions): Promise<LogEntry[]>;
@@ -496,10 +497,13 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return this.ops.updateWorker("", agentId, name, opts);
   }
 
-  /** Обновить агента до версии с сервера; итог — после запуска новой версии. */
+  /**
+   * Обновить агента: до версии с сервера или (`version`) до версии из каталога сборок агента;
+   * итог — после запуска новой версии.
+   */
   updateAgent(
     agentId: string,
-    opts: ActionOptions = {},
+    opts: UpdateAgentOptions = {},
   ): Promise<UpdateResult> {
     return this.ops.updateAgent("", agentId, opts);
   }
@@ -624,7 +628,7 @@ export class Actor {
   }
   updateAgent(
     agentId: string,
-    opts: ActionOptions = {},
+    opts: UpdateAgentOptions = {},
   ): Promise<UpdateResult> {
     return this.ops.updateAgent(this.actor, agentId, opts);
   }

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"flag"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -72,5 +74,31 @@ func TestInstanceFlag(t *testing.T) {
 		if _, err := parse(args...); err == nil {
 			t.Errorf("%v: нет ошибки", args)
 		}
+	}
+}
+
+// --env ИМЯ — agent.ИМЯ.yaml в первом каталоге папки агента, где он есть.
+func TestEnvConfig(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(b, "agent.prod.yaml"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := envConfig("prod", []string{a, b}); err != nil || p != filepath.Join(b, "agent.prod.yaml") {
+		t.Fatalf("%q %v", p, err)
+	}
+	for _, c := range []struct {
+		env  string
+		dirs []string
+		want string
+	}{{"dev", []string{a, b}, "нет agent.dev.yaml"}, {"Prod", []string{b}, "имя окружения"}, {"prod", nil, "службой"}} {
+		if _, err := envConfig(c.env, c.dirs); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s %v: %v", c.env, c.dirs, err)
+		}
+	}
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	tg := configFlag(fs)
+	_ = fs.Parse([]string{"--env", "prod", "-config", "/srv/a.yaml"})
+	if _, err := tg.path(); err == nil {
+		t.Fatal("--env и -config вместе — ошибка")
 	}
 }

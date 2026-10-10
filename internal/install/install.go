@@ -7,10 +7,12 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -131,6 +133,11 @@ type Options struct {
 	Releases string
 	// Instance — экземпляр (несколько агентов на узле, см. Layout); "" — по умолчанию.
 	Instance string
+	// Env — папка агента (--env): установка из её файла agent.<env>.yaml; само
+	// чтение папки — дело команды (bundle), сюда приходит готовый Config.
+	Env string
+	// Vars — ещё переменные в agent.env (значения ${ИМЯ} из файла настроек).
+	Vars map[string]string
 }
 
 var (
@@ -305,10 +312,11 @@ func Install(ctx context.Context, s *System, o Options) error {
 	if err := writeConfig(s, l, o, workers, configExists); err != nil {
 		return err
 	}
-	if err := writeEnv(s, l, user, map[string]string{
-		"AGENT_ENROLL_TOKEN":       o.Token,
-		"AGENT_UPDATE_PUBLIC_KEYS": strings.Join(keyList(o.PublicKeys), ","),
-	}); err != nil {
+	vars := map[string]string{}
+	maps.Copy(vars, o.Vars)
+	vars["AGENT_ENROLL_TOKEN"] = o.Token
+	vars["AGENT_UPDATE_PUBLIC_KEYS"] = strings.Join(keyList(o.PublicKeys), ",")
+	if err := writeEnv(s, l, user, vars); err != nil {
 		return err
 	}
 	if !o.Privileged {
@@ -412,6 +420,12 @@ func writeConfig(s *System, l Paths, o Options, workers []config.TemplateWorker,
 		if err != nil {
 			return err
 		}
+		if old, err := os.ReadFile(s.p(l.ConfigFile)); err == nil && !bytes.Equal(old, raw) {
+			if err := writeFileAtomic(s.p(l.ConfigFile)+".bak", old, 0o644); err != nil {
+				return err
+			}
+			s.warn("%s заменён новым, прежний — %s.bak", l.ConfigFile, l.ConfigFile)
+		}
 		return writeFileAtomic(s.p(l.ConfigFile), raw, 0o644)
 	case !exists:
 		t := config.TemplateOptions{ServerURL: o.Server, Name: o.Name, DataDir: l.DataDir, LogFormat: "json", Workers: workers}
@@ -489,7 +503,8 @@ func writeEnv(s *System, l Paths, user string, vars map[string]string) error {
 		}
 		lines = append(lines, l)
 	}
-	for _, k := range []string{"AGENT_ENROLL_TOKEN", "AGENT_UPDATE_PUBLIC_KEYS"} {
+	keys := slices.Sorted(maps.Keys(vars))
+	for _, k := range keys {
 		if v := vars[k]; v != "" {
 			lines = append(lines, k+"="+v)
 		}

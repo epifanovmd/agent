@@ -39,10 +39,11 @@ version-check: ## версия в VERSION, SDK и примерах одинак�
 	scripts/version.sh check
 sdk-test: ## серверный SDK на Node: lint, typecheck, тесты
 	cd sdk/node && npm ci --no-audit --no-fund --silent && npm run lint && npm run typecheck && npm test
-examples-test: node-sdk ## стенд: ESLint и проверка типов сервера, синтаксис воркеров на Node и Python
+examples-test: node-sdk ## стенд: ESLint и проверка типов сервера, синтаксис воркеров на Node и Python, базы воркеров (agent worker new)
 	cd examples/server && npm ci --no-audit --no-fund --silent && npm run lint && npm run typecheck
 	node --check examples/workers/node-echo/main.mjs
 	python3 -m py_compile examples/workers/echo/main.py
+	python3 -m unittest discover -s test/worker-base
 e2e: node-sdk ## сквозные тесты: сервер стенда, настоящий агент и воркеры-примеры (сборки → .dev/e2e), ~1 мин
 	scripts/e2e.sh
 check: vet fmt-check format-check version-check race sdk-test examples-test e2e ## все проверки — перед коммитом

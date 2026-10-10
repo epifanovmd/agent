@@ -111,7 +111,7 @@ server.listen(8080);
 | `logs(id, { worker?, lines? })`                                                     | `LogEntry[]`                                                      | [observe](docs/observe.md#журнал)                                         |
 | `restartWorker(id, name, { force?, wait?, timeoutMs? })`                            | `{ deferred: false }` или `{ deferred: true, pending, actionId }` | [workers](docs/workers.md#замена-занятого-воркера)                        |
 | `updateWorker(id, name, { force?, wait?, timeoutMs? })`                             | `{ version, previous?, deferred: false }` или как выше            | [releases](docs/releases.md)                                              |
-| `updateAgent(id, { timeoutMs? })`                                                   | `{ version, previous? }`                                          | там же                                                                    |
+| `updateAgent(id, { version?, timeoutMs? })`                                         | `{ version, previous? }`; с `version` — сборка из каталога агента | там же                                                                    |
 | `release()`, `updateCandidates()`, `workerUpdateCandidates()`                       | итоговый набор сборок (у сборок — `source`, `url`) и кандидаты    | [releases](docs/releases.md)                                              |
 | `checkRelease()`                                                                    | проверить удалённый источник сейчас → итоговый набор сборок       | [releases](docs/releases.md#откуда-бэкенд-берёт-агента)                   |
 | `installCommand(opts)`                                                              | строка `curl … \| sudo sh -s -- …`                                | [releases](docs/releases.md#установка-одной-командой)                     |
@@ -240,6 +240,7 @@ interface Agent {
   status?: Status;
   statusAt?: number;
   metrics?: MetricsPoint; // последняя точка
+  update?: { latest; checkedAt }; // новая версия агента, которую он нашёл сам (status важнее hello); нет — новее нет
   alerts: Alert[];
   session?: { id; instance; since }; // какая копия бэкенда держит соединение
 }

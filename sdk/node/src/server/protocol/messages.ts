@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import type { z } from "zod";
 
 import {
+  agentUpdateInfoSchema,
   configReportSchema,
   errorInfoSchema,
   healthSchema,
@@ -70,6 +71,9 @@ export type JobStatus = z.output<typeof jobStatusSchema>;
 
 /** Манифест воркера — ответ `GET /manifest` (§12). */
 export type WorkerManifest = z.output<typeof workerManifestSchema>;
+
+/** Новая версия агента из `hello.agent.update` и `status.update` (§11). */
+export type AgentUpdateInfo = z.output<typeof agentUpdateInfoSchema>;
 
 /** Воркер из `hello.workers`. */
 export type HelloWorker = z.output<typeof helloWorkerSchema>;

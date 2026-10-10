@@ -100,7 +100,13 @@ retryable: false}` с `re` = `id` сообщения; от сервера — а
 
 ```jsonc
 {
-  "agent": { "version": "1.0.0", "bootId": "8f2c…", "startedAt": 1791380000000 },
+  // update — новая версия агента, которую он нашёл сам (§11); нет — не проверял или новее нет
+  "agent": {
+    "version": "1.0.0",
+    "bootId": "8f2c…",
+    "startedAt": 1791380000000,
+    "update": { "latest": "1.1.0", "checkedAt": 1791379000000 },
+  },
   "host": { "os": "linux", "arch": "amd64", "hostname": "node-01", "kernel": "6.8.0" },
   "labels": { "zone": "eu" },
   // воркеры из настроек агента (встроенного sysmetrics здесь нет); version — у воркера со сборкой с сервера
@@ -139,19 +145,19 @@ retryable: false}` с `re` = `id` сообщения; от сервера — а
 
 ## 6. Сообщения агент → сервер
 
-| Тип              | data                                                                                                                                    |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `status`         | `{ workers: [WorkerStatus], outbox }` — раз в `statusIntervalMs` и при изменении, пока есть связь; `outbox` — сколько важных ждут `ack` |
-| `metrics`        | `{ collectedAt, host?, workers?: { "<имя>": <ответ GET /metrics> } }` (§9)                                                              |
-| `log`            | `{ entries: [LogEntry] }` (§9)                                                                                                          |
-| `event`          | `{ worker, type, data?, at }` (§12)                                                                                                     |
-| `config.applied` | `{ worker, key, version, ok, result?, error? }` (§8); `result` — тело ответа воркера при `ok: true`                                     |
-| `fetch.head`     | `{ status, headers }` (§7)                                                                                                              |
-| `fetch.chunk`    | `{ data, encoding: "utf8" \| "base64" }` (§7)                                                                                           |
-| `fetch.end`      | `{ error? }` (§7)                                                                                                                       |
-| `action.result`  | `{ ok, result?, error? }`, `re` — id действия (§10)                                                                                     |
-| `action.done`    | `{ name, worker, ok, result?, error? }`, `re` — id действия: итог отложенной замены воркера (§10)                                       |
-| `request`        | `{ worker, type, data?, timeoutMs }` — запрос воркера к серверу (§12); ответ — `request.result`                                         |
+| Тип              | data                                                                                                                                                                                   |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `status`         | `{ workers: [WorkerStatus], outbox, update? }` — раз в `statusIntervalMs` и при изменении, пока есть связь; `outbox` — сколько важных ждут `ack`; `update` — как в `hello.agent` (§11) |
+| `metrics`        | `{ collectedAt, host?, workers?: { "<имя>": <ответ GET /metrics> } }` (§9)                                                                                                             |
+| `log`            | `{ entries: [LogEntry] }` (§9)                                                                                                                                                         |
+| `event`          | `{ worker, type, data?, at }` (§12)                                                                                                                                                    |
+| `config.applied` | `{ worker, key, version, ok, result?, error? }` (§8); `result` — тело ответа воркера при `ok: true`                                                                                    |
+| `fetch.head`     | `{ status, headers }` (§7)                                                                                                                                                             |
+| `fetch.chunk`    | `{ data, encoding: "utf8" \| "base64" }` (§7)                                                                                                                                          |
+| `fetch.end`      | `{ error? }` (§7)                                                                                                                                                                      |
+| `action.result`  | `{ ok, result?, error? }`, `re` — id действия (§10)                                                                                                                                    |
+| `action.done`    | `{ name, worker, ok, result?, error? }`, `re` — id действия: итог отложенной замены воркера (§10)                                                                                      |
+| `request`        | `{ worker, type, data?, timeoutMs }` — запрос воркера к серверу (§12); ответ — `request.result`                                                                                        |
 
 ```jsonc
 // WorkerStatus
@@ -307,11 +313,13 @@ stdout — `info`, stderr — `warn` (§12).
 | ----------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | `worker.restart`  | `{ name, force? }`                                  | — ; остановить и запустить воркер заново; итог — после запуска; воркер занят — `{ deferred, pending }`   |
 | `worker.update`   | `{ name, version, url, sha256, signature, force? }` | `{ version, previous }`; обновить воркер сборкой с сервера (§11); воркер занят — `{ deferred, pending }` |
-| `agent.update`    | `{ version, url, sha256, signature }`               | `{ version, previous }` — после запуска новой версии (§11); версия та же — сразу                         |
+| `agent.update`    | `{ version, url?, sha256?, signature? }`            | `{ version, previous }` — после запуска новой версии (§11); версия та же — сразу                         |
 | `agent.rotateKey` | —                                                   | `{ secretHash }` — sha256 (hex) нового секрета                                                           |
 | `agent.logs`      | `{ worker?, lines? }`                               | `{ entries: [LogEntry] }` — последние записи журнала агента или воркера (старые отбрасываются до 4 МБ)   |
 
-`worker` в `agent.logs` нет — журнал агента. `url` в `agent.update` и `worker.update` — от корня
+`worker` в `agent.logs` нет — журнал агента. `agent.update` без `url` — агент сам берёт сборку
+версии `version` под свою платформу из своего каталога сборок (§11) с подписью из его
+`manifest.json`; `sha256` и `signature` тогда не нужны. `url` в `agent.update` и `worker.update` — от корня
 (`/api/…`): агент дополняет его адресом сервера, с которым сейчас связь, и скачивает со своим
 ключом; или абсолютная ссылка `https://…` на любой хост (например, файл релиза на GitHub): ключ
 агента туда не отправляется. `http://…` принимается, только если и сервер — `http://` (стенд,
@@ -369,6 +377,14 @@ version, os, arch, file, sha256, signature, stopTimeout?, command? }] }`. `stopT
   Обновление — замена воркера (§13) с возвратом прежней сборки, если новая не запустилась или не
   ответила `ok: true` на `GET /health` за минуту (`UPDATE_FAILED`). Воркер, прописанный командой, —
   `WORKER_NOT_RELEASED`; уже обновляется — `BUSY`.
+
+**Проверка новых версий.** Каталог сборок агента — релизы агента на GitHub или свой адрес
+(`update.releases` в настройках агента) с тем же устройством: `<адрес>/latest/download/manifest.json`
+— последняя версия, `<адрес>/download/v<версия>/<file>` — сборки версии. Раз в
+`update.checkInterval` (по умолчанию 6 ч; `0s` — не проверять) агент читает `manifest.json`
+последней версии. Она новее его собственной — агент сообщает её в `hello.agent.update` и
+`status.update` (`{ latest, checkedAt }`, `checkedAt` — время проверки, мс) и пишет в журнал;
+ставит её только по `agent.update` или команде на узле `agent upgrade`.
 
 Добавить или удалить воркер сервер не может: это решают настройки узла.
 

@@ -1,5 +1,6 @@
 // Данные серверной части: записи Store, события и то, что видит бэкенд.
 import type {
+  AgentUpdateInfo,
   ConfigReport,
   ErrorInfo,
   Hello,
@@ -128,6 +129,8 @@ export interface Agent {
   status?: Status;
   statusAt?: number;
   metrics?: MetricsPoint;
+  /** Новая версия агента, которую он нашёл в своём каталоге сборок (§11); нет — новее нет или агент не проверял. */
+  update?: AgentUpdateInfo;
   alerts: Alert[];
   session?: SessionInfo;
 }

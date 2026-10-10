@@ -8,8 +8,6 @@
 package main
 
 import (
-	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +18,7 @@ import (
 	"time"
 
 	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/internal/releases"
 	"github.com/epifanovmd/agent/internal/update"
 )
 
@@ -46,26 +45,12 @@ func run(args []string) error {
 	}
 }
 
-// signingKey — ключ подписи из AGENT_SIGNING_KEY (nil — не задан).
-func signingKey() (ed25519.PrivateKey, error) {
-	seed := os.Getenv("AGENT_SIGNING_KEY")
-	if seed == "" {
-		return nil, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(seed)
-	if err != nil || len(raw) != ed25519.SeedSize {
-		return nil, errors.New("AGENT_SIGNING_KEY — base64 seed Ed25519 (agent-release keygen)")
-	}
-	return ed25519.NewKeyFromSeed(raw), nil
-}
-
 func keygen() error {
-	pub, priv, err := ed25519.GenerateKey(nil)
+	priv, pub, err := releases.NewKeyPair()
 	if err != nil {
 		return err
 	}
-	fmt.Printf("AGENT_SIGNING_KEY=%s\n", base64.StdEncoding.EncodeToString(priv.Seed()))
-	fmt.Printf("AGENT_UPDATE_PUBLIC_KEY=%s\n", base64.StdEncoding.EncodeToString(pub))
+	fmt.Printf("AGENT_SIGNING_KEY=%s\nAGENT_UPDATE_PUBLIC_KEY=%s\n", priv, pub)
 	return nil
 }
 
@@ -106,7 +91,7 @@ func manifest(args []string) error {
 		return usage
 	}
 	dir, ver := positional[0], positional[1]
-	priv, err := signingKey()
+	priv, err := releases.SigningKey()
 	if err != nil {
 		return err
 	}
@@ -119,7 +104,7 @@ func manifest(args []string) error {
 	files, _ := filepath.Glob(filepath.Join(dir, "agent-*-*"))
 	m := message.Manifest{Version: ver, Artifacts: []message.Artifact{}}
 	if priv != nil {
-		m.PublicKey = base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey))
+		m.PublicKey = releases.PublicKeyOf(priv)
 	}
 	for _, file := range files {
 		parts := strings.Split(filepath.Base(file), "-")

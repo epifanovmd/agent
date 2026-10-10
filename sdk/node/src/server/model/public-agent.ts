@@ -36,6 +36,8 @@ export const publicAgent = (r: AgentRecord): Agent => {
   put("host", r.hello?.host);
   put("hello", r.hello);
   put("status", r.status);
+  // status свежее hello: в нём update пропадает, когда новой версии больше нет.
+  put("update", r.status ? r.status.update : r.hello?.agent?.update);
   put("statusAt", r.statusAt);
   put("metrics", r.metrics);
   put("session", r.online ? r.session : undefined);

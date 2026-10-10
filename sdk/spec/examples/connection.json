@@ -37,7 +37,12 @@
     "message": {
       "type": "hello",
       "data": {
-        "agent": { "version": "1.0.0", "bootId": "8f2c1d0e9a7b6c55", "startedAt": 1791380000000 },
+        "agent": {
+          "version": "1.0.0",
+          "bootId": "8f2c1d0e9a7b6c55",
+          "startedAt": 1791380000000,
+          "update": { "latest": "1.1.0", "checkedAt": 1791379000000 }
+        },
         "host": { "os": "linux", "arch": "amd64", "hostname": "node-01", "kernel": "6.8.0" },
         "labels": { "zone": "eu" },
         "workers": [

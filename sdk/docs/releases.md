@@ -14,6 +14,7 @@
 - [Раздать сборки](#раздать-сборки)
 - [Установка одной командой](#установка-одной-командой)
 - [Обновление агента](#обновление-агента)
+- [Агент сам замечает новые версии](#агент-сам-замечает-новые-версии)
 - [Обновление воркеров с сервера](#обновление-воркеров-с-сервера)
 - [Удаление агента с узла](#удаление-агента-с-узла)
 
@@ -102,11 +103,15 @@ AGENT_SIGNING_KEY=<ключ проекта> agent-release manifest /srv/agent-re
 ## Ключи подписи
 
 ```bash
-scripts/go.sh go run ./cmd/agent-release keygen   # Go в контейнере; где Go есть — go run ./cmd/agent-release keygen
-# AGENT_SIGNING_KEY=…        закрытый: только для подписи сборок (секреты CI), не на бэкенде
-# AGENT_UPDATE_PUBLIC_KEY=…  открытый: вшивается в сборки агента при make release (или update.publicKeys
-#                            в настройках агента) и нужен бэкенду (опция publicKey или updatePublicKeys)
+agent keygen   # пара ключей проекта; для публикации самого агента — go run ./cmd/agent-release keygen
+# AGENT_SIGNING_KEY=…         закрытый: только там, где подписывают сборки (agent pack, секреты CI), не на бэкенде
+# AGENT_UPDATE_PUBLIC_KEYS=…  открытый: agent pack кладёт его в архив, установка из архива — к ключам узла;
+#                             бэкенду — опция updatePublicKeys (install.sh передаёт его узлу)
 ```
+
+Сборки воркеров проекта удобнее всего делать `agent pack` в папке агента: каталог `release/` в
+архиве (`manifest.json` и подписанные архивы воркеров) — готовый каталог сборок для опции
+`releasesDir`. Папка агента и установка из архива — [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#из-папки-агента-и-архива).
 
 Подпись — Ed25519 над строкой `agent-release/1\n<имя>\n<версия>\n<os>\n<arch>\n<sha256>`: она
 не подходит к другой сборке, версии или платформе. Без открытого ключа агент не ставит ни
@@ -237,6 +242,23 @@ previous}}`. Итог приходит уже в новом соединении
 `UPDATE_NOT_SUPPORTED` (`update.mode: external`, обновляют образ; так же при `update.mode: disabled`). Воркеры обновление агента не замечают: они работают
 дальше, новая версия их подхватывает (`lifecycle.onAgentRestart: keep`), — долгая работа не
 прерывается и ждать её окончания не нужно.
+
+## Агент сам замечает новые версии
+
+Агент раз в `update.checkInterval` (6 ч) смотрит последнюю версию в своём каталоге сборок (релизы
+агента на GitHub или его `update.releases`) и сообщает новую в `hello` и `status`; в SDK это поле
+`update` агента:
+
+```ts
+const outdated = (await agents.listAgents()).filter((a) => a.update);
+// [{ id, name, version: "1.1.0", update: { latest: "1.2.0", checkedAt }, … }]
+for (const a of outdated) await agents.updateAgent(a.id, { version: a.update!.latest }); // агент берёт сборку сам
+```
+
+`updateAgent(id, { version })` отправляет `agent.update` только с версией: агент сам скачивает
+сборку под свою платформу из своего каталога сборок и сверяет подпись из его `manifest.json`;
+бэкенду не нужны ни `releasesDir`, ни `agentReleases`. Неверная версия — `MESSAGE_INVALID`. Без
+`version` — как раньше: сборка из набора бэкенда. На узле то же делает `agent upgrade`.
 
 ## Обновление воркеров с сервера
 

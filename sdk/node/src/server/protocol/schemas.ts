@@ -190,11 +190,20 @@ export const helloWorkerSchema = z.object({
 });
 
 /** `hello` (§4). */
+/** Новая версия агента, которую он нашёл в своём каталоге сборок (§11). */
+export const agentUpdateInfoSchema = z.looseObject({
+  latest: z.string().min(1),
+  /** Время проверки, мс. */
+  checkedAt: z.number(),
+});
+
 export const helloSchema = z.looseObject({
   agent: z.looseObject({
     version: z.string(),
     bootId: z.string().min(1),
     startedAt: z.number(),
+    /** Неверное значение пропускается. */
+    update: agentUpdateInfoSchema.optional().catch(undefined),
   }),
   host: hostInfoSchema,
   /** Метки агента; неверные пропускаются. */
@@ -250,6 +259,8 @@ export const statusSchema = z.looseObject({
   workers: z.array(workerStatusSchema),
   /** Сколько важных сообщений ждут `ack`. */
   outbox: z.number().optional(),
+  /** Как `hello.agent.update`; неверное значение пропускается. */
+  update: agentUpdateInfoSchema.optional().catch(undefined),
 });
 
 /**

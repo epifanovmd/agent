@@ -6,6 +6,7 @@
       "type": "status",
       "seq": 15,
       "data": {
+        "update": { "latest": "1.1.0", "checkedAt": 1791379000000 },
         "workers": [
           {
             "name": "report",

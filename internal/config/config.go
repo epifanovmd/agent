@@ -1,5 +1,6 @@
-// Package config — настройки агента: значения по умолчанию → YAML-файл
-// (с подстановкой ${ENV}) → переменные окружения AGENT_*.
+// Package config — настройки агента: значения по умолчанию → YAML-файлы
+// (цепочка extends, подстановка ${ENV}, файлы переменных envFiles) →
+// переменные окружения AGENT_*.
 package config
 
 import (
@@ -95,6 +96,18 @@ func (b ByteSize) String() string {
 
 // Config — настройки агента.
 type Config struct {
+	// Extends — файл настроек, поверх которого читается этот (путь — от этого
+	// файла); в итоговых настройках пусто.
+	Extends string `yaml:"extends,omitempty"`
+	// EnvFiles — файлы переменных KEY=VALUE для ${ИМЯ} и AGENT_* (пути — от
+	// этого файла); окружение процесса важнее их. В итоговых настройках пусто.
+	EnvFiles []string `yaml:"envFiles,omitempty"`
+
+	// Instance — экземпляр агента на узле для agent install (--instance), если флага нет.
+	Instance string `yaml:"instance,omitempty"`
+	// Install — параметры agent install, если флагов нет (пакеты, права службы, sysctl).
+	Install *Install `yaml:"install,omitempty"`
+
 	Server    Server            `yaml:"server"`
 	DataDir   string            `yaml:"dataDir"`
 	Name      string            `yaml:"name"`
@@ -108,6 +121,20 @@ type Config struct {
 
 	// envErrs — неверные значения переменных AGENT_* (их сообщает Validate).
 	envErrs []string
+}
+
+// Install — параметры agent install в файле настроек: те же, что флаги
+// (флаги важнее). Агенту на узле они не нужны — установка их убирает.
+type Install struct {
+	Packages []string `yaml:"packages,omitempty"`
+	// PackagesByManager — свои имена пакетов для менеджера (apt, dnf, yum, apk, zypper).
+	PackagesByManager map[string][]string `yaml:"packagesByManager,omitempty"`
+	Privileged        bool                `yaml:"privileged,omitempty"`
+	User              string              `yaml:"user,omitempty"`
+	RWPaths           []string            `yaml:"rwPaths,omitempty"`
+	Sysctl            map[string]string   `yaml:"sysctl,omitempty"`
+	KillMode          string              `yaml:"killMode,omitempty"`
+	StopTimeout       string              `yaml:"stopTimeout,omitempty"`
 }
 
 // Outbox — очередь важных сообщений на диске.
@@ -200,6 +227,24 @@ type Update struct {
 	// PublicKeys — ещё ключи проверки (base64): подпись сборки принимается,
 	// если сходится с любым из ключей — вшитым при сборке, PublicKey и этими.
 	PublicKeys []string `yaml:"publicKeys"`
+	// Releases — каталог сборок агента, устроенный как релизы на GitHub
+	// (<адрес>/latest/download/…, <адрес>/download/v<версия>/…); пусто — релизы
+	// агента на GitHub.
+	Releases string `yaml:"releases,omitempty"`
+	// CheckInterval — как часто проверять новую версию в каталоге сборок (§11);
+	// nil — DefaultCheckInterval, 0s — не проверять.
+	CheckInterval *Duration `yaml:"checkInterval,omitempty"`
+}
+
+// DefaultCheckInterval — проверка новой версии агента по умолчанию.
+const DefaultCheckInterval = 6 * time.Hour
+
+// CheckEvery — как часто проверять новую версию (0 — не проверять).
+func (u Update) CheckEvery() time.Duration {
+	if u.CheckInterval == nil {
+		return DefaultCheckInterval
+	}
+	return u.CheckInterval.Std()
 }
 
 // Keys — ключи проверки подписи сборок из настроек: publicKey и publicKeys без
@@ -237,6 +282,12 @@ type Worker struct {
 	// .tar.gz; command (если задан) выполняется в каталоге сборки, без
 	// command запускается сам файл или ./run архива.
 	Release bool `yaml:"release"`
+	// Path — папка воркера (путь — от файла настроек): агент запускает в ней
+	// command, по умолчанию ./run; имя по умолчанию — имя папки.
+	Path string `yaml:"path,omitempty"`
+	// From — откуда сборка воркера: agent — из релиза агента той же версии
+	// (воркер со сборкой, как release: true); агент скачивает её сам, если её нет.
+	From string `yaml:"from,omitempty"`
 	// Lifecycle — как агент запускает, проверяет, заменяет и останавливает
 	// воркер (§13); изменение применяется без перезапуска воркера.
 	Lifecycle Lifecycle `yaml:"lifecycle"`
@@ -251,6 +302,9 @@ type Worker struct {
 	// Builtin — встроенный воркер агента (sysmetrics), в agent.yaml его нет.
 	Builtin bool `yaml:"-"`
 }
+
+// FromAgent — Worker.From: сборка из релиза агента.
+const FromAgent = "agent"
 
 // Значения Worker.Routes.
 const (
@@ -514,25 +568,37 @@ func Defaults() Config {
 	}
 }
 
-// Load — настройки из файла path (пустой — без файла) и окружения.
+// Load — настройки из файла path (пустой — без файла; цепочка extends) и окружения.
 func Load(path string) (Config, error) {
 	cfg := Defaults()
+	src := &Source{}
 	if path != "" {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return cfg, fmt.Errorf("config: %w", err)
+		src = ReadSource(path)
+		if len(src.Errors) > 0 {
+			return cfg, problemsError(src.Errors)
 		}
-		if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(raw))), &cfg); err != nil {
+		if err := src.Decode(&cfg); err != nil {
 			return cfg, fmt.Errorf("config %s: %w", path, err)
 		}
 	}
-	applyEnv(&cfg)
+	applyEnv(&cfg, src.Lookup)
 	return cfg, cfg.Validate()
 }
 
-func applyEnv(cfg *Config) {
+// problemsError — ошибки файлов настроек одной ошибкой, по строке на каждую.
+func problemsError(problems []Problem) error {
+	errs := make([]error, len(problems))
+	for i, p := range problems {
+		errs[i] = errors.New("config: " + p.String())
+	}
+	return errors.Join(errs...)
+}
+
+// applyEnv — переменные AGENT_* поверх файла; lookup — окружение процесса,
+// затем файлы переменных.
+func applyEnv(cfg *Config, lookup func(string) (string, bool)) {
 	set := func(target *string, name string) {
-		if v, ok := os.LookupEnv(name); ok && v != "" {
+		if v, ok := lookup(name); ok && v != "" {
 			*target = v
 		}
 	}
@@ -548,7 +614,8 @@ func applyEnv(cfg *Config) {
 	set(&cfg.Server.KeyFile, "AGENT_SERVER_KEY_FILE")
 	set(&cfg.Update.Mode, "AGENT_UPDATE_MODE")
 	set(&cfg.Update.PublicKey, "AGENT_UPDATE_PUBLIC_KEY")
-	if labels, ok := os.LookupEnv("AGENT_LABELS"); ok {
+	set(&cfg.Update.Releases, "AGENT_UPDATE_RELEASES")
+	if labels, ok := lookup("AGENT_LABELS"); ok {
 		if cfg.Labels == nil {
 			cfg.Labels = map[string]string{}
 		}
@@ -560,7 +627,7 @@ func applyEnv(cfg *Config) {
 	}
 	// Списки через запятую; пустая переменная — пустой список.
 	list := func(target *[]string, name string) {
-		if v, ok := os.LookupEnv(name); ok {
+		if v, ok := lookup(name); ok {
 			*target = []string{}
 			for _, item := range strings.Split(v, ",") {
 				if item = strings.TrimSpace(item); item != "" {
@@ -575,7 +642,7 @@ func applyEnv(cfg *Config) {
 	list(&cfg.Telemetry.Metrics, "AGENT_TELEMETRY_METRICS")
 	list(&cfg.Telemetry.Disks, "AGENT_TELEMETRY_DISKS")
 	number := func(target *int, name string) {
-		if v, ok := os.LookupEnv(name); ok && v != "" {
+		if v, ok := lookup(name); ok && v != "" {
 			n, err := strconv.Atoi(strings.TrimSpace(v))
 			if err != nil {
 				cfg.envErrs = append(cfg.envErrs, fmt.Sprintf("%s: %q — нужно целое число", name, v))
@@ -585,7 +652,7 @@ func applyEnv(cfg *Config) {
 		}
 	}
 	duration := func(target *Duration, name string) {
-		if v, ok := os.LookupEnv(name); ok && v != "" {
+		if v, ok := lookup(name); ok && v != "" {
 			d, err := time.ParseDuration(strings.TrimSpace(v))
 			if err != nil {
 				cfg.envErrs = append(cfg.envErrs, fmt.Sprintf("%s: %q — нужна длительность (например, 30s)", name, v))
@@ -593,6 +660,11 @@ func applyEnv(cfg *Config) {
 			}
 			*target = Duration(d)
 		}
+	}
+	if v, ok := lookup("AGENT_UPDATE_CHECK_INTERVAL"); ok && v != "" {
+		var d Duration
+		duration(&d, "AGENT_UPDATE_CHECK_INTERVAL")
+		cfg.Update.CheckInterval = &d
 	}
 	duration(&cfg.Server.Reconnect.Min, "AGENT_SERVER_RECONNECT_MIN")
 	duration(&cfg.Server.Reconnect.Max, "AGENT_SERVER_RECONNECT_MAX")
@@ -664,9 +736,54 @@ func (c *Config) Validate() error {
 	if err := message.CheckLabels(c.Labels); err != nil {
 		errs = append(errs, fmt.Errorf("labels (AGENT_LABELS): %w", err))
 	}
+	if c.Instance != "" && !message.ValidName(c.Instance) {
+		errs = append(errs, fmt.Errorf("instance: %q — строчная латиница, цифры и «-», первая — буква, до 32 символов", c.Instance))
+	}
+	if r := c.Update.Releases; r != "" {
+		if u, err := url.Parse(r); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, fmt.Errorf("update.releases (AGENT_UPDATE_RELEASES): %q — нужен адрес http(s)://", r))
+		}
+	}
+	if d := c.Update.CheckEvery(); d < 0 || (d > 0 && d < time.Minute) {
+		errs = append(errs, fmt.Errorf("update.checkInterval (AGENT_UPDATE_CHECK_INTERVAL): 0s (не проверять) или не меньше 1m, а не %s", dur(Duration(d))))
+	}
+	errs = append(errs, c.checkWorkers()...)
+	return errors.Join(errs...)
+}
+
+// ValidateWorkers — проверить только воркеры и заполнить их умолчания (имя и
+// каталог воркера из папки, сборка, lifecycle): для упаковки, где остальные
+// настройки (адрес сервера, токен) могут быть ещё не заданы.
+func (c *Config) ValidateWorkers() error { return errors.Join(c.checkWorkers()...) }
+
+// checkWorkers — проверка и умолчания воркеров.
+func (c *Config) checkWorkers() []error {
+	var errs []error
 	names := map[string]bool{}
 	for i := range c.Workers {
 		w := &c.Workers[i]
+		if w.Path != "" {
+			if w.Name == "" {
+				w.Name = filepath.Base(w.Path)
+			}
+			if w.Dir != "" && w.Dir != w.Path {
+				errs = append(errs, fmt.Errorf("workers[%d]: dir и path — что-то одно (path — папка воркера, command выполняется в ней)", i))
+			}
+			if w.Release || w.From != "" {
+				errs = append(errs, fmt.Errorf("workers[%d]: path — воркер из папки, release и from — воркер со сборкой: что-то одно", i))
+			}
+			w.Dir = w.Path
+			if len(w.Command) == 0 {
+				w.Command = []string{"./" + ReleaseRun}
+			}
+		}
+		switch w.From {
+		case "":
+		case FromAgent:
+			w.Release = true
+		default:
+			errs = append(errs, fmt.Errorf("workers[%d].from: %q — пока только agent (сборка из релиза агента)", i, w.From))
+		}
 		switch {
 		case !message.ValidName(w.Name):
 			errs = append(errs, fmt.Errorf("workers[%d]: имя %q — строчная латиница, цифры и «-», начало — буква, до 32 символов", i, w.Name))
@@ -694,7 +811,7 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("workers[%d].user: запуск воркера от пользователя %q возможен, только если агент работает от root", i, w.User))
 		}
 	}
-	return errors.Join(errs...)
+	return errs
 }
 
 // Addresses — адреса сервера по порядку: url, затем urls (без повторов и пустых).

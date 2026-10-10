@@ -540,6 +540,17 @@ describe("образцы", () => {
         assert.deepEqual(v, sample("action.result.agent.update").data.result),
     );
     await run(
+      "action.agent.update.release",
+      () => s.agents.updateAgent(creds.agentId, { version: "v1.1.0" }),
+      "action.result.agent.update",
+      v =>
+        assert.deepEqual(v, sample("action.result.agent.update").data.result),
+    );
+    await assert.rejects(
+      s.agents.updateAgent(creds.agentId, { version: "latest" }),
+      { code: "MESSAGE_INVALID" },
+    );
+    await run(
       "action.agent.logs",
       () => s.agents.logs(creds.agentId, { worker: "echo", lines: 100 }),
       "action.result.agent.logs",

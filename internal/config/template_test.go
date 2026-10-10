@@ -183,4 +183,13 @@ func TestResolvePath(t *testing.T) {
 	if got := ResolvePath(""); got != want {
 		t.Fatalf("по умолчанию: %q", got)
 	}
+	// Папка агента: первый существующий agent.yaml из списка — раньше файла по умолчанию.
+	dir := writeFiles(t, map[string]string{"b/agent.yaml": "", "c/agent.yaml": ""})
+	local := []string{filepath.Join(dir, "a/agent.yaml"), filepath.Join(dir, "b/agent.yaml"), filepath.Join(dir, "c/agent.yaml")}
+	if got := ResolvePath("", local...); got != local[1] {
+		t.Fatalf("папка агента: %q", got)
+	}
+	if ResolvePath("/flag.yaml", local...) != "/flag.yaml" {
+		t.Fatal("флаг важнее папки агента")
+	}
 }

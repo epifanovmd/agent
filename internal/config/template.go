@@ -56,6 +56,20 @@ func Template(o TemplateOptions) []byte {
 	line("# Проверить файл: agent config check. Применить без перезапуска (служба): systemctl reload agent.")
 	line("")
 
+	note(0, "Файл поверх другого: сначала читается extends, затем этот (словари сливаются, списки")
+	note(0, "заменяются, воркеры — по имени). envFiles — файлы KEY=VALUE для ${ИМЯ} и AGENT_*;")
+	note(0, "окружение важнее их. Пути — от этого файла.")
+	ex(0, "extends: agent.yaml")
+	ex(0, "envFiles: [.env]")
+	line("")
+
+	note(0, "Для agent install (флаги важнее): экземпляр на узле и параметры установки.")
+	ex(0, "instance: example")
+	ex(0, "install:")
+	ex(0, "  packages: [python3]")
+	ex(0, "  sysctl: { net.ipv4.ping_group_range: \"0 2147483647\" }")
+	line("")
+
 	note(0, "Адрес бэкенда.")
 	line("server:")
 	if o.ServerURL != "" {

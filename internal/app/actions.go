@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/internal/releases"
 	"github.com/epifanovmd/agent/internal/update"
 	"github.com/epifanovmd/agent/internal/worker"
 )
@@ -173,8 +175,8 @@ func (a *App) runAction(ctx context.Context, id string, act message.Action) (any
 		if err := decodeArgs(act, &args); err != nil {
 			return nil, err
 		}
-		if args.Version == "" || args.URL == "" || args.SHA256 == "" {
-			return nil, invalid("нужны version, url, sha256, signature")
+		if args.Version == "" || (args.URL != "" && args.SHA256 == "") {
+			return nil, invalid("нужны version и либо url, sha256, signature, либо ничего больше (сборка из каталога сборок агента)")
 		}
 		return a.agentUpdate(ctx, id, args)
 	case message.ActionAgentRotateKey:
@@ -303,11 +305,22 @@ func (a *App) agentUpdate(ctx context.Context, id string, args message.AgentUpda
 	if args.Version == a.version {
 		return message.UpdateResult{Version: a.version, Previous: a.version}, nil
 	}
-	src, auth, err := a.source(args.URL)
-	if err != nil {
-		return nil, err
+	var rel update.Release
+	var auth string
+	if args.URL == "" {
+		r, err := releases.AgentBuild(ctx, releasesClient, a.config().Update.Releases, args.Version, runtime.GOOS, runtime.GOARCH)
+		if err != nil {
+			return nil, message.NewError(message.CodeUpdateFailed, err.Error())
+		}
+		rel = r
+	} else {
+		src, key, err := a.source(args.URL)
+		if err != nil {
+			return nil, err
+		}
+		rel = update.Release{Version: args.Version, URL: src, SHA256: args.SHA256, Signature: args.Signature}
+		auth = key
 	}
-	rel := update.Release{Version: args.Version, URL: src, SHA256: args.SHA256, Signature: args.Signature}
 	pending := pendingUpdate{ID: id, Version: args.Version, Previous: a.version}
 	raw, _ := json.Marshal(pending)
 	path := filepath.Join(a.config().DataDir, pendingUpdateFile)

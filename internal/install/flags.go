@@ -28,6 +28,14 @@ const Usage = `agent install — поставить агента службой 
 
   sudo agent install --server https://api.example.com --token <токен> [флаги]
 
+Из папки агента или распакованного архива agent pack — по её настройкам:
+
+  sudo ./agent install --env prod [--token <токен>] [флаги]
+
+Настройки (agent.yaml и agent.<env>.yaml поверх) ставятся одним файлом, воркеры из папки — как
+воркеры со сборкой, значения из файлов переменных — в agent.env; instance и install в файле
+настроек — то же, что флаги --instance и флаги установки (флаги важнее).
+
 Повторный запуск обновляет программу и службу; ключ агента, agent.yaml и
 agent.env сохраняются (переданные --token и --update-key заменяют прежние).
 
@@ -42,6 +50,7 @@ agent.env сохраняются (переданные --token и --update-key �
   --token ТОКЕН           токен регистрации → agent.env (0600)
   --token-file ПУТЬ       токен из файла (не виден в списке процессов)
   --name ИМЯ              имя агента (по умолчанию — имя машины)
+  --env ИМЯ               из папки агента: файл agent.ИМЯ.yaml (в архиве agent pack — его файл)
   --config ФАЙЛ           свой agent.yaml вместо создаваемого
   --ca-file ПУТЬ          свой корневой сертификат сервера → ca.pem рядом с agent.yaml
   --update-key КЛЮЧ       ключ проверки подписи сборок (можно несколько раз; подпись принимается,
@@ -79,6 +88,7 @@ func ParseFlags(args []string, errOut io.Writer) (Options, error) {
 	fs.Var(list{to: &o.PublicKeys}, "public-key", "")
 	fs.StringVar(&o.Name, "name", "", "")
 	fs.StringVar(&o.Config, "config", "", "")
+	fs.StringVar(&o.Env, "env", "", "")
 	fs.StringVar(&o.CAFile, "ca-file", "", "")
 	fs.StringVar(&o.User, "user", "", "")
 	fs.StringVar(&o.KillMode, "kill-mode", "", "")

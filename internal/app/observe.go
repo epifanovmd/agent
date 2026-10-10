@@ -111,7 +111,7 @@ func (a *App) status() message.Status {
 	for i := range ws {
 		ws[i].Configs = a.configs.Status(ws[i].Name)
 	}
-	return message.Status{Workers: ws, Outbox: a.outbox.Len()}
+	return message.Status{Workers: ws, Outbox: a.outbox.Len(), Update: a.latest.Load()}
 }
 
 func (a *App) sendStatus() { a.link.Stream(message.TypeStatus, a.status()) }
