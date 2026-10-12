@@ -77,14 +77,14 @@ func Prepare(dir, goos, arch string, o *install.Options) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	l := install.Layout(o.Instance)
+	l := o.Layout()
 	files := make([]string, len(src.Files))
 	for i, f := range src.Files {
 		files[i] = filepath.Base(f)
 	}
 	header := fmt.Sprintf("Настройки агента на узле: собраны из %s (архив agent pack, агент %s, %s).\n"+
-		"Значения ${ИМЯ} — из %s. Проверить: agent config check; применить: systemctl reload %s.",
-		strings.Join(files, " + "), info.Version, time.UnixMilli(info.CreatedAt).Format("2006-01-02"), l.EnvFile, l.Unit)
+		"Значения ${ИМЯ} — из %s. Проверить: agent config check; применить: %s.",
+		strings.Join(files, " + "), info.Version, time.UnixMilli(info.CreatedAt).Format("2006-01-02"), l.EnvFile, install.ReloadHint(l, o.Mode()))
 	flat, err := config.Flatten(main, l.DataDir, header)
 	if err != nil {
 		os.RemoveAll(tmp)
@@ -164,31 +164,48 @@ func Instance(dir string) (string, error) {
 	return cfg.Instance, nil
 }
 
-// apply — раздел install файла настроек там, где флагов нет.
+// apply — раздел install файла настроек там, где флагов нет. Что агенту
+// пользователя без root не подходит, пропускается — с предупреждением
+// установки (Options.Ignored).
 func apply(o *install.Options, in config.Install) {
-	if len(o.Packages) == 0 {
-		o.Packages = in.Packages
+	home := o.Home != ""
+	skip := func(set bool, what string) bool {
+		if set && home {
+			o.Ignored = append(o.Ignored, fmt.Sprintf("install.%s из файла настроек пропущен: нужен root, а агент ставится для пользователя без root", what))
+		}
+		return set && home
 	}
-	if o.PackagesBy == nil {
-		o.PackagesBy = map[string][]string{}
-	}
-	for m, list := range in.PackagesByManager {
-		if len(o.PackagesBy[m]) == 0 {
-			o.PackagesBy[m] = list
+	if !skip(len(in.Packages) > 0 || len(in.PackagesByManager) > 0, "packages") {
+		if len(o.Packages) == 0 {
+			o.Packages = in.Packages
+		}
+		if o.PackagesBy == nil {
+			o.PackagesBy = map[string][]string{}
+		}
+		for m, list := range in.PackagesByManager {
+			if len(o.PackagesBy[m]) == 0 {
+				o.PackagesBy[m] = list
+			}
 		}
 	}
-	o.Privileged = o.Privileged || in.Privileged
-	if o.User == "" {
+	if !skip(in.Privileged, "privileged") {
+		o.Privileged = o.Privileged || in.Privileged
+	}
+	if !skip(in.User != "", "user") && o.User == "" {
 		o.User = in.User
 	}
-	for _, p := range in.RWPaths {
-		if !slices.Contains(o.RWPaths, p) {
-			o.RWPaths = append(o.RWPaths, p)
+	if !skip(len(in.RWPaths) > 0, "rwPaths") {
+		for _, p := range in.RWPaths {
+			if !slices.Contains(o.RWPaths, p) {
+				o.RWPaths = append(o.RWPaths, p)
+			}
 		}
 	}
-	for _, k := range slices.Sorted(maps.Keys(in.Sysctl)) {
-		if !slices.ContainsFunc(o.Sysctls, func(s string) bool { return strings.HasPrefix(s, k+"=") }) {
-			o.Sysctls = append(o.Sysctls, k+"="+in.Sysctl[k])
+	if !skip(len(in.Sysctl) > 0, "sysctl") {
+		for _, k := range slices.Sorted(maps.Keys(in.Sysctl)) {
+			if !slices.ContainsFunc(o.Sysctls, func(s string) bool { return strings.HasPrefix(s, k+"=") }) {
+				o.Sysctls = append(o.Sysctls, k+"="+in.Sysctl[k])
+			}
 		}
 	}
 	if o.KillMode == "" {

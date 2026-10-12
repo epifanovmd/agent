@@ -26,7 +26,12 @@ import { Configs } from "./features/configs";
 import { Connections } from "./features/connections";
 import { Enrollment } from "./features/enrollment";
 import { Inbound } from "./features/inbound";
-import { installCommand, type InstallOptions } from "./features/install";
+import {
+  bundleInstallCommand,
+  type BundleInstallOptions,
+  installCommand,
+  type InstallOptions,
+} from "./features/install";
 import { type JobOptions, type JobResult, Jobs } from "./features/jobs";
 import {
   type EventFilter,
@@ -549,6 +554,15 @@ export class Agents extends EventEmitter<AgentsEvents> {
    */
   installCommand(opts: InstallOptions): string {
     return installCommand(opts, this.settings.baseUrl);
+  }
+
+  /**
+   * Команда установки из архива папки агента проекта (опция bundlesDir) одной строкой:
+   * `curl -fsSL '<адрес>/api/v1/agent-link/bundle/install.sh' | sudo sh -s -- --token '…'`;
+   * rootless — без root, run — без установки (контейнер). Неверные значения — MESSAGE_INVALID.
+   */
+  bundleInstallCommand(opts: BundleInstallOptions): string {
+    return bundleInstallCommand(opts, this.settings.baseUrl);
   }
 
   // ── несколько процессов ──

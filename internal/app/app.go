@@ -42,6 +42,10 @@ import (
 // update.publicKeys) действуют вместе с ним.
 var BuiltinUpdateKey string
 
+// InstallMode — как агент поставлен на узел (agent install: systemd, user,
+// manual; "" — запущен иначе): в hello.agent.install (cmd/agent).
+var InstallMode string
+
 // ErrRestart — агент остановлен для перезапуска (обновление): процесс
 // завершается, менеджер (systemd, Docker) запускает его снова.
 var ErrRestart = errors.New("agent: перезапуск")
@@ -314,7 +318,8 @@ func (a *App) recordError(err error) {
 func (a *App) Hello() message.Hello {
 	cfg := a.config()
 	h := message.Hello{
-		Agent:   message.HelloAgent{Version: a.version, BootID: a.bootID, StartedAt: a.started.UnixMilli(), Update: a.latest.Load()},
+		Agent: message.HelloAgent{Version: a.version, BootID: a.bootID, StartedAt: a.started.UnixMilli(), Update: a.latest.Load(),
+			UpdateMode: cfg.Update.Mode, Install: InstallMode},
 		Host:    a.auth.host,
 		Labels:  cfg.Labels,
 		Configs: a.configs.Versions(),

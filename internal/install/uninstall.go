@@ -4,29 +4,31 @@ import (
 	"context"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
 )
 
 // Uninstall — удалить экземпляр агента instance ("" — по умолчанию):
-// воркеры убирают за собой (agent cleanup), затем служба, программа, файл
-// параметров ядра (с возвратом прежних значений). purge — ещё настройки,
-// данные, пакеты и пользователь службы, если их создала установка (root и
-// пользователей, которые уже были, не трогает). Другие экземпляры не
-// затрагиваются: нужные им пакеты, параметры ядра и пользователь остаются
-// (и переходят в журнал того, кому нужны). self — запущенная программа
-// агента: уборку делает она, если установленной уже нет.
+// воркеры убирают за собой (agent cleanup), затем служба, программа, файл параметров ядра (с возвратом прежних значений). purge —
+// ещё настройки, данные, пакеты и пользователь службы, если их создала
+// установка (root и пользователей, которые уже были, не трогает). Другие
+// экземпляры не затрагиваются: нужные им пакеты, параметры ядра и
+// пользователь остаются (и переходят в журнал того, кому нужны). self —
+// запущенная программа агента: уборку делает она, если установленной уже
+// нет. От root удаляется системный агент, от пользователя — его собственный.
 func Uninstall(ctx context.Context, s *System, instance string, purge bool, self string) error {
 	if err := CheckInstance(instance); err != nil {
 		return err
 	}
-	if err := s.preflight(false); err != nil {
+	l := s.find(instance)
+	if err := s.preflight(false, l); err != nil {
 		return err
 	}
-	l := Layout(instance)
+	mode := s.modeOf(l)
 	// Служба — пользователь, от которого работали агент и воркеры.
 	runAs := ""
-	if raw, err := os.ReadFile(s.p(l.UnitFile)); err == nil {
+	if raw, err := os.ReadFile(s.p(l.UnitFile)); err == nil && !l.Home {
 		for _, l := range strings.Split(string(raw), "\n") {
 			if v, ok := strings.CutPrefix(l, "User="); ok {
 				runAs = strings.TrimSpace(v)
@@ -38,18 +40,24 @@ func Uninstall(ctx context.Context, s *System, instance string, purge bool, self
 	if err != nil {
 		return err
 	}
-	if runAs == "" {
+	if runAs == "" && !l.Home {
 		runAs = j.last("service-user")
 	}
-	if s.has("systemctl") {
-		_ = s.Run(ctx, Cmd{Args: []string{"systemctl", "disable", "--now", l.Service}, Quiet: true})
+	switch {
+	case mode == ModeManual:
+		if err := s.stopManual(ctx, l, time.Minute); err != nil {
+			return err
+		}
+	case s.has("systemctl"):
+		_ = s.Run(ctx, Cmd{Args: append(strings.Fields(l.Systemctl()), "disable", "--now", l.Service), Quiet: true})
 	}
 	// Воркеры убирают за собой (без сервера); ошибка — предупреждение, удаление продолжается.
 	bin := s.p(l.Binary)
 	if !isFile(bin) {
 		bin = self
 	}
-	if bin != "" && isFile(bin) && isFile(s.p(l.ConfigFile)) {
+	switch {
+	case bin != "" && isFile(bin) && isFile(s.p(l.ConfigFile)):
 		var env []string
 		if f, err := os.Open(s.p(l.EnvFile)); err == nil {
 			vars, _ := config.ParseEnv(f)
@@ -65,15 +73,32 @@ func Uninstall(ctx context.Context, s *System, instance string, purge bool, self
 			s.warn("воркеры убрали за собой не всё (agent cleanup) — удаление продолжается")
 		}
 	}
-	_ = os.Remove(s.p(l.UnitFile))
-	if s.has("systemctl") {
-		_ = s.Run(ctx, Cmd{Args: []string{"systemctl", "daemon-reload"}, Quiet: true})
+	if isFile(s.p(l.UnitFile)) {
+		_ = os.Remove(s.p(l.UnitFile))
+		if s.has("systemctl") {
+			_ = s.Run(ctx, Cmd{Args: append(strings.Fields(l.Systemctl()), "daemon-reload"), Quiet: true})
+		}
 	}
 	if target, err := os.Readlink(s.p(l.Link)); err == nil && target == l.Binary {
 		_ = os.Remove(s.p(l.Link))
 	}
 	if err := os.RemoveAll(s.p(l.OptDir)); err != nil {
 		return err
+	}
+	j.drop(func(k, _ string) bool { return k == "mode" })
+	if l.Home {
+		if !purge {
+			if err := j.save(); err != nil {
+				return err
+			}
+			s.say("Агент удалён. Настройки и данные (%s) оставлены: повторная установка продолжит с ними; удалить всё — agent uninstall%s --purge.", l.EtcDir, l.Flag())
+			return nil
+		}
+		if err := os.RemoveAll(s.p(l.EtcDir)); err != nil {
+			return err
+		}
+		s.say("Агент удалён вместе с настройками и данными.")
+		return nil
 	}
 	others := s.others(l)
 	if isFile(s.p(l.SysctlFile)) {

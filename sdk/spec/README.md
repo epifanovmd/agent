@@ -100,12 +100,15 @@ retryable: false}` с `re` = `id` сообщения; от сервера — а
 
 ```jsonc
 {
-  // update — новая версия агента, которую он нашёл сам (§11); нет — не проверял или новее нет
+  // update — новая версия агента, которую он нашёл сам (§11); нет — не проверял или новее нет;
+  // updateMode — обновляет ли агент себя сам (§11); install — как агент поставлен на узел
   "agent": {
     "version": "1.0.0",
     "bootId": "8f2c…",
     "startedAt": 1791380000000,
     "update": { "latest": "1.1.0", "checkedAt": 1791379000000 },
+    "updateMode": "self",
+    "install": "systemd",
   },
   "host": { "os": "linux", "arch": "amd64", "hostname": "node-01", "kernel": "6.8.0" },
   "labels": { "zone": "eu" },
@@ -118,6 +121,14 @@ retryable: false}` с `re` = `id` сообщения; от сервера — а
 
 Обязательны `agent` и `host` (`host.kernel` — версия ядра, если система её сообщила); `labels`,
 `workers` и `configs` пустыми не передаются.
+
+`agent.updateMode` — режим обновления агента: `self` — ставит новую версию по `agent.update`;
+`external` — себя не обновляет (агент в контейнере: новую версию ставят на узле), `disabled` —
+обновления выключены; на `agent.update` оба отвечают `UPDATE_NOT_SUPPORTED` (§11).
+`agent.install` — как агент поставлен на узел командой `agent install`: `systemd` — служба
+systemd, `user` — служба пользователя без root (systemd --user), `manual` — агент пользователя
+без службы; нет — агент запущен иначе (`agent run`: из папки, в контейнере, `install.sh --run`).
+Незнакомое значение сервер принимает как есть.
 
 Сервер → `welcome` `{ serverTime, metricsIntervalMs, statusIntervalMs }`; нет `welcome` за 15 с — агент
 закрывает соединение. После `welcome` обе стороны работают независимо:
@@ -373,7 +384,8 @@ version, os, arch, file, sha256, signature, stopTimeout?, command? }] }`. `stopT
   Затем проверить подпись, скачать и сверить sha256 (файл уже тот же — не скачивать),
   сохранить текущий файл как `.prev`, заменить, перезапуститься. Новая версия не получила `welcome`
   за три запуска — вернуть `.prev`, итог — `UPDATE_FAILED`. Агент в контейнере
-  (`update.mode: external`) себя не обновляет — `UPDATE_NOT_SUPPORTED`.
+  (`update.mode: external`, в `hello.agent.updateMode`) себя не обновляет — `UPDATE_NOT_SUPPORTED`;
+  новую версию даёт новый образ или новый запуск.
 - **Воркер со сборкой с сервера** (`release: true`): сборка — файл или архив `.tar.gz` (если `url`
   оканчивается на `.tar.gz`; распаковывается в каталог) в `<dataDir>/workers/<имя>/current`.
   Обновление — замена воркера (§13) с возвратом прежней сборки, если новая не запустилась или не

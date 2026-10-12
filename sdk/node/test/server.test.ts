@@ -1102,6 +1102,28 @@ describe("сборки", () => {
       (await s.agents.updateCandidates()).map(x => [x.current, x.target]),
       [["1.0.0", "1.1.0"]],
     );
+    // Агент, который себя не обновляет (в контейнере), — не кандидат; hello хранит, как он поставлен.
+    const c2 = await enroll(s.url);
+    const fa2 = await FakeAgent.connect(s.ws, c2, {
+      agent: {
+        version: "1.0.0",
+        bootId: "b2",
+        startedAt: 1,
+        updateMode: "external",
+        install: "user",
+      },
+      workers: [],
+    });
+
+    assert.deepEqual(
+      (await s.agents.updateCandidates()).map(x => x.agentId),
+      [c.agentId],
+    );
+    assert.equal(
+      (await s.agents.getAgent(c2.agentId))?.hello?.agent.install,
+      "user",
+    );
+    await fa2.close();
     assert.deepEqual(
       (await s.agents.workerUpdateCandidates()).map(x => [
         x.worker,

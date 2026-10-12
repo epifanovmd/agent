@@ -1,11 +1,14 @@
-// Команда установки агента на узел: curl … install.sh | sudo sh -s -- флаги.
-// install.sh скачивает сборку агента под узел и передаёт флаги `agent install`.
+// Команды установки агента на узел одной строкой: curl … install.sh | sudo sh -s -- флаги.
+// installCommand — установщик сборок агента (install.sh: программа агента и флаги
+// `agent install`); bundleInstallCommand — установщик из архива папки агента проекта
+// (bundle/install.sh: настройки и воркеры — в архиве). Агент пользователя без root (rootless)
+// и запуск без установки (run, например в контейнере) — без sudo.
 import { z } from "zod";
 
 import { invalid, valid } from "../core/errors";
 import { safeServer, shellQuote } from "../lib/shell";
 import { parse } from "../protocol/checks";
-import { INSTALL_PATH } from "../protocol/messages";
+import { BUNDLE_PATH, INSTALL_PATH } from "../protocol/messages";
 import { nameSchema } from "../protocol/schemas";
 
 /** Менеджеры пакетов `agent install` — в этом порядке флаги --packages-<m> в команде. */
@@ -24,6 +27,14 @@ const installOptionsSchema = z
   .object({
     /** Адрес сервера; пусто — опция baseUrl Agents. */
     baseUrl: z.string().optional(),
+    /** Агент пользователя без root (--rootless): ~/.agent, служба systemd --user; команда — без sudo. */
+    rootless: z.boolean().optional(),
+    /**
+     * Без установки (--run): агент запускается здесь же на переднем плане — в контейнере или
+     * под своим менеджером процессов; данные — AGENT_DATA_DIR (по умолчанию /var/lib/agent).
+     * Команда — без sudo; кроме токена, имени, caFile и releases — ничего.
+     */
+    run: z.boolean().optional(),
     /** Экземпляр агента на узле (--instance): несколько агентов для разных бэкендов; имя — по правилу имён. */
     instance: nameSchema.optional(),
     /** Токен регистрации; ровно одно из token и tokenFile. */
@@ -58,6 +69,34 @@ const installOptionsSchema = z
   .refine(
     o => !o.token !== !o.tokenFile,
     "нужен ровно один из token и tokenFile",
+  )
+  .refine(
+    o =>
+      !o.rootless ||
+      (!o.user &&
+        !o.sysctl &&
+        !o.privileged &&
+        !o.rwPaths?.length &&
+        !o.packages?.length &&
+        !o.packagesByManager),
+    "rootless — без root: без user, sysctl, privileged, rwPaths и пакетов",
+  )
+  .refine(
+    o =>
+      !o.run ||
+      (!o.rootless &&
+        !o.instance &&
+        !o.user &&
+        !o.config &&
+        !o.privileged &&
+        !o.killMode &&
+        !o.packages?.length &&
+        !o.packagesByManager &&
+        !o.sysctl &&
+        !o.rwPaths?.length &&
+        !o.workers?.length &&
+        !o.stopTimeout),
+    "run — без установки: только token или tokenFile, name, caFile и releases",
   );
 
 /** Флаги `agent install`; пустые в команду не попадают. */
@@ -73,13 +112,16 @@ export const installCommand = (
 
   if (!base) throw invalid("Нужен адрес сервера (baseUrl)");
   valid(parse(serverSchema, base, "baseUrl"));
+  const sudo = opts.rootless || opts.run ? "" : "sudo ";
   const parts = [
-    `curl -fsSL ${shellQuote(base + INSTALL_PATH)} | sudo sh -s --`,
+    `curl -fsSL ${shellQuote(base + INSTALL_PATH)} | ${sudo}sh -s --`,
   ];
   const flag = (name: string, value: string | undefined) => {
     if (value) parts.push(`${name} ${shellQuote(value)}`);
   };
 
+  if (opts.rootless) parts.push("--rootless");
+  if (opts.run) parts.push("--run");
   flag("--instance", opts.instance);
   flag("--token", opts.token);
   flag("--token-file", opts.tokenFile);
@@ -103,6 +145,72 @@ export const installCommand = (
   for (const w of opts.workers ?? []) flag("--worker", w);
   flag("--stop-timeout", opts.stopTimeout);
   flag("--releases", opts.releases);
+  const cmd = parts.join(" ");
+
+  if (/[\r\n]/.test(cmd)) throw invalid("Перевод строки в значении");
+
+  return cmd;
+};
+
+/**
+ * Адрес установщика из архива проекта (`<адрес>/api/v1/agent-link/bundle/install.sh`) — например,
+ * чтобы скачать его по SSH и запустить с флагами `agent install` или `--uninstall`.
+ */
+export const bundleInstallUrl = (baseUrl: string): string =>
+  `${baseUrl.replace(/\/+$/, "")}${BUNDLE_PATH}/install.sh`;
+
+/** Параметры установки из архива проекта; пустые в команду не попадают. */
+const bundleOptionsSchema = z
+  .object({
+    /** Адрес сервера; пусто — опция baseUrl Agents. */
+    baseUrl: z.string().optional(),
+    /** Токен регистрации; ровно одно из token и tokenFile. */
+    token: z.string().optional(),
+    /** Путь к файлу с токеном на узле (--token-file). */
+    tokenFile: z.string().optional(),
+    /** Имя агента (по умолчанию — имя машины). */
+    name: z.string().optional(),
+    /** Агент пользователя без root (--rootless): команда без sudo. */
+    rootless: z.boolean().optional(),
+    /** Без установки (--run): агент здесь же на переднем плане — контейнер; команда без sudo. */
+    run: z.boolean().optional(),
+  })
+  .refine(
+    o => !o.token !== !o.tokenFile,
+    "нужен ровно один из token и tokenFile",
+  )
+  .refine(o => !(o.rootless && o.run), "rootless и run — что-то одно");
+
+/** Параметры установки из архива проекта (bundleInstallCommand). */
+export type BundleInstallOptions = z.input<typeof bundleOptionsSchema>;
+
+/**
+ * Команда установки из архива папки агента проекта (опция bundlesDir): `curl -fsSL
+ * '<адрес>/api/v1/agent-link/bundle/install.sh' | sudo sh -s -- --token '…'`. Экземпляр,
+ * воркеры, пакеты и права — в настройках архива; здесь — токен, имя и способ установки.
+ */
+export const bundleInstallCommand = (
+  input: BundleInstallOptions,
+  fallbackBase = "",
+): string => {
+  const opts = valid(parse(bundleOptionsSchema, input, "bundleInstallCommand"));
+  const base = (opts.baseUrl || fallbackBase).replace(/\/+$/, "");
+
+  if (!base) throw invalid("Нужен адрес сервера (baseUrl)");
+  valid(parse(serverSchema, base, "baseUrl"));
+  const sudo = opts.rootless || opts.run ? "" : "sudo ";
+  const parts = [
+    `curl -fsSL ${shellQuote(bundleInstallUrl(base))} | ${sudo}sh -s --`,
+  ];
+
+  if (opts.rootless) parts.push("--rootless");
+  if (opts.run) parts.push("--run");
+  parts.push(
+    opts.tokenFile
+      ? `--token-file ${shellQuote(opts.tokenFile)}`
+      : `--token ${shellQuote(opts.token ?? "")}`,
+  );
+  if (opts.name) parts.push(`--name ${shellQuote(opts.name)}`);
   const cmd = parts.join(" ");
 
   if (/[\r\n]/.test(cmd)) throw invalid("Перевод строки в значении");

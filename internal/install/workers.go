@@ -46,7 +46,7 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, err
 	}
-	if err := s.Chown(root, user); err != nil {
+	if err := s.own(root, user); err != nil {
 		return nil, err
 	}
 	var out []config.TemplateWorker
@@ -59,7 +59,7 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 		if placed.Unsigned {
 			s.warn("воркер %s: в manifest.json нет подписи сборки — сверена только контрольная сумма", name)
 		}
-		if err := s.Chown(releaseDir, user); err != nil {
+		if err := s.own(releaseDir, user); err != nil {
 			return nil, err
 		}
 		s.say("Воркер %s %s поставлен: %s", name, placed.Version, filepath.Join(config.ReleasesDir(l.DataDir), name, config.ReleaseCurrent))

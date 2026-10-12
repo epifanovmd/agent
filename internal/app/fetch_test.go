@@ -121,6 +121,12 @@ func TestCheckLoop(t *testing.T) {
 	if u := a.Hello().Agent.Update; u == nil || u.Latest != "1.1.0" || u.CheckedAt == 0 {
 		t.Fatalf("hello: %+v", u)
 	}
+	// Режим обновления и способ установки — в hello.agent.
+	InstallMode = "user"
+	defer func() { InstallMode = "" }()
+	if h := a.Hello().Agent; h.UpdateMode != config.UpdateSelf || h.Install != "user" {
+		t.Fatalf("hello.agent: %+v", h)
+	}
 	if u := a.status().Update; u == nil || u.Latest != "1.1.0" {
 		t.Fatalf("status: %+v", u)
 	}

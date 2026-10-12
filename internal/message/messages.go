@@ -48,6 +48,11 @@ type HelloAgent struct {
 	// Update — новая версия агента, которую он нашёл сам (§11); nil — не
 	// проверял или новее нет.
 	Update *AgentUpdateInfo `json:"update,omitempty"`
+	// UpdateMode — режим обновления агента: self | external | disabled (§4, §11).
+	UpdateMode string `json:"updateMode,omitempty"`
+	// Install — как агент поставлен на узел (agent install): systemd | user |
+	// manual; "" — запущен иначе.
+	Install string `json:"install,omitempty"`
 }
 
 // AgentUpdateInfo — новая версия агента в его каталоге сборок (§11).

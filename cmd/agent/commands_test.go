@@ -90,7 +90,7 @@ func TestEnvConfig(t *testing.T) {
 		env  string
 		dirs []string
 		want string
-	}{{"dev", []string{a, b}, "нет agent.dev.yaml"}, {"Prod", []string{b}, "имя окружения"}, {"prod", nil, "службой"}} {
+	}{{"dev", []string{a, b}, "нет agent.dev.yaml"}, {"Prod", []string{b}, "имя окружения"}, {"prod", nil, "нет папки агента"}} {
 		if _, err := envConfig(c.env, c.dirs); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s %v: %v", c.env, c.dirs, err)
 		}

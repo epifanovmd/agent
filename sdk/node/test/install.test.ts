@@ -2,7 +2,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Agents, AgentsError, type InstallOptions } from "../src/server/index";
+import {
+  Agents,
+  AgentsError,
+  bundleInstallUrl,
+  type InstallOptions,
+} from "../src/server/index";
 
 const invalid = (err: unknown) =>
   err instanceof AgentsError && err.code === "MESSAGE_INVALID";
@@ -115,6 +120,30 @@ test("installCommand: флаги по порядку, кавычки POSIX, ош
         token: "t",
         releases: "file:///x",
       },
+      "rootless и sysctl": {
+        baseUrl: "https://api.example.com",
+        token: "t",
+        rootless: true,
+        sysctl: { "vm.max_map_count": "262144" },
+      },
+      "rootless и privileged": {
+        baseUrl: "https://api.example.com",
+        token: "t",
+        rootless: true,
+        privileged: true,
+      },
+      "run и воркеры": {
+        baseUrl: "https://api.example.com",
+        token: "t",
+        run: true,
+        workers: ["report"],
+      },
+      "run и rootless": {
+        baseUrl: "https://api.example.com",
+        token: "t",
+        run: true,
+        rootless: true,
+      },
     };
 
     for (const [name, opts] of Object.entries(bad))
@@ -143,6 +172,38 @@ test("installCommand: флаги по порядку, кавычки POSIX, ош
       "curl -fsSL 'http://127.0.0.1:8080/api/v1/agent-link/install.sh' | sudo sh -s -- " +
         "--token-file '/root/agent.token' --kill-mode 'mixed'",
     );
+    // Агент пользователя без root и запуск без установки (контейнер) — без sudo.
+    assert.equal(
+      withBase.installCommand({ token: "it", rootless: true }),
+      "curl -fsSL 'http://127.0.0.1:8080/api/v1/agent-link/install.sh' | sh -s -- --rootless --token 'it'",
+    );
+    assert.equal(
+      withBase.installCommand({ token: "it", run: true, name: "n1" }),
+      "curl -fsSL 'http://127.0.0.1:8080/api/v1/agent-link/install.sh' | sh -s -- --run --token 'it' --name 'n1'",
+    );
+    // Из архива проекта: служба, без root, без установки; ошибки.
+    assert.equal(
+      withBase.bundleInstallCommand({ token: "a'b", name: "msk 1" }),
+      "curl -fsSL 'http://127.0.0.1:8080/api/v1/agent-link/bundle/install.sh' | sudo sh -s -- --token 'a'\\''b' --name 'msk 1'",
+    );
+    assert.equal(
+      withBase.bundleInstallCommand({ tokenFile: "/run/t", rootless: true }),
+      "curl -fsSL 'http://127.0.0.1:8080/api/v1/agent-link/bundle/install.sh' | sh -s -- --rootless --token-file '/run/t'",
+    );
+    assert.equal(
+      withBase.bundleInstallCommand({ token: "t", run: true }),
+      "curl -fsSL 'http://127.0.0.1:8080/api/v1/agent-link/bundle/install.sh' | sh -s -- --run --token 't'",
+    );
+    assert.equal(
+      bundleInstallUrl("https://api.example.com/"),
+      "https://api.example.com/api/v1/agent-link/bundle/install.sh",
+    );
+    for (const bad of [
+      { token: "t", run: true, rootless: true },
+      { token: "t", tokenFile: "/run/t" },
+      { token: "t", name: "a\nb" },
+    ])
+      assert.throws(() => withBase.bundleInstallCommand(bad), invalid);
   } finally {
     await withBase.close();
   }

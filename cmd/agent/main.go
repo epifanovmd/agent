@@ -5,7 +5,8 @@
 //	                                   SIGUSR1 — перезапуск, SIGTERM/SIGINT — остановка
 //	agent restart                      перезапустить работающего агента (воркеры — по lifecycle.onAgentRestart)
 //	agent stop-workers                 остановить воркеры, оставшиеся работать после остановки агента
-//	agent install --server URL --token ТОКЕН [флаги]   поставить службой systemd (Linux, root)
+//	agent install --server URL --token ТОКЕН [флаги]   поставить службой systemd (Linux, root);
+//	                                   --rootless — агент пользователя без root
 //	agent uninstall [--purge]          удалить службу (с --purge — настройки и данные)
 //	                                   --instance ИМЯ у install, uninstall, status, logs, restart,
 //	                                   stop-workers, cleanup, config check — экземпляр агента на узле;
@@ -15,7 +16,7 @@
 //	                                   (-config ФАЙЛ — один файл настроек с пояснениями)
 //	agent config check                 проверить настройки и показать итоговые значения
 //	agent status [--json]              работает ли агент, связь, воркеры (код выхода 0 — работает)
-//	agent logs [-f] [-n N]             лог службы (journalctl)
+//	agent logs [-f] [-n N]             лог службы (journalctl) или агента без службы (его файл)
 //	agent cleanup                      уборка воркеров перед удалением агента (без сервера; её вызывает uninstall)
 //	agent upgrade [--check] [--version X]   поставить новую версию агента из каталога сборок
 //	agent pack [--env ИМЯ] [--platform linux/amd64,…]   архив папки агента для узла
@@ -26,9 +27,11 @@
 //	agent sysmetrics                   встроенный воркер метрик узла (агент запускает его сам)
 //
 // Файл настроек — -config, иначе --env ИМЯ (agent.ИМЯ.yaml папки агента), иначе
-// --instance ИМЯ (/etc/agent-ИМЯ/agent.yaml), иначе AGENT_CONFIG, иначе экземпляр,
-// чья это программа (/opt/agent-ИМЯ/bin/agent), иначе agent.yaml папки агента
-// (рядом с программой, затем в текущем каталоге), иначе /etc/agent/agent.yaml
+// --instance ИМЯ (/etc/agent-ИМЯ/agent.yaml; у пользователя без root — его
+// ~/.agent-ИМЯ/agent.yaml, если он есть), иначе AGENT_CONFIG, иначе экземпляр,
+// чья это программа (/opt/agent-ИМЯ/bin/agent, ~/.agent/bin/agent), иначе
+// agent.yaml папки агента (рядом с программой, затем в текущем каталоге),
+// иначе ~/.agent/agent.yaml агента пользователя, иначе /etc/agent/agent.yaml
 // (на macOS ~/.agent/agent.yaml), если он есть. Файл может опираться на другой
 // (extends) и брать значения из файлов переменных (envFiles).
 //
@@ -74,7 +77,8 @@ const usage = `agent — агент для узлов: связь с серве�
   agent run [-config ФАЙЛ | --env ИМЯ]
                                  работать (по умолчанию)
   agent install --server URL --token ТОКЕН [флаги]
-                                 поставить службой systemd (Linux, sudo); флаги — agent install -h
+                                 поставить службой systemd (Linux, sudo); --rootless — для пользователя
+                                 без root (~/.agent); флаги — agent install -h
   agent uninstall [--purge]      удалить службу; --purge — ещё настройки и данные
   agent init [ПАПКА] [--server URL] [--token ТОКЕН] [--force]
                                  папка агента: программа, agent.yaml (эта машина), agent.prod.yaml
@@ -105,9 +109,9 @@ const usage = `agent — агент для узлов: связь с серве�
 с --instance ИМЯ (или через ссылку agent-ИМЯ) работают с ним.
 
 Файл настроек: -config, иначе --env ИМЯ (agent.ИМЯ.yaml папки агента), иначе --instance,
-иначе AGENT_CONFIG, иначе agent.yaml рядом с программой или в текущем каталоге, иначе %s
-(если есть). Файл может опираться на другой (extends: agent.yaml) и брать значения ${ИМЯ}
-из файлов переменных (envFiles: [.env]).
+иначе AGENT_CONFIG, иначе agent.yaml рядом с программой или в текущем каталоге, иначе
+~/.agent/agent.yaml (агент пользователя), иначе %s (если есть). Файл может опираться
+на другой (extends: agent.yaml) и брать значения ${ИМЯ} из файлов переменных (envFiles: [.env]).
 `
 
 func main() {
@@ -183,22 +187,27 @@ func configFlag(fs *flag.FlagSet) target {
 	}
 }
 
-// layout — экземпляр: --instance, иначе тот, чья это программа
-// (/opt/agent-ИМЯ/bin/agent, в том числе по ссылке agent-ИМЯ), иначе по умолчанию.
+// layout — экземпляр: тот, чья это программа (/opt/agent-ИМЯ/bin/agent,
+// ~/.agent/bin/agent, в том числе по ссылке), если флагов нет; иначе
+// --instance (или по умолчанию) — от пользователя его собственный агент,
+// если он поставлен, иначе системный.
 func (t target) layout() (install.Paths, error) {
 	name := *t.instance
 	if name == "" && *t.config == "" && *t.env == "" && os.Getenv("AGENT_CONFIG") == "" {
-		name = selfInstance()
+		if l, ok := selfLayout(); ok {
+			return l, nil
+		}
 	}
 	if err := install.CheckInstance(name); err != nil {
 		return install.Paths{}, err
 	}
-	return install.Layout(name), nil
+	return install.Find(name, userHome(), os.Geteuid()), nil
 }
 
 // path — файл настроек: -config, --env (файл окружения в папке агента),
 // --instance (или экземпляр программы), AGENT_CONFIG, agent.yaml в папке
-// агента, файл по умолчанию. -config, --env и --instance — что-то одно.
+// агента, агент пользователя (~/.agent/agent.yaml), файл по умолчанию.
+// -config, --env и --instance — что-то одно.
 func (t target) path() (string, error) {
 	set := 0
 	for _, v := range []string{*t.config, *t.env, *t.instance} {
@@ -223,6 +232,9 @@ func (t target) path() (string, error) {
 	for _, dir := range localDirs() {
 		local = append(local, filepath.Join(dir, config.FileName))
 	}
+	if l.Home {
+		local = append(local, l.ConfigFile)
+	}
 	return config.ResolvePath(*t.config, local...), nil
 }
 
@@ -238,20 +250,25 @@ func envConfig(env string, dirs []string) (string, error) {
 		}
 	}
 	if len(dirs) == 0 {
-		return "", fmt.Errorf("--env: у агента, поставленного службой, нет папки агента — его настройки в %s", install.Layout(selfInstance()).ConfigFile)
+		l, ok := selfLayout()
+		if !ok {
+			l = install.Layout("")
+		}
+		return "", fmt.Errorf("--env: у установленного агента нет папки агента — его настройки в %s", l.ConfigFile)
 	}
 	return "", fmt.Errorf("--env %s: нет %s (искал в %s)", env, name, strings.Join(dirs, ", "))
 }
 
-// localDirs — папка агента: каталог программы, затем текущий. У программы,
-// поставленной службой (/opt/agent…/bin), папки нет — её настройки в /etc.
+// localDirs — папка агента: каталог программы, затем текущий. У
+// установленной программы (/opt/agent…/bin, ~/.agent…/bin) папки нет — её
+// настройки в /etc/agent… или ~/.agent….
 func localDirs() []string {
 	var dirs []string
 	if exe, err := os.Executable(); err == nil {
 		if real, err := filepath.EvalSymlinks(exe); err == nil {
 			exe = real
 		}
-		if _, ok := install.InstanceOf(exe); ok || exe == install.Binary {
+		if _, ok := install.Self(exe, userHome()); ok {
 			return nil
 		}
 		dirs = append(dirs, filepath.Dir(exe))
@@ -270,20 +287,41 @@ func warning(path string, p config.Problem) string {
 	return config.ShortPath(path) + ": " + p.String()
 }
 
-// selfInstance — экземпляр, которому принадлежит запущенная программа ("" — нет).
-func selfInstance() string {
+// selfLayout — установленный экземпляр, которому принадлежит запущенная
+// программа (ok=false — программа не установленного агента).
+func selfLayout() (install.Paths, bool) {
 	exe, err := os.Executable()
 	if err != nil {
-		return ""
+		return install.Paths{}, false
 	}
-	name, _ := install.InstanceOf(exe)
-	return name
+	if real, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = real
+	}
+	return install.Self(exe, userHome())
+}
+
+// userHome — домашний каталог пользователя ("" — нет).
+func userHome() string {
+	h, _ := os.UserHomeDir()
+	return h
+}
+
+// selfRestart — перезапускается ли агент сам (exec): установлен без службы
+// (агент пользователя без systemd --user) — перезапустить его некому.
+// Остальных перезапускает менеджер процесса: служба, контейнер, свой.
+func selfRestart() bool {
+	l, ok := selfLayout()
+	return ok && install.ModeOf(l) == install.ModeManual
 }
 
 func run(args []string) error {
 	// Первым делом: новая версия, не связавшаяся с сервером за несколько
 	// запусков, откатывается — даже если падает на конфигурации.
-	if exe, err := os.Executable(); err == nil {
+	exe, exeErr := os.Executable()
+	if exeErr == nil {
+		if real, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = real
+		}
 		if err := update.Boot(update.NewPaths(exe)); err != nil {
 			fmt.Fprintln(os.Stderr, "agent: проверка обновления:", err)
 		}
@@ -301,6 +339,10 @@ func run(args []string) error {
 		for _, p := range config.Unknown(path) {
 			fmt.Fprintf(os.Stderr, "agent: предупреждение: %s\n", warning(path, p))
 		}
+		// agent.env рядом с настройками (токен, ключи) — как у службы; окружение важнее.
+		if _, err := config.ApplyEnvFile(config.EnvFile(path)); err != nil {
+			return err
+		}
 	}
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -310,6 +352,9 @@ func run(args []string) error {
 		return err
 	}
 	app.BuiltinUpdateKey = updateKey
+	if l, ok := selfLayout(); ok {
+		app.InstallMode = install.ModeOf(l)
+	}
 	agent, err := app.New(cfg, version)
 	if err != nil {
 		app.RecordExit(cfg.DataDir, err)
@@ -317,6 +362,10 @@ func run(args []string) error {
 	}
 	// SIGTERM, SIGINT — остановка; SIGUSR1 — перезапуск; SIGHUP (systemctl reload) — перечитать настройки.
 	err = agent.Serve(path)
+	if errors.Is(err, app.ErrRestart) && exeErr == nil && selfRestart() {
+		// Агент без службы перезапускает себя сам — новой версией после обновления.
+		return syscall.Exec(exe, os.Args, os.Environ())
+	}
 	if errors.Is(err, app.ErrRestart) || errors.Is(err, context.Canceled) {
 		// Перезапуск — дело менеджера процесса (systemd Restart=always, Docker restart).
 		return nil
@@ -427,7 +476,7 @@ func stopWorkersCmd(args []string) error {
 	names, err := app.StopWorkers(cfg)
 	if errors.Is(err, app.ErrLocked) {
 		l, _ := flagPath.layout()
-		return fmt.Errorf("агент работает — сначала остановите его (systemctl stop %s)", l.Unit)
+		return fmt.Errorf("агент работает — сначала остановите его (%s stop %s)", l.Systemctl(), l.Unit)
 	}
 	if err != nil {
 		return err

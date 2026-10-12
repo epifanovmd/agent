@@ -207,8 +207,25 @@ const cmd = agents.installCommand({
 `tokenFile` или нет адреса (ни `baseUrl` в вызове, ни опции `baseUrl`). `privileged: true` нужен, только если воркер настраивает
 сам узел: сеть, firewall, системные файлы.
 
+Способ установки — опции `rootless` и `run` (по умолчанию — служба systemd от root):
+
+```ts
+agents.installCommand({ token, rootless: true });
+// curl -fsSL '…/install.sh' | sh -s -- --rootless --token '…'   — без sudo, агент в ~/.agent
+agents.installCommand({ token, run: true });
+// curl -fsSL '…/install.sh' | sh -s -- --run --token '…'        — без установки, на переднем плане
+```
+
+`rootless` — агент пользователя без root: команда без `sudo`, служба пользователя systemd (её нет —
+агент в фоне с автозапуском из `crontab`); с ним нельзя `user`, `sysctl`, `privileged`, `rwPaths` и
+пакеты. `run` — без установки: агент запускается здесь же на переднем плане (контейнер, свой
+менеджер процессов), себя не обновляет; с ним — только `token` или `tokenFile`, `name`, `caFile` и
+`releases`. Несовместимые опции — ошибка `MESSAGE_INVALID`. Что ставится в каждом случае —
+[ARCHITECTURE.md](../../docs/ARCHITECTURE.md#установка).
+
 `install.sh` скачивает с бэкенда сборку агента под машину, сверяет контрольную сумму и
-запускает `agent install` с этими флагами. Агент ставится службой systemd, при первом запуске
+запускает `agent install` с этими флагами (с `run` — `agent run`). Агент ставится службой systemd
+(или так, как задано опциями `rootless` и `run`), при первом запуске
 регистрируется по токену ([connection.md](connection.md#регистрация-по-токену)) и появляется в
 `agents.listAgents()`. Воркер со сборкой с сервера (`--worker report`) ставится в
 `/var/lib/agent/workers/report/current` и прописывается в `agent.yaml` с `release: true`.
@@ -220,6 +237,29 @@ const cmd = agents.installCommand({
 обновляются по отдельности. Пути и команды экземпляра —
 [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#несколько-агентов-на-одном-узле).
 
+## Установка из архива проекта
+
+Бэкенд, у которого настройки и воркеры агента — своя папка агента (`agent pack`), раздаёт её архивы:
+опция `bundlesDir` — каталог архивов `agent-<окружение>-<версия>-linux-<arch>.tar.gz`. SDK отдаёт
+установщик `GET /api/v1/agent-link/bundle/install.sh` (адрес сервера подставлен) и новейший архив под
+платформу узла `GET /api/v1/agent-link/bundle/linux-<arch>.tar.gz` (`darwin-<arch>` — для разработки); команда — `bundleInstallCommand`:
+
+```ts
+const agents = new Agents({ bundlesDir: "/app/agent/bundle", baseUrl: "https://api.example.com", … });
+agents.bundleInstallCommand({ token, name: "node-01" });
+// curl -fsSL '…/api/v1/agent-link/bundle/install.sh' | sudo sh -s -- --token '…' --name 'node-01'
+agents.bundleInstallCommand({ token, rootless: true }); // без root: | sh -s -- --rootless …
+agents.bundleInstallCommand({ token, run: true });      // без установки (контейнер): | sh -s -- --run …
+```
+
+Адрес установщика — `bundleInstallUrl(baseUrl)` (например, чтобы скачать его по SSH и запустить
+с `--token-file` или `--uninstall`). Экземпляр, воркеры, пакеты и права — в настройках архива
+(`instance`, `install:`); в команде — только
+токен (`token` или `tokenFile`), имя и способ (`rootless` или `run`). Установщик скачивает архив под
+машину и запускает из него `agent install --server <адрес>` (служба или `--rootless`) или `agent run`
+(`--run`: данные — `AGENT_DATA_DIR`, по умолчанию `/var/lib/agent`); удалить — тем же установщиком:
+`… | sudo sh -s -- --uninstall [--purge]`.
+
 ## Обновление агента
 
 ```ts
@@ -228,6 +268,10 @@ for (const c of candidates) await agents.updateAgent(c.agentId); // → { versio
 ```
 
 Кандидаты — агенты, чья версия отличается от версии в манифесте сборок и для чьих ОС и процессора есть сборка.
+Агенты, которые себя не обновляют (`hello.agent.updateMode` — `external` у агента в контейнере или
+`disabled`), в кандидаты не входят: `agent.update` им ответил бы `UPDATE_NOT_SUPPORTED`. Как агент
+поставлен на узел — `hello.agent.install` (`systemd`, `user`, `manual`; нет — запущен иначе,
+например в контейнере).
 Нет манифеста или сборки — `UPDATE_NOT_AVAILABLE`. Аудит — `agent.update`.
 
 **Что уходит по сети.** `action {name: "agent.update", args: {version, url, sha256, signature}}`

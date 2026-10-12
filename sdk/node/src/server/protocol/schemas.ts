@@ -204,6 +204,10 @@ export const helloSchema = z.looseObject({
     startedAt: z.number(),
     /** Неверное значение пропускается. */
     update: agentUpdateInfoSchema.optional().catch(undefined),
+    /** Режим обновления агента: self | external | disabled (§4, §11). */
+    updateMode: z.string().optional().catch(undefined),
+    /** Как агент поставлен на узел: systemd | user | manual (§4). */
+    install: z.string().optional().catch(undefined),
   }),
   host: hostInfoSchema,
   /** Метки агента; неверные пропускаются. */

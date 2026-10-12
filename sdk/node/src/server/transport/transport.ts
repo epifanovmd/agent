@@ -18,6 +18,7 @@ import {
   WS_CHANNEL,
 } from "../protocol/messages";
 import { envelopeSchema } from "../protocol/schemas";
+import { type BundleSource, serveBundle } from "./bundle";
 import { baseUrl, clientAddress, readJSON, sendJSON } from "./http";
 import { type ReleaseSource, serveRelease } from "./releases";
 
@@ -30,7 +31,8 @@ export const transportDefaults = {
 const MISSED_PONGS = 2;
 
 /** Что транспорт передаёт дальше. */
-export interface TransportHost extends ReleaseSource {
+export interface TransportHost extends ReleaseSource, BundleSource {
+  readonly settings: ReleaseSource["settings"] & BundleSource["settings"];
   /** Частота ping агенту, мс (опция pingIntervalMs). */
   readonly pingIntervalMs: number;
   /** Регистрация: функция чтения тела и адрес клиента → ключ агента. */
@@ -59,7 +61,10 @@ export class Transport {
       return true;
     }
 
-    return serveRelease(this.host, req, res, path);
+    return (
+      (await serveBundle(this.host, req, res, path)) ||
+      serveRelease(this.host, req, res, path)
+    );
   }
 
   close(): void {

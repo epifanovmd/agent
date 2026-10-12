@@ -171,6 +171,12 @@ export interface AgentsOptions {
    */
   releasesDir?: string;
   /**
+   * Каталог архивов папки агента проекта (`agent pack`: agent-<окружение>-<версия>-linux-<arch>.tar.gz).
+   * SDK раздаёт установщик `bundle/install.sh` и новейший архив под платформу узла; команда —
+   * bundleInstallCommand.
+   */
+  bundlesDir?: string;
+  /**
    * Откуда брать агента и его воркеры (netprobe): релизы GitHub (GitHub Releases) или база сборок по ссылке. SDK
    * сам следит за новыми версиями; итоговые сборки — удалённые плюс воркеры проекта из
    * releasesDir.
@@ -231,6 +237,7 @@ type Optional =
   | "onEvent"
   | "onWorkerRequest"
   | "releasesDir"
+  | "bundlesDir"
   | "agentReleases"
   | "publicKey"
   | "baseUrl"
@@ -271,6 +278,7 @@ export const resolveOptions = (opts: AgentsOptions): Settings => {
     actionTimeoutMs: opts.actionTimeoutMs ?? 60_000,
     updateTimeoutMs: opts.updateTimeoutMs ?? 300_000,
     releasesDir: opts.releasesDir,
+    bundlesDir: opts.bundlesDir,
     agentReleases: opts.agentReleases,
     publicKey: opts.publicKey,
     updatePublicKeys: opts.updatePublicKeys ?? [],

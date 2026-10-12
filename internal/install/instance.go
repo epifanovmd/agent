@@ -16,7 +16,10 @@ import (
 // установки. Экземпляр по умолчанию (без имени) — пути без окончания.
 type Paths struct {
 	// Instance — имя экземпляра ("" — по умолчанию).
-	Instance    string
+	Instance string
+	// Home — агент пользователя без root (HomeLayout): всё в ~/.agent[-ИМЯ],
+	// служба — systemd --user.
+	Home        bool
 	EtcDir      string
 	ConfigFile  string
 	EnvFile     string
@@ -34,7 +37,7 @@ type Paths struct {
 	// Service — имя службы systemd; Unit — оно же без .service (journalctl -u).
 	Service string
 	Unit    string
-	// User — пользователь службы по умолчанию.
+	// User — пользователь службы по умолчанию ("" — у агента пользователя: он сам).
 	User string
 }
 
@@ -56,6 +59,69 @@ func Layout(name string) Paths {
 		SysctlFile: "/etc/sysctl.d/90-" + base + ".conf", Link: "/usr/local/bin/" + base,
 		Service: base + ".service", Unit: base, User: base,
 	}
+}
+
+// HomeLayout — пути экземпляра name агента пользователя без root с домашним
+// каталогом home: настройки и журнал установки — в ~/.agent[-ИМЯ], данные — в его data, программа — в bin; служба —
+// ~/.config/systemd/user/agent[-ИМЯ].service, ссылка — ~/.local/bin. Те же
+// пути, что у агента на macOS по умолчанию (~/.agent/agent.yaml, ~/.agent/data).
+func HomeLayout(home, name string) Paths {
+	base := "agent"
+	if name != "" {
+		base += "-" + name
+	}
+	dir := filepath.Join(home, "."+base)
+	bin := filepath.Join(dir, "bin")
+	return Paths{
+		Instance: name, Home: true, EtcDir: dir, ConfigFile: filepath.Join(dir, "agent.yaml"),
+		EnvFile: filepath.Join(dir, "agent.env"), CAFile: filepath.Join(dir, "ca.pem"),
+		JournalFile: filepath.Join(dir, "install-state"), DataDir: filepath.Join(dir, "data"),
+		OptDir: bin, BinDir: bin, Binary: filepath.Join(bin, "agent"),
+		UnitFile: filepath.Join(home, ".config/systemd/user", base+".service"),
+		Link:     filepath.Join(home, ".local/bin", base),
+		Service:  base + ".service", Unit: base,
+	}
+}
+
+// Find — экземпляр name на этой машине: от root — системный; от
+// пользователя — его собственный (HomeLayout), если он поставлен, иначе системный.
+func Find(name, home string, euid int) Paths {
+	return (&System{Euid: func() int { return euid }, Home: home}).find(name)
+}
+
+func (s *System) find(name string) Paths {
+	if s.Euid() != 0 && s.Home != "" {
+		if l := HomeLayout(s.Home, name); isFile(s.p(l.JournalFile)) || isFile(s.p(l.ConfigFile)) {
+			return l
+		}
+	}
+	return Layout(name)
+}
+
+// Self — экземпляр, которому принадлежит программа exe: системный
+// (/opt/agent[-ИМЯ]/bin/agent) или пользователя с домашним каталогом home
+// (~/.agent[-ИМЯ]/bin/agent); ok=false — программа не установленного агента.
+func Self(exe, home string) (Paths, bool) {
+	if name, ok := InstanceOf(exe); ok {
+		return Layout(name), true
+	}
+	if exe == Binary {
+		return Layout(""), true
+	}
+	if home == "" || filepath.Base(filepath.Dir(exe)) != "bin" {
+		return Paths{}, false
+	}
+	dir := filepath.Dir(filepath.Dir(exe))
+	if filepath.Dir(dir) != filepath.Clean(home) {
+		return Paths{}, false
+	}
+	switch base := filepath.Base(dir); {
+	case base == ".agent":
+		return HomeLayout(home, ""), true
+	case strings.HasPrefix(base, ".agent-") && message.ValidName(strings.TrimPrefix(base, ".agent-")):
+		return HomeLayout(home, strings.TrimPrefix(base, ".agent-")), true
+	}
+	return Paths{}, false
 }
 
 // CheckInstance — имя экземпляра: как имя воркера (строчная латиница, цифры
@@ -85,6 +151,14 @@ func InstanceOf(exe string) (string, bool) {
 
 // Name — имя экземпляра для текстов: «agent» или «agent-ИМЯ».
 func (l Paths) Name() string { return l.Unit }
+
+// Systemctl — systemctl для службы экземпляра: «systemctl» или «systemctl --user».
+func (l Paths) Systemctl() string {
+	if l.Home {
+		return "systemctl --user"
+	}
+	return "systemctl"
+}
 
 // Flag — флаг экземпляра для подсказок команд: "" или " --instance ИМЯ".
 func (l Paths) Flag() string {

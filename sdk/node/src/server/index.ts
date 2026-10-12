@@ -32,6 +32,9 @@ export type {
   WorkerUpdateResult,
 } from "./features/actions";
 export {
+  bundleInstallCommand,
+  type BundleInstallOptions,
+  bundleInstallUrl,
   installCommand,
   type InstallOptions,
   PACKAGE_MANAGERS,

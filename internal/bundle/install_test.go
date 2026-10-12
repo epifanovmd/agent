@@ -159,3 +159,23 @@ func TestInstallFromBundle(t *testing.T) {
 		t.Fatal(".bak")
 	}
 }
+
+// Раздел install файла настроек у агента пользователя без root: что требует
+// root, пропускается — в Ignored; служба получает всё.
+func TestApplyRootless(t *testing.T) {
+	in := config.Install{
+		Packages: []string{"jq"}, Privileged: true, User: "svc", RWPaths: []string{"/srv/example"},
+		Sysctl: map[string]string{"vm.max_map_count": "262144"}, KillMode: "mixed", StopTimeout: "1min",
+	}
+	home := install.Options{Rootless: true, Home: "/home/u"}
+	apply(&home, in)
+	if len(home.Packages) != 0 || home.Privileged || home.User != "" || len(home.RWPaths) != 0 || len(home.Sysctls) != 0 ||
+		home.KillMode != "mixed" || home.StopTimeout != "1min" || len(home.Ignored) != 5 {
+		t.Fatalf("агент пользователя: %+v", home)
+	}
+	system := install.Options{}
+	apply(&system, in)
+	if len(system.Packages) != 1 || !system.Privileged || system.User != "svc" || system.KillMode != "mixed" || len(system.Ignored) != 0 {
+		t.Fatalf("служба: %+v", system)
+	}
+}

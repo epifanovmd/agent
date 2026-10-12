@@ -24,9 +24,12 @@ func (l list) Set(v string) error {
 }
 
 // Usage — справка agent install.
-const Usage = `agent install — поставить агента службой systemd (Linux, нужен root).
+const Usage = `agent install — поставить агента на Linux: службой systemd (root) или для пользователя
+без root.
 
-  sudo agent install --server https://api.example.com --token <токен> [флаги]
+  sudo agent install --server https://api.example.com --token <токен> [флаги]   служба systemd
+  agent install --rootless --server … --token …     без root: ~/.agent, служба systemd --user
+                                                     (её нет — в фоне, автозапуск из crontab)
 
 Из папки агента или распакованного архива agent pack — по её настройкам:
 
@@ -36,8 +39,9 @@ const Usage = `agent install — поставить агента службой 
 воркеры со сборкой, значения из файлов переменных — в agent.env; instance и install в файле
 настроек — то же, что флаги --instance и флаги установки (флаги важнее).
 
-Повторный запуск обновляет программу и службу; ключ агента, agent.yaml и
-agent.env сохраняются (переданные --token и --update-key заменяют прежние).
+Повторный запуск обновляет программу и службу прежним способом; ключ агента,
+agent.yaml и agent.env сохраняются (переданные --token и --update-key заменяют прежние).
+Сменить способ — agent uninstall (настройки и данные остаются), затем install.
 
 Несколько агентов на одном узле (для разных бэкендов) — экземпляры:
 --instance ИМЯ ставит или обновляет экземпляр ИМЯ со своими путями
@@ -45,6 +49,7 @@ agent.env сохраняются (переданные --token и --update-key �
 без флага — экземпляр по умолчанию (/etc/agent, служба agent).
 
 Флаги:
+  --rootless              агент пользователя без root (запускать без sudo)
   --instance ИМЯ          экземпляр: строчная латиница, цифры и «-», до 32 символов
   --server URL            адрес бэкенда (нужен, если ещё нет agent.yaml экземпляра)
   --token ТОКЕН           токен регистрации → agent.env (0600)
@@ -70,7 +75,7 @@ agent.env сохраняются (переданные --token и --update-key �
                           работают дальше; mixed — и воркеры (запоминается)
   --stop-timeout СРОК     сколько systemd ждёт остановки (по умолчанию 15min)
 
-Удаление: sudo agent uninstall [--instance ИМЯ] [--purge]
+Удаление: [sudo] agent uninstall [--instance ИМЯ] [--purge] — тем же пользователем, что и установка
 `
 
 // ParseFlags — флаги agent install.
@@ -95,6 +100,7 @@ func ParseFlags(args []string, errOut io.Writer) (Options, error) {
 	fs.StringVar(&o.StopTimeout, "stop-timeout", "", "")
 	fs.StringVar(&o.Releases, "releases", "", "")
 	fs.BoolVar(&o.Privileged, "privileged", false, "")
+	fs.BoolVar(&o.Rootless, "rootless", false, "")
 	fs.Var(list{to: &o.RWPaths}, "rw-path", "")
 	fs.Var(list{to: &o.Sysctls}, "sysctl", "")
 	fs.Var(list{to: &o.Workers}, "worker", "")

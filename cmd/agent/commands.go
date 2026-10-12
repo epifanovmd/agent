@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,7 +38,7 @@ func installCmd(args []string) error {
 		return err
 	}
 	if runtime.GOOS != "linux" {
-		return errors.New("agent install — для Linux с systemd; здесь запускайте агента напрямую: agent init, затем agent run")
+		return errors.New("agent install — для Linux (служба systemd или агент пользователя без root); здесь запускайте агента напрямую: agent init, затем agent run")
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -46,9 +47,12 @@ func installCmd(args []string) error {
 	if real, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = real
 	}
+	sys := install.Host(os.Stdout, os.Stderr)
 	if o.Instance == "" {
-		// Программа экземпляра (/opt/agent-ИМЯ/bin/agent) обновляет свой экземпляр.
-		o.Instance, _ = install.InstanceOf(exe)
+		// Программа экземпляра (/opt/agent-ИМЯ/bin/agent, ~/.agent-ИМЯ/bin/agent) обновляет свой экземпляр.
+		if l, ok := install.Self(exe, sys.Home); ok {
+			o.Instance = l.Instance
+		}
 	}
 	o.Binary, o.Version, o.BuiltinKey = exe, version, updateKey
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -70,21 +74,30 @@ func installCmd(args []string) error {
 		defer os.RemoveAll(filepath.Dir(dir))
 		packed = true
 	} else if !packed {
-		return install.Install(ctx, install.Host(os.Stdout, os.Stderr), o)
+		return install.Install(ctx, sys, o)
+	}
+	// Экземпляр из настроек архива — до выбора путей установки.
+	if o.Instance == "" {
+		if o.Instance, err = bundle.Instance(dir); err != nil {
+			return err
+		}
+	}
+	if err := install.Plan(sys, &o); err != nil {
+		return err
 	}
 	tmp, err := bundle.Prepare(dir, runtime.GOOS, runtime.GOARCH, &o)
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	if err := install.Install(ctx, install.Host(os.Stdout, os.Stderr), o); err != nil {
+	if err := install.Install(ctx, sys, o); err != nil {
 		return err
 	}
 	if o.Token == "" && o.TokenFile == "" {
 		fmt.Fprintln(os.Stderr, "agent: предупреждение: токена регистрации нет (--token или AGENT_ENROLL_TOKEN в файле переменных) — без него агент не зарегистрируется, если ещё не зарегистрирован")
 	}
 	cfg := config.Defaults()
-	cfg.DataDir = install.Layout(o.Instance).DataDir
+	cfg.DataDir = o.Layout().DataDir
 	updateNotice(cfg, true)
 	return nil
 }
@@ -132,7 +145,9 @@ func uninstallCmd(args []string) error {
 	}
 	self, _ := os.Executable()
 	if *instance == "" {
-		*instance = selfInstance()
+		if l, ok := selfLayout(); ok {
+			*instance = l.Instance
+		}
 	}
 	if *instance == "" && self != "" {
 		// Из распакованного архива agent pack — экземпляр из его настроек.
@@ -143,7 +158,10 @@ func uninstallCmd(args []string) error {
 		*instance = name
 	}
 	if runtime.GOOS != "linux" {
-		return errors.New("agent uninstall — для Linux с systemd")
+		return errors.New("agent uninstall — для Linux")
+	}
+	if err := install.CheckInstance(*instance); err != nil {
+		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -440,8 +458,11 @@ func printStatus(w io.Writer, rep statusReport, now time.Time) {
 		if e := rep.LastExit; e != nil {
 			fmt.Fprintf(w, "Последний раз завершился с ошибкой %s:\n  %s\n", when(e.At), short(e.Error))
 		}
-		if u := rep.unit; u.UnitFile != "" && isFile(u.UnitFile) {
-			fmt.Fprintf(w, "Служба: systemctl status %s; лог: agent logs%s (journalctl -u %s -n 100)\n", u.Unit, u.Flag(), u.Unit)
+		switch u := rep.unit; install.ModeOf(u) {
+		case install.ModeSystemd, install.ModeUser:
+			fmt.Fprintf(w, "Служба: %s status %s; лог: agent logs%s\n", u.Systemctl(), u.Unit, u.Flag())
+		case install.ModeManual:
+			fmt.Fprintf(w, "Без службы: запустить — %s run; лог — agent logs%s (%s)\n", u.Binary, u.Flag(), install.ManualLog(u))
 		}
 		return
 	}
@@ -535,7 +556,8 @@ func isFile(path string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// logs — лог службы: journalctl -u agent[-ИМЯ]. Без службы systemd — где искать лог.
+// logs — лог службы: journalctl -u agent[-ИМЯ] (у агента пользователя —
+// journalctl --user), без службы — файл лога (agent install запускает агента в фоне).
 func logs(args []string) error {
 	set := flag.NewFlagSet("logs", flag.ContinueOnError)
 	follow := set.Bool("f", false, "следить за новыми записями")
@@ -548,17 +570,34 @@ func logs(args []string) error {
 	if err != nil {
 		return err
 	}
-	journalctl, err := exec.LookPath("journalctl")
-	if err != nil || !isFile(l.UnitFile) {
+	var argv []string
+	switch install.ModeOf(l) {
+	case install.ModeSystemd, install.ModeUser:
+		argv = []string{"journalctl", "-u", l.Unit, "-n", strconv.Itoa(*lines), "--no-pager"}
+		if l.Home {
+			argv = slices.Insert(argv, 1, "--user")
+		}
+	case install.ModeManual:
+		// Агент без службы пишет лог в файл (agent install запускает его в фоне).
+		argv = []string{"tail", "-n", strconv.Itoa(*lines)}
+		if *follow {
+			argv = append(argv, "-F")
+		}
+		argv = append(argv, install.ManualLog(l))
+	}
+	if *follow && argv != nil && argv[0] != "tail" {
+		argv = append(argv, "-f")
+	}
+	prog := ""
+	if argv != nil {
+		prog, err = exec.LookPath(argv[0])
+	}
+	if argv == nil || err != nil {
 		fmt.Println("Агент пишет лог в stderr, своих файлов лога нет:")
-		fmt.Printf("  служба systemd — journalctl -u %s -f (служба не найдена на этой машине);\n", l.Unit)
+		fmt.Printf("  служба systemd — journalctl -u %s -f, служба пользователя — journalctl --user -u %s -f (служба не найдена на этой машине);\n", l.Unit, l.Unit)
 		fmt.Println("  контейнер — docker logs -f <контейнер>;")
 		fmt.Println("  agent run в терминале — лог в этом терминале.")
 		return errQuiet
 	}
-	argv := []string{"journalctl", "-u", l.Unit, "-n", strconv.Itoa(*lines), "--no-pager"}
-	if *follow {
-		argv = append(argv, "-f")
-	}
-	return syscall.Exec(journalctl, argv, os.Environ())
+	return syscall.Exec(prog, argv, os.Environ())
 }

@@ -1,11 +1,14 @@
 #!/bin/sh
-# Установка агента одной командой (Linux с systemd): скачивает сборку агента под эту машину
-# и запускает `agent install` — он и ставит службу. Все флаги, кроме своих (ниже), передаются
-# agent install как есть: --token, --name, --worker, --packages, --sysctl, --privileged и др.
+# Установка агента одной командой (Linux): скачивает сборку агента под эту машину и запускает
+# `agent install` — он и ставит службу systemd или агента пользователя без root (--rootless).
+# Все флаги, кроме своих (ниже), передаются agent install как есть: --token, --name, --worker,
+# --packages, --sysctl, --privileged, --rootless и др.
 # (список — agent install -h и docs/ARCHITECTURE.md, раздел «Установка»).
 #
 # С сервера (он раздаёт этот скрипт со своим адресом и ключами проверки подписи сборок):
 #   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --token <токен> [флаги]
+#   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sh -s -- --rootless --token <токен>
+#   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sh -s -- --run --token <токен>
 #   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --uninstall [--purge]
 #
 # Свои флаги:
@@ -17,7 +20,12 @@
 #   --instance ИМЯ    экземпляр агента (несколько агентов на одном узле — для разных бэкендов);
 #                     передаётся и agent install
 #   --uninstall [--purge]   удалить агента: /opt/agent/bin/agent uninstall [--purge]
-#                     (экземпляр — /opt/agent-ИМЯ/bin/agent uninstall --instance ИМЯ [--purge])
+#                     (экземпляр — /opt/agent-ИМЯ/bin/agent uninstall --instance ИМЯ [--purge];
+#                     без sudo — агента пользователя: ~/.agent[-ИМЯ]/bin/agent uninstall)
+#   --run             без установки: агент здесь же на переднем плане (контейнер, свой менеджер
+#                     процессов) — `agent run` с --token/--token-file и --name, данные —
+#                     AGENT_DATA_DIR (по умолчанию /var/lib/agent); себя не обновляет
+# Без root — только с --rootless или --run (агент пользователя в ~/.agent или без установки).
 #
 # Без скрипта — то же самое вручную: скачать agent-linux-<arch> и выполнить
 #   sudo ./agent-linux-<arch> install --server URL --token <токен>
@@ -33,7 +41,7 @@ die() {
   exit 1
 }
 
-SERVER="$DEFAULT_SERVER" RELEASES="" BINARY="" CA_FILE="" UNINSTALL="" PURGE="" INSTANCE=""
+SERVER="$DEFAULT_SERVER" RELEASES="" BINARY="" CA_FILE="" UNINSTALL="" PURGE="" INSTANCE="" ROOTLESS="" RUN=""
 # Свои флаги забираются, остальные остаются в "$@" по порядку (для agent install).
 n=$#
 while [ "$n" -gt 0 ]; do
@@ -43,6 +51,11 @@ while [ "$n" -gt 0 ]; do
   case "$a" in
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
+    --rootless)
+      ROOTLESS=1
+      set -- "$@" "$a"
+      ;;
+    --run) RUN=1 ;;
     --binary | --server | --releases | --ca-file | --instance)
       [ "$n" -gt 0 ] || die "$a: нужно значение"
       v=$1
@@ -83,8 +96,9 @@ while [ "$n" -gt 0 ]; do
   esac
 done
 
-[ "$(uname -s)" = Linux ] || die "установка службой — только Linux с systemd; на других системах: agent init (папка агента), затем agent run"
-[ "$(id -u)" -eq 0 ] || die "нужны права root (sudo)"
+[ "$(uname -s)" = Linux ] || die "установка — только Linux; на других системах: agent init (папка агента), затем agent run"
+[ "$(id -u)" -eq 0 ] || [ -n "$ROOTLESS" ] || [ -n "$RUN" ] || [ -n "$UNINSTALL" ] ||
+  die "нужны права root (sudo); без root — агент пользователя (--rootless) или без установки (--run)"
 
 SERVER="${SERVER%/}"
 TMP="$(mktemp -d)"
@@ -132,20 +146,26 @@ fetch_agent() {
 }
 
 case "$INSTANCE" in
-  "") OPT=/opt/agent ;;
+  "") SUFFIX="" ;;
   [a-z]*)
     case "$INSTANCE" in
       *[!a-z0-9-]*) die "--instance: имя экземпляра — строчная латиница, цифры и «-», первая — буква" ;;
     esac
-    OPT="/opt/agent-$INSTANCE"
+    SUFFIX="-$INSTANCE"
     ;;
   *) die "--instance: имя экземпляра — строчная латиница, цифры и «-», первая — буква" ;;
 esac
+# Программа установленного агента: системного (root) или пользователя (~/.agent).
+if [ "$(id -u)" -eq 0 ]; then
+  BIN="/opt/agent$SUFFIX/bin/agent"
+else
+  BIN="${HOME:-}/.agent$SUFFIX/bin/agent"
+fi
 
 if [ -n "$UNINSTALL" ]; then
   # Удаляет установленная программа; её уже нет (удалена без --purge) — скачанная.
-  if [ -x "$OPT/bin/agent" ]; then
-    "$OPT/bin/agent" uninstall ${INSTANCE:+--instance "$INSTANCE"} ${PURGE:+--purge}
+  if [ -x "$BIN" ]; then
+    "$BIN" uninstall ${INSTANCE:+--instance "$INSTANCE"} ${PURGE:+--purge}
   else
     fetch_agent
     "$TMP/agent" uninstall ${INSTANCE:+--instance "$INSTANCE"} ${PURGE:+--purge}
@@ -154,6 +174,38 @@ if [ -n "$UNINSTALL" ]; then
 fi
 
 fetch_agent
+
+# Без установки: agent run здесь же (настройки — из окружения), только токен и имя.
+if [ -n "$RUN" ]; then
+  [ -n "$SERVER" ] || die "--server: адрес сервера"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --token | --token-file | --name | --releases | --ca-file | --instance) [ $# -ge 2 ] || die "$1: нужно значение" ;;
+    esac
+    case "$1" in
+      --token) AGENT_ENROLL_TOKEN=$2; shift 2 ;;
+      --token=*) AGENT_ENROLL_TOKEN=${1#*=}; shift ;;
+      --token-file) AGENT_ENROLL_TOKEN=$(tr -d ' \t\r\n' <"$2"); shift 2 ;;
+      --token-file=*) AGENT_ENROLL_TOKEN=$(tr -d ' \t\r\n' <"${1#*=}"); shift ;;
+      --name) AGENT_NAME=$2; shift 2 ;;
+      --name=*) AGENT_NAME=${1#*=}; shift ;;
+      # Флаги скрипта, уже учтённые при загрузке.
+      --releases | --ca-file | --instance) shift 2 ;;
+      --releases=* | --ca-file=* | --instance=*) shift ;;
+      *) die "--run: $1 — здесь только --token, --token-file и --name" ;;
+    esac
+  done
+  AGENT_SERVER_URL="$SERVER"
+  AGENT_DATA_DIR="${AGENT_DATA_DIR:-/var/lib/agent}"
+  AGENT_UPDATE_MODE="${AGENT_UPDATE_MODE:-external}"
+  export AGENT_SERVER_URL AGENT_DATA_DIR AGENT_UPDATE_MODE
+  [ -z "${AGENT_ENROLL_TOKEN:-}" ] || export AGENT_ENROLL_TOKEN
+  [ -z "${AGENT_NAME:-}" ] || export AGENT_NAME
+  [ -z "$CA_FILE" ] || export AGENT_SERVER_CA_FILE="$CA_FILE"
+  [ -z "$DEFAULT_UPDATE_KEYS" ] || export AGENT_UPDATE_PUBLIC_KEYS="$(echo $DEFAULT_UPDATE_KEYS | tr ' ' ',')"
+  mkdir -p "$AGENT_DATA_DIR"
+  exec "$TMP/agent" run
+fi
 
 # Ключи сервера — флагами --update-key перед остальными (ключи — base64 без пробелов).
 for k in $DEFAULT_UPDATE_KEYS; do

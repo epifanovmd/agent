@@ -17,12 +17,17 @@ import type {
 } from "../model/types";
 import { parseManifest } from "../protocol/checks";
 import {
+  type Hello,
   type ReleaseArtifact,
   type ReleaseManifest,
   RELEASES_PATH,
   type WorkerArtifact,
 } from "../protocol/messages";
 import { AgentReleases, isAbsolute } from "./agent-releases";
+
+/** Обновляет ли агент себя по agent.update: updateMode нет (старый агент) или self. */
+const selfUpdating = (h: Hello): boolean =>
+  !h.agent.updateMode || h.agent.updateMode === "self";
 
 /** Аргументы действия обновления: версия и где взять сборку. */
 export interface UpdateArgs extends Record<string, unknown> {
@@ -260,7 +265,10 @@ export class Release {
     return { name, ...updateArgs(art.version, art) };
   }
 
-  /** Агенты, чья версия не как на сервере и для чьих os/arch есть сборка. */
+  /**
+   * Агенты, чья версия не как на сервере и для чьих os/arch есть сборка. Агенты,
+   * которые себя не обновляют (`hello.agent.updateMode` — не self), не входят.
+   */
   async updateCandidates(): Promise<UpdateCandidate[]> {
     const m = await this.manifest();
 
@@ -271,6 +279,7 @@ export class Release {
       const h = a.hello;
 
       if (a.revoked || !h || sameVersion(h.agent.version, m.version)) continue;
+      if (!selfUpdating(h)) continue;
       if (!agentArtifact(m, h.host.os, h.host.arch)) continue;
       const { os, arch } = h.host;
 
