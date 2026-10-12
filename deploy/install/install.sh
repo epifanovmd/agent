@@ -202,7 +202,10 @@ if [ -n "$RUN" ]; then
   [ -z "${AGENT_ENROLL_TOKEN:-}" ] || export AGENT_ENROLL_TOKEN
   [ -z "${AGENT_NAME:-}" ] || export AGENT_NAME
   [ -z "$CA_FILE" ] || export AGENT_SERVER_CA_FILE="$CA_FILE"
-  [ -z "$DEFAULT_UPDATE_KEYS" ] || export AGENT_UPDATE_PUBLIC_KEYS="$(echo $DEFAULT_UPDATE_KEYS | tr ' ' ',')"
+  if [ -n "$DEFAULT_UPDATE_KEYS" ]; then
+    AGENT_UPDATE_PUBLIC_KEYS=$(echo "$DEFAULT_UPDATE_KEYS" | tr ' ' ',')
+    export AGENT_UPDATE_PUBLIC_KEYS
+  fi
   mkdir -p "$AGENT_DATA_DIR"
   exec "$TMP/agent" run
 fi
