@@ -2,7 +2,7 @@ module github.com/epifanovmd/agent
 
 // go — младшая версия Go, с которой собирается модуль; toolchain — версия, которой собираются
 // агент и его сборки для узлов (scripts/go.sh, CI, образы).
-go 1.25.0
+go 1.26.0
 
 toolchain go1.26.9
 
@@ -12,7 +12,7 @@ require github.com/shirou/gopsutil/v4 v4.25.10
 
 require (
 	go.etcd.io/bbolt v1.4.3
-	golang.org/x/sys v0.37.0
+	golang.org/x/sys v0.49.0
 )
 
 require (
