@@ -1,0 +1,314 @@
+// Package update — самообновление исполняемого файла агента: загрузка,
+// проверка sha256 и подписи Ed25519, замена с копией .prev, откат версии,
+// не дошедшей до связи с сервером за несколько запусков (boot guard); сборки
+// воркеров с сервера — файлом или архивом .tar.gz.
+package update
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"runtime"
+	"slices"
+	"strings"
+	"syscall"
+
+	"github.com/epifanovmd/agent/internal/fsutil"
+)
+
+// MaxBootAttempts — запусков новой версии без связи до отката.
+const MaxBootAttempts = 3
+
+// Release — что ставить: из команды agent.update.
+type Release struct {
+	Version   string `json:"version"`
+	URL       string `json:"url"`
+	SHA256    string `json:"sha256"`
+	Signature string `json:"signature"`
+}
+
+type marker struct {
+	Version  string `json:"version"`
+	SHA256   string `json:"sha256"`
+	Attempts int    `json:"attempts"`
+}
+
+// Paths — исполняемый файл и отметка обновления.
+type Paths struct {
+	Binary string
+	Marker string
+}
+
+// NewPaths — пути для бинаря; отметка обновления — рядом с ним: Boot
+// работает до загрузки конфигурации (новая версия может упасть раньше).
+func NewPaths(binary string) Paths {
+	return Paths{Binary: binary, Marker: binary + ".update.json"}
+}
+
+// AgentName — имя сборки агента в подписи.
+const AgentName = "agent"
+
+// Build — что подписывается: сборка Name (agent или имя воркера) версии
+// Version под OS/Arch с содержимым SHA256 (hex).
+type Build struct {
+	Name, Version, OS, Arch, SHA256 string
+}
+
+// Local — сборка name версии version под эту машину.
+func Local(name, version, sha256hex string) Build {
+	return Build{Name: name, Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH, SHA256: sha256hex}
+}
+
+// Payload — подписываемая строка (§10): agent-release/1, имя, версия, os,
+// arch, sha256 строчными — через \n.
+func (b Build) Payload() string {
+	return strings.Join([]string{"agent-release/1", b.Name, b.Version, b.OS, b.Arch, strings.ToLower(b.SHA256)}, "\n")
+}
+
+// Sign — подпись сборки: Ed25519 над Payload, base64.
+func Sign(priv ed25519.PrivateKey, b Build) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(priv, []byte(b.Payload())))
+}
+
+// Verify — подпись сборки ключом публикации: подпись другой сборки (версии,
+// платформы, имени) не подходит.
+func Verify(pub ed25519.PublicKey, b Build, signature string) error {
+	sig, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil || !ed25519.Verify(pub, []byte(b.Payload()), sig) {
+		return fmt.Errorf("update: подпись сборки %s %s (%s/%s) не сходится", b.Name, b.Version, b.OS, b.Arch)
+	}
+	return nil
+}
+
+// ParsePublicKey — ключ проверки из base64.
+func ParsePublicKey(b64 string) (ed25519.PublicKey, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	if err != nil || len(raw) != ed25519.PublicKeySize {
+		return nil, errors.New("update: ключ проверки — base64 32 байт Ed25519")
+	}
+	return ed25519.PublicKey(raw), nil
+}
+
+// Keys — ключи проверки подписи сборок: подпись сборки принимается, если сходится
+// с любым из них (автор агента подписывает агента и его воркеры, проект —
+// свои воркеры).
+type Keys []ed25519.PublicKey
+
+// ParseKeys — ключи из base64; пустые строки и повторы пропускаются.
+func ParseKeys(list ...string) (Keys, error) {
+	var out Keys
+	for _, s := range list {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		k, err := ParsePublicKey(s)
+		if err != nil {
+			return nil, err
+		}
+		if !slices.ContainsFunc(out, func(x ed25519.PublicKey) bool { return x.Equal(k) }) {
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}
+
+// Verify — подпись сборки сходится хотя бы с одним ключом; ключей нет —
+// ErrNotVerified.
+func (k Keys) Verify(b Build, signature string) error {
+	if len(k) == 0 {
+		return ErrNotVerified
+	}
+	for _, pub := range k {
+		if Verify(pub, b, signature) == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("update: подпись сборки %s %s (%s/%s) не сходится ни с одним ключом проверки", b.Name, b.Version, b.OS, b.Arch)
+}
+
+// FileHash — sha256 файла, hex.
+func FileHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// Install — скачать, проверить и подменить исполняемый файл (без перезапуска).
+func Install(ctx context.Context, client *http.Client, auth string, p Paths, keys Keys, rel Release) error {
+	if err := keys.Verify(Local(AgentName, rel.Version, rel.SHA256), rel.Signature); err != nil {
+		return err
+	}
+	if current, err := FileHash(p.Binary); err == nil && SameHash(current, rel.SHA256) {
+		return nil
+	}
+	next := p.Binary + ".new"
+	if err := Download(ctx, client, auth, rel.URL, next, rel.SHA256); err != nil {
+		return err
+	}
+	if _, err := fsutil.CopyFile(p.Binary, p.Binary+".prev", 0o755); err != nil {
+		os.Remove(next)
+		return fmt.Errorf("update: копия текущей версии: %w", err)
+	}
+	if err := writeMarker(p.Marker, marker{Version: rel.Version, SHA256: strings.ToLower(rel.SHA256)}); err != nil {
+		os.Remove(next)
+		return err
+	}
+	return os.Rename(next, p.Binary)
+}
+
+// ErrNotVerified — ни одного ключа проверки подписи нет: сборку нельзя
+// проверить, ставить её агент не будет.
+var ErrNotVerified = errors.New("update: не задан ключ проверки подписи сборок (update.publicKey, update.publicKeys)")
+
+// Fetch — проверить подпись сборки b ключами проверки и скачать файл в dst
+// (0755) со сверкой sha256. Ключей нет — ErrNotVerified.
+func Fetch(ctx context.Context, client *http.Client, auth string, keys Keys, b Build, url, signature, dst string) error {
+	if err := keys.Verify(b, signature); err != nil {
+		return err
+	}
+	return Download(ctx, client, auth, url, dst, b.SHA256)
+}
+
+// FetchArchive — как Fetch, но сборка — архив .tar.gz: после проверки он
+// распаковывается в новый каталог dst (Extract), сам архив удаляется.
+func FetchArchive(ctx context.Context, client *http.Client, auth string, keys Keys, b Build, url, signature, dst string) error {
+	archive := dst + ".tar.gz"
+	if err := Fetch(ctx, client, auth, keys, b, url, signature, archive); err != nil {
+		return err
+	}
+	defer os.Remove(archive)
+	return Extract(archive, dst)
+}
+
+// SameHash — одна ли сумма sha256 (hex): регистр букв не важен (§10).
+func SameHash(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+// Download — скачать url (ссылку http(s):// или путь к локальному файлу) в dst
+// (0755) и сверить sha256; при ошибке dst удаляется.
+func Download(ctx context.Context, client *http.Client, auth, url, dst, sha256hex string) error {
+	var body io.ReadCloser
+	if strings.Contains(url, "://") {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("update: загрузка: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return fmt.Errorf("update: загрузка: HTTP %d", resp.StatusCode)
+		}
+		body = resp.Body
+	} else {
+		in, err := os.Open(url)
+		if err != nil {
+			return fmt.Errorf("update: %w", err)
+		}
+		body = in
+	}
+	defer body.Close()
+	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return fmt.Errorf("update: %w", err)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(f, h), body); err != nil {
+		f.Close()
+		os.Remove(dst)
+		return fmt.Errorf("update: загрузка: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); !SameHash(got, sha256hex) {
+		os.Remove(dst)
+		return fmt.Errorf("update: sha256 не сходится: %s", got)
+	}
+	return nil
+}
+
+// Guard — перед каждым запуском: считать запуски новой версии; не дошла до
+// связи за MaxBootAttempts — вернуть .prev. true — откат выполнен.
+func Guard(p Paths) (bool, error) {
+	m, err := readMarker(p.Marker)
+	if err != nil || m == nil {
+		return false, nil
+	}
+	m.Attempts++
+	if m.Attempts <= MaxBootAttempts {
+		return false, writeMarker(p.Marker, *m)
+	}
+	prev := p.Binary + ".prev"
+	if _, err := os.Stat(prev); err != nil {
+		_ = os.Remove(p.Marker)
+		return false, nil
+	}
+	if _, err := fsutil.CopyFile(prev, p.Binary+".rollback", 0o755); err != nil {
+		return false, fmt.Errorf("update: откат: %w", err)
+	}
+	if err := os.Rename(p.Binary+".rollback", p.Binary); err != nil {
+		return false, fmt.Errorf("update: откат: %w", err)
+	}
+	_ = os.Remove(p.Marker)
+	return true, nil
+}
+
+// Boot — Guard в самом процессе: после отката — перезапуск прежней версии
+// (exec). Под systemd проверку делает прежняя версия до запуска новой
+// (`agent.prev boot-guard`, AGENT_BOOT_GUARD=external) — так откатывается и
+// версия, падающая до main.
+func Boot(p Paths) error {
+	if os.Getenv("AGENT_BOOT_GUARD") == "external" {
+		return nil
+	}
+	rolledBack, err := Guard(p)
+	if err != nil || !rolledBack {
+		return err
+	}
+	return syscall.Exec(p.Binary, os.Args, os.Environ())
+}
+
+// Healthy — новая версия связалась с сервером: отметка снимается.
+func Healthy(p Paths) {
+	_ = os.Remove(p.Marker)
+}
+
+func readMarker(path string) (*marker, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m marker
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func writeMarker(path string, m marker) error {
+	raw, _ := json.Marshal(m)
+	return os.WriteFile(path, raw, 0o600)
+}

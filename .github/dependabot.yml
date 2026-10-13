@@ -1,0 +1,14 @@
+# Обновления зависимостей: раз в неделю, по одному запросу на каталог.
+version: 2
+updates:
+  # Агент (go.mod в корне).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Действия CI и публикации версий.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

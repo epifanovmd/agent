@@ -1,0 +1,43 @@
+{{- /*
+Служба systemd агента (Unit). Home — агент пользователя (systemd --user): без User=, без
+ожидания сети и без ограничений файловой системы (в службах пользователя они работают не везде).
+*/ -}}
+[Unit]
+Description=Agent{{ with .Paths.Instance }} {{ . }}{{ end }}
+# Перезапуск без предела числа попыток.
+StartLimitIntervalSec=0
+{{- if not .Paths.Home }}
+Wants=network-online.target
+After=network-online.target
+{{- end }}
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
+{{- if not .Paths.Home }}
+User={{ .User }}
+{{- end }}
+EnvironmentFile=-{{ .Paths.EnvFile }}
+Environment=AGENT_BOOT_GUARD=external
+ExecStartPre=-/bin/sh -c '[ ! -x {{ .Paths.Binary }}.prev ] || {{ .Paths.Binary }}.prev boot-guard {{ .Paths.Binary }}'
+ExecStart={{ .Paths.Binary }} run -config {{ .Paths.ConfigFile }}
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+KillMode=process
+TimeoutStopSec=15min
+{{- if .Paths.Home }}
+NoNewPrivileges=true
+{{- else if .Privileged }}
+# --privileged: агент и воркеры настраивают узел — без ограничений файловой системы.
+{{- else }}
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths={{ .Paths.DataDir }} {{ .Paths.OptDir }}
+{{- end }}
+
+[Install]
+WantedBy={{ if .Paths.Home }}default.target{{ else }}multi-user.target{{ end }}

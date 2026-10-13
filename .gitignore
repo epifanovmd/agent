@@ -1,0 +1,20 @@
+# Сборки и рабочие каталоги
+dist/
+build/
+.dev/
+*.tgz
+
+# Зависимости и кеши
+node_modules/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Окружение, редакторы, ассистенты
+.env
+.idea/
+.claude/
+CLAUDE.md
+.DS_Store

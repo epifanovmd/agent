@@ -1,0 +1,166 @@
+package identity
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/epifanovmd/agent/protocol"
+)
+
+func TestStoreRoundTripAndPermissions(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	if _, ok, err := s.Load(); ok || err != nil {
+		t.Fatalf("пусто: ok=%v err=%v", ok, err)
+	}
+	want := Credentials{AgentID: "a", Secret: "s"}
+	if err := s.Save(want); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.Load()
+	if err != nil || !ok || got != want {
+		t.Fatalf("%v %v %v", got, ok, err)
+	}
+	info, _ := os.Stat(filepath.Join(dir, fileName))
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("права: %v", info.Mode().Perm())
+	}
+	if want.Authorization() != "Agent a.s" {
+		t.Fatal(want.Authorization())
+	}
+	_ = s.Forget()
+	if _, ok, _ := s.Load(); ok {
+		t.Fatal("после Forget — пусто")
+	}
+}
+
+// Регистрация (§2): 200 — ключ; 401 — токен не принят (повтор не нужен);
+// 429 — подождать Retry-After; 5xx — обычный повтор.
+func TestEnroll(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req protocol.Enroll
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case r.URL.Path != protocol.BackendPrefix+protocol.PathEnroll:
+			w.WriteHeader(http.StatusNotFound)
+		case req.Token == "busy":
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":"RATE_LIMITED","message":"подождите"}`))
+		case req.Token == "down":
+			w.WriteHeader(http.StatusBadGateway)
+		case req.Token == "proxy-SECRET-CANARY":
+			// Ответ не от сервера агентов, повторяющий запрос с токеном.
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("<html>" + req.Token + "</html>"))
+		case req.Token == "half-SECRET-CANARY":
+			_, _ = w.Write([]byte(`{"secret":"SECRET-CANARY-agent"}`))
+		case req.Token != "good" || req.Host.OS == "":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"ENROLL_DENIED","message":"токен не принят"}`))
+		default:
+			_, _ = w.Write([]byte(`{"agentId":"id-1","secret":"sec"}`))
+		}
+	}))
+	defer srv.Close()
+	host := protocol.Host{OS: "linux", Arch: "amd64", Hostname: "node-01"}
+	c, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: "good", Name: "n", Host: host})
+	if err != nil || c.AgentID != "id-1" || c.Secret != "sec" {
+		t.Fatalf("%v %v", c, err)
+	}
+	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: "bad", Host: host}); !errors.Is(err, ErrTokenRejected) ||
+		!strings.Contains(err.Error(), "ENROLL_DENIED") {
+		t.Fatalf("плохой токен: %v", err)
+	}
+	var rl *RateLimited
+	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: "busy", Host: host}); !errors.As(err, &rl) || rl.After != 7*time.Second {
+		t.Fatalf("429: %v", err)
+	}
+	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: "down", Host: host}); err == nil ||
+		errors.Is(err, ErrTokenRejected) || errors.As(err, &rl) {
+		t.Fatalf("5xx — обычная ошибка: %v", err)
+	}
+	// Тело ответа в текст ошибки не попадает: в нём может быть токен или секрет.
+	for _, tok := range []string{"proxy-SECRET-CANARY", "half-SECRET-CANARY"} {
+		_, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: tok, Host: host})
+		if err == nil || strings.Contains(err.Error(), "SECRET-CANARY") {
+			t.Fatalf("%s: %v", tok, err)
+		}
+	}
+}
+
+func TestKeysRotateFallbackPromote(t *testing.T) {
+	s := NewStore(t.TempDir())
+	creds := Credentials{AgentID: "a", Secret: "old"}
+	if err := s.Save(creds); err != nil {
+		t.Fatal(err)
+	}
+	k := NewKeys(s, creds)
+	if k.Authorization() != "Agent a.old" || k.Fallback() {
+		t.Fatal("без ожидающего — основной, отката нет")
+	}
+
+	hash, err := k.Rotate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, _, _ := s.Load()
+	if saved.Secret != "old" || len(saved.PendingSecret) != 48 || SecretHash(saved.PendingSecret) != hash || len(hash) != 64 {
+		t.Fatalf("ожидающий в файле: %+v hash=%s", saved, hash)
+	}
+	pending := "Agent a." + saved.PendingSecret
+
+	// Повторный rotate заменяет ожидающий.
+	hash2, _ := k.Rotate()
+	saved2, _, _ := s.Load()
+	if hash2 == hash || saved2.Secret != "old" || SecretHash(saved2.PendingSecret) != hash2 {
+		t.Fatalf("повторный rotate: %+v", saved2)
+	}
+	pending = "Agent a." + saved2.PendingSecret
+
+	// Сначала ожидающий; 401 — основной; снова 401 — отката нет, серия сначала.
+	if k.Authorization() != pending {
+		t.Fatal("первым — ожидающий")
+	}
+	if !k.Fallback() || k.Authorization() != "Agent a.old" {
+		t.Fatal("откат на основной")
+	}
+	if k.Fallback() {
+		t.Fatal("оба отклонены — отката нет")
+	}
+	if k.Authorization() != pending {
+		t.Fatal("новая серия — снова с ожидающего")
+	}
+
+	// Принят основной — ожидающий остаётся, следующее подключение — снова с него.
+	k.Fallback()
+	if err := k.Accepted("Agent a.old"); err != nil {
+		t.Fatal(err)
+	}
+	if k.Session() != "Agent a.old" || k.Authorization() != pending {
+		t.Fatal("после принятия основного")
+	}
+	if got, _, _ := s.Load(); got != saved2 {
+		t.Fatalf("файл не меняется: %+v", got)
+	}
+
+	// Принят ожидающий — становится основным.
+	if err := k.Accepted(pending); err != nil {
+		t.Fatal(err)
+	}
+	want := Credentials{AgentID: "a", Secret: saved2.PendingSecret}
+	if got, _, _ := s.Load(); got != want || k.Credentials() != want {
+		t.Fatalf("повышение: %+v", got)
+	}
+	if k.Authorization() != pending || k.Session() != pending || k.Fallback() {
+		t.Fatal("после повышения — один секрет")
+	}
+}
