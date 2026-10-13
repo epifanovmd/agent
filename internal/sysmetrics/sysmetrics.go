@@ -3,8 +3,8 @@
 // обычный воркер: HTTP на unix-сокете AGENT_WORKER_SOCKET, GET /metrics →
 // message.HostMetrics (агент кладёт ответ в metrics.host), GET /health и
 // GET /manifest (обязательный минимум воркера, версия — версия агента).
-// Какие группы собирать — переменная EnvSettings (JSON Settings) из
-// настроек агента telemetry. Сбор идёт в отдельном процессе: сбой или
+// Собирает группы DefaultSettings (переменная EnvSettings — другие, для
+// тестов). Сбор идёт в отдельном процессе: сбой или
 // зависание чтения системы не задевает агента.
 package sysmetrics
 
@@ -46,6 +46,23 @@ type Settings struct {
 	ExcludeInterfaces []string `json:"excludeInterfaces,omitempty"`
 }
 
+// DefaultSettings — что собирает воркер: основные группы метрик, корневая
+// файловая система; интерфейсы — без петли, контейнеров, мостов и служебных
+// интерфейсов macOS.
+func DefaultSettings() Settings {
+	return Settings{
+		Metrics: []string{
+			message.MetricsCPU, message.MetricsLoad, message.MetricsMemory, message.MetricsSwap, message.MetricsDisk,
+			message.MetricsNetwork, message.MetricsInterfaces, message.MetricsConntrack, message.MetricsUptime,
+		},
+		Disks: []string{"/"},
+		ExcludeInterfaces: []string{
+			"lo", "veth", "docker", "br-", "virbr", "vnet", "cni", "flannel", "cali", "kube", "tunl",
+			"gif", "stf", "awdl", "llw", "anpi", "utun", "bridge", "ap",
+		},
+	}
+}
+
 // Dispatch — служебные режимы программы агента: args[0] — Command или
 // SensorsCommand. false — это не они.
 func Dispatch(args []string) (bool, error) {
@@ -64,10 +81,11 @@ func Dispatch(args []string) (bool, error) {
 }
 
 // Run — воркер sysmetrics до отмены ctx: сокет — AGENT_WORKER_SOCKET,
-// настройки — EnvSettings.
+// настройки — EnvSettings, без неё — DefaultSettings.
 func Run(ctx context.Context) error {
-	var set Settings
+	set := DefaultSettings()
 	if raw := os.Getenv(EnvSettings); raw != "" {
+		set = Settings{}
 		if err := json.Unmarshal([]byte(raw), &set); err != nil {
 			return fmt.Errorf("sysmetrics: %s: %w", EnvSettings, err)
 		}

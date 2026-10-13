@@ -37,10 +37,8 @@ func Flatten(path, dataDir, header string) ([]byte, error) {
 			return nil, fmt.Errorf("%s: %s", l.file, notMapping)
 		}
 		dropKeys(m, "extends", "envFiles", "instance", "install")
-		for _, key := range []string{"caFile", "certFile", "keyFile"} {
-			if v := mapValue(mapValue(m, "server"), key); v != nil && v.Value != "" && !filepath.IsAbs(v.Value) && !strings.HasPrefix(v.Value, "__agentvar__") {
-				return nil, fmt.Errorf("%s: server.%s %q — путь от папки агента на узле не годится: укажите путь на узле или --ca-file", l.file, key, v.Value)
-			}
+		if v := mapValue(mapValue(m, "server"), "caFile"); v != nil && v.Value != "" && !filepath.IsAbs(v.Value) && !strings.HasPrefix(v.Value, "__agentvar__") {
+			return nil, fmt.Errorf("%s: server.caFile %q — путь от папки агента на узле не годится: укажите путь на узле или --ca-file", l.file, v.Value)
 		}
 		if root == nil {
 			root = m

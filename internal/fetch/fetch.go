@@ -1,7 +1,7 @@
 // Package fetch — запрос сервера к воркеру (§7): HTTP по unix-сокету
 // воркера, ответ кусками fetch.head → fetch.chunk… → fetch.end в том же
 // соединении, сроки, отмена, пределы; к воркеру проходят только маршруты и
-// задачи из его манифеста (routes: open — любой путь, кроме служебных).
+// задачи из его манифеста.
 package fetch
 
 import (
@@ -31,8 +31,6 @@ type Workers interface {
 	Client(name string) (*http.Client, error)
 	// Manifest — манифест зарегистрированного воркера.
 	Manifest(name string) *message.WorkerManifest
-	// OpenRoutes — не сверять запросы с манифестом (routes: open).
-	OpenRoutes(name string) bool
 }
 
 // Session — соединение, в котором пришёл запрос: ответ уходит только в него.
@@ -259,9 +257,6 @@ func (t *Tunnel) run(ctx context.Context, s Session, id string, f message.Fetch,
 // allowed — запрос объявлен в манифесте воркера (§7): код и текст ошибки,
 // "" — запрос можно передать воркеру.
 func (t *Tunnel) allowed(f message.Fetch, body []byte) (string, string) {
-	if t.workers.OpenRoutes(f.Worker) {
-		return "", ""
-	}
 	u, err := url.Parse(f.Path)
 	if err != nil {
 		return message.CodeMessageInvalid, "path: " + err.Error()

@@ -31,14 +31,9 @@ func fast(t *testing.T) {
 	t.Cleanup(func() { busyPoll, tailEvery, adoptPoll = oldBusy, oldTail, oldAdopt })
 }
 
-// life — жизнь тестового воркера: короткие сроки.
+// life — остановка тестового воркера: короткий срок.
 func life() config.Lifecycle {
-	l := config.DefaultLifecycle()
-	l.Backoff = config.Backoff{Min: config.Duration(20 * time.Millisecond), Max: config.Duration(50 * time.Millisecond)}
-	interval := config.Duration(50 * time.Millisecond)
-	l.Health.Interval, l.Health.Timeout = &interval, config.Duration(200*time.Millisecond)
-	l.StartTimeout, l.StopTimeout = config.Duration(5*time.Second), config.Duration(2*time.Second)
-	return l
+	return config.Lifecycle{StopTimeout: config.Duration(2 * time.Second)}
 }
 
 // spec — тестовый воркер name в режиме mode; события — в файл events.
@@ -168,21 +163,11 @@ func TestStartEnvHealthOutput(t *testing.T) {
 }
 
 // Падение (§13): перезапуск с растущей паузой, state backoff, счётчик
-// restarts, stderr — warn; maxRestarts — воркер остаётся остановленным до
-// worker.restart.
-func TestCrashBackoffAndMaxRestarts(t *testing.T) {
+// restarts без предела, stderr — warn.
+func TestCrashBackoff(t *testing.T) {
 	events := filepath.Join(t.TempDir(), "events")
-	crash := spec("crash", "crash", events)
-	crash.Lifecycle.MaxRestarts = 3
-	h := start(t, crash)
-	eventually(t, "остановлен после maxRestarts", func() bool {
-		st := h.status("crash")
-		return st.State == message.WorkerStopped && st.Restarts == 4
-	})
-	time.Sleep(200 * time.Millisecond)
-	if st := h.status("crash"); st.Restarts != 4 {
-		t.Fatalf("после maxRestarts не перезапускается: %+v", st)
-	}
+	h := start(t, spec("crash", "crash", events))
+	eventually(t, "перезапуски", func() bool { return h.status("crash").Restarts >= 4 })
 	lines := h.journal.Tail("crash", 10)
 	if len(lines) == 0 || lines[0].Msg != "падаю" || lines[0].Level != "warn" {
 		t.Fatalf("stderr: %+v", lines)
@@ -192,7 +177,6 @@ func TestCrashBackoffAndMaxRestarts(t *testing.T) {
 	if err := h.sup.Restart(ctx, "crash", false); err == nil {
 		t.Fatal("падающий воркер не запустился — ошибка")
 	}
-	eventually(t, "worker.restart запускает снова", func() bool { return h.status("crash").Restarts > 4 })
 }
 
 // Замена (§13): сначала уходит прежний процесс, потом запускается новый;
@@ -233,38 +217,26 @@ func childPid(t *testing.T, path string) int {
 	return pid
 }
 
-// keepChildren: false — остановка завершает всю группу процессов; true —
-// потомки переживают перезапуск воркера.
-func TestKeepChildren(t *testing.T) {
-	for _, keep := range []bool{false, true} {
-		t.Run(fmt.Sprint(keep), func(t *testing.T) {
-			dir := t.TempDir()
-			w := spec("parent", "children", filepath.Join(dir, "events"))
-			w.Env["TEST_CHILD_PID"] = filepath.Join(dir, "child")
-			w.Lifecycle.KeepChildren = keep
-			h := start(t, w)
-			<-h.started
-			pid := childPid(t, filepath.Join(dir, "child"))
-			defer syscall.Kill(pid, syscall.SIGKILL)
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			if err := h.sup.Restart(ctx, "parent", false); err != nil {
-				t.Fatal(err)
-			}
-			if keep {
-				time.Sleep(100 * time.Millisecond)
-				if !alive(pid) {
-					t.Fatal("keepChildren: потомок должен пережить перезапуск")
-				}
-				return
-			}
-			eventually(t, "потомок завершён", func() bool {
-				var ws syscall.WaitStatus
-				_, _ = syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
-				return !alive(pid) || zombie(pid)
-			})
-		})
+// Остановка завершает всю группу процессов воркера: потомки не переживают
+// его перезапуск.
+func TestChildrenStopped(t *testing.T) {
+	dir := t.TempDir()
+	w := spec("parent", "children", filepath.Join(dir, "events"))
+	w.Env["TEST_CHILD_PID"] = filepath.Join(dir, "child")
+	h := start(t, w)
+	<-h.started
+	pid := childPid(t, filepath.Join(dir, "child"))
+	defer syscall.Kill(pid, syscall.SIGKILL)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := h.sup.Restart(ctx, "parent", false); err != nil {
+		t.Fatal(err)
 	}
+	eventually(t, "потомок завершён", func() bool {
+		var ws syscall.WaitStatus
+		_, _ = syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
+		return !alive(pid) || zombie(pid)
+	})
 }
 
 // zombie — процесс завершился, но не убран родителем (в контейнере его

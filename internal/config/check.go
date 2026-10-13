@@ -4,9 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -41,10 +39,6 @@ type CheckResult struct {
 	Source *Source
 	// Config — итоговые настройки: умолчания, файлы, окружение.
 	Config Config
-	// FromEnv — переменные AGENT_* окружения процесса, которые заменили значения файлов.
-	FromEnv []string
-	// FromEnvFiles — переменные AGENT_* из файлов переменных (envFiles).
-	FromEnvFiles []string
 	// Warnings — неизвестные поля: агент их не читает (опечатка или поле
 	// другой версии), но работать это не мешает.
 	Warnings []Problem
@@ -55,7 +49,6 @@ type CheckResult struct {
 var (
 	reLine    = regexp.MustCompile(`^(?:yaml: )?(?:line|строка) (\d+): (.*)$`)
 	reUnknown = regexp.MustCompile(`^field (\S+) not found in type`)
-	rePath    = regexp.MustCompile(`^[A-Za-z]+(?:\[\d+\])?(?:\.[A-Za-z]+(?:\[\d+\])?)*`)
 )
 
 // Check — проверить настройки, как их прочитает agent run: цепочку файлов
@@ -77,24 +70,10 @@ func Check(path string) CheckResult {
 			return res
 		}
 	}
-	for _, e := range envVars {
-		if v, ok := os.LookupEnv(e.Name); ok && v != "" {
-			res.FromEnv = append(res.FromEnv, e.Name)
-		} else if v := src.Env[e.Name]; v != "" {
-			res.FromEnvFiles = append(res.FromEnvFiles, e.Name)
-		}
-	}
 	applyEnv(&res.Config, src.Lookup)
 	if err := res.Config.Validate(); err != nil {
 		for _, text := range strings.Split(err.Error(), "\n") {
-			p := Problem{Text: text}
-			if pos, ok := src.originOf(text); ok {
-				p.Line = pos.Line
-				if len(src.Files) > 1 {
-					p.File = pos.File
-				}
-			}
-			res.Errors = append(res.Errors, p)
+			res.Errors = append(res.Errors, Problem{Text: text})
 		}
 	}
 	return res
@@ -152,56 +131,4 @@ func splitLine(s string) (int, string) {
 		return n, m[2]
 	}
 	return 0, strings.TrimPrefix(s, "yaml: ")
-}
-
-// Annotated — итоговые настройки cfg деревом YAML с пометкой, откуда каждое
-// значение: файл и строка или переменная окружения. Без пометки — по умолчанию.
-func (r CheckResult) Annotated(cfg Config) (*yaml.Node, error) {
-	var root yaml.Node
-	if err := root.Encode(cfg); err != nil {
-		return nil, err
-	}
-	from := map[string]string{}
-	if r.Source != nil {
-		for p, pos := range r.Source.Origin {
-			from[p] = pos.String()
-		}
-	}
-	for _, e := range envVars {
-		if slices.Contains(r.FromEnvFiles, e.Name) {
-			from[e.Path] = e.Name + " из файла переменных"
-		}
-		if slices.Contains(r.FromEnv, e.Name) {
-			from[e.Path] = e.Name
-		}
-	}
-	annotate(&root, "", from)
-	return &root, nil
-}
-
-// annotate — пометки у значений (и у списков — на строке ключа).
-func annotate(n *yaml.Node, path string, from map[string]string) {
-	switch n.Kind {
-	case yaml.MappingNode:
-		for i := 0; i+1 < len(n.Content); i += 2 {
-			k, v := n.Content[i], n.Content[i+1]
-			p := k.Value
-			if path != "" {
-				p = path + "." + p
-			}
-			if text, ok := from[p]; ok {
-				switch v.Kind {
-				case yaml.ScalarNode:
-					v.LineComment = text
-				case yaml.SequenceNode:
-					k.LineComment = text
-				}
-			}
-			annotate(v, p, from)
-		}
-	case yaml.SequenceNode:
-		for i, c := range n.Content {
-			annotate(c, fmt.Sprintf("%s[%d]", path, i), from)
-		}
-	}
 }

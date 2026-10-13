@@ -288,13 +288,10 @@ type WorkerUpdateArgs struct {
 	Force bool `json:"force,omitempty"`
 }
 
-// AgentUpdateArgs — args agent.update; URL пусто — сборка версии Version из
-// каталога сборок агента (§11), с подписью из его manifest.json.
+// AgentUpdateArgs — args agent.update: сборка версии Version из каталога
+// сборок агента (§11), с подписью из его manifest.json.
 type AgentUpdateArgs struct {
-	Version   string `json:"version"`
-	URL       string `json:"url,omitempty"`
-	SHA256    string `json:"sha256,omitempty"`
-	Signature string `json:"signature,omitempty"`
+	Version string `json:"version"`
 }
 
 // AgentLogsArgs — args agent.logs; Worker пусто — журнал агента.

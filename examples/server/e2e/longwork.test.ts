@@ -33,10 +33,9 @@ describe("долгая задача", () => {
     const r = await s.job("echo", {
       type: "echo.long",
       data: { steps, delayMs },
-      timeoutMs: 1,
     });
 
-    assert.equal(r.state, "running");
+    assert.equal(r.status, 202);
 
     return { jobId: r.jobId, id: r.id! };
   };
@@ -57,8 +56,8 @@ describe("долгая задача", () => {
   const echoPid = async (): Promise<number | undefined> =>
     (await s.worker("echo"))?.health?.info?.pid as number | undefined;
 
-  const job = (id: string): Promise<Job> =>
-    s.api<Job>("GET", `/api/agents/${s.agentId}/workers/echo/jobs/${id}`);
+  const job = async (id: string): Promise<Job> =>
+    (await (await s.fetchWorker("echo", `/jobs/${id}`)).json()) as Job;
 
   const actions = (): Promise<ActionRecord[]> =>
     s.api<ActionRecord[]>("GET", `/api/agents/${s.agentId}/actions`);
@@ -92,7 +91,7 @@ describe("долгая задача", () => {
 
   it("restartWorker во время задачи: сразу deferred (pending: restart), замена и событие action — после её окончания; force — сразу", async () => {
     const pid = await echoPid();
-    const { jobId } = await startJob(8, 500);
+    const { jobId } = await startJob(16, 500);
 
     await waitFor(
       "echo занят",
@@ -129,7 +128,7 @@ describe("долгая задача", () => {
     assert.equal((await s.worker("echo"))?.pending, undefined);
 
     // force: замена сразу; ход задачи на диске — новый процесс продолжает её.
-    const long = await startJob(10, 500);
+    const long = await startJob(20, 500);
 
     await waitFor(
       "echo занят",
@@ -158,8 +157,8 @@ describe("долгая задача", () => {
       60_000,
     );
     assert.deepEqual(
-      steps(await s.jobEvents("echo", long.jobId), 10),
-      Array.from({ length: 10 }, (_, i) => i + 1),
+      steps(await s.jobEvents("echo", long.jobId), 20),
+      Array.from({ length: 20 }, (_, i) => i + 1),
     );
   });
 });

@@ -75,11 +75,9 @@ func (o *Options) checkMode() error {
 		}
 	}
 	why := "нужен root, а агент ставится для пользователя без root"
-	no(o.User != "", "--user", why)
 	no(len(o.Sysctls) > 0, "--sysctl", why)
 	no(len(o.Packages) > 0 || len(o.PackagesBy) > 0, "--packages", why)
 	no(o.Privileged, "--privileged", why)
-	no(len(o.RWPaths) > 0, "--rw-path", "служба пользователя работает без ограничений файловой системы — флаг не нужен")
 	return errors.Join(errs...)
 }
 

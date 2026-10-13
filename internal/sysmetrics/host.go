@@ -222,7 +222,7 @@ func RealMounts(parts []disk.PartitionStat) []string {
 	return out
 }
 
-// diskUsage — корень (diskUsedBytes, diskTotalBytes) и disks по telemetry.disks.
+// diskUsage — корень (diskUsedBytes, diskTotalBytes) и disks по mounts.
 func (c *collector) diskUsage(ctx context.Context, h *message.HostMetrics, mounts []string) {
 	if u, err := c.src.usage(ctx, "/"); err == nil {
 		h.DiskUsedBytes, h.DiskTotalBytes = &u.Used, &u.Total

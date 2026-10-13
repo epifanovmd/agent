@@ -65,7 +65,6 @@ describe("связь и наблюдение", () => {
       workers.find(w => w.name === "echo")?.health?.info?.version,
       "1.0.0",
     );
-    assert.deepEqual(a.alerts, []);
   });
 
   describe("запросы к воркерам", () => {
@@ -177,19 +176,20 @@ describe("связь и наблюдение", () => {
         data: { text: "привет" },
       });
 
-      assert.deepEqual(
-        [quick.state, quick.result],
-        ["done", { text: "ПРИВЕТ" }],
-      );
+      assert.deepEqual([quick.status, quick.result], [200, { text: "ПРИВЕТ" }]);
       const long = await s.job(w, {
         type: "echo.long",
         data: { steps: 3, delayMs: 100 },
-        timeoutMs: 20_000,
       });
 
-      assert.equal(long.state, "done", w);
+      assert.equal(long.status, 202, w);
       assert.ok(long.id, w);
-      assert.deepEqual(long.result, { text: "ГОТОВО: 3 ШАГОВ" });
+      const end = await s.jobEnd(w, long.jobId);
+
+      assert.deepEqual(
+        [end.type, (end.data as { result?: unknown }).result],
+        ["job.done", { text: "ГОТОВО: 3 ШАГОВ" }],
+      );
       const events = await s.jobEvents(w, long.jobId);
 
       assert.deepEqual(
@@ -202,24 +202,20 @@ describe("связь и наблюдение", () => {
         ],
         w,
       );
-      // Не дождались итога — задача идёт; её состояние и отмена.
+      // Долгая задача идёт: её состояние и отмена — GET /jobs/{id} и POST /jobs/{id}/cancel.
       const slow = await s.job(w, {
         type: "echo.long",
         data: { steps: 50, delayMs: 200 },
-        timeoutMs: 1,
       });
+      const state = async (init: RequestInit, path = "") =>
+        (
+          (await (
+            await s.fetchWorker(w, `/jobs/${slow.id}${path}`, init)
+          ).json()) as { state: string }
+        ).state;
 
-      assert.equal(slow.state, "running", w);
-      const base = `/api/agents/${s.agentId}/workers/${w}/jobs/${slow.id}`;
-
-      assert.equal(
-        (await s.api<{ state: string }>("GET", base)).state,
-        "running",
-      );
-      assert.equal(
-        (await s.api<{ state: string }>("POST", `${base}/cancel`)).state,
-        "cancelled",
-      );
+      assert.equal(await state({}), "running", w);
+      assert.equal(await state({ method: "POST" }, "/cancel"), "cancelled");
       await waitFor(`${w}: job.cancelled`, async () =>
         (await s.jobEvents(w, slow.jobId)).some(
           e => e.type === "job.cancelled",
@@ -249,7 +245,7 @@ describe("связь и наблюдение", () => {
 
   describe("метрики и журнал", () => {
     it("metrics.host (группы cpu, load, memory, network, uptime) и metrics.workers", async () => {
-      // Поля групп из telemetry.metrics стенда; скорости — со второй точки.
+      // Поля групп метрик узла по умолчанию; скорости — со второй точки.
       const fields = [
         "cpuPercent",
         "load1",

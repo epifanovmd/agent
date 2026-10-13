@@ -167,7 +167,7 @@ func (a *App) metricsLoop(ctx context.Context) {
 }
 
 // collect — GET /metrics всех запущенных воркеров сразу (срок —
-// lifecycle.health.timeout воркера); ответ
+// message.ProbeTimeout); ответ
 // sysmetrics — host, остальных — workers как есть (§9).
 func (a *App) collect(ctx context.Context) (message.Metrics, bool) {
 	m := message.Metrics{CollectedAt: time.Now().UnixMilli()}
@@ -178,14 +178,10 @@ func (a *App) collect(ctx context.Context) (message.Metrics, bool) {
 		if err != nil {
 			continue
 		}
-		timeout := message.ProbeTimeout
-		if spec, ok := a.workers.Spec(name); ok {
-			timeout = spec.Lifecycle.Health.Timeout.Std()
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			raw, ok := probeMetrics(ctx, client, timeout)
+			raw, ok := probeMetrics(ctx, client, message.ProbeTimeout)
 			if !ok {
 				return
 			}

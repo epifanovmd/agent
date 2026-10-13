@@ -1,17 +1,14 @@
 // Настройки воркеров на агентах (§4, §5): желаемые значения с версиями, доставка агенту на связи
 // и сверка при подключении, итоги применения (config.applied), события config.
-import type { AlertChanges, Context } from "../core/context";
+import type { Context } from "../core/context";
 import { codeError, invalid, revoked, valid } from "../core/errors";
 import type { Session } from "../core/session";
-import { recheckAlerts } from "../model/alerts";
 import {
   configStatus,
   configStatuses,
   report,
   sameReport,
 } from "../model/config-report";
-import { workerManifest } from "../model/manifest";
-import { publicAgent } from "../model/public-agent";
 import type { AgentRecord, ConfigRecord, ConfigStatus } from "../model/types";
 import { parseConfigApplied, parseName } from "../protocol/checks";
 import { type Envelope, MAX_CONFIG_BYTES } from "../protocol/messages";
@@ -24,7 +21,6 @@ export class Configs {
   }
 
   async set(
-    actor: string,
     agentId: string,
     worker: string,
     key: string,
@@ -40,18 +36,10 @@ export class Configs {
     const a = await this.ctx.agent(agentId);
 
     if (a.revoked) throw revoked();
-    if (this.ctx.settings.validate.configs) this.validate(a, worker, key, data);
     const reported = a.configs[worker]?.[key];
     // Версия — больше, чем уже у агента (Store мог быть сброшен).
     const rec = await this.ctx.store.setConfig(agentId, worker, key, data, {
-      actor: actor || undefined,
       minVersion: (reported?.version ?? 0) + 1,
-    });
-
-    this.ctx.audit(actor, "config.set", agentId, {
-      worker,
-      key,
-      version: rec.version,
     });
     const ss = this.ctx.live(agentId);
 
@@ -63,17 +51,11 @@ export class Configs {
   }
 
   /** Удалить ключ; false — ключа не было. */
-  async delete(
-    actor: string,
-    agentId: string,
-    worker: string,
-    key: string,
-  ): Promise<boolean> {
+  async delete(agentId: string, worker: string, key: string): Promise<boolean> {
     valid(parseName("worker", worker));
     valid(parseName("key", key));
     if (!(await this.ctx.store.deleteConfig(agentId, worker, key)))
       return false;
-    this.ctx.audit(actor, "config.delete", agentId, { worker, key });
     const ss = this.ctx.live(agentId);
 
     if (ss) sendDelete(ss, `${worker}/${key}`);
@@ -118,9 +100,7 @@ export class Configs {
     if (!p.ok) return p.error;
     const { worker, key, ...result } = p.value;
     const now = Date.now();
-    let alerts: AlertChanges = { started: [], ended: [] };
     const { agent, changed } = await this.ctx.mutate(ss.agentId, a => {
-      alerts = { started: [], ended: [] };
       const prev = a.configs[worker]?.[key];
 
       if (prev && prev.version > result.version) return false;
@@ -129,15 +109,11 @@ export class Configs {
       if (prev && sameReport(prev, next)) return false;
       (a.configs[worker] ??= {})[key] = next;
       a.lastSeenAt = now;
-      alerts = recheckAlerts(a, now);
 
       return true;
     });
 
-    if (agent && changed) {
-      await this.emitStatuses(agent, [`${worker}/${key}`]);
-      this.ctx.emitAlerts(alerts);
-    }
+    if (agent && changed) await this.emitStatuses(agent, [`${worker}/${key}`]);
 
     return "";
   }
@@ -165,33 +141,6 @@ export class Configs {
           : { agentId: agent.id, worker, key, version: null, state: "deleted" },
       );
     }
-  }
-
-  /**
-   * Значение по JSON Schema ключа из манифеста воркера; не подходит — CONFIG_INVALID. Нет схемы
-   * — без проверки; схему нельзя применить — запись в журнал, без проверки.
-   */
-  private validate(
-    a: AgentRecord,
-    worker: string,
-    key: string,
-    data: unknown,
-  ): void {
-    const schema = workerManifest(publicAgent(a), worker)?.configs?.find(
-      c => c.key === key,
-    )?.schema;
-    const problems = this.ctx.schemaProblems(schema, data, "ключа", {
-      agentId: a.id,
-      worker,
-      key,
-    });
-
-    if (problems.length)
-      throw codeError(
-        "CONFIG_INVALID",
-        `${worker}/${key}: ${problems.join("; ")}`,
-        400,
-      );
   }
 
   /** config.put, если у агента версия старее. */

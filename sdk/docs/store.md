@@ -15,14 +15,14 @@ const dev = new Agents({ enrollToken, store: new MemoryStore() });
 
 ## Что хранит Store
 
-| Что       | Запись                                                                                                                                                                         | Кто пишет                                              |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------ |
-| агенты    | `AgentRecord`: имя, метки, хеш ключа и ожидающий новый ключ, отзыв, учёт потока, последние `hello` и `status`, последняя точка метрик, итоги настроек, текущие проблемы, `rev` | регистрация, каждое сообщение потока, действия бэкенда |
-| настройки | `ConfigRecord`: агент, воркер, ключ, версия, значение, время, автор                                                                                                            | `setConfig`, `deleteConfig`                            |
+| Что       | Запись                                                                                                                                                       | Кто пишет                                              |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------ |
+| агенты    | `AgentRecord`: имя, метки, хеш ключа и ожидающий новый ключ, отзыв, учёт потока, последние `hello` и `status`, последняя точка метрик, итоги настроек, `rev` | регистрация, каждое сообщение потока, действия бэкенда |
+| настройки | `ConfigRecord`: агент, воркер, ключ, версия, значение, время                                                                                                 | `setConfig`, `deleteConfig`                            |
 
-Истории в Store нет. Метрики, события воркеров, журнал, проблемы, итоги действий и аудит
-приходят событиями `Agents` (и обработчиком `onEvent`) — сохраните сами то, что нужно
-([observe.md](observe.md)). Зрители `watch` и ожидание итогов действий и задач живут в памяти копии бэкенда с соединением
+Истории в Store нет. Метрики, события воркеров, журнал и итоги действий приходят событиями
+`Agents` (и обработчиком `onEvent`) — сохраните сами то, что нужно; проблемы узлов и аудит бэкенд
+ведёт сам ([observe.md](observe.md)). Зрители `watch` и ожидание итогов действий живут в памяти копии бэкенда с соединением
 агента.
 
 ## Методы
@@ -35,7 +35,7 @@ interface Store {
   updateAgent(agent: AgentRecord): Promise<boolean>; // условная запись по rev
   deleteAgent(id: string): Promise<boolean>; // и его настройки
 
-  setConfig(agentId, worker, key, data, opts?: { actor?; minVersion? }): Promise<ConfigRecord>;
+  setConfig(agentId, worker, key, data, opts?: { minVersion? }): Promise<ConfigRecord>;
   listConfigs(agentId): Promise<ConfigRecord[]>; // без удалённых
   deleteConfig(agentId, worker, key): Promise<boolean>;
 }
@@ -72,7 +72,7 @@ interface Store {
 ```sql
 CREATE TABLE agents  (id text PRIMARY KEY, rev bigint NOT NULL, record jsonb NOT NULL);
 CREATE TABLE configs (agent_id text, worker text, key text, version bigint NOT NULL, data jsonb,
-                      updated_at bigint, actor text, PRIMARY KEY (agent_id, worker, key));
+                      updated_at bigint, PRIMARY KEY (agent_id, worker, key));
 ```
 
 ```ts
@@ -86,7 +86,6 @@ const config = (r: any): ConfigRecord => ({
   version: Number(r.version),
   data: r.data,
   updatedAt: Number(r.updated_at),
-  ...(r.actor ? { actor: r.actor } : {}),
 });
 
 export class PgStore implements Store {
@@ -122,11 +121,11 @@ export class PgStore implements Store {
   }
   async setConfig(agentId: string, worker: string, key: string, data: unknown, o: SetConfigOptions = {}) {
     const r = await this.pg.query(
-      `INSERT INTO configs VALUES ($1, $2, $3, GREATEST(1, $4), $5, $6, $7)
+      `INSERT INTO configs VALUES ($1, $2, $3, GREATEST(1, $4), $5, $6)
        ON CONFLICT (agent_id, worker, key) DO UPDATE SET version = GREATEST(configs.version + 1, $4),
-         data = $5, updated_at = $6, actor = $7
+         data = $5, updated_at = $6
        RETURNING *`,
-      [agentId, worker, key, o.minVersion ?? 0, JSON.stringify(data), Date.now(), o.actor ?? null],
+      [agentId, worker, key, o.minVersion ?? 0, JSON.stringify(data), Date.now()],
     );
     return config(r.rows[0]);
   }

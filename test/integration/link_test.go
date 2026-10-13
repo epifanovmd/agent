@@ -4,18 +4,10 @@ package integration
 
 import (
 	"bufio"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -164,19 +156,6 @@ func linkStatus(t *testing.T, base, authorization string) int {
 	return resp.StatusCode
 }
 
-// Несколько адресов сервера: первый недоступен — агент регистрируется и работает через второй.
-func TestServerURLs(t *testing.T) {
-	t.Parallel()
-	s := newStand(t)
-	dead := httptest.NewServer(http.NotFoundHandler())
-	deadURL := dead.URL
-	dead.Close()
-	cfg := s.config()
-	cfg.Server.URL, cfg.Server.URLs = deadURL, []string{s.http.URL}
-	s.start(cfg)
-	s.online()
-}
-
 // Обрыв связи: события воркера (outbox) и точки метрик (поток) досылаются после
 // подключения — события без повторов, метрики с моментами сбора за время без связи.
 func TestOutageBackfill(t *testing.T) {
@@ -312,39 +291,6 @@ func TestProxyFromEnvironment(t *testing.T) {
 	}
 }
 
-// testPKI — свой CA и клиентский сертификат агента, подписанный им (PEM-файлы в dir).
-func testPKI(t *testing.T, dir string) (certFile, keyFile string, pool *x509.CertPool) {
-	t.Helper()
-	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	caTpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "it CA"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
-		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
-	}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTpl, caTpl, &caKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ca, _ := x509.ParseCertificate(caDER)
-	pool = x509.NewCertPool()
-	pool.AddCert(ca)
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	tpl := &x509.Certificate{
-		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: agentName},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, KeyUsage: x509.KeyUsageDigitalSignature,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tpl, caTpl, &key.PublicKey, caKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, _ := x509.MarshalECPrivateKey(key)
-	certFile, keyFile = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
-	writeFile(t, certFile, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})))
-	writeFile(t, keyFile, string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})))
-	return certFile, keyFile, pool
-}
-
 // serverCA — сертификат тестового TLS-сервера в PEM (его «свой CA»).
 func serverCA(t *testing.T, s *stand, dir string) string {
 	path := filepath.Join(dir, "server-ca.pem")
@@ -372,27 +318,6 @@ func TestTLSCustomCA(t *testing.T) {
 
 	cfg := s.config()
 	cfg.Server.CAFile = serverCA(t, s, t.TempDir())
-	s.start(cfg)
-	s.online()
-}
-
-// mTLS: сервер требует клиентский сертификат от своего CA.
-func TestTLSClientCertificate(t *testing.T) {
-	t.Parallel()
-	s := newUnstartedStand(t)
-	certFile, keyFile, pool := testPKI(t, t.TempDir())
-	s.http.TLS = &tls.Config{ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool}
-	s.http.StartTLS()
-	ca := serverCA(t, s, t.TempDir())
-
-	noCert := s.config()
-	noCert.Server.CAFile = ca
-	n := s.start(noCert)
-	noAgentFor(t, s, time.Second)
-	n.stop()
-
-	cfg := s.config()
-	cfg.Server.CAFile, cfg.Server.CertFile, cfg.Server.KeyFile = ca, certFile, keyFile
 	s.start(cfg)
 	s.online()
 }

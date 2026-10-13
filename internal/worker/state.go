@@ -39,9 +39,8 @@ type procState struct {
 	Spec      string `json:"spec"`
 	StartedAt int64  `json:"startedAt"`
 	// Output — с каких мест читать файлы вывода (stdout, stderr).
-	Output       [2]int64        `json:"output"`
-	StopTimeout  config.Duration `json:"stopTimeout"`
-	KeepChildren bool            `json:"keepChildren,omitempty"`
+	Output      [2]int64        `json:"output"`
+	StopTimeout config.Duration `json:"stopTimeout"`
 }
 
 func statePath(dir, name string) string { return filepath.Join(dir, name+".json") }
@@ -84,10 +83,10 @@ func (st procState) alive() bool {
 	return ok && start == st.Start
 }
 
-// specHash — отпечаток настроек, от которых зависит процесс: без lifecycle,
-// logs и routes (они меняются на ходу).
+// specHash — отпечаток настроек, от которых зависит процесс: без lifecycle
+// (он меняется на ходу).
 func specHash(spec config.Worker) string {
-	spec.Lifecycle, spec.Logs, spec.Routes = config.Lifecycle{}, config.Logs{}, ""
+	spec.Lifecycle = config.Lifecycle{}
 	raw, _ := json.Marshal(spec)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:12])
@@ -104,7 +103,7 @@ func stopOrphan(st procState) bool {
 		if !st.alive() {
 			return
 		}
-		if !st.KeepChildren && syscall.Kill(-st.PID, sig) == nil {
+		if syscall.Kill(-st.PID, sig) == nil {
 			return
 		}
 		_ = syscall.Kill(st.PID, sig)

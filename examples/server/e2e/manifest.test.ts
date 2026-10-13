@@ -1,6 +1,6 @@
 // Манифест воркеров (§12): echo, node-echo, sysinfo и netprobe описывают себя, агент передаёт
-// манифест в status; supports по манифесту; validate.configs — неверная настройка отклонена
-// сервером до отправки агенту.
+// манифест в status; неверная настройка отклонена сервером стенда по схеме из манифеста до
+// отправки агенту.
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 
@@ -10,19 +10,9 @@ import { ApiError, Stand, VERSION, waitFor, WORKERS } from "./stand";
 
 describe("манифест воркеров", () => {
   let s: Stand;
-  const supported = async (worker: string, query: string) =>
-    (
-      await s.api<{ supported: boolean }>(
-        "GET",
-        `/api/agents/${s.agentId}/workers/${worker}/supports?${query}`,
-      )
-    ).supported;
 
   before(async () => {
-    s = await Stand.start({
-      name: "e2e-manifest",
-      server: { validate: { configs: true } },
-    });
+    s = await Stand.start({ name: "e2e-manifest", validate: true });
   });
   after(() => s?.close());
 
@@ -86,23 +76,7 @@ describe("манифест воркеров", () => {
     );
   });
 
-  it("supports: маршрут, ключ, событие по манифесту", async () => {
-    assert.equal(await supported("echo", "method=POST&path=/echo"), true);
-    assert.equal(
-      await supported("node-echo", "method=GET&path=/stream%3Fn%3D3"),
-      true,
-    );
-    assert.equal(await supported("echo", "method=GET&path=/echo"), false);
-    assert.equal(
-      await supported("echo", "config=settings&event=echo.started"),
-      true,
-    );
-    assert.equal(await supported("sysinfo", "method=GET&path=/info"), true);
-    assert.equal(await supported("netprobe", "config=banner"), false);
-    assert.equal(await supported("sysmetrics", "config=settings"), false);
-  });
-
-  it("validate.configs: неверная настройка отклонена до отправки агенту", async () => {
+  it("неверная настройка отклонена по схеме манифеста до отправки агенту", async () => {
     const path = `/api/agents/${s.agentId}/configs/echo/settings`;
     const err = await s.api("PUT", path, { prefix: 5, extra: 1 }).then(
       () => assert.fail("ждали CONFIG_INVALID"),

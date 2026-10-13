@@ -2,10 +2,14 @@ package app
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	"github.com/epifanovmd/agent/internal/releases"
 )
+
+// releasesClient — запросы к каталогу сборок агента (не к серверу: свой TLS не нужен).
+var releasesClient = &http.Client{Timeout: 10 * time.Minute, Transport: &http.Transport{Proxy: http.ProxyFromEnvironment}}
 
 // checkLoop — раз в update.checkInterval проверить последнюю версию в каталоге
 // сборок агента (§11): новее своей — в hello.agent.update, status.update и в

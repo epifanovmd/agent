@@ -2,21 +2,16 @@
 // небольшой HTTP API над ним (examples/API.md).
 //
 //   PORT=8080 ENROLL_TOKEN=demo-token npm start   (node --import tsx src/main.ts)
-//   RELEASES_DIR=dist/<VERSION> — каталог сборок (обновления; его install.sh — GET /install.sh);
-//     с AGENT_RELEASES_* — воркеры проекта;
-//   AGENT_RELEASES_GITHUB=owner/repo — агент и его воркеры из релизов GitHub (AGENT_RELEASES_RANGE —
-//     диапазон версий, AGENT_RELEASES_TOKEN — токен API) или AGENT_RELEASES_URL — адрес каталога сборок;
-//     AGENT_RELEASES_PROXY=1 — сборки узлам через сервер потоком;
+//   RELEASES_DIR=dist/<VERSION> — каталог сборок воркеров (обновления воркеров; его install.sh —
+//     GET /install.sh); агент обновляется из своего каталога сборок (update.releases);
 //   PUBLIC_KEY — ключ проверки подписи сборок (base64) и UPDATE_PUBLIC_KEYS — ещё ключи через
 //     запятую: флагами --update-key в команде установки;
 //   PUBLIC_URL — адрес сервера для команды установки (по умолчанию — из запроса);
-//   VALIDATE_CONFIGS=1 — проверять настройки по схеме из манифеста воркера до отправки агенту;
-//   VALIDATE_REQUESTS=1 — проверять тело запросов к воркерам и data запросов воркеров по схемам;
-//   VALIDATE_EVENTS=log|reject — проверять data событий по схемам (по умолчанию off).
+//   VALIDATE=1 — проверять настройки и тела запросов к воркерам по схемам из манифеста воркера.
 import { resolve } from "node:path";
 import { format } from "node:util";
 
-import { Agents, type AgentsOptions } from "agent-sdk/server";
+import { Agents } from "agent-sdk/server";
 
 import { createApp } from "./app";
 import { History } from "./history";
@@ -26,27 +21,6 @@ const env = process.env;
 const port = Number(env.PORT ?? 8080);
 const enrollToken = env.ENROLL_TOKEN ?? "demo-token";
 const interval = (v: string | undefined) => Number(v ?? 5000);
-
-/** Откуда берутся сборки агента (из окружения); не задано — undefined. */
-const agentReleases = (): AgentsOptions["agentReleases"] => {
-  const common = {
-    proxy: env.AGENT_RELEASES_PROXY === "1",
-    checkIntervalMs: env.AGENT_RELEASES_CHECK_INTERVAL_MS
-      ? Number(env.AGENT_RELEASES_CHECK_INTERVAL_MS)
-      : undefined,
-  };
-
-  if (env.AGENT_RELEASES_GITHUB)
-    return {
-      ...common,
-      github: env.AGENT_RELEASES_GITHUB,
-      range: env.AGENT_RELEASES_RANGE || undefined,
-      token: env.AGENT_RELEASES_TOKEN || undefined,
-    };
-  if (env.AGENT_RELEASES_URL) return { ...common, url: env.AGENT_RELEASES_URL };
-
-  return undefined;
-};
 
 const log = (msg: string, extra?: Record<string, unknown>) => {
   process.stdout.write(
@@ -65,15 +39,6 @@ const agents = new Agents({
   statusIntervalMs: interval(env.STATUS_INTERVAL_MS),
   metricsIntervalMs: interval(env.METRICS_INTERVAL_MS),
   releasesDir: env.RELEASES_DIR ? resolve(env.RELEASES_DIR) : undefined,
-  agentReleases: agentReleases(),
-  validate: {
-    configs: env.VALIDATE_CONFIGS === "1",
-    requests: env.VALIDATE_REQUESTS === "1",
-    events:
-      env.VALIDATE_EVENTS === "log" || env.VALIDATE_EVENTS === "reject"
-        ? env.VALIDATE_EVENTS
-        : "off",
-  },
   log,
 });
 
@@ -89,13 +54,13 @@ const server = createApp(agents, {
   ]
     .map(k => k.trim())
     .filter(Boolean),
+  validate: env.VALIDATE === "1",
 });
 
 server.listen(port, () =>
   log(`сервер на :${port}`, {
     enrollToken,
     releasesDir: env.RELEASES_DIR ?? null,
-    agentReleases: env.AGENT_RELEASES_GITHUB ?? env.AGENT_RELEASES_URL ?? null,
   }),
 );
 

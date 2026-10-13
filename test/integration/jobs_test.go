@@ -6,13 +6,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/epifanovmd/agent/test/testserver"
 )
 
 // Задачи воркера (§12): события job.* агент принимает, только если манифест объявляет jobs;
-// runJob сервера — быстрая задача (итог сразу) и долгая (итог по событиям job.*).
+// задача — fetch POST /jobs: быстрая — итог в ответе, долгая — 202 и итог событиями job.*.
 func TestJobs(t *testing.T) {
 	t.Parallel()
 	s := newStand(t)
@@ -33,28 +34,29 @@ func TestJobs(t *testing.T) {
 	}
 	n.emit("jobs", "job.progress", 0, 1)
 
-	var quick testserver.JobResult
-	if err := s.server.Action("runJob", a.ID, &quick, "jobs", map[string]any{"type": "example.quick", "data": map[string]int{"n": 1}}); err != nil {
-		t.Fatal(err)
+	job := func(body string) testserver.FetchResponse {
+		return s.fetch(a.ID, "jobs", "/jobs", testserver.FetchInit{Method: "POST",
+			Headers: map[string]string{"Content-Type": "application/json"}, Body: body})
 	}
-	if quick.State != "done" || quick.ID != "" || string(quick.Result) != `{"echo":{"n":1}}` {
-		t.Fatalf("быстрая задача: %+v %s", quick, quick.Result)
+	if res := job(`{"type":"example.quick","data":{"n":1}}`); res.Status != 200 || res.Body != `{"result":{"echo":{"n":1}}}` {
+		t.Fatalf("быстрая задача: %+v", res)
 	}
-
-	var long testserver.JobResult
-	if err := s.server.Action("runJob", a.ID, &long, "jobs", map[string]any{"type": "example.long", "jobId": "j-1", "timeoutMs": 10_000}); err != nil {
-		t.Fatal(err)
+	if res := job(`{"type":"example.long","jobId":"j-1"}`); res.Status != 202 || !strings.Contains(res.Body, `"w-j-1"`) {
+		t.Fatalf("долгая задача: %+v", res)
 	}
-	var result struct{ PID int }
-	if long.JobID != "j-1" || long.ID != "w-j-1" || long.State != "done" || json.Unmarshal(long.Result, &result) != nil || result.PID == 0 {
-		t.Fatalf("долгая задача: %+v %s", long, long.Result)
+	var result struct {
+		JobID  string
+		Result struct{ PID int }
 	}
-	if err := s.server.Action("runJob", a.ID, nil, "jobs", map[string]any{"type": "example.none"}); errorCode(err) != "JOB_UNKNOWN" {
-		t.Fatalf("тип не из манифеста: %v", err)
-	}
-	if err := s.server.Action("runJob", a.ID, nil, "plain", map[string]any{"type": "example.quick"}); errorCode(err) != "JOB_UNKNOWN" {
-		t.Fatalf("воркер без jobs: %v", err)
-	}
+	eventually(t, "итог долгой задачи — событие job.done", func() bool {
+		b, _ := s.server.Agent(agentName)
+		for _, e := range b.Events {
+			if e.Type == "job.done" && json.Unmarshal(e.Data, &result) == nil && result.JobID == "j-1" {
+				return result.Result.PID != 0
+			}
+		}
+		return false
+	})
 
 	// Агент сам сверяет задачи с манифестом (§7): тип не из jobs — JOB_UNKNOWN, задачи у
 	// воркера без jobs — ROUTE_UNDECLARED; до воркера такие запросы не доходят.

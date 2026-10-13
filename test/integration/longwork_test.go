@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/test/testserver"
 )
@@ -66,13 +65,13 @@ name: %s
 enroll: {token: %s}
 log: {level: error}
 telemetry: {metrics: []}
-update: {mode: self, publicKey: %q}
+update: {mode: self, publicKey: %q, releases: %q, checkInterval: 0s}
 workers:
   - name: w
     command: [%q]
     env: {IT_WORKER: "1", IT_STATE: %q}
     lifecycle: {stopTimeout: 5s}
-`, s.http.URL, data, agentName, token, kit.pub, exe, state))
+`, s.http.URL, data, agentName, token, kit.pub, kit.catalog, exe, state))
 	r := runAgent(t, bin, conf, data)
 	a := s.running("w")
 	pid := s.pid(a.ID, "w")
@@ -98,7 +97,7 @@ workers:
 	// Самообновление агента во время работы.
 	kit.setAgent("1.1.0", testBinary(t, "1.1.0"))
 	var res testserver.UpdateResult
-	if err := s.server.Action("updateAgent", a.ID, &res, map[string]any{"timeoutMs": 120_000}); err != nil || res.Version != "1.1.0" {
+	if err := s.server.Action("updateAgent", a.ID, &res, map[string]any{"version": "1.1.0", "timeoutMs": 120_000}); err != nil || res.Version != "1.1.0" {
 		t.Fatalf("agent.update: %+v %v", res, err)
 	}
 	if got := s.pid(a.ID, "w"); got != pid {
@@ -126,14 +125,11 @@ workers:
 func TestRestartWaitsForBusy(t *testing.T) {
 	t.Parallel()
 	s := newStand(t)
-	w := s.worker("w")
-	interval := config.Duration(200 * time.Millisecond)
-	w.Lifecycle.Health.Interval, w.Lifecycle.Health.Timeout = &interval, interval
-	s.start(s.config(w))
+	s.start(s.config(s.worker("w")))
 	a := s.running("w")
 	pid := s.pid(a.ID, "w")
 
-	s.fetch(a.ID, "w", "/work?id=a&steps=8&ms=250", testserver.FetchInit{Method: "POST"})
+	s.fetch(a.ID, "w", "/work?id=a&steps=28&ms=250", testserver.FetchInit{Method: "POST"})
 	eventually(t, "воркер занят", func() bool {
 		b, _ := s.server.Agent(agentName)
 		w, _ := b.Worker("w")
@@ -177,7 +173,7 @@ func TestRestartWaitsForBusy(t *testing.T) {
 	}
 
 	// wait — вызов ждёт итога отложенной замены.
-	s.fetch(a.ID, "w", "/work?id=c&steps=4&ms=250", testserver.FetchInit{Method: "POST"})
+	s.fetch(a.ID, "w", "/work?id=c&steps=28&ms=250", testserver.FetchInit{Method: "POST"})
 	eventually(t, "воркер занят", func() bool {
 		b, _ := s.server.Agent(agentName)
 		w, _ := b.Worker("w")

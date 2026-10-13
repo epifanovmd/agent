@@ -1,25 +1,21 @@
-// Действия и обновления: обновление агента из каталога сборок (подпись тестовым ключом),
-// перезапуск зависшего воркера, смена ключа агента, отзыв.
+// Действия и обновления: обновление агента из его каталога сборок (update.releases — папка,
+// устроенная как релизы; подпись тестовым ключом), перезапуск зависшего воркера, смена ключа
+// агента, отзыв.
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 
-import {
-  type Agent,
-  LINK_PATH,
-  type LogEntry,
-  type UpdateCandidate,
-  WS_CHANNEL,
-} from "agent-sdk/server";
+import { type Agent, LINK_PATH, type LogEntry } from "agent-sdk/server";
 
 import {
   ApiError,
   BIN,
   bin,
+  keygen,
   NEXT_VERSION,
   ROOT,
   run,
@@ -27,18 +23,6 @@ import {
   VERSION,
   waitFor,
 } from "./stand";
-
-/** Пара ключей подписи сборок (agent keygen). */
-const keygen = async () => {
-  const { stdout } = await run(bin("agent"), ["keygen"]);
-  const value = (name: string) =>
-    stdout.match(new RegExp(`^${name}=(.+)$`, "m"))![1];
-
-  return {
-    signing: value("AGENT_SIGNING_KEY"),
-    public: value("AGENT_UPDATE_PUBLIC_KEYS"),
-  };
-};
 
 /** manifest.json каталога сборок с подписью ключом signing. */
 const manifest = (dir: string, signing: string) =>
@@ -55,7 +39,7 @@ const linkStatus = (url: string, agentId: string, secret: string) =>
         upgrade: "websocket",
         "sec-websocket-version": "13",
         "sec-websocket-key": randomBytes(16).toString("base64"),
-        "sec-websocket-protocol": WS_CHANNEL,
+        "sec-websocket-protocol": "agent.v2",
         authorization: `Agent ${agentId}.${secret}`,
       },
     });
@@ -75,43 +59,57 @@ const linkStatus = (url: string, agentId: string, secret: string) =>
 describe("действия и обновления", () => {
   let s: Stand;
   let releases: string;
+  let catalog: string;
   let keys: { signing: string; public: string };
+
+  /** Версия NEXT_VERSION в каталоге сборок агента, подпись ключом signing; она же — последняя. */
+  const publish = async (signing: string) => {
+    const dir = join(catalog, "download", `v${NEXT_VERSION}`);
+    const latest = join(catalog, "latest", "download");
+
+    await manifest(dir, signing);
+    await mkdir(latest, { recursive: true });
+    await copyFile(join(dir, "manifest.json"), join(latest, "manifest.json"));
+  };
 
   before(async () => {
     assert.ok(NEXT_VERSION, `нет сборки следующей версии в ${BIN}/next`);
     releases = await mkdtemp(join(tmpdir(), "agent-e2e-release-"));
-    keys = await keygen();
-    await copyFile(bin("agent", join(BIN, "next")), bin("agent", releases));
+    catalog = await mkdtemp(join(tmpdir(), "agent-e2e-catalog-"));
+    keys = keygen();
+    const dir = join(catalog, "download", `v${NEXT_VERSION}`);
+
+    await mkdir(dir, { recursive: true });
+    await copyFile(bin("agent", join(BIN, "next")), bin("agent", dir));
     await copyFile(
       join(ROOT, "deploy/install/install.sh"),
       join(releases, "install.sh"),
     );
     // Сначала сборки подписаны чужим ключом.
-    await manifest(releases, (await keygen()).signing);
+    await publish(keygen().signing);
     s = await Stand.start({
       name: "e2e-actions",
       releasesDir: releases,
+      agentReleases: catalog,
       updateKey: keys.public,
     });
   });
   after(async () => {
     await s?.close();
     await rm(releases, { recursive: true, force: true });
+    await rm(catalog, { recursive: true, force: true });
   });
 
   describe("обновление агента", () => {
-    it("кандидаты обновления и команда установки", async () => {
-      const r = await s.api<{
-        release: { version: string };
-        candidates: { agents: UpdateCandidate[] };
-        installCommand: string;
-      }>("GET", "/api/releases");
+    it("агент нашёл новую версию в своём каталоге сборок; команда установки", async () => {
+      const a = await s.waitAgent("агент сообщил о новой версии", x =>
+        Boolean(x.update?.latest),
+      );
 
-      assert.equal(r.release.version, NEXT_VERSION);
-      const c = r.candidates.agents.find(x => x.agentId === s.agentId);
+      assert.equal(a.version, VERSION);
+      assert.equal(a.update?.latest, NEXT_VERSION);
+      const r = await s.api<{ installCommand: string }>("GET", "/api/releases");
 
-      assert.equal(c?.current, VERSION);
-      assert.equal(c?.target, NEXT_VERSION);
       assert.match(
         r.installCommand,
         /^curl -fsSL '.+\/install\.sh' \| sudo sh -s -- '--server' '.+' '--token' /,
@@ -136,7 +134,7 @@ describe("действия и обновления", () => {
     });
 
     it("подписанные сборки: агент ставит новую версию и перезапускается, работа воркера не прерывается", async () => {
-      await manifest(releases, keys.signing);
+      await publish(keys.signing);
       const starts = s.agentStarts;
       const echoPid = async () =>
         (await s.worker("echo"))?.health?.info?.pid as number | undefined;
@@ -144,7 +142,6 @@ describe("действия и обновления", () => {
       const { jobId } = await s.job("echo", {
         type: "echo.long",
         data: { steps: 15, delayMs: 400 },
-        timeoutMs: 1,
       });
       const result = await s.api("POST", `/api/agents/${s.agentId}/update`);
 
@@ -159,11 +156,7 @@ describe("действия и обновления", () => {
       const { stdout } = await run(s.agentBin, ["version"]);
 
       assert.equal(stdout.trim(), NEXT_VERSION);
-      const { candidates } = await s.api<{
-        candidates: { agents: UpdateCandidate[] };
-      }>("GET", "/api/releases");
-
-      assert.deepEqual(candidates.agents, []);
+      assert.equal(a.update, undefined, "новее нет");
       await s.waitWorkers();
       assert.equal(await echoPid(), pid, "echo пережил обновление агента");
       const finished = await waitFor(
@@ -216,7 +209,7 @@ describe("действия и обновления", () => {
     const res = await s.fetchWorker("echo", "/hang", { method: "POST" });
 
     assert.equal(res.status, 202);
-    // GET /health у echo — раз в 2 с (stand.ts), три пропуска подряд — перезапуск.
+    // GET /health — раз в 5 с, три пропуска подряд — перезапуск.
     await waitFor(
       "новый процесс echo",
       async () => {

@@ -19,6 +19,13 @@ import (
 // tailEvery — как часто агент читает файлы вывода воркера; переменная — для тестов.
 var tailEvery = 200 * time.Millisecond
 
+// Файл вывода больше logMaxSize копируется в .1 (прежняя копия
+// удаляется) и очищается; переменная — для тестов.
+var logMaxSize int64 = 10 << 20
+
+// logMaxFiles — сколько копий файла вывода хранить.
+const logMaxFiles = 1
+
 // tailChunk — сколько байт файла вывода читается за раз.
 const tailChunk = 256 << 10
 
@@ -35,8 +42,8 @@ type output struct {
 	files [2]*tailFile
 	// start — места, с которых чтение началось.
 	start [2]int64
-	// limits — текущие logs воркера (меняются перечитыванием настроек).
-	limits func() config.Logs
+	// maxSize — logMaxSize на момент запуска.
+	maxSize int64
 
 	mu      sync.Mutex
 	stopped bool
@@ -53,13 +60,13 @@ type tailFile struct {
 // openOutput — файлы вывода воркера spec в dir: для процесса (дописывание)
 // и чтение агентом с offsets; nil offsets — с текущего конца (старое уже
 // было в логе прежнего запуска).
-func openOutput(dir string, spec config.Worker, offsets *[2]int64, log *slog.Logger, limits func() config.Logs) (*output, [2]*os.File, error) {
+func openOutput(dir string, spec config.Worker, offsets *[2]int64, log *slog.Logger) (*output, [2]*os.File, error) {
 	var child [2]*os.File
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, child, fmt.Errorf("каталог вывода воркеров: %w", err)
 	}
 	out := log.With(logx.OutputKey, spec.Name)
-	o := &output{limits: limits, stop: make(chan struct{}), done: make(chan struct{})}
+	o := &output{maxSize: logMaxSize, stop: make(chan struct{}), done: make(chan struct{})}
 	levels := [2]slog.Level{slog.LevelInfo, slog.LevelWarn}
 	for i, path := range LogFiles(dir, spec.Name) {
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
@@ -101,11 +108,10 @@ func (o *output) run() {
 
 // read — новые строки всех файлов; большой файл — в копию и очистка.
 func (o *output) read() {
-	limits := o.limits()
 	for _, f := range o.files {
 		f.read()
-		if st, err := os.Stat(f.path); err == nil && st.Size() > int64(limits.MaxSize) {
-			f.rotate(limits.Files())
+		if st, err := os.Stat(f.path); err == nil && st.Size() > o.maxSize {
+			f.rotate(logMaxFiles)
 		}
 	}
 }

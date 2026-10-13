@@ -2,7 +2,7 @@
 
 // Package worker — воркеры агента (§12, §13): одна копия процесса на
 // воркер, запуск с переменными окружения, выводом в файлы и ожиданием
-// сокета, перезапуск после выхода по lifecycle.restart с растущей паузой,
+// сокета, перезапуск после сбоя с растущей паузой,
 // регистрация (GET /health и GET /manifest после каждого запуска, §12),
 // проверка GET /health, замена «сначала
 // остановить» с ожиданием, пока воркер занят, подхват воркеров, переживших
@@ -39,7 +39,23 @@ var (
 	stableRun = time.Minute
 	// busyPoll — как часто отложенная замена спрашивает GET /health.
 	busyPoll = time.Second
+	// restartBackoff — пауза перед перезапуском упавшего воркера и перед
+	// повтором проверки регистрации.
+	restartBackoff = backoff.Policy{Min: time.Second, Max: 30 * time.Second}
+	// startTimeout — сколько ждать, пока сокет воркера начнёт отвечать.
+	startTimeout = message.WorkerStartTimeout
+	// healthInterval — как часто агент спрашивает GET /health; healthMisses
+	// пропусков подряд — воркер завис и перезапускается.
+	healthInterval = message.HealthInterval
+	// probeTimeout — срок ответа GET /health, GET /manifest и GET /metrics.
+	probeTimeout = message.ProbeTimeout
+	// busyTimeout — плановая замена занятого воркера (GET /health → busy:
+	// true) ждёт окончания работы не дольше.
+	busyTimeout = 24 * time.Hour
 )
+
+// healthMisses — пропусков GET /health подряд до перезапуска.
+const healthMisses = message.HealthMisses
 
 // Ошибки доступа к воркеру.
 var (
@@ -55,11 +71,9 @@ type Exit int32
 const (
 	// ExitShutdown — остановить все воркеры (по умолчанию).
 	ExitShutdown Exit = iota
-	// ExitRestart — агент перезапускается: воркеры с lifecycle.onAgentExit:
-	// keep работают дальше.
+	// ExitRestart — агент перезапускается: воркеры работают дальше.
 	ExitRestart
-	// ExitStop — агент останавливается: воркеры с lifecycle.onAgentExit:
-	// keep работают дальше.
+	// ExitStop — агент останавливается: воркеры работают дальше.
 	ExitStop
 )
 
@@ -286,18 +300,11 @@ func (s *Supervisor) Apply(specs []config.Worker) {
 
 func (w *Worker) opts() Options { return w.sup.opts }
 
-// life — текущая жизнь воркера.
+// life — текущие настройки остановки воркера.
 func (w *Worker) life() config.Lifecycle {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.spec.Lifecycle
-}
-
-// logs — текущие настройки файлов вывода.
-func (w *Worker) logs() config.Logs {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.spec.Logs
 }
 
 // get — воркер по имени.
@@ -515,7 +522,7 @@ func (w *Worker) replace(ctx context.Context, swap func() error, kind string, fo
 }
 
 // waitIdle — плановая замена ждёт, пока воркер отвечает busy: true на
-// GET /health (не дольше lifecycle.busyTimeout). true — ждать не нужно и заменять
+// GET /health (не дольше busyTimeout). true — ждать не нужно и заменять
 // тоже: это перезапуск, а воркер за время ожидания уже запущен заново.
 func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 	w.mu.Lock()
@@ -537,15 +544,11 @@ func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 		}
 	}()
 	for {
-		life := w.life()
-		if life.BusyWait() <= 0 {
-			return restarted()
-		}
 		client, err := w.sup.Client(w.name)
 		if err != nil {
 			return restarted()
 		}
-		h, err := probeHealth(ctx, client, life.Health.Timeout.Std())
+		h, err := probeHealth(ctx, client, probeTimeout)
 		if err != nil || h == nil || !h.Busy {
 			if !deadline.IsZero() {
 				log.Info("воркер освободился — замена")
@@ -554,15 +557,15 @@ func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 		}
 		w.setHealth(h)
 		if deadline.IsZero() {
-			deadline = time.Now().Add(life.BusyWait())
+			deadline = time.Now().Add(busyTimeout)
 			w.mu.Lock()
 			w.waiting[kind]++
 			w.mu.Unlock()
 			w.opts().OnChange()
-			log.Info("воркер занят — замена отложена до окончания работы", "busyTimeout", life.BusyWait(), "message", h.Message)
+			log.Info("воркер занят — замена отложена до окончания работы", "busyTimeout", busyTimeout, "message", h.Message)
 			notifyDeferred(ctx, kind)
 		} else if time.Now().After(deadline) {
-			log.Warn("воркер занят дольше busyTimeout — замена", "busyTimeout", life.BusyWait())
+			log.Warn("воркер занят дольше busyTimeout — замена", "busyTimeout", busyTimeout)
 			return false
 		}
 		select {
@@ -611,9 +614,8 @@ func (w *Worker) settle() {
 	}
 }
 
-// keepOnExit — агент уходит, а воркер работает дальше (SetExit,
-// lifecycle.onAgentExit); встроенный и удалённый из
-// настроек — никогда.
+// keepOnExit — агент уходит, а воркер работает дальше (SetExit);
+// встроенный и удалённый из настроек — никогда.
 func (w *Worker) keepOnExit() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -622,7 +624,7 @@ func (w *Worker) keepOnExit() bool {
 	}
 	switch Exit(w.sup.exit.Load()) {
 	case ExitRestart, ExitStop:
-		return w.spec.Lifecycle.OnAgentExit == config.Keep
+		return true
 	}
 	return false
 }
@@ -753,25 +755,17 @@ func (w *Worker) loop(ctx context.Context) {
 			w.setState(message.WorkerStopped)
 			return
 		}
-		life := w.life()
 		var wait <-chan time.Time
-		switch {
-		case life.Restart == config.RestartNever || life.Restart == config.RestartFailure && !failed:
-			log.Info("воркер не перезапускается (lifecycle.restart: "+life.Restart+") — до worker.restart или изменения настроек", "restart", life.Restart)
-			w.setState(message.WorkerStopped)
-		default:
+		if failed {
 			failures++
 			w.mu.Lock()
 			w.restarts++
 			w.mu.Unlock()
-			if life.MaxRestarts > 0 && failures > life.MaxRestarts {
-				log.Error("воркер падает подряд чаще maxRestarts — остаётся остановленным до worker.restart", "maxRestarts", life.MaxRestarts)
-				w.setState(message.WorkerStopped)
-			} else {
-				policy := backoff.Policy{Min: life.Backoff.Min.Std(), Max: life.Backoff.Max.Std()}
-				w.setState(message.WorkerBackoff)
-				wait = time.After(policy.Delay(failures - 1))
-			}
+			w.setState(message.WorkerBackoff)
+			wait = time.After(restartBackoff.Delay(failures - 1))
+		} else {
+			log.Info("воркер завершился сам (exit 0) — не перезапускается до worker.restart или изменения настроек")
+			w.setState(message.WorkerStopped)
 		}
 		select {
 		case <-ctx.Done():
@@ -805,14 +799,14 @@ func (w *Worker) adopt(ctx context.Context, spec config.Worker) (*process, procS
 		removeState(dir, w.name)
 		return nil, st
 	}
-	p, err := adoptProcess(st, spec, w.sup.logDir, w.opts().Log, w.life, w.logs)
+	p, err := adoptProcess(st, spec, w.sup.logDir, w.opts().Log, w.life)
 	if err != nil {
 		log.Warn("воркер не подхвачен — запуск заново", "err", err)
 		stopOrphan(st)
 		removeState(dir, w.name)
 		return nil, st
 	}
-	if err := p.waitReady(ctx, spec.Lifecycle.StartTimeout.Std()); err != nil {
+	if err := p.waitReady(ctx, startTimeout); err != nil {
 		log.Warn("воркер не подхвачен: сокет не отвечает — запуск заново", "err", err)
 		p.detach()
 		stopOrphan(st)
@@ -856,49 +850,43 @@ func (w *Worker) clearProc() {
 func (w *Worker) start(ctx context.Context, spec config.Worker) (*process, error) {
 	o := w.opts()
 	p, err := startProcess(spec, o.RunDir, w.sup.logDir,
-		env{agentSocket: o.AgentSocket, agentVersion: o.AgentVersion, token: w.getToken(), extra: o.Env}, o.Log, w.life, w.logs)
+		env{agentSocket: o.AgentSocket, agentVersion: o.AgentVersion, token: w.getToken(), extra: o.Env}, o.Log, w.life)
 	if err != nil {
 		return nil, err
 	}
-	if err := p.waitReady(ctx, spec.Lifecycle.StartTimeout.Std()); err != nil {
+	if err := p.waitReady(ctx, startTimeout); err != nil {
 		p.stop()
 		return nil, err
 	}
 	return p, nil
 }
 
-// healthLoop — GET /health раз в health.interval (первый — сразу; 0 — не
-// проверять); health.failures раз подряд без ответа — воркер завис и
-// перезапускается (0 — не перезапускается), даже если он был занят.
+// healthLoop — GET /health раз в healthInterval (первый — сразу);
+// healthMisses раз подряд без ответа — воркер завис и перезапускается, даже
+// если он был занят.
 func (w *Worker) healthLoop(ctx context.Context, p *process) {
 	misses := 0
 	for {
-		life := w.life()
-		interval := life.HealthInterval()
-		if interval > 0 {
-			h, err := probeHealth(ctx, p.client, life.Health.Timeout.Std())
-			if ctx.Err() != nil {
+		h, err := probeHealth(ctx, p.client, probeTimeout)
+		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, errNoResponse) {
+			misses++
+			p.log.Warn("воркер не ответил на GET /health", "misses", misses)
+			if misses >= healthMisses {
+				p.log.Error("воркер завис: нет ответа на GET /health — перезапуск", "misses", misses)
+				p.kill("воркер завис: нет ответа на GET /health")
 				return
 			}
-			if errors.Is(err, errNoResponse) {
-				misses++
-				p.log.Warn("воркер не ответил на GET /health", "misses", misses)
-				if limit := life.HealthFailures(); limit > 0 && misses >= limit {
-					p.log.Error("воркер завис: нет ответа на GET /health — перезапуск", "misses", misses)
-					p.kill("воркер завис: нет ответа на GET /health")
-					return
-				}
-			} else {
-				misses = 0
-				w.setHealth(h)
-			}
 		} else {
-			interval = time.Second // проверка выключена: ждать, не включат ли её
+			misses = 0
+			w.setHealth(h)
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(interval):
+		case <-time.After(healthInterval):
 		}
 	}
 }
@@ -917,7 +905,7 @@ func (w *Worker) setHealth(h *message.Health) {
 // корректны — state: running, иначе — invalid с причиной. Манифест
 // обновляется при каждой проверке. true — зарегистрирован.
 func (w *Worker) register(ctx context.Context, p *process) bool {
-	m, reason := probeRegistration(ctx, p.client, w.life().Health.Timeout.Std())
+	m, reason := probeRegistration(ctx, p.client, probeTimeout)
 	if ctx.Err() != nil {
 		return false
 	}
@@ -945,16 +933,14 @@ func (w *Worker) register(ctx context.Context, p *process) bool {
 }
 
 // retryRegister — повтор проверки регистрации с растущей паузой
-// (lifecycle.backoff), пока воркер не зарегистрируется или процесс не
+// (restartBackoff), пока воркер не зарегистрируется или процесс не
 // сменится.
 func (w *Worker) retryRegister(ctx context.Context, p *process, adopted bool) {
 	for attempt := 0; ; attempt++ {
-		life := w.life()
-		policy := backoff.Policy{Min: life.Backoff.Min.Std(), Max: life.Backoff.Max.Std()}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(policy.Delay(attempt)):
+		case <-time.After(restartBackoff.Delay(attempt)):
 		}
 		if w.register(ctx, p) {
 			p.log.Info("воркер зарегистрирован")

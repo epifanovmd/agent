@@ -1,19 +1,14 @@
-// Общее для частей Agents: Store, настройки, сессии этого процесса, события, аудит, условная
-// запись агента. Части получают Context и не знают друг о друге.
+// Общее для частей Agents: Store, настройки, сессии этого процесса, события, условная запись
+// агента. Части получают Context и не знают друг о друге.
 import type { EventEmitter } from "node:events";
 
-import { jsonSchemaProblems } from "../lib/json-schema";
 import { publicAgent } from "../model/public-agent";
 import type {
   ActionRecord,
   Agent,
   AgentEvent,
   AgentRecord,
-  Alert,
-  AuditAction,
-  AuditEntry,
   ConfigStatus,
-  InvalidEvent,
   MetricsPoint,
 } from "../model/types";
 import type { LogEntry } from "../protocol/messages";
@@ -33,45 +28,20 @@ export interface LogEvent {
   entries: LogEntry[];
 }
 
-/** Проблема началась (active) или закончилась. */
-export interface AlertEvent extends Alert {
-  active: boolean;
-}
-
 /** Что-то изменилось в Store для агента: другим процессам — refresh(agentId). */
 export interface ChangeEvent {
   agentId: string;
   reason: "session" | "config" | "revoke" | "delete";
 }
 
-/** Удалённый источник сборок агента дал новую версию (опция agentReleases). */
-export interface ReleaseEvent {
-  /** Новая версия агента. */
-  version: string;
-  /** Прежняя версия; нет — сборки получены впервые. */
-  previous?: string;
-  /** Источник: `github:owner/repo` или база сборок (url). */
-  from: string;
-}
-
 export interface AgentsEvents {
   agent: [Agent];
   event: [AgentEvent];
-  invalidEvent: [InvalidEvent];
   metrics: [MetricsEvent];
   log: [LogEvent];
   config: [ConfigStatus];
-  alert: [AlertEvent];
   action: [ActionRecord];
-  audit: [AuditEntry];
   change: [ChangeEvent];
-  release: [ReleaseEvent];
-}
-
-/** Начавшиеся и закончившиеся проблемы. */
-export interface AlertChanges {
-  started: Alert[];
-  ended: Alert[];
 }
 
 /** Итог условной записи: свежая запись (нет — агента нет) и записано ли изменение. */
@@ -87,28 +57,11 @@ export interface Context {
   /** Сессии этого процесса: id агента → сессия. */
   readonly sessions: Map<string, Session>;
   log(msg: string, extra?: Record<string, unknown>): void;
-  /**
-   * Замечания к data по схеме из манифеста воркера (пусто — подходит). Нет схемы или её нельзя
-   * применить — без проверки (второе — запись в журнал: «схема what … не применяется», fields).
-   */
-  schemaProblems(
-    schema: Record<string, unknown> | undefined,
-    data: unknown,
-    what: string,
-    fields: Record<string, unknown>,
-  ): string[];
   /** Событие; ошибка подписчика не мешает работе. */
   emit<K extends keyof AgentsEvents>(event: K, ...args: AgentsEvents[K]): void;
   listens(event: keyof AgentsEvents): boolean;
   /** Событие agent с видом записи для бэкенда. */
   emitAgent(a: AgentRecord): void;
-  emitAlerts(changes: AlertChanges): void;
-  audit(
-    actor: string,
-    action: AuditAction,
-    agentId: string,
-    details?: Record<string, unknown>,
-  ): void;
   change(agentId: string, reason: ChangeEvent["reason"]): void;
   /**
    * Условная запись агента: fn меняет свежую запись (false — ничего не менять); запись изменилась
@@ -144,20 +97,6 @@ export const createContext = (
     sessions,
     log,
 
-    schemaProblems(schema, data, what, fields) {
-      if (!schema) return [];
-      try {
-        return jsonSchemaProblems(schema, data);
-      } catch (e) {
-        log(`схема ${what} из манифеста воркера не применяется`, {
-          ...fields,
-          err: String(e),
-        });
-
-        return [];
-      }
-    },
-
     emit(event, ...args) {
       try {
         (emitter.emit as (e: string, ...a: unknown[]) => boolean).call(
@@ -174,18 +113,6 @@ export const createContext = (
 
     emitAgent: a => ctx.emit("agent", publicAgent(a)),
 
-    emitAlerts({ started, ended }) {
-      for (const al of started) ctx.emit("alert", { ...al, active: true });
-      for (const al of ended) ctx.emit("alert", { ...al, active: false });
-    },
-
-    audit(actor, action, agentId, details) {
-      const e: AuditEntry = { at: Date.now(), actor, action, agentId };
-
-      if (details) e.details = details;
-      ctx.emit("audit", e);
-    },
-
     change: (agentId, reason) => ctx.emit("change", { agentId, reason }),
 
     async mutate(id, fn) {
@@ -194,7 +121,6 @@ export const createContext = (
 
         if (!a) return { agent: undefined, changed: false };
         a.configs ??= {};
-        a.alerts ??= [];
         if (!fn(a)) return { agent: a, changed: false };
         if (await store.updateAgent(a)) return { agent: a, changed: true };
       }

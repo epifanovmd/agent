@@ -63,16 +63,10 @@ agent.yaml и agent.env сохраняются (переданные --token и 
                           --public-key — то же
   --worker ИМЯ            воркер со сборкой с сервера (можно несколько раз)
   --releases URL          откуда брать воркеры (по умолчанию <server>/api/v1/agent-link/releases)
-  --user ИМЯ              пользователь службы (по умолчанию agent, у экземпляра — agent-ИМЯ;
-                          нет — создаётся)
   --privileged            агент и воркеры — root без ограничений (воркеры настраивают узел)
-  --rw-path ПУТЬ          разрешить запись ещё в этот каталог (можно несколько раз)
   --packages "…"          системные пакеты для воркеров (apt, dnf, yum, apk, zypper)
   --packages-apt "…"      свои имена пакетов для менеджера (также -dnf, -yum, -apk, -zypper)
   --sysctl КЛЮЧ=ЗНАЧЕНИЕ  параметр ядра для воркеров (можно несколько раз)
-  --kill-mode process|mixed  process (по умолчанию) — systemd останавливает только агента, воркеры
-                          работают дальше; mixed — и воркеры (запоминается)
-  --stop-timeout СРОК     сколько systemd ждёт остановки (по умолчанию 15min)
 
 Удаление: [sudo] agent uninstall [--instance ИМЯ] [--purge] — тем же пользователем, что и установка
 `
@@ -94,13 +88,9 @@ func ParseFlags(args []string, errOut io.Writer) (Options, error) {
 	fs.StringVar(&o.Config, "config", "", "")
 	fs.StringVar(&o.Env, "env", "", "")
 	fs.StringVar(&o.CAFile, "ca-file", "", "")
-	fs.StringVar(&o.User, "user", "", "")
-	fs.StringVar(&o.KillMode, "kill-mode", "", "")
-	fs.StringVar(&o.StopTimeout, "stop-timeout", "", "")
 	fs.StringVar(&o.Releases, "releases", "", "")
 	fs.BoolVar(&o.Privileged, "privileged", false, "")
 	fs.BoolVar(&o.Rootless, "rootless", false, "")
-	fs.Var(list{to: &o.RWPaths}, "rw-path", "")
 	fs.Var(list{to: &o.Sysctls}, "sysctl", "")
 	fs.Var(list{to: &o.Workers}, "worker", "")
 	fs.Var(list{to: &o.Packages, words: true}, "packages", "")

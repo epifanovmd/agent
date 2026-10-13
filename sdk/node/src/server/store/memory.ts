@@ -71,7 +71,6 @@ export class MemoryStore implements Store {
       updatedAt: Date.now(),
     };
 
-    if (opts.actor) rec.actor = opts.actor;
     this.versions.set(id, version);
     this.configs.set(id, rec);
 

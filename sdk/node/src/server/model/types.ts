@@ -6,11 +6,6 @@ import type {
   Hello,
   HelloWorker,
   LogLevel,
-  ManifestConfig,
-  ManifestEvent,
-  ManifestJob,
-  ManifestRequest,
-  ManifestRoute,
   Metrics,
   ReleaseArtifact,
   ReleaseManifest,
@@ -37,27 +32,6 @@ export interface ConfigReported extends ConfigReport {
   at: number;
 }
 
-export type AlertType =
-  | "offline"
-  | "workerDown"
-  | "workerInvalid"
-  | "workerUnhealthy"
-  | "configFailed";
-
-/** Проблема агента: начинается и заканчивается сама по сообщениям агента. */
-export interface Alert {
-  /** Ключ проблемы в пределах агента: `offline`, `workerDown:<воркер>`, `workerInvalid:<воркер>`, `configFailed:<воркер>/<ключ>`. */
-  key: string;
-  agentId: string;
-  agentName: string;
-  type: AlertType;
-  worker?: string;
-  configKey?: string;
-  message: string;
-  /** С какого времени, мс. */
-  since: number;
-}
-
 /** Сессия агента: какой процесс бэкенда держит соединение. */
 export interface SessionInfo {
   id: string;
@@ -68,7 +42,7 @@ export interface SessionInfo {
 
 /**
  * Запись агента в Store: ключ, учёт потока и последнее, что агент сообщил (hello, status,
- * метрики, итоги настроек, проблемы) — чтобы getAgent работал из любого процесса. `rev` — версия
+ * метрики, итоги настроек) — чтобы getAgent работал из любого процесса. `rev` — версия
  * записи для условной записи (store.md); остальное Store хранит как есть (одним JSON).
  */
 export interface AgentRecord {
@@ -98,8 +72,6 @@ export interface AgentRecord {
   lastSeq: number;
   /** Что агент сообщил о настройках: воркер → ключ → итог. */
   configs: Record<string, Record<string, ConfigReported>>;
-  /** Текущие проблемы. */
-  alerts: Alert[];
   rev: number;
 }
 
@@ -131,7 +103,6 @@ export interface Agent {
   metrics?: MetricsPoint;
   /** Новая версия агента, которую он нашёл в своём каталоге сборок (§11); нет — новее нет или агент не проверял. */
   update?: AgentUpdateInfo;
-  alerts: Alert[];
   session?: SessionInfo;
 }
 
@@ -144,7 +115,6 @@ export interface ConfigRecord {
   version: number;
   data: unknown;
   updatedAt: number;
-  actor?: string;
 }
 
 export type ConfigState =
@@ -187,17 +157,6 @@ export interface AgentEvent {
   /** Когда случилось на узле, мс. */
   at: number;
   receivedAt: number;
-  /** data не по events[].schema манифеста (validate.events: log): «поле: замечание». */
-  problems?: string[];
-}
-
-/** Событие, data которого не подходит под events[].schema манифеста (опция validate.events). */
-export interface InvalidEvent {
-  event: AgentEvent;
-  /** Что не так: «поле: замечание», не больше трёх. */
-  problems: string[];
-  /** reject — событие подтверждено агенту, но не передано onEvent и событию event. */
-  rejected: boolean;
 }
 
 /** Запрос воркера к серверу (опция onWorkerRequest, §12). */
@@ -215,17 +174,6 @@ export interface WorkerRequest {
   timeoutMs: number;
   /** Отмена: истёк срок или связь с агентом оборвалась. */
   signal: AbortSignal;
-}
-
-/** Что умеет воркер — из его манифеста (Agents.capabilities). */
-export interface WorkerCapabilities {
-  version?: string;
-  description?: string;
-  configs: ManifestConfig[];
-  routes: ManifestRoute[];
-  events: ManifestEvent[];
-  jobs: ManifestJob[];
-  requests: ManifestRequest[];
 }
 
 /** Точка метрик. */
@@ -247,7 +195,6 @@ export interface ActionRecord {
   agentId: string;
   name: ActionName;
   args?: Record<string, unknown>;
-  actor?: string;
   status: "done" | "failed";
   result?: unknown;
   error?: ErrorInfo;
@@ -257,88 +204,8 @@ export interface ActionRecord {
   deferred?: true;
 }
 
-/** Откуда сборка: remote — удалённый источник (agentReleases), local — releasesDir. */
-export type ReleaseOrigin = "remote" | "local";
-
-/** Где лежит сборка: источник и ссылка (у local — путь от корня сервера). */
-export interface ReleaseLocation {
-  source: ReleaseOrigin;
-  url: string;
-}
-
-/**
- * Сборки, которые раздаёт Agents: manifest.json (file — имя файла для
- * `…/releases/<file>`) с источником каждой сборки; с agentReleases — агент и его воркеры из
- * удалённого источника плюс воркеры проекта из releasesDir.
- */
+/** Сборки, которые раздаёт Agents: manifest.json из releasesDir со ссылкой url на каждую сборку. */
 export interface ReleaseView extends ReleaseManifest {
-  artifacts: (ReleaseArtifact & ReleaseLocation)[];
-  workers?: (WorkerArtifact & ReleaseLocation)[];
-  /**
-   * Удалённые сборки: версия, источник (`github:owner/repo` или url), когда проверен (мс), ключ
-   * его подписи (publicKey из его manifest.json).
-   */
-  remote?: {
-    version: string;
-    from: string;
-    checkedAt: number;
-    publicKey?: string;
-  };
-}
-
-/** Агент, которого можно обновить до версии с сервера. */
-export interface UpdateCandidate {
-  agentId: string;
-  agentName: string;
-  online: boolean;
-  current: string;
-  target: string;
-  os: string;
-  arch: string;
-  /**
-   * server — сборка с сервера (updateAgent без version); agent — версия, которую агент нашёл в
-   * своём каталоге сборок (updateAgent с version: target).
-   */
-  source: "server" | "agent";
-}
-
-/** Воркер со сборкой с сервера, которого можно обновить. */
-export interface WorkerUpdateCandidate {
-  agentId: string;
-  agentName: string;
-  online: boolean;
-  worker: string;
-  current: string;
-  target: string;
-  os: string;
-  arch: string;
-}
-
-/** Итог updateCandidates: агенты и воркеры, которых можно обновить. */
-export interface UpdateCandidates {
-  agents: UpdateCandidate[];
-  workers: WorkerUpdateCandidate[];
-}
-
-export type AuditAction =
-  | "agent.enroll"
-  | "agent.revoke"
-  | "agent.delete"
-  | "agent.rotateKey"
-  | "agent.update"
-  | "agent.logs"
-  | "worker.restart"
-  | "worker.update"
-  | "config.set"
-  | "config.delete"
-  | "fetch";
-
-/** Запись аудита: кто что сделал (agents.by(actor)). */
-export interface AuditEntry {
-  at: number;
-  /** Пусто — без by(). */
-  actor: string;
-  action: AuditAction;
-  agentId: string;
-  details?: Record<string, unknown>;
+  artifacts: (ReleaseArtifact & { url: string })[];
+  workers?: (WorkerArtifact & { url: string })[];
 }

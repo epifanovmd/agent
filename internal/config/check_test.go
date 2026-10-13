@@ -3,12 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
-
-	"gopkg.in/yaml.v3"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -20,79 +17,8 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
-func strictDecode(t *testing.T, src []byte) Config {
-	t.Helper()
-	cfg := Defaults()
-	dec := yaml.NewDecoder(strings.NewReader(string(src)))
-	dec.KnownFields(true)
-	if err := dec.Decode(&cfg); err != nil {
-		t.Fatalf("%v\n%s", err, src)
-	}
-	return cfg
-}
-
-// Созданный файл читается агентом: заданные значения на месте, остальное —
-// умолчания; закомментированные примеры — тоже верный YAML с известными
-// полями; в примерах есть каждый раздел настроек.
-func TestTemplate(t *testing.T) {
-	opts := TemplateOptions{
-		ServerURL: "https://api.example.com:8443/agents", Token: "tok: #1", Name: "node 01", DataDir: "/srv/agent",
-		LogFormat: "json",
-		Workers: []TemplateWorker{
-			{Name: "example", Release: true, StopTimeout: "1m"},
-			{Name: "report", Release: true, Command: []string{"./bin/report"}},
-		},
-	}
-	src := Template(opts)
-	cfg, err := Load(writeConfig(t, string(src)))
-	if err != nil {
-		t.Fatalf("%v\n%s", err, src)
-	}
-	if cfg.Server.URL != opts.ServerURL || cfg.Enroll.Token != opts.Token || cfg.Name != opts.Name ||
-		cfg.DataDir != opts.DataDir || cfg.Log.Format != "json" || cfg.Log.Level != "info" {
-		t.Fatalf("значения: %+v", cfg)
-	}
-	if len(cfg.Workers) != 2 || !cfg.Workers[0].Release ||
-		cfg.Workers[0].Lifecycle.StopTimeout.Std().String() != "1m0s" || !slices.Equal(cfg.Workers[1].Command, []string{"./bin/report"}) {
-		t.Fatalf("воркеры: %+v", cfg.Workers)
-	}
-	if !reflect.DeepEqual(cfg.Telemetry, Defaults().Telemetry) || !reflect.DeepEqual(cfg.Update, Defaults().Update) {
-		t.Fatalf("умолчания: %+v %+v", cfg.Telemetry, cfg.Update)
-	}
-
-	// Минимальный файл: только адрес; без воркеров — пустой список.
-	minimal := Template(TemplateOptions{ServerURL: "https://api.example.com"})
-	cfg, err = Load(writeConfig(t, string(minimal)))
-	if err != nil || cfg.Server.URL != "https://api.example.com" || len(cfg.Workers) != 0 || cfg.DataDir != DefaultDataDir() {
-		t.Fatalf("минимальный: %+v %v\n%s", cfg, err, minimal)
-	}
-	if !strings.Contains(string(minimal), "# enroll:") || !strings.Contains(string(minimal), "#   token:") {
-		t.Fatalf("токен — примером:\n%s", minimal)
-	}
-
-	// Примеры без «#» — верный YAML с известными полями.
-	for _, o := range []TemplateOptions{{uncomment: true}, {ServerURL: "https://api.example.com", Workers: opts.Workers, LogFormat: "json", uncomment: true}} {
-		full := strictDecode(t, Template(o))
-		if len(full.Workers) < 2 || !slices.Equal(full.Telemetry.Metrics, Defaults().Telemetry.Metrics) {
-			t.Fatalf("примеры: %+v", full)
-		}
-	}
-	// Каждый раздел Config есть в примерах.
-	example := string(Template(TemplateOptions{uncomment: true}))
-	rt := reflect.TypeOf(Config{})
-	for i := range rt.NumField() {
-		tag := strings.Split(rt.Field(i).Tag.Get("yaml"), ",")[0]
-		if tag == "" {
-			continue // служебное поле
-		}
-		if !strings.Contains(example, "\n"+tag+":") {
-			t.Errorf("в шаблоне нет раздела %s", tag)
-		}
-	}
-}
-
 // config check: неизвестные поля — предупреждения со строкой; ошибки
-// значений — со строкой поля; переменные AGENT_* перечислены.
+// значений — с именем поля; переменные AGENT_* — поверх файла.
 func TestCheck(t *testing.T) {
 	t.Setenv("AGENT_NAME", "from-env")
 	path := writeConfig(t, `server:
@@ -103,25 +29,25 @@ workers:
   - name: a
     command: ["a"]
   - name: b
-    command: ["b"]
-    lifecycle: {maxRestarts: -1}
+    path: workers/b
+    release: true
     limits:
       memory: 1G
 `)
 	res := Check(path)
-	if res.Config.Name != "from-env" || !slices.Contains(res.FromEnv, "AGENT_NAME") {
+	if res.Config.Name != "from-env" {
 		t.Fatalf("окружение: %+v", res)
 	}
 	if len(res.Warnings) != 2 || res.Warnings[0].Line != 3 || !strings.Contains(res.Warnings[0].Text, "«enrol»") ||
 		res.Warnings[1].Line != 11 || !strings.Contains(res.Warnings[1].Text, "«limits»") {
 		t.Fatalf("предупреждения: %+v", res.Warnings)
 	}
-	if len(res.Errors) != 1 || res.Errors[0].Line != 10 || !strings.Contains(res.Errors[0].String(), "строка 10: workers[1].lifecycle.maxRestarts") {
+	if len(res.Errors) != 1 || !strings.Contains(res.Errors[0].String(), "workers[1]: path") {
 		t.Fatalf("ошибки: %+v", res.Errors)
 	}
 
 	// Разметка и типы — со строкой.
-	res = Check(writeConfig(t, "server:\n  url: https://api.example.com\ntelemetry:\n  metrics: many\n"))
+	res = Check(writeConfig(t, "server:\n  url: https://api.example.com\noutbox:\n  maxMessages: many\n"))
 	if len(res.Errors) != 1 || res.Errors[0].Line != 4 {
 		t.Fatalf("тип: %+v", res.Errors)
 	}

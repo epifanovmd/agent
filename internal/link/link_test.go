@@ -187,12 +187,12 @@ func newLink(t *testing.T, f *fakeServer, auth *testAuth, h *testHandler) (*Link
 	}
 	buf := stream.New(message.StreamBacklog)
 	l := New(Options{
-		ServerURLs: []string{f.srv.URL},
-		Auth:       auth,
-		Outbox:     ob,
-		Stream:     buf,
-		Log:        logx.Discard(),
-		Backoff:    backoff.Policy{Min: 10 * time.Millisecond, Max: 50 * time.Millisecond},
+		ServerURL: f.srv.URL,
+		Auth:      auth,
+		Outbox:    ob,
+		Stream:    buf,
+		Log:       logx.Discard(),
+		Backoff:   backoff.Policy{Min: 10 * time.Millisecond, Max: 50 * time.Millisecond},
 	}, h)
 	return l, ob, buf
 }
@@ -341,7 +341,7 @@ func TestPingWithoutPong(t *testing.T) {
 // Пауза по коду закрытия (§2): 1012 — до 1 с, 4409 — не меньше 30 с,
 // 4400 — растущая пауза, 426 — наибольшая.
 func TestCloseCodeDelays(t *testing.T) {
-	l := New(Options{ServerURLs: []string{"http://a"}, Auth: &testAuth{}, Log: logx.Discard(),
+	l := New(Options{ServerURL: "http://a", Auth: &testAuth{}, Log: logx.Discard(),
 		Backoff: backoff.Policy{Min: 10 * time.Millisecond, Max: time.Second}}, &testHandler{})
 	ctx := context.Background()
 	if d := l.delay(ctx, &CloseError{Code: message.CloseRestart}, 5); d >= time.Second {
@@ -416,7 +416,7 @@ func runKeysLink(t *testing.T, f *fakeServer, auth *keysAuth) *testHandler {
 	}
 	h := &testHandler{}
 	l := New(Options{
-		ServerURLs: []string{f.srv.URL}, Auth: auth, Outbox: ob, Stream: stream.New(100),
+		ServerURL: f.srv.URL, Auth: auth, Outbox: ob, Stream: stream.New(100),
 		Log:     logx.Discard(),
 		Backoff: backoff.Policy{Min: 10 * time.Millisecond, Max: 50 * time.Millisecond},
 	}, h)
@@ -467,50 +467,6 @@ func TestBothSecretsRejectedRenews(t *testing.T) {
 	auth, _ := newKeysAuth(t, identity.Credentials{AgentID: "a", Secret: "s", PendingSecret: "new"})
 	runKeysLink(t, f, auth)
 	eventually(t, "регистрация заново", func() bool { return auth.renewed.Load() >= 1 })
-}
-
-// Несколько адресов: первый недоступен — связь через второй; закрытие кодом
-// и отказ 4xx адрес не меняют.
-func TestServerURLsRoundRobin(t *testing.T) {
-	dead := httptest.NewServer(http.NotFoundHandler())
-	deadURL := dead.URL
-	dead.Close() // порт закрыт: соединение отклоняется
-	f := newFakeServer(t)
-	ob, err := outbox.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	auth := &testAuth{}
-	auth.value.Store("Agent a.s")
-	h := &testHandler{}
-	l := New(Options{
-		ServerURLs: []string{deadURL, f.srv.URL, deadURL}, Auth: auth,
-		Outbox: ob, Stream: stream.New(100), Log: logx.Discard(),
-		Backoff: backoff.Policy{Min: 10 * time.Millisecond, Max: 50 * time.Millisecond},
-	}, h)
-	if len(l.urls) != 2 || l.ServerURL() != deadURL {
-		t.Fatalf("адреса: %v", l.urls)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go l.Run(ctx)
-	eventually(t, "сессия через второй адрес", func() bool { return l.Connected() })
-	if l.ServerURL() != f.srv.URL {
-		t.Fatalf("адрес: %s", l.ServerURL())
-	}
-	for _, c := range []struct {
-		err  error
-		want bool
-	}{
-		{errors.New("connection refused"), true},
-		{&DialError{Status: 502}, true},
-		{&DialError{Status: 401}, false},
-		{&CloseError{Code: message.CloseRestart}, false},
-	} {
-		if got := switchable(c.err); got != c.want {
-			t.Errorf("switchable(%v) = %v", c.err, got)
-		}
-	}
 }
 
 // Перегрузка сервера: 4429 с секундами в reason, HTTP 429/503 с Retry-After —

@@ -74,9 +74,7 @@ func TestEvents(t *testing.T) {
 func TestMetrics(t *testing.T) {
 	t.Parallel()
 	s := newStand(t)
-	cfg := s.config(s.worker("w"))
-	cfg.Telemetry.Metrics = []string{message.MetricsCPU, message.MetricsMemory, message.MetricsUptime}
-	s.start(cfg)
+	s.start(s.config(s.worker("w")))
 	a := s.running("w")
 	eventually(t, "метрики узла и воркера", func() bool {
 		for _, p := range s.server.Metrics(a.ID) {

@@ -33,8 +33,7 @@ export const readBody = async (
 export const readJSON = async (
   req: IncomingMessage,
   limit = MAX_BODY,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- тело JSON произвольно; any — умолчание публичного API
-): Promise<any> => {
+): Promise<unknown> => {
   const raw = await readBody(req, limit);
 
   try {

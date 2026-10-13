@@ -22,8 +22,8 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2
 StartLimitIntervalSec=0
-KillMode={{ .KillMode }}
-TimeoutStopSec={{ .StopTimeout }}
+KillMode=process
+TimeoutStopSec=15min
 {{- if .Paths.Home }}
 NoNewPrivileges=true
 {{- else if .Privileged }}
@@ -33,7 +33,7 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths={{ .Paths.DataDir }} {{ .Paths.OptDir }}{{ range .RWPaths }} {{ . }}{{ end }}
+ReadWritePaths={{ .Paths.DataDir }} {{ .Paths.OptDir }}
 {{- end }}
 
 [Install]

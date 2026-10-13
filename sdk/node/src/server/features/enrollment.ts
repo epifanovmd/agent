@@ -119,30 +119,27 @@ export class Enrollment {
     return !!agent;
   }
 
-  async revoke(actor: string, agentId: string): Promise<Agent> {
+  async revoke(agentId: string): Promise<Agent> {
     const { agent } = await this.ctx.mutate(agentId, a => {
       if (a.revoked) return false;
       Object.assign(a, { revoked: true, online: false });
       delete a.session;
       delete a.pendingSecretHash;
-      a.alerts = [];
 
       return true;
     });
 
     if (!agent) throw notFound();
     this.dropSession(agentId, "ключ отозван");
-    this.ctx.audit(actor, "agent.revoke", agentId);
     this.ctx.change(agentId, "revoke");
     this.ctx.emitAgent(agent);
 
     return publicAgent(agent);
   }
 
-  async remove(actor: string, agentId: string): Promise<void> {
+  async remove(agentId: string): Promise<void> {
     if (!(await this.ctx.store.deleteAgent(agentId))) throw notFound();
     this.dropSession(agentId, "агент удалён");
-    this.ctx.audit(actor, "agent.delete", agentId);
     this.ctx.change(agentId, "delete");
   }
 
@@ -179,14 +176,12 @@ export class Enrollment {
       secretHash: sha256(secret),
       lastSeq: 0,
       configs: {},
-      alerts: [],
       rev: 0,
     };
 
     if (address !== "*") agent.address = address;
     await this.ctx.store.createAgent(agent);
     this.ctx.log("агент зарегистрирован", { agent: agent.name, id: agent.id });
-    this.ctx.audit("", "agent.enroll", agent.id, { name: agent.name });
     this.ctx.emitAgent(agent);
 
     return { agentId: agent.id, secret };

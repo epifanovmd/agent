@@ -196,7 +196,6 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 		m.PublicKey = releases.PublicKeyOf(o.Signing)
 		info.PublicKeys = []string{m.PublicKey}
 	}
-	var agentManifest *message.Manifest
 	for _, w := range cfg.Workers {
 		switch {
 		case w.Path != "":
@@ -233,28 +232,6 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 					return err
 				}
 			}
-		case w.From == config.FromAgent:
-			if agentManifest == nil {
-				am, err := releases.Manifest(ctx, o.Client, releases.VersionDir(cfg.Update.Releases, o.Version))
-				if err != nil {
-					return fmt.Errorf("воркер %s: %w", w.Name, err)
-				}
-				agentManifest = am
-			}
-			a := agentManifest.Worker(w.Name, p.OS, p.Arch)
-			if a == nil {
-				return fmt.Errorf("воркер %s: в релизе агента %s нет его сборки под %s", w.Name, o.Version, p)
-			}
-			src, err := releases.BuildURL(releases.VersionDir(cfg.Update.Releases, o.Version), a.File)
-			if err != nil {
-				return err
-			}
-			entry := *a
-			entry.File = filepath.Base(a.File)
-			if err := download(ctx, o, src, filepath.Join(release, entry.File), entry.SHA256); err != nil {
-				return fmt.Errorf("воркер %s: %w", w.Name, err)
-			}
-			m.Workers = append(m.Workers, entry)
 		case w.Release:
 			o.Warn(fmt.Sprintf("воркер %s со сборкой с сервера (release: true) — в архив не попадает: его ставит сервер", w.Name))
 			continue

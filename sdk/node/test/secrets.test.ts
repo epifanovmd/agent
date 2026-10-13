@@ -24,7 +24,6 @@ describe("секреты не попадают в журнал SDK", () => {
   before(async () => {
     s = await startServer({
       enrollToken: TOKEN,
-      validate: { events: "log" },
       onWorkerRequest: req => ({ echo: req.data }),
       log: (msg, extra) => logged.push([msg, extra]),
     });
@@ -118,7 +117,7 @@ describe("секреты не попадают в журнал SDK", () => {
 
     await assert.rejects(res.text());
 
-    // События: по схеме, не по схеме (замечание — в журнал, значение — нет), неверное.
+    // События: обычное, с неверным значением, неверное сообщение (причина — в журнал, значение — нет).
     const event = (id: string, data: unknown) =>
       fa.send({
         type: "event",
@@ -145,7 +144,7 @@ describe("секреты не попадают в журнал SDK", () => {
 
     const text = JSON.stringify(logged);
 
-    assert.match(text, /data события не по схеме/, "журнал не пустой");
+    assert.match(text, /неверное сообщение агента/, "журнал не пустой");
     for (const x of [CANARY, TOKEN, creds.secret])
       assert.ok(!text.includes(x), `в журнале ${x}: ${text}`);
   });

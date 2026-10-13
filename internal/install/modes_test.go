@@ -143,9 +143,7 @@ func TestInstallModeRefuses(t *testing.T) {
 		"без root и флагов":  func(f *fake, s *System, _ *Options) { asUser(f, s) },
 		"rootless sysctl":    func(f *fake, s *System, o *Options) { asUser(f, s); o.Rootless, o.Sysctls = true, []string{"vm.x=1"} },
 		"rootless пакеты":    func(f *fake, s *System, o *Options) { asUser(f, s); o.Rootless, o.Packages = true, []string{"jq"} },
-		"rootless user":      func(f *fake, s *System, o *Options) { asUser(f, s); o.Rootless, o.User = true, "agent" },
 		"rootless privilege": func(f *fake, s *System, o *Options) { asUser(f, s); o.Rootless, o.Privileged = true, true },
-		"rootless rw-path":   func(f *fake, s *System, o *Options) { asUser(f, s); o.Rootless, o.RWPaths = true, []string{"/srv/x"} },
 		"rootless без HOME":  func(f *fake, s *System, o *Options) { asUser(f, s); s.Home, o.Rootless = "", true },
 	}
 	for name, mutate := range cases {

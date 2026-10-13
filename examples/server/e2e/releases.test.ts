@@ -1,8 +1,7 @@
-// Сборки агента с другого сервера: агент и netprobe (подпись ключом автора агента)
-// лежит на отдельном HTTP-сервере, как на GitHub (agentReleases.url); воркер проекта — netprobe
-// следующей версии — в releasesDir (подпись ключом проекта). Агент знает оба ключа
-// (update.publicKeys): воркер обновляется из releasesDir, агент — из удалённого источника по
-// перенаправлению 302.
+// Каталог сборок агента на отдельном HTTP-сервере, устроенный как релизы GitHub
+// (update.releases; подпись ключом автора агента); воркер проекта — netprobe следующей версии —
+// в releasesDir сервера (подпись ключом проекта). Агент знает оба ключа (update.publicKeys):
+// воркер обновляется с сервера, агент — из своего каталога сборок.
 import assert from "node:assert/strict";
 import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
@@ -12,23 +11,11 @@ import { dirname, join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import type { ReleaseView, UpdateCandidate } from "agent-sdk/server";
+import type { ReleaseView } from "agent-sdk/server";
 
-import { BIN, bin, NEXT_VERSION, run, Stand, VERSION } from "./stand";
+import { BIN, bin, keygen, NEXT_VERSION, run, Stand, VERSION } from "./stand";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-
-/** Пара ключей подписи сборок (agent keygen). */
-const keygen = async () => {
-  const { stdout } = await run(bin("agent"), ["keygen"]);
-  const value = (name: string) =>
-    stdout.match(new RegExp(`^${name}=(.+)$`, "m"))![1];
-
-  return {
-    signing: value("AGENT_SIGNING_KEY"),
-    public: value("AGENT_UPDATE_PUBLIC_KEYS"),
-  };
-};
 
 /** manifest.json в dir, подпись ключом signing; args — ещё аргументы agent manifest. */
 const manifest = (dir: string, signing: string, ...args: string[]) =>
@@ -36,7 +23,10 @@ const manifest = (dir: string, signing: string, ...args: string[]) =>
     env: { ...process.env, AGENT_SIGNING_KEY: signing },
   });
 
-/** Статический сервер каталога dir (как файлы релиза GitHub); запросы — в журнал. */
+/**
+ * Статический сервер каталога dir, устроенный как релизы GitHub: файл — по последней части пути
+ * (…/latest/download/manifest.json, …/download/v<версия>/<файл>); запросы — в журнал.
+ */
 const serveDir = async (dir: string) => {
   const requests: string[] = [];
   const server: Server = createServer(async (req, res) => {
@@ -56,7 +46,7 @@ const serveDir = async (dir: string) => {
   await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
 
   return {
-    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/download/v${NEXT_VERSION}`,
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     requests,
     close: () =>
       new Promise<void>(r => {
@@ -66,7 +56,7 @@ const serveDir = async (dir: string) => {
   };
 };
 
-describe("сборки агента с другого сервера", () => {
+describe("каталог сборок агента на другом сервере", () => {
   let s: Stand;
   let remoteDir: string;
   let projectDir: string;
@@ -77,27 +67,18 @@ describe("сборки агента с другого сервера", () => {
 
   before(async () => {
     assert.ok(NEXT_VERSION, `нет сборок следующей версии в ${BIN}/next`);
-    [author, project] = await Promise.all([keygen(), keygen()]);
+    [author, project] = [keygen(), keygen()];
     remoteDir = await mkdtemp(join(tmpdir(), "agent-e2e-remote-"));
     projectDir = await mkdtemp(join(tmpdir(), "agent-e2e-project-"));
     const next = join(BIN, "next");
 
-    // Сборки автора агента: агент, netprobe и install.sh (как scripts/release.sh).
+    // Сборки автора агента: агент и install.sh (как scripts/release.sh).
     await copyFile(bin("agent", next), bin("agent", remoteDir));
-    await copyFile(
-      bin("netprobe", next),
-      join(remoteDir, `netprobe-${NEXT_VERSION}-${platform}`),
-    );
     await copyFile(
       join(ROOT, "deploy/install/install.sh"),
       join(remoteDir, "install.sh"),
     );
-    await manifest(
-      remoteDir,
-      author.signing,
-      "--worker",
-      `netprobe=${NEXT_VERSION}`,
-    );
+    await manifest(remoteDir, author.signing);
     // Воркеры проекта: netprobe той же версии, подпись ключом проекта.
     await copyFile(
       bin("netprobe", next),
@@ -115,7 +96,7 @@ describe("сборки агента с другого сервера", () => {
       releasesDir: projectDir,
       updateKeys: [project.public, author.public],
       releaseNetprobe: true,
-      server: { agentReleases: { url: remote.url } },
+      agentReleases: remote.url,
     });
   });
   after(async () => {
@@ -125,43 +106,28 @@ describe("сборки агента с другого сервера", () => {
     await rm(projectDir, { recursive: true, force: true });
   });
 
-  it("итоговый список сборок: агент из источника, netprobe — из releasesDir", async () => {
-    const r = await s.api<{
-      release: ReleaseView;
-      candidates: { agents: UpdateCandidate[] };
-    }>("GET", "/api/releases");
+  it("сборки сервера — воркеры проекта; новую версию агента агент нашёл в своём каталоге", async () => {
+    const r = await s.api<{ release: ReleaseView }>("GET", "/api/releases");
 
     assert.equal(r.release.version, NEXT_VERSION);
-    assert.equal(r.release.remote?.from, remote.url);
-    assert.equal(r.release.remote?.publicKey, author.public);
     assert.deepEqual(
-      r.release.artifacts.map(a => [a.source, a.url]),
-      [["remote", `${remote.url}/agent-${platform}`]],
+      r.release.workers?.map(w => [w.name, w.url]),
+      [
+        [
+          "netprobe",
+          `/api/v1/agent-link/releases/netprobe-${NEXT_VERSION}-${platform}`,
+        ],
+      ],
     );
-    assert.deepEqual(
-      r.release.workers?.map(w => [w.name, w.source]),
-      [["netprobe", "local"]],
+    const a = await s.waitAgent("агент сообщил о новой версии", x =>
+      Boolean(x.update?.latest),
     );
-    assert.equal(
-      r.candidates.agents.find(c => c.agentId === s.agentId)?.target,
-      NEXT_VERSION,
-    );
+
+    assert.equal(a.update?.latest, NEXT_VERSION);
+    assert.ok(remote.requests.includes("/latest/download/manifest.json"));
   });
 
-  it("сборка агента из источника — 302 на его ссылку", async () => {
-    const res = await fetch(
-      `${s.url}/api/v1/agent-link/releases/agent-${platform}`,
-      { redirect: "manual" },
-    );
-
-    assert.equal(res.status, 302);
-    assert.equal(
-      res.headers.get("location"),
-      `${remote.url}/agent-${platform}`,
-    );
-  });
-
-  it("воркер проекта обновляется (ключ проекта), агент — из источника (ключ автора)", async () => {
+  it("воркер проекта обновляется с сервера (ключ проекта), агент — из своего каталога (ключ автора)", async () => {
     const w = await s.api<{ version: string; previous: string }>(
       "POST",
       `/api/agents/${s.agentId}/workers/netprobe/update`,
@@ -189,7 +155,7 @@ describe("сборки агента с другого сервера", () => {
     );
     assert.ok(
       remote.requests.includes(`/download/v${NEXT_VERSION}/agent-${platform}`),
-      "сборка агента скачана из источника",
+      "сборка агента скачана из каталога сборок агента",
     );
     const { stdout } = await run(s.agentBin, ["version"]);
 

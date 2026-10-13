@@ -1,25 +1,17 @@
 // Наблюдение: наблюдатели watch в памяти процесса (сводятся в один watch агенту) и события
-// воркеров (проверка data по схеме, обработчик onEvent, подтверждение после него, отсечение
-// повторов, ожидание waitEvent в этом процессе).
+// воркеров (обработчик onEvent, подтверждение после него, отсечение повторов).
 import { LRUCache } from "lru-cache";
 import { z } from "zod";
 
 import type { Context } from "../core/context";
-import { codeError, valid } from "../core/errors";
+import { valid } from "../core/errors";
 import type { Session } from "../core/session";
 import { bounded, DAY_MS } from "../lib/util";
-import { declaresEvent, workerManifest } from "../model/manifest";
-import { publicAgent } from "../model/public-agent";
 import type { AgentEvent, Watcher } from "../model/types";
 import { summarize } from "../model/watchers";
 import { parse, parseEvent } from "../protocol/checks";
-import { type Envelope, JOB_EVENT_PREFIX, newId } from "../protocol/messages";
-import {
-  eventTypeSchema,
-  logLevelSchema,
-  messageIdSchema,
-  nameSchema,
-} from "../protocol/schemas";
+import { type Envelope, newId } from "../protocol/messages";
+import { logLevelSchema, messageIdSchema } from "../protocol/schemas";
 
 /** Параметры наблюдателя watch (§9). */
 const watchOptionsSchema = z.object({
@@ -49,24 +41,6 @@ export interface Watch extends WatchRef {
   close(): Promise<void>;
 }
 
-/** Параметры waitEvent. */
-export interface WaitEventOptions {
-  /** Подходит ли событие (по data); нет — первое событие этого типа. */
-  match?: (e: AgentEvent) => boolean;
-  /** Сколько ждать, мс (по умолчанию 30 000, не больше суток); не дождались — TIMEOUT. */
-  timeoutMs?: number;
-  /** Отмена ожидания — CANCELLED. */
-  signal?: AbortSignal;
-}
-
-/** Ожидающий события (waitEvent). */
-interface Waiter {
-  agentId: string;
-  worker: string;
-  type: string;
-  take: (e: AgentEvent) => void;
-}
-
 /** Сколько последних id событий помнить для отсечения повторов. */
 const SEEN_EVENTS = 10_000;
 
@@ -76,14 +50,9 @@ export class Observe {
   private readonly watchers = new Map<string, Map<string, Watcher>>();
   /** Обработанные события ("агент\nid"): повтор доставки подтверждается без обработки. */
   private readonly seen = new LRUCache<string, true>({ max: SEEN_EVENTS });
-  /** После обработчика бэкенда: события задач — ожидающим runJob. */
-  private readonly handled: (e: AgentEvent) => void;
-  /** Ожидающие событий в этом процессе (waitEvent). */
-  private readonly waiters = new Set<Waiter>();
 
-  constructor(ctx: Context, handled: (e: AgentEvent) => void = () => {}) {
+  constructor(ctx: Context) {
     this.ctx = ctx;
-    this.handled = handled;
   }
 
   /**
@@ -145,70 +114,8 @@ export class Observe {
   }
 
   /**
-   * Первое подходящее событие после вызова. Агент известен и манифест воркера есть — тип
-   * сверяется сразу (нет в манифесте — EVENT_UNDECLARED); не дождались — TIMEOUT, отмена —
-   * CANCELLED.
-   */
-  async waitEvent(
-    agentId: string,
-    worker: string,
-    type: string,
-    opts: WaitEventOptions = {},
-  ): Promise<AgentEvent> {
-    valid(parse(messageIdSchema, agentId, "agentId"));
-    valid(parse(nameSchema, worker, "worker"));
-    valid(parse(eventTypeSchema, type, "type"));
-    const a = await this.ctx.store.getAgent(agentId);
-    const m = a && workerManifest(publicAgent(a), worker);
-
-    if (m && !declaresEvent(m, type))
-      throw codeError(
-        "EVENT_UNDECLARED",
-        `события ${type} нет в манифесте воркера ${worker} (events)`,
-      );
-    const { match, signal } = opts;
-    const timeoutMs = bounded(opts.timeoutMs, 30_000, 1, DAY_MS);
-    const { promise, resolve, reject } = Promise.withResolvers<AgentEvent>();
-    const w: Waiter = {
-      agentId,
-      worker,
-      type,
-      take: e => {
-        try {
-          if (!match || match(e)) resolve(e);
-        } catch (err) {
-          reject(err);
-        }
-      },
-    };
-    const onAbort = () => reject(codeError("CANCELLED", "ожидание отменено"));
-    const timer = setTimeout(
-      () =>
-        reject(
-          codeError(
-            "TIMEOUT",
-            `нет события ${type} от воркера ${worker} за ${timeoutMs} мс`,
-          ),
-        ),
-      timeoutMs,
-    );
-
-    this.waiters.add(w);
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) onAbort();
-    try {
-      return await promise;
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      this.waiters.delete(w);
-    }
-  }
-
-  /**
-   * Важное сообщение event: проверка data по схеме (validate.events), обработчик onEvent, затем
-   * ожидающие задач (runJob), событие event и waitEvent; ошибка обработчика — без подтверждения
-   * (агент пришлёт снова). Непустой результат — причина отказа.
+   * Важное сообщение event: обработчик onEvent, затем событие event; ошибка обработчика — без
+   * подтверждения (агент пришлёт снова). Непустой результат — причина отказа.
    */
   async event(ss: Session, env: Envelope): Promise<string> {
     const p = parseEvent(env.data);
@@ -229,61 +136,11 @@ export class Observe {
     };
 
     if (d.data !== undefined) e.data = d.data;
-    if (await this.rejected(e)) {
-      this.seen.set(seenKey, true);
-
-      return "";
-    }
     await this.ctx.settings.onEvent?.(e);
     this.seen.set(seenKey, true);
-    this.handled(e);
     this.ctx.emit("event", e);
-    for (const w of this.waiters)
-      if (w.agentId === e.agentId && w.worker === e.worker && w.type === e.type)
-        w.take(e);
 
     return "";
-  }
-
-  /**
-   * data не по events[].schema (validate.events): журнал и invalidEvent; log — замечания в
-   * problems события, reject — не передавать.
-   */
-  private async rejected(e: AgentEvent): Promise<boolean> {
-    const mode = this.ctx.settings.validate.events;
-
-    if (mode === "off" || e.type.startsWith(JOB_EVENT_PREFIX)) return false;
-    const a = await this.ctx.store.getAgent(e.agentId);
-    const schema = a
-      ? workerManifest(publicAgent(a), e.worker)?.events?.find(
-          x => x.type === e.type,
-        )?.schema
-      : undefined;
-    const problems = this.ctx.schemaProblems(
-      schema,
-      e.data ?? null,
-      "события",
-      {
-        agentId: e.agentId,
-        worker: e.worker,
-        type: e.type,
-      },
-    );
-
-    if (!problems.length) return false;
-    const rejected = mode === "reject";
-
-    this.ctx.log("data события не по схеме манифеста", {
-      agentId: e.agentId,
-      worker: e.worker,
-      type: e.type,
-      problems,
-      rejected,
-    });
-    this.ctx.emit("invalidEvent", { event: e, problems, rejected });
-    if (!rejected) e.problems = problems;
-
-    return rejected;
   }
 
   private applyLive(agentId: string): void {

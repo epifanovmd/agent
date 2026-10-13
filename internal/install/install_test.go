@@ -151,7 +151,7 @@ func TestInstallUninstall(t *testing.T) {
 	f.sysctl["vm.max_map_count"] = "65530"
 	o := Options{
 		Binary: binary(t, "v1"), Version: "1.0.0", Server: "https://api.example.com/", Token: "tok", Name: "node-01",
-		RWPaths: []string{"/etc/example"}, Packages: []string{"jq", "curl"}, Sysctls: []string{"vm.max_map_count=262144"},
+		Packages: []string{"jq", "curl"}, Sysctls: []string{"vm.max_map_count=262144"},
 	}
 	if err := Install(ctx, s, o); err != nil {
 		t.Fatal(err)
@@ -178,7 +178,7 @@ func TestInstallUninstall(t *testing.T) {
 	}
 	unit := f.read(t, UnitFile)
 	for _, want := range []string{"User=agent\n", "KillMode=process\n", "TimeoutStopSec=15min\n", "ProtectSystem=full\n",
-		"ReadWritePaths=/var/lib/agent /opt/agent /etc/example\n", "ExecStart=/opt/agent/bin/agent run -config /etc/agent/agent.yaml\n",
+		"ReadWritePaths=/var/lib/agent /opt/agent\n", "ExecStart=/opt/agent/bin/agent run -config /etc/agent/agent.yaml\n",
 		"ExecStartPre=-/bin/sh -c '[ ! -x /opt/agent/bin/agent.prev ] || /opt/agent/bin/agent.prev boot-guard /opt/agent/bin/agent'\n",
 		"EnvironmentFile=-/etc/agent/agent.env\n", "Environment=AGENT_BOOT_GUARD=external\n", "ExecReload=/bin/kill -HUP $MAINPID\n"} {
 		if !strings.Contains(unit, want) {
@@ -195,7 +195,7 @@ func TestInstallUninstall(t *testing.T) {
 		t.Fatalf("параметры ядра: %q", sc)
 	}
 	journal := f.read(t, JournalFile)
-	for _, want := range []string{"kill-mode process", "package curl", "user agent", "sysctl vm.max_map_count=262144", "sysctl-prev vm.max_map_count=65530"} {
+	for _, want := range []string{"package curl", "user agent", "sysctl vm.max_map_count=262144", "sysctl-prev vm.max_map_count=65530"} {
 		if !strings.Contains(journal, "\n"+want+"\n") {
 			t.Errorf("в журнале нет %q:\n%s", want, journal)
 		}
@@ -203,18 +203,18 @@ func TestInstallUninstall(t *testing.T) {
 	if strings.Contains(journal, "package jq") {
 		t.Error("jq стоял до установки — не в журнал")
 	}
-	for _, p := range []string{DataDir, OptDir, Binary, EnvFile, "/etc/example"} {
+	for _, p := range []string{DataDir, OptDir, Binary, EnvFile} {
 		if f.owners[p] != "agent" {
 			t.Errorf("%s: владелец %q", p, f.owners[p])
 		}
 	}
 
 	// Повторно: без токена — прежний сохраняется; agent.yaml не меняется;
-	// режим остановки запоминается; пользователь не создаётся снова.
+	// пользователь не создаётся снова.
 	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte(f.read(t, ConfigFile)+"# своё\n"), 0o644)
 	_ = os.WriteFile(filepath.Join(f.root, EnvFile), []byte(f.read(t, EnvFile)+"EXAMPLE_KEY=1\n"), 0o600)
 	f.cmds = nil
-	again := Options{Binary: binary(t, "v2"), Version: "1.3.0", KillMode: "mixed", PublicKeys: []string{testKeyA, testKeyB, testKeyA}}
+	again := Options{Binary: binary(t, "v2"), Version: "1.3.0", PublicKeys: []string{testKeyA, testKeyB, testKeyA}}
 	if err := Install(ctx, s, again); err != nil {
 		t.Fatal(err)
 	}
@@ -224,13 +224,12 @@ func TestInstallUninstall(t *testing.T) {
 	if env := f.read(t, EnvFile); env != "AGENT_ENROLL_TOKEN=tok\nEXAMPLE_KEY=1\nAGENT_UPDATE_PUBLIC_KEYS="+testKeyA+","+testKeyB+"\n" {
 		t.Fatalf("agent.env: %q", env)
 	}
-	again.KillMode = ""
 	again.Token = "tok2"
 	if err := Install(ctx, s, again); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(f.read(t, UnitFile), "KillMode=mixed\n") || !strings.Contains(f.read(t, EnvFile), "AGENT_ENROLL_TOKEN=tok2\n") {
-		t.Fatal("режим остановки запоминается, новый токен заменяет прежний")
+	if !strings.Contains(f.read(t, EnvFile), "AGENT_ENROLL_TOKEN=tok2\n") {
+		t.Fatal("новый токен заменяет прежний")
 	}
 	for _, c := range f.cmds {
 		if strings.HasPrefix(c, "useradd") || strings.HasPrefix(c, "apt-get") {
@@ -278,7 +277,7 @@ func TestInstallPrivileged(t *testing.T) {
 	f, s := newFake(t, "systemctl", "useradd")
 	own := filepath.Join(t.TempDir(), "agent.yaml")
 	_ = os.WriteFile(own, []byte("server:\n  url: https://api.example.com\n# своё\n"), 0o600)
-	if err := Install(ctx, s, Options{Binary: binary(t, "v1"), Config: own, Privileged: true, User: "agent", TokenFile: writeToken(t, " tok \n")}); err != nil {
+	if err := Install(ctx, s, Options{Binary: binary(t, "v1"), Config: own, Privileged: true, TokenFile: writeToken(t, " tok \n")}); err != nil {
 		t.Fatal(err)
 	}
 	unit := f.read(t, UnitFile)
@@ -436,14 +435,12 @@ func TestInstallRefuses(t *testing.T) {
 		"без systemd": func(f *fake, _ *System, _ *Options) { _ = os.RemoveAll(filepath.Join(f.root, "run/systemd")) },
 		"без адреса":  func(_ *fake, _ *System, o *Options) { o.Server = "" },
 		"адрес":       func(_ *fake, _ *System, o *Options) { o.Server = "api.example.com" },
-		"kill-mode":   func(_ *fake, _ *System, o *Options) { o.KillMode = "all" },
 		"sysctl":      func(_ *fake, _ *System, o *Options) { o.Sysctls = []string{"vm.x"} },
 		"воркер":      func(_ *fake, _ *System, o *Options) { o.Workers = []string{"a b"} },
 		"пакет":       func(_ *fake, _ *System, o *Options) { o.Packages = []string{"a;b"} },
 		"менеджер":    func(_ *fake, _ *System, o *Options) { o.PackagesBy = map[string][]string{"pacman": {"x"}} },
 		"токен":       func(_ *fake, _ *System, o *Options) { o.TokenFile = "/nonexistent" },
 		"два токена":  func(_ *fake, _ *System, o *Options) { o.TokenFile = "/x" },
-		"rw-path":     func(_ *fake, _ *System, o *Options) { o.RWPaths = []string{"relative"} },
 		"экземпляр":   func(_ *fake, _ *System, o *Options) { o.Instance = "Web" },
 		"нет пакетного менеджера": func(_ *fake, _ *System, o *Options) {
 			o.Packages = []string{"jq"}
@@ -579,16 +576,16 @@ func tarGz(t *testing.T, entries map[string]string) []byte {
 // Флаги: повторяемые, пакеты через пробел, пакеты под менеджер.
 func TestParseFlags(t *testing.T) {
 	o, err := ParseFlags([]string{
-		"--server", "https://api.example.com", "--token", "t", "--name", "n", "--privileged", "--kill-mode", "process",
+		"--server", "https://api.example.com", "--token", "t", "--name", "n", "--privileged",
 		"--packages", "jq curl", "--packages", "git", "--packages-apk", "bind-tools", "--sysctl", "a=1", "--sysctl", "b=2",
-		"--rw-path", "/x", "--worker", "collector", "--worker", "report", "--releases", "https://example.com/r", "--instance", "web",
+		"--worker", "collector", "--worker", "report", "--releases", "https://example.com/r", "--instance", "web",
 	}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.Server != "https://api.example.com" || o.Token != "t" || o.Name != "n" || !o.Privileged || o.KillMode != "process" ||
+	if o.Server != "https://api.example.com" || o.Token != "t" || o.Name != "n" || !o.Privileged ||
 		!slices.Equal(o.Packages, []string{"jq", "curl", "git"}) || !slices.Equal(o.PackagesBy["apk"], []string{"bind-tools"}) ||
-		len(o.PackagesBy) != 1 || !slices.Equal(o.Sysctls, []string{"a=1", "b=2"}) || !slices.Equal(o.RWPaths, []string{"/x"}) ||
+		len(o.PackagesBy) != 1 || !slices.Equal(o.Sysctls, []string{"a=1", "b=2"}) ||
 		!slices.Equal(o.Workers, []string{"collector", "report"}) || o.Releases != "https://example.com/r" || o.Instance != "web" {
 		t.Fatalf("%+v", o)
 	}
@@ -603,17 +600,17 @@ func TestParseFlags(t *testing.T) {
 // Флаги, которые install.sh передаёт agent install как есть: все известны.
 func TestParseFlagsFromScript(t *testing.T) {
 	o, err := ParseFlags([]string{
-		"--instance", "web-2", "--token", "tok'en", "--name", "node 01", "--user", "root", "--config", "/etc/agent/node.yaml", "--privileged",
-		"--kill-mode", "process", "--packages", "jq curl", "--packages-apk", "bind-tools",
+		"--instance", "web-2", "--token", "tok'en", "--name", "node 01", "--config", "/etc/agent/node.yaml", "--privileged",
+		"--packages", "jq curl", "--packages-apk", "bind-tools",
 		"--sysctl", "net.core.somaxconn=1024", "--sysctl", "vm.max_map_count=262144",
-		"--rw-path", "/etc/example", "--rw-path", "/var/lib/it's", "--ca-file", "/etc/agent/ca.pem", "--worker", "report",
-		"--stop-timeout", "15min", "--token-file", "/root/agent.token", "--public-key", "a2V5", "--update-key", "b2V5", "--server", "https://api.example.com",
+		"--ca-file", "/etc/agent/ca.pem", "--worker", "report",
+		"--token-file", "/root/agent.token", "--public-key", "a2V5", "--update-key", "b2V5", "--server", "https://api.example.com",
 	}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.Token != "tok'en" || o.User != "root" || o.Config != "/etc/agent/node.yaml" || o.CAFile != "/etc/agent/ca.pem" ||
-		o.StopTimeout != "15min" || o.TokenFile != "/root/agent.token" || !slices.Equal(o.PublicKeys, []string{"a2V5", "b2V5"}) || o.Instance != "web-2" {
+	if o.Token != "tok'en" || o.Config != "/etc/agent/node.yaml" || o.CAFile != "/etc/agent/ca.pem" ||
+		o.TokenFile != "/root/agent.token" || !slices.Equal(o.PublicKeys, []string{"a2V5", "b2V5"}) || o.Instance != "web-2" {
 		t.Fatalf("%+v", o)
 	}
 }

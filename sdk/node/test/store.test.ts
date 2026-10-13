@@ -15,7 +15,6 @@ const agent = (id: string): AgentRecord => ({
   secretHash: "h",
   lastSeq: 0,
   configs: {},
-  alerts: [],
   rev: 0,
 });
 

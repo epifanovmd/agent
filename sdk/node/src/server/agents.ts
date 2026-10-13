@@ -1,11 +1,12 @@
 // Agents — серверная часть связи с агентами. Фасад: собирает части из features/ (регистрация и
-// ключи, сессии, приём сообщений, настройки, fetch, задачи, наблюдение и подписки на события,
-// запросы воркеров, действия, раздача сборок, пересылка между процессами) и передаёт им вызовы. Общее для частей — core/, данные — store/, HTTP и WebSocket — transport/.
+// ключи, сессии, приём сообщений, настройки, fetch, наблюдение, запросы воркеров, действия,
+// раздача сборок) и передаёт им вызовы. Общее для частей — core/, данные — store/, HTTP и
+// WebSocket — transport/.
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
 import { type AgentsEvents, createContext } from "./core/context";
-import { AgentsError, codeError } from "./core/errors";
+import { AgentsError } from "./core/errors";
 import {
   agentsDefaults,
   type AgentsOptions,
@@ -26,103 +27,32 @@ import { Configs } from "./features/configs";
 import { Connections } from "./features/connections";
 import { Enrollment } from "./features/enrollment";
 import { Inbound } from "./features/inbound";
-import { type JobOptions, type JobResult, Jobs } from "./features/jobs";
-import {
-  Observe,
-  type WaitEventOptions,
-  type Watch,
-  type WatchOptions,
-  type WatchRef,
-} from "./features/observe";
-import { Relay } from "./features/relay";
+import { Observe, type Watch, type WatchOptions } from "./features/observe";
 import { Release } from "./features/release";
 import { Requests } from "./features/requests";
-import {
-  type Fetcher,
-  type FetchInit,
-  fetchReply,
-  Tunnel,
-} from "./features/tunnel";
-import { capabilities } from "./model/manifest";
+import { type FetchInit, fetchReply, Tunnel } from "./features/tunnel";
 import { publicAgent } from "./model/public-agent";
 import type {
   Agent,
-  AgentEvent,
-  Alert,
   ConfigRecord,
   ConfigStatus,
   ReleaseView,
-  UpdateCandidates,
-  WorkerCapabilities,
 } from "./model/types";
-import { type JobStatus, type LogEntry, newId } from "./protocol/messages";
+import { type LogEntry, newId } from "./protocol/messages";
 import { MemoryStore } from "./store/memory";
 import type { Store } from "./store/store";
 import { Transport } from "./transport/transport";
-
-/**
- * Вызовы от имени actor (общие для Agents и Actor). Вызовы, которым нужна сессия агента, при
- * опции relay уходят в процесс с сессией (features/relay.ts).
- */
-const createOperations = (
-  enrollment: Enrollment,
-  configs: Configs,
-  relay: Relay,
-  jobs: Jobs,
-) => ({
-  enrollment,
-  configs,
-  fetch: relay.fetch,
-  restartWorker: (
-    actor: string,
-    agentId: string,
-    name: string,
-    o: WorkerActionOptions,
-  ) => relay.run<RestartResult>("restartWorker", actor, agentId, [name, o]),
-  updateWorker: (
-    actor: string,
-    agentId: string,
-    name: string,
-    o: WorkerActionOptions,
-  ) => relay.run<WorkerUpdateResult>("updateWorker", actor, agentId, [name, o]),
-  updateAgent: (actor: string, agentId: string, o: UpdateAgentOptions) =>
-    relay.run<UpdateResult>("updateAgent", actor, agentId, [o]),
-  rotateKey: (actor: string, agentId: string, o: ActionOptions) =>
-    relay.run<void>("rotateKey", actor, agentId, [o]),
-  logs: (actor: string, agentId: string, o: LogsOptions) =>
-    relay.run<LogEntry[]>("logs", actor, agentId, [o]),
-  runJob: (
-    actor: string,
-    agentId: string,
-    worker: string,
-    { signal, ...o }: JobOptions,
-  ) => relay.run<JobResult>("runJob", actor, agentId, [worker, o], signal),
-  jobStatus: (actor: string, agentId: string, worker: string, id: string) =>
-    jobs.status(actor, agentId, worker, id, relay.fetch),
-  cancelJob: (actor: string, agentId: string, worker: string, id: string) =>
-    jobs.cancel(actor, agentId, worker, id, relay.fetch),
-});
-
-type Operations = ReturnType<typeof createOperations>;
-
-const operations = new WeakMap<Agents, Operations>();
-
-/** Параметры вызова из пересылки (JSON): нет — пустые. */
-const opt = <T>(o: unknown): T => (o ?? {}) as T;
 
 export class Agents extends EventEmitter<AgentsEvents> {
   readonly store: Store;
   readonly instanceId: string;
   private readonly settings: Settings;
-  private readonly ops: Operations;
+  private readonly enrollment: Enrollment;
+  private readonly configs: Configs;
   private readonly links: Connections;
   private readonly actions: Actions;
-  private readonly watchers: {
-    watch(agentId: string, opts: WatchOptions): Promise<WatchRef>;
-    unwatch(agentId: string, id: string): Promise<void>;
-  };
-  private readonly relay: Relay;
   private readonly observe: Observe;
+  private readonly tunnel: Tunnel;
   private readonly releases: Release;
   private readonly transport: Transport;
   private readonly timer: NodeJS.Timeout;
@@ -135,8 +65,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
     const ctx = createContext(this, this.store, this.settings, this.instanceId);
 
     const configs = new Configs(ctx);
-    const jobs = new Jobs(ctx);
-    const observe = new Observe(ctx, e => jobs.event(e));
+    const observe = new Observe(ctx);
     const releases = new Release(ctx);
     const links = new Connections(ctx, {
       known: (ss, c) => configs.known(ss, c),
@@ -149,7 +78,6 @@ export class Agents extends EventEmitter<AgentsEvents> {
       links.drop(agentId, reason);
     });
     const actions = new Actions(ctx, {
-      agentUpdate: a => releases.agentUpdate(a),
       workerUpdate: (a, name) => releases.workerUpdate(a, name),
       acceptKey: (agentId, hash) => enrollment.acceptKey(agentId, hash),
     });
@@ -167,32 +95,6 @@ export class Agents extends EventEmitter<AgentsEvents> {
       dropForeign: (ss, a) => links.dropForeign(ss, a),
       statusSeen: (agentId, workers) => actions.pendingSeen(agentId, workers),
     });
-    const tunnel = new Tunnel(ctx);
-    const localFetch: Fetcher = (actor, agentId, worker, path, init) =>
-      tunnel.fetch(actor, agentId, worker, path, init);
-    // Вызовы в этом процессе (и пересланные сюда из других) — без пересылки дальше.
-    const relay = new Relay(ctx, localFetch, {
-      restartWorker: (actor, agentId, [name, o]) =>
-        actions.restartWorker(actor, agentId, String(name), opt(o)),
-      updateWorker: (actor, agentId, [name, o]) =>
-        actions.updateWorker(actor, agentId, String(name), opt(o)),
-      updateAgent: (actor, agentId, [o]) =>
-        actions.updateAgent(actor, agentId, opt(o)),
-      rotateKey: (actor, agentId, [o]) =>
-        actions.rotateKey(actor, agentId, opt(o)),
-      logs: (actor, agentId, [o]) => actions.logs(actor, agentId, opt(o)),
-      watch: (_actor, agentId, [o]) => observe.watch(agentId, opt(o)),
-      unwatch: async (_actor, agentId, [id]) =>
-        observe.unwatch(agentId, String(id)),
-      runJob: (actor, agentId, [worker, o], signal) =>
-        jobs.run(
-          actor,
-          agentId,
-          String(worker),
-          { ...opt<JobOptions>(o), signal },
-          localFetch,
-        ),
-    });
 
     this.transport = new Transport({
       settings: this.settings,
@@ -200,23 +102,18 @@ export class Agents extends EventEmitter<AgentsEvents> {
       releaseEnabled: () => releases.enabled(),
       servedManifest: () => releases.served(),
       releaseFile: name => releases.file(name),
-      downloadRelease: (url, signal) => releases.download(url, signal),
       enroll: (body, remote) => enrollment.enroll(body, remote),
       authenticate: header => enrollment.authenticate(header),
       open: (ss, env) => links.open(ss, env),
       process: (ss, env) => inbound.process(ss, env),
       closed: ss => links.closed(ss),
     });
-    this.ops = createOperations(enrollment, configs, relay, jobs);
-    operations.set(this, this.ops);
+    this.enrollment = enrollment;
+    this.configs = configs;
     this.links = links;
-    this.watchers = {
-      watch: (agentId, o) => relay.run("watch", "", agentId, [o]),
-      unwatch: (agentId, id) => relay.run("unwatch", "", agentId, [id]),
-    };
     this.actions = actions;
-    this.relay = relay;
     this.observe = observe;
+    this.tunnel = new Tunnel(ctx);
     this.releases = releases;
 
     if (!opts.enrollToken && !opts.enroll)
@@ -248,28 +145,14 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return this.transport.handle(req, res);
   }
 
-  /**
-   * Принять вызов, пересланный другим процессом (опция relay): выполнить его здесь и ответить
-   * (fetch — потоком). Вызывающему маршрут доверяет: закройте его сетью или relaySecret.
-   */
-  handleRelay(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    return this.relay.handle(req, res);
-  }
-
   /** Остановить: соединения закрываются кодом 1012 (агенты сразу подключатся снова). */
   async close(): Promise<void> {
     clearInterval(this.timer);
-    this.releases.close();
     this.actions.close();
     const offline = this.links.close();
 
     this.transport.close();
     await offline;
-  }
-
-  /** Действия от имени actor: он попадает в аудит (событие audit), записи настроек и итоги действий. */
-  by(actor: string): Actor {
-    return new Actor(this, actor);
   }
 
   // ── агенты ──
@@ -284,37 +167,13 @@ export class Agents extends EventEmitter<AgentsEvents> {
     return a && publicAgent(a);
   }
 
-  /** Текущие проблемы (всех агентов или одного) — из записей агентов. */
-  async listAlerts(agentId?: string): Promise<Alert[]> {
-    const list = agentId
-      ? [await this.store.getAgent(agentId)]
-      : await this.store.listAgents();
-
-    return list.flatMap(a => a?.alerts ?? []);
-  }
-
+  /** Отозвать агента: его соединение закрывается (4401), ключ больше не принимается. */
   revoke(agentId: string): Promise<Agent> {
-    return this.ops.enrollment.revoke("", agentId);
-  }
-
-  /**
-   * Что умеет воркер агента — из его манифеста (последний status): маршруты, события, задачи,
-   * ключи настроек и запросы к серверу со схемами. Нет агента — AGENT_NOT_FOUND; воркер себя не
-   * описал (нет в status или нет манифеста) — undefined.
-   */
-  async capabilities(
-    agentId: string,
-    worker: string,
-  ): Promise<WorkerCapabilities | undefined> {
-    const a = await this.store.getAgent(agentId);
-
-    if (!a) throw codeError("AGENT_NOT_FOUND", "агент не найден");
-
-    return capabilities(publicAgent(a), worker);
+    return this.enrollment.revoke(agentId);
   }
 
   deleteAgent(agentId: string): Promise<void> {
-    return this.ops.enrollment.remove("", agentId);
+    return this.enrollment.remove(agentId);
   }
 
   // ── запрос к воркеру ──
@@ -323,9 +182,9 @@ export class Agents extends EventEmitter<AgentsEvents> {
    * HTTP-запрос к воркеру через агента (§7). Ответ — Response: status, headers, body (поток),
    * text(), json(), arrayBuffer(). Ошибка до ответа — AgentsError с кодом (AGENT_OFFLINE,
    * AGENT_ELSEWHERE, WORKER_UNKNOWN, WORKER_UNAVAILABLE, WORKER_INVALID, TIMEOUT, CANCELLED,
-   * PATH_FORBIDDEN, ROUTE_UNDECLARED, JOB_UNKNOWN, REQUEST_INVALID, BODY_TOO_LARGE, BUSY, DISCONNECTED);
-   * после — ошибка чтения потока body с тем же AgentsError.
-   * Сессия агента в другом процессе — запрос уходит туда (опция relay), без relay — AGENT_ELSEWHERE.
+   * PATH_FORBIDDEN, ROUTE_UNDECLARED, JOB_UNKNOWN, BODY_TOO_LARGE, BUSY, DISCONNECTED);
+   * после — ошибка чтения потока body с тем же AgentsError. Сессия агента в другом процессе
+   * бэкенда — AGENT_ELSEWHERE.
    */
   fetch(
     agentId: string,
@@ -333,33 +192,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
     path: string,
     init: FetchInit = {},
   ): Promise<Response> {
-    return this.ops.fetch("", agentId, worker, path, init);
-  }
-
-  // ── задачи воркера (§12) ──
-
-  /**
-   * Задача воркеру: POST /jobs. Быстрая (200) — итог сразу; долгая (202) — ждать события
-   * job.done, job.failed или job.cancelled не дольше timeoutMs (по умолчанию 30 с), не дождались —
-   * state: running; wait: false — не ждать, сразу state: running. Тип нет в manifest.jobs — JOB_UNKNOWN; data не по схеме (validate.jobs) —
-   * JOB_INVALID; отказ воркера — JOB_REJECTED. События задач доходят и до onEvent.
-   */
-  runJob(
-    agentId: string,
-    worker: string,
-    opts: JobOptions,
-  ): Promise<JobResult> {
-    return this.ops.runJob("", agentId, worker, opts);
-  }
-
-  /** Состояние задачи воркера (GET /jobs/{id}); нет задачи — JOB_NOT_FOUND. */
-  jobStatus(agentId: string, worker: string, id: string): Promise<JobStatus> {
-    return this.ops.jobStatus("", agentId, worker, id);
-  }
-
-  /** Прервать долгую задачу (POST /jobs/{id}/cancel); нет задачи — JOB_NOT_FOUND. */
-  cancelJob(agentId: string, worker: string, id: string): Promise<JobStatus> {
-    return this.ops.cancelJob("", agentId, worker, id);
+    return this.tunnel.fetch(agentId, worker, path, init);
   }
 
   // ── настройки ──
@@ -375,12 +208,12 @@ export class Agents extends EventEmitter<AgentsEvents> {
     key: string,
     data: unknown,
   ): Promise<ConfigRecord> {
-    return this.ops.configs.set("", agentId, worker, key, data);
+    return this.configs.set(agentId, worker, key, data);
   }
 
   /** Удалить ключ настроек: агент удалит его у себя и у воркера. false — ключа не было. */
   deleteConfig(agentId: string, worker: string, key: string): Promise<boolean> {
-    return this.ops.configs.delete("", agentId, worker, key);
+    return this.configs.delete(agentId, worker, key);
   }
 
   async getConfig(
@@ -399,7 +232,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
 
   /** Статус ключей (желаемая, доставленная, применённая версия, ошибка); worker — только его ключи. */
   configStatus(agentId: string, worker?: string): Promise<ConfigStatus[]> {
-    return this.ops.configs.status(agentId, worker);
+    return this.configs.status(agentId, worker);
   }
 
   // ── наблюдение ──
@@ -408,14 +241,13 @@ export class Agents extends EventEmitter<AgentsEvents> {
    * Наблюдатель: пока он есть, агент присылает метрики чаще и журнал подробнее (§9). Наблюдатель
    * продлевается сам, пока его не закроют (close) или не закончится процесс: тогда он истекает
    * через ttlMs. Повтор с тем же id заменяет параметры. Наблюдатели сводятся в один watch;
-   * живут в памяти процесса с сессией агента (опция relay — туда и уходят) и действуют, пока
-   * агент на связи с ним.
+   * живут в памяти этого процесса и действуют, пока агент на связи с ним.
    */
   async watch(agentId: string, opts: WatchOptions = {}): Promise<Watch> {
-    const ref = await this.watchers.watch(agentId, opts);
+    const ref = await this.observe.watch(agentId, opts);
     const renew = setInterval(
       () =>
-        void this.watchers
+        void this.observe
           .watch(agentId, { ...opts, id: ref.id })
           .then(r => (w.until = r.until))
           .catch(e => {
@@ -436,7 +268,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
       close: () => {
         clearInterval(renew);
 
-        return this.watchers.unwatch(agentId, ref.id);
+        return this.unwatch(agentId, ref.id);
       },
     };
 
@@ -444,22 +276,8 @@ export class Agents extends EventEmitter<AgentsEvents> {
   }
 
   /** Снять наблюдателя по id (например, созданного другим процессом). */
-  unwatch(agentId: string, id: string): Promise<void> {
-    return this.watchers.unwatch(agentId, id);
-  }
-
-  /**
-   * Первое событие type воркера worker агента agentId после вызова (match — своё условие, по
-   * data): не дождались за timeoutMs (по умолчанию 30 000) — TIMEOUT, отмена signal — CANCELLED.
-   * Событие, пришедшее до вызова, не попадает: начните ждать до действия, которое его вызовет.
-   */
-  waitEvent(
-    agentId: string,
-    worker: string,
-    type: string,
-    opts: WaitEventOptions = {},
-  ): Promise<AgentEvent> {
-    return this.observe.waitEvent(agentId, worker, type, opts);
+  async unwatch(agentId: string, id: string): Promise<void> {
+    this.observe.unwatch(agentId, id);
   }
 
   // ── действия (§10) ──
@@ -474,7 +292,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
     name: string,
     opts: WorkerActionOptions = {},
   ): Promise<RestartResult> {
-    return this.ops.restartWorker("", agentId, name, opts);
+    return this.actions.restartWorker(agentId, name, opts);
   }
 
   /**
@@ -486,44 +304,35 @@ export class Agents extends EventEmitter<AgentsEvents> {
     name: string,
     opts: WorkerActionOptions = {},
   ): Promise<WorkerUpdateResult> {
-    return this.ops.updateWorker("", agentId, name, opts);
+    return this.actions.updateWorker(agentId, name, opts);
   }
 
   /**
-   * Обновить агента: до версии с сервера или (`version`) до версии из каталога сборок агента;
-   * итог — после запуска новой версии.
+   * Обновить агента до версии version из его каталога сборок (§11): сборку под свою платформу
+   * агент берёт и проверяет сам; итог — после запуска новой версии.
    */
   updateAgent(
     agentId: string,
-    opts: UpdateAgentOptions = {},
+    opts: UpdateAgentOptions,
   ): Promise<UpdateResult> {
-    return this.ops.updateAgent("", agentId, opts);
+    return this.actions.updateAgent(agentId, opts);
   }
 
   /** Сменить ключ агента: он переподключится с новым секретом. */
   rotateKey(agentId: string, opts: ActionOptions = {}): Promise<void> {
-    return this.ops.rotateKey("", agentId, opts);
+    return this.actions.rotateKey(agentId, opts);
   }
 
   /** Последние строки журнала агента или воркера. */
   logs(agentId: string, opts: LogsOptions = {}): Promise<LogEntry[]> {
-    return this.ops.logs("", agentId, opts);
+    return this.actions.logs(agentId, opts);
   }
 
   // ── сборки ──
 
-  /**
-   * Итоговые сборки или null: агент и его воркеры — из удалённого источника (agentReleases), воркеры
-   * проекта — из releasesDir; у каждой сборки — источник (source) и ссылка (url). refresh —
-   * проверить удалённый источник сейчас, не дожидаясь checkIntervalMs.
-   */
-  release(opts: { refresh?: boolean } = {}): Promise<ReleaseView | null> {
-    return opts.refresh ? this.releases.check() : this.releases.manifest();
-  }
-
-  /** Агенты и воркеры, которых можно обновить (UpdateCandidate.source — откуда версия). */
-  updateCandidates(): Promise<UpdateCandidates> {
-    return this.releases.updateCandidates();
+  /** Сборки воркеров проекта из releasesDir (у каждой — ссылка url) или null. */
+  release(): Promise<ReleaseView | null> {
+    return this.releases.manifest();
   }
 
   // ── несколько процессов ──
@@ -536,81 +345,5 @@ export class Agents extends EventEmitter<AgentsEvents> {
    */
   refresh(agentId?: string): Promise<void> {
     return this.links.refresh(agentId);
-  }
-}
-
-/** Изменяющие методы от имени actor (agents.by(actor)). */
-export class Actor {
-  readonly actor: string;
-  private readonly ops: Operations;
-
-  constructor(agents: Agents, actor: string) {
-    this.ops = operations.get(agents)!;
-    this.actor = actor;
-  }
-
-  revoke(agentId: string): Promise<Agent> {
-    return this.ops.enrollment.revoke(this.actor, agentId);
-  }
-  deleteAgent(agentId: string): Promise<void> {
-    return this.ops.enrollment.remove(this.actor, agentId);
-  }
-  fetch(
-    agentId: string,
-    worker: string,
-    path: string,
-    init: FetchInit = {},
-  ): Promise<Response> {
-    return this.ops.fetch(this.actor, agentId, worker, path, init);
-  }
-  runJob(
-    agentId: string,
-    worker: string,
-    opts: JobOptions,
-  ): Promise<JobResult> {
-    return this.ops.runJob(this.actor, agentId, worker, opts);
-  }
-  jobStatus(agentId: string, worker: string, id: string): Promise<JobStatus> {
-    return this.ops.jobStatus(this.actor, agentId, worker, id);
-  }
-  cancelJob(agentId: string, worker: string, id: string): Promise<JobStatus> {
-    return this.ops.cancelJob(this.actor, agentId, worker, id);
-  }
-  setConfig(
-    agentId: string,
-    worker: string,
-    key: string,
-    data: unknown,
-  ): Promise<ConfigRecord> {
-    return this.ops.configs.set(this.actor, agentId, worker, key, data);
-  }
-  deleteConfig(agentId: string, worker: string, key: string): Promise<boolean> {
-    return this.ops.configs.delete(this.actor, agentId, worker, key);
-  }
-  restartWorker(
-    agentId: string,
-    name: string,
-    opts: WorkerActionOptions = {},
-  ): Promise<RestartResult> {
-    return this.ops.restartWorker(this.actor, agentId, name, opts);
-  }
-  updateWorker(
-    agentId: string,
-    name: string,
-    opts: WorkerActionOptions = {},
-  ): Promise<WorkerUpdateResult> {
-    return this.ops.updateWorker(this.actor, agentId, name, opts);
-  }
-  updateAgent(
-    agentId: string,
-    opts: UpdateAgentOptions = {},
-  ): Promise<UpdateResult> {
-    return this.ops.updateAgent(this.actor, agentId, opts);
-  }
-  rotateKey(agentId: string, opts: ActionOptions = {}): Promise<void> {
-    return this.ops.rotateKey(this.actor, agentId, opts);
-  }
-  logs(agentId: string, opts: LogsOptions = {}): Promise<LogEntry[]> {
-    return this.ops.logs(this.actor, agentId, opts);
   }
 }

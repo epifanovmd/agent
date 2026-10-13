@@ -39,7 +39,7 @@ func packCmd(args []string) error {
 		return err
 	}
 	if path == "" {
-		return fmt.Errorf("нет файла настроек папки агента: agent init, затем agent pack --env prod")
+		return fmt.Errorf("нет файла настроек папки агента (agent.yaml)")
 	}
 	list, err := bundle.ParsePlatforms(*platforms)
 	if err != nil {
@@ -80,7 +80,7 @@ func packCmd(args []string) error {
 		fmt.Println("  " + config.ShortPath(a))
 	}
 	if signing == nil {
-		fmt.Fprintln(os.Stderr, "agent: предупреждение: AGENT_SIGNING_KEY не задан — сборки воркеров без подписи: поставить их можно, обновить с сервера — нет (ключи: agent keygen)")
+		fmt.Fprintln(os.Stderr, "agent: предупреждение: AGENT_SIGNING_KEY не задан — сборки воркеров без подписи: поставить их можно, обновить с сервера — нет (ключи — docs/ARCHITECTURE.md, «Ключи подписи»)")
 	}
 	if *withEnv {
 		fmt.Fprintln(os.Stderr, "agent: предупреждение: в архивах файлы переменных с секретами — передавайте их только надёжным способом")
@@ -94,22 +94,5 @@ func packCmd(args []string) error {
 		fmt.Print(" --token <токен регистрации>")
 	}
 	fmt.Println()
-	return nil
-}
-
-// keygenCmd — agent keygen: пара ключей подписи сборок (агента, воркеров проекта).
-func keygenCmd(args []string) error {
-	if len(args) > 0 {
-		return fmt.Errorf("лишние аргументы: %s", strings.Join(args, " "))
-	}
-	priv, pub, err := releases.NewKeyPair()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("%s=%s\nAGENT_UPDATE_PUBLIC_KEYS=%s\n", releases.SigningKeyEnv, priv, pub)
-	fmt.Fprintln(os.Stderr, "\nЗакрытый ключ (AGENT_SIGNING_KEY) — только там, где собирают архивы и релизы (agent pack, agent manifest): секрет CI или")
-	fmt.Fprintln(os.Stderr, "переменная окружения; в папку агента и в git его не кладут. Открытый (AGENT_UPDATE_PUBLIC_KEYS)")
-	fmt.Fprintln(os.Stderr, "agent pack кладёт в архив сам, установка добавит его к ключам проверки узла; в .env.prod —")
-	fmt.Fprintln(os.Stderr, "если узел ставится не из архива.")
 	return nil
 }

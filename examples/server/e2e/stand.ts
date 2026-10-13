@@ -5,6 +5,7 @@
 //
 // Сборки агента и Go-воркеров — в E2E_BIN (по умолчанию .dev/e2e; их собирает scripts/e2e.sh).
 import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { createWriteStream, existsSync, readFileSync } from "node:fs";
 import {
   copyFile,
@@ -27,7 +28,6 @@ import {
   type AgentEvent,
   Agents,
   type AgentsOptions,
-  type JobResult,
   MemoryStore,
 } from "agent-sdk/server";
 
@@ -58,6 +58,20 @@ const TOKEN = "e2e-token";
 export const WORKERS = ["echo", "node-echo", "sysinfo", "netprobe"];
 
 export const run = promisify(execFile);
+
+/**
+ * Пара ключей подписи сборок Ed25519, base64: signing — seed (AGENT_SIGNING_KEY), public —
+ * открытый ключ (update.publicKeys). В DER обоих ключ — последние 32 байта.
+ */
+export const keygen = () => {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const tail = (der: Buffer) => der.subarray(-32).toString("base64");
+
+  return {
+    signing: tail(privateKey.export({ format: "der", type: "pkcs8" })),
+    public: tail(publicKey.export({ format: "der", type: "spki" })),
+  };
+};
 
 type Check<T> = () => T | undefined | false | Promise<T | undefined | false>;
 
@@ -98,17 +112,32 @@ export class ApiError extends Error {
   }
 }
 
+/** Ответ воркера на POST /jobs. */
+export interface JobReply {
+  jobId: string;
+  /** 200 — быстрая задача, 202 — долгая. */
+  status: number;
+  /** id долгой задачи у воркера. */
+  id?: string;
+  /** Итог быстрой задачи. */
+  result?: unknown;
+}
+
 export interface StandOptions {
   /** Имя агента. */
   name: string;
-  /** Каталог сборок для Agents. */
+  /** Каталог сборок для Agents (воркеры проекта, install.sh). */
   releasesDir?: string;
+  /** Каталог сборок агента (update.releases): ссылка или папка, устроенная как релизы. */
+  agentReleases?: string;
   /** Ключ проверки подписи сборок для агента (update.publicKey); без него и updateKeys — update.mode: disabled. */
   updateKey?: string;
   /** Ключи проверки подписи сборок для агента (update.publicKeys): подпись принимается, если сходится с любым. */
   updateKeys?: string[];
   /** netprobe — воркер со сборкой с сервера (release: true): сборка в <dataDir>/workers/netprobe/current. */
   releaseNetprobe?: boolean;
+  /** Сервер стенда проверяет настройки и тела запросов к воркерам по схемам манифестов. */
+  validate?: boolean;
   /** Свои настройки Agents сервера стенда. */
   server?: Partial<AgentsOptions>;
   /** Ещё воркеры в agent.yaml (кроме воркеров-примеров). */
@@ -215,6 +244,7 @@ export class Stand {
         ...(this.opts.updateKey ? [this.opts.updateKey] : []),
         ...(this.opts.updateKeys ?? []),
       ],
+      validate: this.opts.validate,
     });
     await new Promise<void>((ok, fail) => {
       this.server.once("error", fail);
@@ -269,12 +299,37 @@ export class Stand {
     );
   };
 
-  /** Задача воркеру через API стенда (runJob): { type, jobId?, data?, timeoutMs? }. */
-  job = (worker: string, body: Record<string, unknown>): Promise<JobResult> =>
-    this.api<JobResult>(
-      "POST",
-      `/api/agents/${this.agentId}/workers/${worker}/jobs`,
-      body,
+  /**
+   * Задача воркеру: POST /jobs через API стенда ({ type, jobId?, data? }; jobId по умолчанию —
+   * новый). 200 — итог сразу (result), 202 — долгая (id; итог — события job.*); отказ — ApiError.
+   */
+  job = async (
+    worker: string,
+    body: Record<string, unknown>,
+  ): Promise<JobReply> => {
+    const jobId = String(body.jobId ?? randomUUID().replaceAll("-", ""));
+    const res = await this.fetchWorker(worker, "/jobs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...body, jobId }),
+    });
+    const data = await res.json().catch(() => null);
+
+    if (!res.ok)
+      throw new ApiError(res.status, data?.code ?? "", data?.message ?? "");
+
+    return { jobId, status: res.status, id: data?.id, result: data?.result };
+  };
+
+  /** Событие итога задачи (job.done, job.failed, job.cancelled), не дольше timeoutMs. */
+  jobEnd = (worker: string, jobId: string, timeoutMs = 20_000) =>
+    waitFor(
+      `${worker}: итог задачи ${jobId}`,
+      async () =>
+        (await this.jobEvents(worker, jobId)).find(e =>
+          ["job.done", "job.failed", "job.cancelled"].includes(e.type),
+        ),
+      timeoutMs,
     );
 
   /** События задачи jobId воркера (job.*), по порядку прихода. */
@@ -352,7 +407,8 @@ export class Stand {
     JSON.parse(await readFile(join(this.dataDir, "credentials.json"), "utf8"));
 
   writeConfig = async (): Promise<void> => {
-    const { name, updateKey, updateKeys, releaseNetprobe } = this.opts;
+    const { name, updateKey, updateKeys, releaseNetprobe, agentReleases } =
+      this.opts;
     const echoEnv = (worker: string) => ({
       ECHO_STATE_FILE: this.stateFile(worker),
     });
@@ -365,10 +421,14 @@ export class Stand {
       enroll: { token: TOKEN },
       update:
         updateKey || updateKeys
-          ? { mode: "self", publicKey: updateKey, publicKeys: updateKeys }
+          ? {
+              mode: "self",
+              publicKey: updateKey,
+              publicKeys: updateKeys,
+              releases: agentReleases,
+            }
           : { mode: "disabled" },
       log: { level: "debug", forward: "warn" },
-      telemetry: { metrics: ["cpu", "load", "memory", "network", "uptime"] },
       workers: [
         {
           name: "echo",
@@ -378,11 +438,7 @@ export class Stand {
             ECHO_JOBS_DIR: this.jobsDir,
             ...echoEnv("echo"),
           },
-          // GET /health чаще обычного: busy и зависание видны быстрее.
-          lifecycle: {
-            ...lifecycle,
-            health: { interval: "2s", timeout: "1s", failures: 3 },
-          },
+          lifecycle,
         },
         {
           name: "node-echo",
@@ -446,8 +502,8 @@ export class Stand {
   };
 
   /**
-   * Перезапустить процесс агента: SIGTERM (воркеры работают дальше — lifecycle.onAgentExit:
-   * keep), затем запуск — новый агент подхватывает воркеры.
+   * Перезапустить процесс агента: SIGTERM (воркеры работают дальше), затем запуск — новый
+   * агент подхватывает воркеры.
    */
   restartAgent = async (): Promise<void> => {
     await this.stopAgent();

@@ -2,9 +2,8 @@
 // второй сессии, перечитывание Store (refresh), обход раз в секунду.
 import type { Context } from "../core/context";
 import type { Session } from "../core/session";
-import { clearOffline, raiseOffline } from "../model/alerts";
 import { reportedFromHello } from "../model/config-report";
-import type { AgentRecord, Alert } from "../model/types";
+import type { AgentRecord } from "../model/types";
 import { parseHello } from "../protocol/checks";
 import {
   Close,
@@ -55,7 +54,6 @@ export class Connections {
       if (this.stopped)
         return ss.close(Close.Restart, "сервер перезапускается");
       const now = Date.now();
-      let ended: Alert[] = [];
       const { agent } = await this.ctx.mutate(ss.agentId, a => {
         if (a.revoked) return false;
         if (a.bootId !== hello.agent.bootId) {
@@ -70,7 +68,6 @@ export class Connections {
         if (ss.address) a.address = ss.address;
         a.labels = { ...hello.labels, ...a.grantedLabels };
         a.configs = reportedFromHello(a.configs, hello.configs, now);
-        ended = clearOffline(a);
 
         return true;
       });
@@ -98,7 +95,6 @@ export class Connections {
       this.ctx.log("агент на связи", { agent: agent.name, id: agent.id });
       this.ctx.change(agent.id, "session");
       this.ctx.emitAgent(agent);
-      this.ctx.emitAlerts({ started: [], ended });
     });
   }
 
@@ -218,15 +214,11 @@ export class Connections {
     when: (a: AgentRecord) => boolean,
     seenAt = 0,
   ): Promise<void> {
-    const now = Date.now();
-    let started: Alert | undefined;
     const { agent, changed } = await this.ctx.mutate(agentId, a => {
-      started = undefined;
       if (!a.online || a.revoked || !when(a)) return false;
       a.online = false;
       a.lastSeenAt = Math.max(a.lastSeenAt ?? 0, seenAt);
       delete a.session;
-      started = raiseOffline(a, now);
 
       return true;
     });
@@ -234,6 +226,5 @@ export class Connections {
     if (!agent || !changed) return;
     this.ctx.log("агент без связи", { agent: agent.name, id: agent.id });
     this.ctx.emitAgent(agent);
-    if (started) this.ctx.emitAlerts({ started: [started], ended: [] });
   }
 }

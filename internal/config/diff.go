@@ -15,18 +15,16 @@ type Diff struct {
 	Restart []string
 	// Log — уровень, формат лога или порог отправки серверу (log.forward).
 	Log bool
-	// Telemetry — группы метрик, диски, исключённые интерфейсы.
-	Telemetry bool
 	// Hello — имя или метки: агент переподключается с новым hello.
 	Hello bool
-	// Workers — набор воркеров или их настройки (в том числе lifecycle и
-	// logs — они применяются без перезапуска воркера).
+	// Workers — набор воркеров или их настройки (в том числе lifecycle — он
+	// применяется без перезапуска воркера).
 	Workers bool
 }
 
 // Changed — есть что применять или о чём предупредить.
 func (d Diff) Changed() bool {
-	return len(d.Restart) > 0 || d.Log || d.Telemetry || d.Hello || d.Workers
+	return len(d.Restart) > 0 || d.Log || d.Hello || d.Workers
 }
 
 // Compare — разница настроек old → next (обе после Validate).
@@ -49,7 +47,6 @@ func Compare(old, next Config) Diff {
 	oldLog, nextLog := old.Log, next.Log
 	oldLog.Buffer, nextLog.Buffer = 0, 0
 	d.Log = oldLog != nextLog
-	d.Telemetry = !reflect.DeepEqual(old.Telemetry, next.Telemetry)
 	d.Hello = old.Name != next.Name || !maps.Equal(old.Labels, next.Labels)
 	d.Workers = !reflect.DeepEqual(old.Workers, next.Workers)
 	return d

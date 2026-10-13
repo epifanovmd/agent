@@ -25,11 +25,9 @@ import (
 	"github.com/epifanovmd/agent/internal/app"
 	"github.com/epifanovmd/agent/internal/bundle"
 	"github.com/epifanovmd/agent/internal/config"
-	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/install"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/releases"
-	"github.com/epifanovmd/agent/internal/scaffold"
 	"github.com/epifanovmd/agent/internal/update"
 )
 
@@ -39,7 +37,7 @@ func installCmd(args []string) error {
 		return err
 	}
 	if runtime.GOOS != "linux" {
-		return errors.New("agent install — для Linux (служба systemd или агент пользователя без root); здесь запускайте агента напрямую: agent init, затем agent run")
+		return errors.New("agent install — для Linux (служба systemd или агент пользователя без root); здесь запускайте агента напрямую: agent run")
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -169,119 +167,15 @@ func uninstallCmd(args []string) error {
 	return install.Uninstall(ctx, install.Host(os.Stdout, os.Stderr), *instance, *purge, self)
 }
 
-// initCmd — agent init [ПАПКА]: папка агента (программа, настройки, образцы
-// переменных, воркеры); agent init -config ФАЙЛ — один файл настроек с пояснениями.
-func initCmd(args []string) error {
-	set := flag.NewFlagSet("init", flag.ContinueOnError)
-	path := set.String("config", "", "вместо папки агента — один файл настроек с пояснениями (например, "+config.DefaultPath()+")")
-	var o config.TemplateOptions
-	set.StringVar(&o.ServerURL, "server", "", "адрес бэкенда, например https://api.example.com")
-	set.StringVar(&o.Token, "token", "", "токен регистрации (файл будет доступен только владельцу)")
-	set.StringVar(&o.Name, "name", "", "имя агента (по умолчанию — имя машины; только с -config)")
-	set.StringVar(&o.DataDir, "data-dir", "", "каталог данных (только с -config; по умолчанию "+config.DefaultDataDir()+")")
-	force := set.Bool("force", false, "перезаписать готовые файлы")
-	// Папка — где угодно среди флагов: agent init agent --server URL.
-	var dirs []string
-	for {
-		if err := set.Parse(args); err != nil {
-			return err
-		}
-		if set.NArg() == 0 {
-			break
-		}
-		dirs = append(dirs, set.Arg(0))
-		args = set.Args()[1:]
-	}
-	if len(dirs) > 1 {
-		return fmt.Errorf("папка агента — одна, а не %s", strings.Join(dirs, ", "))
-	}
-	if *path != "" {
-		if len(dirs) > 0 {
-			return errors.New("-config — один файл настроек, без папки агента")
-		}
-		return initFile(*path, o, *force)
-	}
-	if o.Name != "" || o.DataDir != "" {
-		return errors.New("--name и --data-dir — только с -config; в папке агента имя и данные — в agent.yaml")
-	}
-	dir := "."
-	if len(dirs) == 1 {
-		dir = dirs[0]
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	res, err := scaffold.Init(scaffold.Options{Dir: dir, Server: o.ServerURL, Token: o.Token, Binary: exe, Force: *force})
-	if err != nil {
-		return err
-	}
-	abs, _ := filepath.Abs(dir)
-	fmt.Printf("Папка агента: %s\n", abs)
-	if len(res.Created) > 0 {
-		fmt.Println("  создано:   ", strings.Join(res.Created, ", "))
-	}
-	if len(res.Skipped) > 0 {
-		fmt.Println("  уже были:  ", strings.Join(res.Skipped, ", "), "(не тронуты; перезаписать — --force)")
-	}
-	run := "./agent"
-	if dir != "." {
-		run = filepath.Join(dir, "agent")
-	}
-	fmt.Println("\nДальше:")
-	if o.Token == "" {
-		fmt.Printf("  впишите адрес бэкенда и токен регистрации в %s\n", filepath.Join(dir, ".env"))
-	}
-	fmt.Printf("  проверить:  %s config check\n  запустить:  %s run\n", run, run)
-	fmt.Printf("  что здесь что — %s\n", filepath.Join(dir, "README.md"))
-	return nil
-}
-
-// initFile — agent init -config ФАЙЛ: один файл настроек с пояснениями.
-func initFile(path string, o config.TemplateOptions, force bool) error {
-	if _, err := os.Stat(path); err == nil && !force {
-		return fmt.Errorf("%s уже есть — проверьте его: agent config check; перезаписать: agent init --force", path)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	perm := os.FileMode(0o644)
-	if o.Token != "" {
-		perm = 0o600
-	}
-	if err := fsutil.WriteFile(path, config.Template(o), perm); err != nil {
-		return err
-	}
-	flagHint := ""
-	if path != config.DefaultPath() {
-		flagHint = " -config " + path
-	}
-	fmt.Printf("Создан %s.\n", path)
-	if o.ServerURL == "" {
-		fmt.Println("Впишите адрес сервера (server.url) — или задайте AGENT_SERVER_URL.")
-	}
-	if o.Token == "" {
-		fmt.Println("Токен регистрации — enroll.token в файле или переменная AGENT_ENROLL_TOKEN.")
-	}
-	fmt.Printf("Проверить: agent config check%s\nЗапустить: agent run%s\n", flagHint, flagHint)
-	return nil
-}
-
 func configCmd(args []string) error {
-	if len(args) == 0 {
-		return errors.New("agent config check | agent config init")
+	if len(args) == 0 || args[0] != "check" {
+		return errors.New("agent config check [-config ФАЙЛ | --env ИМЯ]")
 	}
-	switch args[0] {
-	case "check":
-		return configCheck(args[1:])
-	case "init":
-		return initCmd(args[1:])
-	}
-	return fmt.Errorf("agent config: неизвестная команда %q (check | init)", args[0])
+	return configCheck(args[1:])
 }
 
-// configCheck — agent config check: файл, переменные, ошибки со строками,
-// итоговые значения.
+// configCheck — agent config check: проверить настройки и показать итоговые
+// значения.
 func configCheck(args []string) error {
 	set := flag.NewFlagSet("config check", flag.ContinueOnError)
 	flagPath := configFlag(set)
@@ -293,7 +187,7 @@ func configCheck(args []string) error {
 		return err
 	}
 	envFile := config.EnvFile(path)
-	applied, envErr := config.ApplyEnvFile(envFile)
+	_, envErr := config.ApplyEnvFile(envFile)
 	res := config.Check(path)
 
 	switch {
@@ -306,31 +200,13 @@ func configCheck(args []string) error {
 	case path != "":
 		fmt.Println("Файл настроек:", path)
 	default:
-		fmt.Printf("Файл настроек: нет (%s не найден) — только переменные окружения. Создать: agent init\n", config.DefaultPath())
+		fmt.Printf("Файл настроек: нет (%s не найден) — только переменные окружения\n", config.DefaultPath())
 	}
 	switch {
 	case errors.Is(envErr, fs.ErrPermission):
 		fmt.Printf("%s не прочитан (нужны права root) — токен и ключ из него не учтены\n", envFile)
 	case envErr != nil:
 		fmt.Printf("%s: %v\n", envFile, envErr)
-	case len(applied) > 0:
-		fmt.Printf("Переменные из %s: %s\n", envFile, strings.Join(applied, ", "))
-	}
-	if res.Source != nil && len(res.Source.EnvFiles) > 0 {
-		short := make([]string, len(res.Source.EnvFiles))
-		for i, f := range res.Source.EnvFiles {
-			short[i] = config.ShortPath(f)
-		}
-		fmt.Println("Файлы переменных (envFiles):", strings.Join(short, ", "))
-	}
-	var fromShell []string
-	for _, name := range res.FromEnv {
-		if !contains(applied, name) {
-			fromShell = append(fromShell, name)
-		}
-	}
-	if len(fromShell) > 0 {
-		fmt.Println("Из окружения (важнее файла):", strings.Join(fromShell, ", "))
 	}
 	warnings := res.Warnings
 	if len(res.Errors) == 0 && res.Config.Enroll.Token == "" {
@@ -357,26 +233,13 @@ func configCheck(args []string) error {
 	if cfg.Enroll.Token != "" {
 		cfg.Enroll.Token = "<скрыт>"
 	}
-	doc, err := res.Annotated(cfg)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("\nНастройки в порядке. Итоговые значения; в комментарии — откуда значение (без комментария — по умолчанию):\n\n")
+	fmt.Printf("\nНастройки в порядке. Итоговые значения:\n\n")
 	enc := yaml.NewEncoder(os.Stdout)
 	enc.SetIndent(2)
-	if err := enc.Encode(doc); err != nil {
+	if err := enc.Encode(cfg); err != nil {
 		return err
 	}
 	return enc.Close()
-}
-
-func contains(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }
 
 // statusReport — agent status --json.

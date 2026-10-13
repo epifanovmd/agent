@@ -1,12 +1,11 @@
-// Манифест воркера (§12): приём в hello и status, supports, проверка настроек по JSON Schema
-// ключа (validate.configs).
+// Манифест воркера (§12): приём в hello и status, шаблоны маршрутов, проверка значений по схемам
+// манифеста (schemaProblems).
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 
 import {
   type Agent,
-  AgentsError,
-  supports,
+  schemaProblems,
   type WorkerManifest,
 } from "../src/server/index";
 import { jsonSchemaProblems } from "../src/server/lib/json-schema";
@@ -114,7 +113,7 @@ describe("JSON Schema", () => {
   });
 });
 
-describe("supports", () => {
+describe("маршруты и схемы", () => {
   it("шаблон маршрута: {name} — один непустой сегмент, параметры не учитываются", () => {
     assert.equal(matchRoute("/items/{id}", "/items/42"), true);
     assert.equal(matchRoute("/items/{id}", "/items/42?full=1"), true);
@@ -129,37 +128,60 @@ describe("supports", () => {
     assert.equal(matchRoute("/items/{id}", "/items/%D1%8F"), true);
   });
 
-  it("маршрут, ключ, событие — все заданные условия", () => {
+  it("schemaProblems: значение ключа, тело маршрута по шаблону; нечем проверить — пусто", () => {
     const a = agentWith(manifest);
 
-    assert.equal(
-      supports(a, "echo", { route: { method: "post", path: "/echo" } }),
-      true,
+    assert.deepEqual(
+      schemaProblems(a, "echo", { config: "settings" }, { prefix: 5 }),
+      ["prefix: ожидается строка"],
     );
-    assert.equal(
-      supports(a, "echo", {
-        route: { method: "GET", path: "/items/7/parts/a" },
-        config: "settings",
-        event: "echo.done",
-      }),
-      true,
+    assert.deepEqual(
+      schemaProblems(a, "echo", { config: "settings" }, { prefix: "> " }),
+      [],
     );
-    assert.equal(
-      supports(a, "echo", { route: { method: "GET", path: "/echo" } }),
-      false,
+    // Ключ без схемы, незнакомый ключ, воркер без манифеста, нет воркера.
+    assert.deepEqual(schemaProblems(a, "echo", { config: "limits" }, 5), []);
+    assert.deepEqual(schemaProblems(a, "echo", { config: "main" }, 5), []);
+    assert.deepEqual(schemaProblems(a, "plain", { config: "settings" }, 5), []);
+    assert.deepEqual(schemaProblems(a, "nope", { config: "settings" }, 5), []);
+    const withBody = agentWith({
+      routes: [
+        {
+          method: "POST",
+          path: "/items/{id}",
+          request: { type: "object", required: ["n"] },
+        },
+      ],
+    });
+
+    assert.deepEqual(
+      schemaProblems(
+        withBody,
+        "echo",
+        { route: { method: "post", path: "/items/7?x=1" } },
+        {},
+      ),
+      ["нет поля n"],
     );
-    assert.equal(supports(a, "echo", { config: "main" }), false);
-    assert.equal(
-      supports(a, "echo", { config: "settings", event: "echo.started" }),
-      false,
+    assert.deepEqual(
+      schemaProblems(
+        withBody,
+        "echo",
+        { route: { method: "GET", path: "/items/7" } },
+        {},
+      ),
+      [],
     );
-    assert.equal(supports(a, "echo", {}), true);
   });
 
-  it("нет манифеста или воркера — false", () => {
-    assert.equal(supports(agentWith(), "echo", {}), false);
-    assert.equal(supports(agentWith(manifest), "plain", {}), false);
-    assert.equal(supports(agentWith(manifest), "nope", {}), false);
+  it("schemaProblems: схему нельзя применить — исключение", () => {
+    const a = agentWith({
+      configs: [
+        { key: "settings", schema: { $ref: "https://example.com/s.json" } },
+      ],
+    });
+
+    assert.throws(() => schemaProblems(a, "echo", { config: "settings" }, 1));
   });
 });
 
@@ -264,70 +286,5 @@ describe("манифест в hello и status", () => {
       a?.hello?.workers?.[0].manifest,
       sample("hello").data.workers[0].manifest,
     );
-  });
-});
-
-describe("validateConfigs", () => {
-  const reject = async (p: Promise<unknown>, pattern: RegExp) => {
-    const err = await p.then(
-      () => assert.fail("ждали CONFIG_INVALID"),
-      (e: unknown) => e,
-    );
-
-    assert.ok(err instanceof AgentsError);
-    assert.equal(err.code, "CONFIG_INVALID");
-    assert.equal(err.status, 400);
-    assert.match(err.message, pattern);
-  };
-
-  it("неверное значение отклонено до отправки агенту; верное — отправлено", async () => {
-    const s = await server({ validate: { configs: true } });
-    const { c, fa } = await connect(s, manifest);
-
-    await reject(
-      s.agents.setConfig(c.agentId, "echo", "settings", { prefix: 5 }),
-      /^echo\/settings: prefix: ожидается строка$/,
-    );
-    await reject(
-      s.agents.by("admin").setConfig(c.agentId, "echo", "settings", {}),
-      /нет поля prefix/,
-    );
-    assert.deepEqual(await s.agents.listConfigs(c.agentId), []);
-    assert.deepEqual(await fa.collect("config.put", 100), []);
-
-    const rec = await s.agents.setConfig(c.agentId, "echo", "settings", {
-      prefix: "> ",
-    });
-
-    assert.equal(rec.version, 1);
-    assert.deepEqual((await fa.next("config.put")).data.data, {
-      prefix: "> ",
-    });
-    // Ключ без схемы и воркер без манифеста — без проверки.
-    await s.agents.setConfig(c.agentId, "echo", "limits", 5);
-    await s.agents.setConfig(c.agentId, "other", "main", 5);
-  });
-
-  it("схему нельзя применить — без проверки, запись в журнал", async () => {
-    const logs: string[] = [];
-    const s = await server({
-      validate: { configs: true },
-      log: msg => logs.push(msg),
-    });
-    const { c } = await connect(s, {
-      configs: [
-        { key: "settings", schema: { $ref: "https://example.com/s.json" } },
-      ],
-    });
-
-    await s.agents.setConfig(c.agentId, "echo", "settings", 1);
-    assert.ok(logs.some(m => m.includes("схема ключа")));
-  });
-
-  it("по умолчанию выключено", async () => {
-    const s = await server();
-    const { c } = await connect(s, manifest);
-
-    await s.agents.setConfig(c.agentId, "echo", "settings", { prefix: 5 });
   });
 });

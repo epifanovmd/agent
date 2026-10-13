@@ -109,8 +109,7 @@ func releaseVersion(spec config.Worker) string {
 	return readVersion(filepath.Join(spec.ReleaseDir, config.ReleaseVersion))
 }
 
-// socketDir — каталог сокета воркера: доступен только пользователю воркера
-// (агенту-root он доступен и так).
+// socketDir — каталог сокета воркера (0700).
 func socketDir(runDir string, spec config.Worker) (string, error) {
 	dir := filepath.Join(runDir, spec.Name)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -118,15 +117,6 @@ func socketDir(runDir string, spec config.Worker) (string, error) {
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return "", err
-	}
-	if spec.User != "" {
-		cred, _, err := lookupUser(spec.User)
-		if err != nil {
-			return "", err
-		}
-		if err := os.Chown(dir, int(cred.Uid), int(cred.Gid)); err != nil {
-			return "", err
-		}
 	}
 	return dir, nil
 }
@@ -146,7 +136,7 @@ func unixClient(socket string) *http.Client {
 // startProcess — запустить процесс воркера (не дожидаясь сокета): свой сеанс
 // и группа процессов (воркер не получает сигналов терминала и переживает
 // выход агента), вывод — в файлы logDir.
-func startProcess(spec config.Worker, runDir, logDir string, e env, log *slog.Logger, life func() config.Lifecycle, logs func() config.Logs) (*process, error) {
+func startProcess(spec config.Worker, runDir, logDir string, e env, log *slog.Logger, life func() config.Lifecycle) (*process, error) {
 	args, dir, err := argv(spec)
 	if err != nil {
 		return nil, err
@@ -165,14 +155,7 @@ func startProcess(spec config.Worker, runDir, logDir string, e env, log *slog.Lo
 		message.EnvVersion:      e.agentVersion,
 		"PYTHONUNBUFFERED":      "1",
 	}
-	var cred *syscall.Credential
-	var userEnv map[string]string
-	if spec.User != "" {
-		if cred, userEnv, err = lookupUser(spec.User); err != nil {
-			return nil, err
-		}
-	}
-	out, files, err := openOutput(logDir, spec, nil, log, logs)
+	out, files, err := openOutput(logDir, spec, nil, log)
 	if err != nil {
 		return nil, err
 	}
@@ -188,9 +171,9 @@ func startProcess(spec config.Worker, runDir, logDir string, e env, log *slog.Lo
 	}
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = dir
-	cmd.Env = workerEnv(os.Environ(), spec, e.extra, set, userEnv)
+	cmd.Env = workerEnv(os.Environ(), spec, e.extra, set)
 	cmd.Stdout, cmd.Stderr = files[0], files[1]
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Credential: cred}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	err = cmd.Start()
 	files[0].Close()
 	files[1].Close()
@@ -217,8 +200,8 @@ func startProcess(spec config.Worker, runDir, logDir string, e env, log *slog.Lo
 
 // adoptProcess — процесс воркера из файла st, запущенный прежним агентом:
 // агент следит за ним, как за своим, и читает вывод с мест из файла.
-func adoptProcess(st procState, spec config.Worker, logDir string, log *slog.Logger, life func() config.Lifecycle, logs func() config.Logs) (*process, error) {
-	out, files, err := openOutput(logDir, spec, &st.Output, log, logs)
+func adoptProcess(st procState, spec config.Worker, logDir string, log *slog.Logger, life func() config.Lifecycle) (*process, error) {
+	out, files, err := openOutput(logDir, spec, &st.Output, log)
 	if err != nil {
 		return nil, err
 	}
@@ -248,12 +231,10 @@ func adoptProcess(st procState, spec config.Worker, logDir string, log *slog.Log
 	return p, nil
 }
 
-// exit — процесс завершился: потомки без keepChildren завершаются вместе с
-// ним, вывод дочитывается.
+// exit — процесс завершился: его потомки завершаются вместе с ним, вывод
+// дочитывается.
 func (p *process) exit() {
-	if !p.life().KeepChildren {
-		_ = syscall.Kill(-p.pid, syscall.SIGKILL)
-	}
+	_ = syscall.Kill(-p.pid, syscall.SIGKILL)
 	p.out.close(true)
 	p.client.CloseIdleConnections()
 	close(p.exited)
@@ -267,9 +248,8 @@ func (p *process) alive() bool {
 
 // state — файл процесса для следующего запуска агента.
 func (p *process) state(token, spec string, startedAt time.Time, output [2]int64) procState {
-	life := p.life()
 	return procState{PID: p.pid, Start: p.start, Socket: p.socket, Token: token, Version: p.version, Spec: spec,
-		StartedAt: startedAt.UnixMilli(), Output: output, StopTimeout: life.StopTimeout, KeepChildren: life.KeepChildren}
+		StartedAt: startedAt.UnixMilli(), Output: output, StopTimeout: p.life().StopTimeout}
 }
 
 // detach — агент уходит, процесс работает дальше: дочитать вывод и
@@ -305,16 +285,14 @@ func (p *process) waitReady(ctx context.Context, wait time.Duration) error {
 	}
 }
 
-// signal — сигнал воркеру: с keepChildren — только основному процессу,
-// иначе всей группе. Подхваченному — только если pid всё ещё его.
+// signal — сигнал всей группе процессов воркера. Подхваченному — только
+// если pid всё ещё его.
 func (p *process) signal(sig syscall.Signal) {
 	if p.adopted && !p.alive() {
 		return
 	}
-	if !p.life().KeepChildren {
-		if err := syscall.Kill(-p.pid, sig); err == nil {
-			return
-		}
+	if err := syscall.Kill(-p.pid, sig); err == nil {
+		return
 	}
 	_ = syscall.Kill(p.pid, sig)
 }
@@ -361,7 +339,7 @@ func (p *process) exitReason() string {
 	return p.exitErr.Error()
 }
 
-// failed — выход — сбой (lifecycle.restart: on-failure): код не 0, сигнал,
+// failed — выход — сбой (воркер перезапускается): код не 0, сигнал,
 // агент убил зависший; у подхваченного код неизвестен — тоже сбой.
 func (p *process) failed() bool {
 	p.mu.Lock()

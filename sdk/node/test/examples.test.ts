@@ -52,22 +52,13 @@ const same = (got: Envelope, name: string, ignore: string[] = []) => {
 
 const releaseDir = (): string => {
   const dir = mkdtempSync(join(tmpdir(), "agent-release-"));
-  const upd = sample("action.agent.update").data.args;
   const wupd = sample("action.worker.update").data.args;
 
   writeFileSync(
     join(dir, "manifest.json"),
     JSON.stringify({
-      version: upd.version,
-      artifacts: [
-        {
-          os: "linux",
-          arch: "amd64",
-          file: "agent-linux-amd64",
-          sha256: upd.sha256,
-          signature: upd.signature,
-        },
-      ],
+      version: wupd.version,
+      artifacts: [],
       workers: [
         {
           name: "report",
@@ -534,13 +525,6 @@ describe("образцы", () => {
     );
     await run(
       "action.agent.update",
-      () => s.agents.updateAgent(creds.agentId),
-      "action.result.agent.update",
-      v =>
-        assert.deepEqual(v, sample("action.result.agent.update").data.result),
-    );
-    await run(
-      "action.agent.update.release",
       () => s.agents.updateAgent(creds.agentId, { version: "v1.1.0" }),
       "action.result.agent.update",
       v =>
@@ -598,7 +582,7 @@ describe("образцы", () => {
     assert.equal(rec?.pendingSecretHash, rr.data.result.secretHash);
   });
 
-  it("задачи: runJob — POST /jobs, итог по событиям job.*", async () => {
+  it("задачи: POST /jobs — через fetch, события job.* — как события воркера", async () => {
     const all = samples();
     const long = all.get("worker.jobs.long")!.request!.body as {
       type: string;
@@ -647,70 +631,34 @@ describe("образцы", () => {
       return fj.ackOf(e.id!);
     };
 
+    const got: AgentEvent[] = [];
+    const onEvent = (e: AgentEvent) => void got.push(e);
+
+    s.agents.on("event", onEvent);
     // Долгая задача: 202, затем job.progress и job.done.
-    const p = s.agents.runJob(jc.agentId, "report", {
-      type: long.type,
-      jobId: long.jobId,
-      data: long.data,
-      files: long.files,
+    const p = s.agents.fetch(jc.agentId, "report", "/jobs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(long),
     });
     const req = await fj.next("fetch");
+    const accepted = all.get("worker.jobs.long")!.response!.body;
 
     assert.deepEqual(
       [req.data.method, req.data.path, JSON.parse(req.data.body)],
       ["POST", "/jobs", long],
     );
-    reply(req.id!, 202, all.get("worker.jobs.long")!.response!.body);
-    await event("event.job.progress");
-    await event("event.job.done");
-    assert.deepEqual(await p, {
-      jobId: long.jobId,
-      id: "b81c",
-      state: "done",
-      result: sample("event.job.done").data.data.result,
-    });
+    reply(req.id!, 202, accepted);
+    const res = await p;
 
-    // Итог пришёл раньше ответа 202 — всё равно дошёл.
-    const failed = sample("event.job.failed").data.data;
-    const f = s.agents.runJob(jc.agentId, "report", {
-      type: "report.build",
-      jobId: failed.jobId,
-    });
-    const freq = await fj.next("fetch");
+    assert.deepEqual([res.status, await res.json()], [202, accepted]);
+    const jobEvents = ["progress", "done", "failed", "cancelled"];
 
-    await event("event.job.failed");
-    reply(freq.id!, 202, { id: failed.id });
-    assert.deepEqual(await f, {
-      jobId: failed.jobId,
-      id: failed.id,
-      state: "failed",
-      error: failed.error,
-    });
-
-    const cancelled = sample("event.job.cancelled").data.data;
-    const c = s.agents.runJob(jc.agentId, "report", {
-      type: "report.build",
-      jobId: cancelled.jobId,
-    });
-
-    reply((await fj.next("fetch")).id!, 202, { id: cancelled.id });
-    await event("event.job.cancelled");
-    assert.deepEqual(await c, { ...cancelled, state: "cancelled" });
-
-    // Быстрая задача — итог сразу; типа нет в манифесте — JOB_UNKNOWN.
-    const quick = all.get("worker.jobs.quick")!;
-    const q = s.agents.runJob(jc.agentId, "report", {
-      type: "report.check",
-    });
-
-    reply((await fj.next("fetch")).id!, 200, quick.response!.body);
+    for (const t of jobEvents) await event(`event.job.${t}`);
+    s.agents.off("event", onEvent);
     assert.deepEqual(
-      (await q).result,
-      (quick.response!.body as { result: unknown }).result,
-    );
-    await assert.rejects(
-      s.agents.runJob(jc.agentId, "report", { type: "report.unknown" }),
-      { code: "JOB_UNKNOWN", status: 409 },
+      got.map(e => [e.type, e.data]),
+      jobEvents.map(t => [`job.${t}`, sample(`event.job.${t}`).data.data]),
     );
     await fj.close();
   });

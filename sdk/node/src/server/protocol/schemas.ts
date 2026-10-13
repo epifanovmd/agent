@@ -357,12 +357,6 @@ export const jobStateSchema = z.enum([
   "cancelled",
 ]);
 
-/** Ответ воркера на `POST /jobs`: итог быстрой задачи (200) или id долгой (202). */
-export const jobReplySchema = z.object({
-  id: z.string().min(1).optional(),
-  result: z.unknown().optional(),
-});
-
 /** Ответ воркера на `GET /jobs/{id}` и `POST /jobs/{id}/cancel`. */
 export const jobStatusSchema = z
   .looseObject({
@@ -373,16 +367,6 @@ export const jobStatusSchema = z
     error: errorInfoSchema.optional().catch(undefined),
   })
   .transform(compact);
-
-/** data событий задач (job.progress, job.done, job.failed, job.cancelled). */
-export const jobEventSchema = z.looseObject({
-  jobId: z.string().min(1),
-  id: z.string().optional().catch(undefined),
-  progress: z.number().optional().catch(undefined),
-  message: z.string().optional().catch(undefined),
-  result: z.unknown().optional(),
-  error: errorOr("JOB_FAILED").optional().catch(undefined),
-});
 
 /** Итог agent.rotateKey: хеш нового секрета (64 шестнадцатеричных символа). */
 export const rotateKeyResultSchema = z.object({
@@ -452,16 +436,3 @@ export const releaseManifestSchema = z.object({
   artifacts: validItems(releaseArtifactSchema).catch([]),
   workers: validItems(workerArtifactSchema).optional().catch(undefined),
 });
-
-/** Релиз GitHub (ответ `GET /repos/{owner}/{repo}/releases`): нужное SDK; неверные файлы пропускаются. */
-export const githubReleaseSchema = z.looseObject({
-  tag_name: z.string(),
-  draft: z.boolean().catch(false),
-  prerelease: z.boolean().catch(false),
-  assets: validItems(
-    z.looseObject({ name: z.string(), browser_download_url: z.string() }),
-  ).catch([]),
-});
-
-/** Список релизов GitHub; неверные записи пропускаются. */
-export const githubReleasesSchema = validItems(githubReleaseSchema);

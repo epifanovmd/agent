@@ -5,9 +5,7 @@ import type { Context } from "../core/context";
 import { AgentsError } from "../core/errors";
 import type { Session } from "../core/session";
 import { bounded } from "../lib/util";
-import { workerManifest } from "../model/manifest";
 import { publicAgent } from "../model/public-agent";
-import type { Agent } from "../model/types";
 import { parseWorkerRequest } from "../protocol/checks";
 import {
   type Envelope,
@@ -69,10 +67,6 @@ export class Requests {
         "на сервере нет обработчика запросов воркеров",
       );
     const agent = publicAgent(await this.ctx.agent(ss.agentId));
-    const problems = this.problems(agent, worker, type, data);
-
-    if (problems.length)
-      return refuse("REQUEST_INVALID", `${type}: ${problems.join("; ")}`);
     const timeoutMs = bounded(
       p.value.timeoutMs,
       REQUEST_TIMEOUT_MS,
@@ -130,25 +124,6 @@ export class Requests {
       clearTimeout(timer);
       stop();
     }
-  }
-
-  /** data не по requests[].schema (validate.requests); схема не применяется — без проверки. */
-  private problems(
-    agent: Agent,
-    worker: string,
-    type: string,
-    data: unknown,
-  ): string[] {
-    if (!this.ctx.settings.validate.requests) return [];
-    const schema = workerManifest(agent, worker)?.requests?.find(
-      r => r.type === type,
-    )?.schema;
-
-    return this.ctx.schemaProblems(schema, data ?? null, "запроса", {
-      agentId: agent.id,
-      worker,
-      type,
-    });
   }
 
   /** Ответ обработчика: undefined — без data; больше предела — BODY_TOO_LARGE. */

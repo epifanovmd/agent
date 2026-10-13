@@ -61,12 +61,6 @@ describe("регистрация воркера", () => {
       ((await res.json()) as { code: string }).code,
       "WORKER_INVALID",
     );
-    const alerts = await s.api<{ type: string }[]>(
-      "GET",
-      `/api/alerts?agentId=${s.agentId}`,
-    );
-
-    assert.ok(alerts.some(a => a.type === "workerInvalid"));
   });
 
   it("манифест появился — воркер зарегистрирован", async () => {

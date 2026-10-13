@@ -5,7 +5,6 @@ import type {
   ActionRecord,
   AgentEvent,
   Agents,
-  AuditEntry,
   MetricsEvent,
   MetricsPoint,
 } from "agent-sdk/server";
@@ -65,11 +64,10 @@ export class History {
       this.eventKeys.delete(eventKey(old));
   };
 
-  /** Подписаться на события Agents: метрики, итоги действий, удаление агента. */
+  /** Подписаться на события Agents: метрики, итоги действий. */
   follow(agents: Agents): void {
     agents.on("metrics", m => this.addMetrics(m));
     agents.on("action", a => this.addAction(a));
-    agents.on("audit", e => this.audit(e));
   }
 
   /** События, новые первыми. */
@@ -129,11 +127,10 @@ export class History {
   }
 
   /** Агента удалили — его история больше не нужна. */
-  private audit(e: AuditEntry): void {
-    if (e.action !== "agent.delete") return;
-    this.metrics.delete(e.agentId);
-    this.actions.delete(e.agentId);
-    this.events = this.events.filter(x => x.agentId !== e.agentId);
+  forget(agentId: string): void {
+    this.metrics.delete(agentId);
+    this.actions.delete(agentId);
+    this.events = this.events.filter(x => x.agentId !== agentId);
     this.eventKeys.clear();
     for (const x of this.events) this.eventKeys.add(eventKey(x));
   }

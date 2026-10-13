@@ -18,18 +18,9 @@ func SigningKey() (ed25519.PrivateKey, error) {
 	}
 	raw, err := base64.StdEncoding.DecodeString(seed)
 	if err != nil || len(raw) != ed25519.SeedSize {
-		return nil, errors.New(SigningKeyEnv + " — base64 seed Ed25519 (agent keygen)")
+		return nil, errors.New(SigningKeyEnv + " — base64 seed Ed25519 (openssl: docs/ARCHITECTURE.md, «Ключи подписи»)")
 	}
 	return ed25519.NewKeyFromSeed(raw), nil
-}
-
-// NewKeyPair — новая пара ключей подписи: закрытый (seed) и открытый, base64.
-func NewKeyPair() (private, public string, err error) {
-	pub, priv, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		return "", "", err
-	}
-	return base64.StdEncoding.EncodeToString(priv.Seed()), base64.StdEncoding.EncodeToString(pub), nil
 }
 
 // PublicKeyOf — открытый ключ закрытого priv, base64.

@@ -14,11 +14,7 @@ update:
 # На сервер — записи журнала с warn; пока открыт поток /api/agents/{id}/watch, сервер просит подробнее.
 log:
   forward: warn
-# Метрики узла собирает встроенный воркер sysmetrics (в workers его не описывают). Сверх
-# стандартных групп — диски, сокеты, процессы и температура.
-telemetry:
-  metrics:
-    [cpu, load, memory, swap, disk, diskio, network, interfaces, conntrack, sockets, processes, uptime, temperatures]
+# Метрики узла собирает встроенный воркер sysmetrics (в workers его не описывают).
 workers:
   # Python, только стандартная библиотека: POST /echo, GET /stream, GET /bytes, задачи POST /jobs
   # (долгая работа: события, busy в health, ход — на диске), POST /hang, настройка settings,
@@ -29,26 +25,20 @@ workers:
     env:
       PYTHONUNBUFFERED: "1"
       ECHO_JOBS_DIR: ${DEMO_ROOT}/.dev/demo-agent-${DEMO_AGENT}/echo-jobs
-    # Жизнь воркера: остальное — по умолчанию (перезапуск и остановка агента его не прерывают,
-    # замена ждёт окончания работы до 24 ч). Здесь — короче для стенда.
+    # Перезапуск и остановка агента его не прерывают, замена ждёт окончания работы. После
+    # SIGTERM агент ждёт выхода stopTimeout (по умолчанию 30s), потом SIGKILL.
     lifecycle:
       stopTimeout: 10s
-      busyTimeout: 10m
-      health: { interval: 5s, timeout: 2s, failures: 3 }
-    logs: { maxSize: 1MB, maxFiles: 2 }
   # Node.js, только node:http: то же, что echo.
   - name: node-echo
     command: ["node", "examples/workers/node-echo/main.mjs"]
     dir: ${DEMO_ROOT}
     lifecycle:
       stopTimeout: 10s
-  # Go: GET /info, настройка banner, метрики процесса, событие sys.started. Перезапуск и
-  # остановка агента останавливают и его; вышел сам с кодом 0 — не перезапускается.
+  # Go: GET /info, настройка banner, метрики процесса, событие sys.started. Вышел сам с кодом
+  # 0 — не перезапускается.
   - name: sysinfo
     command: ["${SYSINFO_BIN}"]
-    lifecycle:
-      onAgentExit: stop
-      restart: on-failure
   # Go: проверка сети до целей из настройки targets, итоги — в GET /metrics.
   - name: netprobe
     command: ["${NETPROBE_BIN}"]

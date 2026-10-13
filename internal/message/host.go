@@ -3,7 +3,7 @@ package message
 // Метрики узла — ответ GET /metrics встроенного воркера sysmetrics и
 // metrics.host (§9).
 
-// Группы метрик узла (telemetry.metrics агента, §9):
+// Группы метрик узла (§9):
 // какие поля HostMetrics собираются. Нет группы — нет её полей.
 const (
 	MetricsCPU          = "cpu"          // cpuPercent, cpuCores
@@ -48,7 +48,7 @@ type HostMetrics struct {
 	// DiskUsedBytes, DiskTotalBytes — корневая файловая система.
 	DiskUsedBytes  *uint64 `json:"diskUsedBytes,omitempty"`
 	DiskTotalBytes *uint64 `json:"diskTotalBytes,omitempty"`
-	// Disks — файловые системы по настройке агента telemetry.disks.
+	// Disks — файловые системы, которые агент отслеживает.
 	Disks []DiskMetrics `json:"disks,omitempty"`
 	// DiskReadBps … DiskWriteIops — сумма по физическим дискам: байт/с и операций/с.
 	DiskReadBps   *uint64 `json:"diskReadBps,omitempty"`

@@ -19,14 +19,13 @@ import (
 	"github.com/epifanovmd/agent/internal/update"
 )
 
-// folder — папка агента: agent.yaml (воркер из папки и воркер из релиза
-// агента), agent.prod.yaml поверх, .env.prod с секретом.
-func folder(t *testing.T, releasesURL string) string {
+// folder — папка агента: agent.yaml (воркер из папки), agent.prod.yaml поверх,
+// .env.prod с секретом.
+func folder(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	files := map[string]string{
-		"agent.yaml": "envFiles: [.env]\ndataDir: .data\nworkers:\n  - path: workers/echo\n  - name: probe\n    from: agent\n" +
-			"update: { releases: " + releasesURL + " }\n",
+		"agent.yaml":                     "envFiles: [.env]\ndataDir: .data\nworkers:\n  - path: workers/echo\n",
 		"agent.prod.yaml":                "extends: agent.yaml\nenvFiles: [.env.prod]\nlog: { format: json }\n",
 		".env.prod":                      "AGENT_ENROLL_TOKEN=secret\n",
 		"workers/echo/run":               "#!/bin/sh\nexec sleep 1\n",
@@ -48,25 +47,9 @@ func folder(t *testing.T, releasesURL string) string {
 }
 
 // Архив: программа, файлы настроек без секретов, воркер из папки и его
-// подписанная сборка, сборка воркера из релиза агента; bundle.json.
+// подписанная сборка; bundle.json.
 func TestPack(t *testing.T) {
-	probe := []byte("probe build")
-	sum := sha256.Sum256(probe)
-	probeHash := hex.EncodeToString(sum[:])
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/download/v1.2.0/manifest.json":
-			_ = json.NewEncoder(w).Encode(message.Manifest{Version: "1.2.0", Workers: []message.WorkerArtifact{
-				{Name: "probe", Version: "1.2.0", OS: runtime.GOOS, Arch: runtime.GOARCH, File: "probe-1.2.0", SHA256: probeHash, Signature: "author"},
-			}})
-		case "/download/v1.2.0/probe-1.2.0":
-			_, _ = w.Write(probe)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-	dir := folder(t, srv.URL)
+	dir := folder(t)
 	self := filepath.Join(t.TempDir(), "agent-self")
 	_ = os.WriteFile(self, []byte("agent program"), 0o755)
 	pub, priv, _ := ed25519.GenerateKey(nil)
@@ -90,7 +73,7 @@ func TestPack(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := filepath.Join(x, Dir)
-	for _, name := range []string{"agent", "agent.yaml", "agent.prod.yaml", "workers/echo/run", "workers/echo/VERSION", InfoFile, "release/manifest.json", "release/probe-1.2.0"} {
+	for _, name := range []string{"agent", "agent.yaml", "agent.prod.yaml", "workers/echo/run", "workers/echo/VERSION", InfoFile, "release/manifest.json"} {
 		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
 			t.Errorf("нет %s", name)
 		}
@@ -106,7 +89,7 @@ func TestPack(t *testing.T) {
 	var info Info
 	raw, _ := os.ReadFile(filepath.Join(root, InfoFile))
 	_ = json.Unmarshal(raw, &info)
-	if info.Version != "1.2.0" || info.Config != "agent.prod.yaml" || info.Env != "prod" || !slices.Equal(info.Workers, []string{"echo", "probe"}) || len(info.PublicKeys) != 1 {
+	if info.Version != "1.2.0" || info.Config != "agent.prod.yaml" || info.Env != "prod" || !slices.Equal(info.Workers, []string{"echo"}) || len(info.PublicKeys) != 1 {
 		t.Fatalf("bundle.json: %+v", info)
 	}
 	var m message.Manifest
@@ -120,9 +103,6 @@ func TestPack(t *testing.T) {
 	keys := update.Keys{pub}
 	if hash != echo.SHA256 || keys.Verify(update.Build{Name: "echo", Version: "1.4.0", OS: runtime.GOOS, Arch: runtime.GOARCH, SHA256: hash}, echo.Signature) != nil {
 		t.Fatal("сборка echo: sha256 или подпись")
-	}
-	if p := m.Worker("probe", runtime.GOOS, runtime.GOARCH); p == nil || p.Signature != "author" {
-		t.Fatalf("probe — подпись автора сохраняется: %+v", p)
 	}
 
 	// Общий каталог сборок для бэкенда — только воркеры из папки, подписанные.

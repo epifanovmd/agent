@@ -26,14 +26,10 @@ export class AgentsError extends Error {
 
   /**
    * Повтор того же вызова позже может удаться: связь с агентом, занятый или ещё не готовый
-   * воркер, срок, отказ воркера в задаче с 5xx, 408, 409 или 429. Неверный вызов — false.
+   * воркер, срок. Неверный вызов — false.
    */
   get retryable(): boolean {
-    return (
-      RETRYABLE.has(this.code) ||
-      (this.code === "JOB_REJECTED" &&
-        (this.status >= 500 || [408, 409, 429].includes(this.status)))
-    );
+    return RETRYABLE.has(this.code);
   }
 }
 
@@ -46,7 +42,6 @@ const RETRYABLE = new Set([
   "TIMEOUT",
   "BUSY",
   "DISCONNECTED",
-  "RELAY_FAILED",
   "RATE_LIMITED",
   "INTERNAL",
 ]);

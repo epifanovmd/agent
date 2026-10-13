@@ -1,12 +1,16 @@
 // Строгие возможности воркеров: агент пропускает только маршруты и задачи из манифеста, воркер
-// спрашивает бэкенд (запрос echo.lookup), сервер ждёт событие (waitEvent) и описывает воркер
-// (capabilities). Сервер проверяет тела запросов и data событий по схемам манифестов.
+// спрашивает бэкенд (запрос echo.lookup), сервер отдаёт манифест воркера и сам проверяет тела
+// запросов и data событий по схемам из него (schemaProblems).
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 
-import type { InvalidEvent, WorkerCapabilities } from "agent-sdk/server";
+import {
+  type AgentEvent,
+  schemaProblems,
+  type WorkerManifest,
+} from "agent-sdk/server";
 
-import { Stand } from "./stand";
+import { Stand, waitFor } from "./stand";
 
 const ECHOES = ["echo", "node-echo"];
 const NAME = "e2e-strict";
@@ -19,14 +23,9 @@ const apiError = async (res: Response) => ({
 
 describe("строгие возможности воркеров", () => {
   let s: Stand;
-  const invalid: InvalidEvent[] = [];
 
   before(async () => {
-    s = await Stand.start({
-      name: NAME,
-      server: { validate: { requests: true, events: "reject" } },
-    });
-    s.agents.on("invalidEvent", e => invalid.push(e));
+    s = await Stand.start({ name: NAME, validate: true });
   });
   after(() => s?.close());
 
@@ -93,46 +92,55 @@ describe("строгие возможности воркеров", () => {
       });
 
       assert.deepEqual(
-        [r.state, r.result],
-        ["done", { text: `${NAME}: ПРИВЕТ`, prefix: `${NAME}: ` }],
+        [r.status, r.result],
+        [200, { text: `${NAME}: ПРИВЕТ`, prefix: `${NAME}: ` }],
         w,
       );
     }
   });
 
-  it("waitEvent: событие echo.started после перезапуска воркера; data — по схеме", async () => {
+  it("событие echo.started после перезапуска воркера; data — по схеме манифеста", async () => {
     for (const w of ECHOES) {
-      const started = s.agents.waitEvent(s.agentId, w, "echo.started", {
-        timeoutMs: 30_000,
-      });
+      const since = Date.now();
 
       await s.api("POST", `/api/agents/${s.agentId}/workers/${w}/restart`);
-      const e = await started;
+      const e = await waitFor(`${w}: echo.started`, async () =>
+        (
+          await s.api<AgentEvent[]>(
+            "GET",
+            `/api/events?agentId=${s.agentId}&worker=${w}&type=echo.started`,
+          )
+        ).find(x => x.receivedAt >= since),
+      );
 
       assert.equal(typeof (e.data as { pid?: unknown }).pid, "number", w);
+      assert.deepEqual(
+        schemaProblems(await s.agent(), w, { event: e.type }, e.data),
+        [],
+        w,
+      );
     }
-    assert.deepEqual(invalid, []);
   });
 
-  it("capabilities: маршруты, события, задачи и запросы со схемами", async () => {
-    const caps = await s.api<WorkerCapabilities>(
+  it("манифест воркера: маршруты, события, задачи и запросы со схемами", async () => {
+    const m = await s.api<WorkerManifest>(
       "GET",
-      `/api/agents/${s.agentId}/workers/echo/capabilities`,
+      `/api/agents/${s.agentId}/workers/echo/manifest`,
     );
 
     assert.deepEqual(
-      caps.requests.map(r => r.type),
+      m.requests?.map(r => r.type),
       ["echo.lookup"],
     );
-    assert.equal(typeof caps.requests[0].schema, "object");
-    assert.equal(typeof caps.routes[0].request, "object");
-    assert.equal(typeof caps.events[0].schema, "object");
+    assert.equal(typeof m.requests?.[0].schema, "object");
+    assert.equal(typeof m.routes?.[0].request, "object");
+    assert.equal(typeof m.events?.[0].schema, "object");
     assert.deepEqual(
-      caps.jobs.map(j => j.type),
+      m.jobs?.map(j => j.type),
       ["echo.quick", "echo.long"],
     );
     const res = await fetch(
-      `${s.url}/api/agents/${s.agentId}/workers/nope/capabilities`,
+      `${s.url}/api/agents/${s.agentId}/workers/nope/manifest`,
     );
 
     assert.equal(res.status, 404);

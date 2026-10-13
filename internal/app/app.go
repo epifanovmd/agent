@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,7 +104,7 @@ func New(cfg config.Config, version string) (*App, error) {
 	logCtl.SetForwarder(forward)
 	if cfg.Insecure() {
 		log.Warn("связь без шифрования — ключ агента и настройки воркеров идут открытым текстом; нужен https://",
-			"server", strings.Join(cfg.Server.Addresses(), ", "))
+			"server", cfg.Server.URL)
 	}
 	lock, err := LockDataDir(cfg.DataDir)
 	if err != nil {
@@ -139,16 +138,15 @@ func New(cfg config.Config, version string) (*App, error) {
 	if exe, err := os.Executable(); err == nil {
 		a.update = update.NewPaths(exe)
 	}
-	if err := prepareRunDir(cfg, a.runDir); err != nil {
+	if err := prepareRunDir(a.runDir); err != nil {
 		return nil, err
 	}
 	a.auth = &auth{store: identity.NewStore(cfg.DataDir), cfg: cfg, client: client, host: HostInfo(), log: log, onError: a.recordError}
 	a.link = link.New(link.Options{
-		ServerURLs: cfg.Server.Addresses(),
+		ServerURL:  cfg.Server.URL,
 		Auth:       a.auth,
 		Outbox:     ob,
-		Stream:     stream.New(cfg.Server.StreamBuffer),
-		Backoff:    reconnect(cfg.Server),
+		Stream:     stream.New(message.StreamBacklog),
 		HTTPClient: client,
 		Log:        log,
 	}, a)
@@ -177,20 +175,12 @@ func New(cfg config.Config, version string) (*App, error) {
 	return a, nil
 }
 
-// prepareRunDir — каталог сокетов: проходимый для воркеров с user (у
-// каждого свой подкаталог 0700); каталог данных — тоже проходимый, если
-// такие воркеры есть.
-func prepareRunDir(cfg config.Config, dir string) error {
+// prepareRunDir — каталог сокетов (у каждого воркера в нём свой подкаталог 0700).
+func prepareRunDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o711); err != nil {
 		return fmt.Errorf("agent: каталог сокетов: %w", err)
 	}
-	if err := os.Chmod(dir, 0o711); err != nil {
-		return err
-	}
-	if slices.ContainsFunc(cfg.Workers, func(w config.Worker) bool { return w.User != "" }) {
-		return os.Chmod(cfg.DataDir, 0o711)
-	}
-	return nil
+	return os.Chmod(dir, 0o711)
 }
 
 // configWorkers — воркеры, которым сервер может слать настройки и запросы:
@@ -204,12 +194,6 @@ func (c configWorkers) Has(name string) bool {
 
 // Manifest — манифест воркера (ключи, которые ему можно передавать).
 func (c configWorkers) Manifest(name string) *message.WorkerManifest { return c.s.Manifest(name) }
-
-// OpenRoutes — fetch к воркеру без сверки с манифестом (routes: open).
-func (c configWorkers) OpenRoutes(name string) bool {
-	spec, _ := c.s.Spec(name)
-	return spec.OpenRoutes()
-}
 
 func (c configWorkers) Client(name string) (*http.Client, error) {
 	if !c.Has(name) {
@@ -235,7 +219,7 @@ func (a *App) Run(ctx context.Context) error {
 	defer sock.Close()
 
 	cfg := a.config()
-	a.log.Info("агент запущен", "version", a.version, "name", cfg.Name, "server", strings.Join(cfg.Server.Addresses(), ", "),
+	a.log.Info("агент запущен", "version", a.version, "name", cfg.Name, "server", cfg.Server.URL,
 		"workers", len(cfg.Workers))
 	var wg sync.WaitGroup
 	run := func(f func(context.Context)) {
@@ -249,7 +233,6 @@ func (a *App) Run(ctx context.Context) error {
 		_ = heartbeat{path: filepath.Join(cfg.DataDir, StatusFile), snapshot: a.snapshot}.run(ctx)
 	})
 	run(a.workers.Run)
-	run(func(ctx context.Context) { a.fetchAgentWorkers(ctx, cfg) })
 	run(a.checkLoop)
 	run(a.configs.Run)
 	run(a.metricsLoop)
@@ -274,8 +257,8 @@ func (a *App) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// requestRestart — выйти для перезапуска (ErrRestart): воркеры — по
-// lifecycle.onAgentExit.
+// requestRestart — выйти для перезапуска (ErrRestart): воркеры работают
+// дальше.
 func (a *App) requestRestart() {
 	a.restart.Store(true)
 	a.setExit(worker.ExitRestart)
@@ -480,31 +463,17 @@ func SysmetricsCommand() []string {
 	return []string{exe, sysmetrics.Command}
 }
 
-// workerSpecs — воркеры из настроек и встроенный sysmetrics, если есть
-// группы метрик узла (telemetry.metrics).
+// workerSpecs — воркеры из настроек и встроенный sysmetrics (метрики узла).
 func workerSpecs(cfg config.Config, sysmetricsCmd []string) []config.Worker {
-	specs := slices.Clone(cfg.Workers)
-	if len(cfg.Telemetry.Metrics) > 0 {
-		set, _ := json.Marshal(sysmetrics.Settings{
-			Metrics: cfg.Telemetry.Metrics, Disks: cfg.Telemetry.Disks, ExcludeInterfaces: cfg.Telemetry.ExcludeInterfaces,
-		})
-		specs = append(specs, config.Worker{
-			Name: config.SysmetricsWorker, Command: sysmetricsCmd, Builtin: true,
-			Env:       map[string]string{sysmetrics.EnvSettings: string(set)},
-			Lifecycle: config.Lifecycle{StopTimeout: config.Duration(5 * time.Second)},
-		})
-	}
-	return specs
-}
-
-// reconnect — пауза переподключения и повтора регистрации (server.reconnect).
-func reconnect(s config.Server) backoff.Policy {
-	return backoff.Policy{Min: s.Reconnect.Min.Std(), Max: s.Reconnect.Max.Std()}
+	return append(slices.Clone(cfg.Workers), config.Worker{
+		Name: config.SysmetricsWorker, Command: sysmetricsCmd, Builtin: true,
+		Lifecycle: config.Lifecycle{StopTimeout: config.Duration(5 * time.Second)},
+	})
 }
 
 // httpClient — клиент для запросов агента к серверу (WebSocket,
 // регистрация, загрузка сборок): прокси из окружения, системные корни +
-// server.caFile, клиентский сертификат.
+// server.caFile.
 func httpClient(s config.Server) (*http.Client, error) {
 	tlsCfg, err := s.TLSConfig()
 	if err != nil {
@@ -608,7 +577,7 @@ func (a *auth) ensure(ctx context.Context) error {
 		if err == nil || errors.Is(err, identity.ErrTokenRejected) {
 			return err
 		}
-		delay := reconnect(a.cfg.Server).Delay(attempt)
+		delay := backoff.Default.Delay(attempt)
 		var rl *identity.RateLimited
 		if errors.As(err, &rl) {
 			delay = rl.After
@@ -631,21 +600,11 @@ func (a *auth) Renew(ctx context.Context) error {
 	return a.enroll(ctx)
 }
 
-// enroll — регистрация по токену: адреса сервера по порядку, пока один не
-// ответит (отклонённый токен — сразу ошибка).
+// enroll — регистрация по токену.
 func (a *auth) enroll(ctx context.Context) error {
 	req := message.Enroll{Token: a.cfg.Enroll.Token, Name: a.cfg.Name, Labels: a.cfg.Labels,
 		Host: message.Host{OS: a.host.OS, Arch: a.host.Arch, Hostname: a.host.Hostname}}
-	var creds identity.Credentials
-	var err error
-	for _, addr := range a.cfg.Server.Addresses() {
-		creds, err = identity.Enroll(ctx, a.client, addr, req)
-		var rl *identity.RateLimited
-		if err == nil || errors.Is(err, identity.ErrTokenRejected) || errors.As(err, &rl) || ctx.Err() != nil {
-			break
-		}
-		a.log.Warn("регистрация: адрес недоступен", "server", addr, "err", err)
-	}
+	creds, err := identity.Enroll(ctx, a.client, a.cfg.Server.URL, req)
 	if err != nil {
 		return err
 	}

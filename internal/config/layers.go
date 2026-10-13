@@ -18,26 +18,12 @@ import (
 // заменяются целиком; воркеры (workers) сливаются по имени. ${ИМЯ} и
 // переменные AGENT_* берутся из окружения процесса, а если там их нет — из
 // файлов переменных envFiles. Относительные пути (extends, envFiles, dataDir,
-// server.caFile, server.certFile, server.keyFile, workers[].dir,
-// workers[].path) — от файла, в котором записаны.
+// server.caFile, workers[].dir, workers[].path) — от файла, в котором записаны.
 
 const notMapping = "файл настроек — словарь ключей (server:, workers: …)"
 
 // maxExtends — сколько файлов может быть в цепочке extends.
 const maxExtends = 8
-
-// Pos — где задано значение: файл и строка.
-type Pos struct {
-	File string
-	Line int
-}
-
-func (p Pos) String() string {
-	if p.Line > 0 {
-		return fmt.Sprintf("%s:%d", ShortPath(p.File), p.Line)
-	}
-	return ShortPath(p.File)
-}
 
 // ShortPath — путь для текстов: от текущего каталога, если файл внутри него.
 func ShortPath(path string) string {
@@ -59,9 +45,6 @@ type Source struct {
 	EnvFiles []string
 	// Env — значения из EnvFiles; окружение процесса важнее их.
 	Env map[string]string
-	// Origin — где задано каждое поле итоговых настроек: "server.url",
-	// "workers[0].dir".
-	Origin map[string]Pos
 	// Warnings — неизвестные поля и ненайденные файлы переменных.
 	Warnings []Problem
 	// Errors — с такими файлами агент не запустится (чтение, разметка, типы).
@@ -111,7 +94,7 @@ func fromFile(file, value string) string {
 
 // ReadSource — цепочка файлов настроек, начиная с path. Ошибки — в Errors.
 func ReadSource(path string) *Source {
-	s := &Source{Env: map[string]string{}, Origin: map[string]Pos{}}
+	s := &Source{Env: map[string]string{}}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		abs = path
@@ -145,7 +128,6 @@ func ReadSource(path string) *Source {
 		}
 	}
 
-	files := map[*yaml.Node]string{}
 	for _, l := range chain {
 		src := s.expand(l.raw)
 		for _, p := range unknownFields(src) {
@@ -169,15 +151,11 @@ func ReadSource(path string) *Source {
 		}
 		dropKeys(root, "extends", "envFiles")
 		resolvePaths(root, l.file)
-		markFile(root, l.file, files)
 		if s.node == nil {
 			s.node = root
 		} else {
 			mergeMap(s.node, root, true)
 		}
-	}
-	if s.node != nil {
-		s.origins(s.node, "", files)
 	}
 	if len(s.Files) == 1 {
 		// Один файл — в текстах только номера строк, как раньше.
@@ -328,23 +306,12 @@ func resolvePaths(root *yaml.Node, file string) {
 		}
 	}
 	fix(mapValue(root, "dataDir"))
-	server := mapValue(root, "server")
-	for _, key := range []string{"caFile", "certFile", "keyFile"} {
-		fix(mapValue(server, key))
-	}
+	fix(mapValue(mapValue(root, "server"), "caFile"))
 	if workers := mapValue(root, "workers"); workers != nil && workers.Kind == yaml.SequenceNode {
 		for _, w := range workers.Content {
 			fix(mapValue(w, "dir"))
 			fix(mapValue(w, "path"))
 		}
-	}
-}
-
-// markFile — файл каждого узла дерева (для Origin).
-func markFile(n *yaml.Node, file string, files map[*yaml.Node]string) {
-	files[n] = file
-	for _, c := range n.Content {
-		markFile(c, file, files)
 	}
 }
 
@@ -390,49 +357,4 @@ func mergeWorkers(base, over *yaml.Node) {
 		}
 		base.Content = append(base.Content, w)
 	}
-}
-
-// origins — Origin итогового дерева: у значения — его строка, у словаря и
-// списка — строка ключа.
-func (s *Source) origins(n *yaml.Node, path string, files map[*yaml.Node]string) {
-	pos := func(n *yaml.Node) Pos { return Pos{File: files[n], Line: n.Line} }
-	switch n.Kind {
-	case yaml.MappingNode:
-		for i := 0; i+1 < len(n.Content); i += 2 {
-			k, v := n.Content[i], n.Content[i+1]
-			p := k.Value
-			if path != "" {
-				p = path + "." + p
-			}
-			if v.Kind == yaml.ScalarNode || v.Kind == yaml.AliasNode {
-				s.Origin[p] = pos(v)
-			} else {
-				s.Origin[p] = pos(k)
-			}
-			s.origins(v, p, files)
-		}
-	case yaml.SequenceNode:
-		for i, c := range n.Content {
-			p := fmt.Sprintf("%s[%d]", path, i)
-			s.Origin[p] = pos(c)
-			s.origins(c, p, files)
-		}
-	}
-}
-
-// originOf — где задано поле, о котором текст ошибки Validate
-// («workers[1].user: …»): само поле или ближайшее объемлющее.
-func (s *Source) originOf(text string) (Pos, bool) {
-	p := rePath.FindString(text)
-	for p != "" {
-		if pos, ok := s.Origin[p]; ok {
-			return pos, true
-		}
-		i := strings.LastIndexAny(p, ".[")
-		if i < 0 {
-			break
-		}
-		p = p[:i]
-	}
-	return Pos{}, false
 }

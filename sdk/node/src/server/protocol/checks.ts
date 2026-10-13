@@ -12,11 +12,7 @@ import {
   eventSchema,
   eventTypeSchema,
   fetchReplySchemas,
-  githubReleasesSchema,
   helloSchema,
-  jobEventSchema,
-  jobReplySchema,
-  jobStatusSchema,
   labelsSchema,
   logSchema,
   messageIdSchema,
@@ -203,24 +199,6 @@ export const parseDeferred = (
 ): z.output<typeof deferredResultSchema> | undefined =>
   deferredResultSchema.safeParse(result).data;
 
-/** data события задачи (§12). */
-export type JobEventData = z.output<typeof jobEventSchema>;
-
-export const parseJobEvent = (data: unknown): JobEventData | undefined =>
-  jobEventSchema.safeParse(data).data;
-
-/** Ответ воркера на POST /jobs. */
-export const parseJobReply = (
-  body: unknown,
-): Parsed<z.output<typeof jobReplySchema>> =>
-  parse(jobReplySchema, body, "ответ POST /jobs");
-
-/** Ответ воркера на GET /jobs/{id} и POST /jobs/{id}/cancel. */
-export const parseJobStatus = (
-  body: unknown,
-): Parsed<z.output<typeof jobStatusSchema>> =>
-  parse(jobStatusSchema, body, "состояние задачи");
-
 /** Хеш нового секрета в итоге agent.rotateKey (64 шестнадцатеричных символа). */
 export const parseSecretHash = (result: unknown): string | undefined =>
   rotateKeyResultSchema.safeParse(result).data?.secretHash;
@@ -242,9 +220,3 @@ export const parseManifest = (
   data: unknown,
 ): Parsed<z.output<typeof releaseManifestSchema>> =>
   parse(releaseManifestSchema, data, "manifest.json");
-
-/** Список релизов GitHub (удалённый источник сборок агента). */
-export const parseGithubReleases = (
-  data: unknown,
-): Parsed<z.output<typeof githubReleasesSchema>> =>
-  parse(githubReleasesSchema, data, "релизы GitHub");

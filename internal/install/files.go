@@ -2,6 +2,7 @@ package install
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -29,18 +30,58 @@ func yamlUnmarshal(raw []byte, v any) error {
 	return yaml.Unmarshal([]byte(os.ExpandEnv(string(raw))), v)
 }
 
+// newWorker — воркер со сборкой, поставленный установкой (--worker).
+type newWorker struct {
+	Name      string        `yaml:"name"`
+	Release   bool          `yaml:"release"`
+	Command   []string      `yaml:"command,omitempty,flow"`
+	Lifecycle *newLifecycle `yaml:"lifecycle,omitempty"`
+}
+
+type newLifecycle struct {
+	StopTimeout string `yaml:"stopTimeout"`
+}
+
+// newConfig — agent.yaml, который создаёт установка: заданные значения, без
+// значений по умолчанию (их показывает agent config check).
+func newConfig(server, caFile, name, dataDir string, workers []newWorker) []byte {
+	type srv struct {
+		URL    string `yaml:"url"`
+		CAFile string `yaml:"caFile,omitempty"`
+	}
+	type logs struct {
+		Format string `yaml:"format"`
+	}
+	doc := struct {
+		Server  srv         `yaml:"server"`
+		Name    string      `yaml:"name,omitempty"`
+		DataDir string      `yaml:"dataDir"`
+		Log     logs        `yaml:"log"`
+		Workers []newWorker `yaml:"workers,omitempty"`
+	}{srv{server, caFile}, name, dataDir, logs{"json"}, workers}
+	var b bytes.Buffer
+	b.WriteString("# Настройки агента; итоговые значения — agent config check.\n")
+	enc := yaml.NewEncoder(&b)
+	enc.SetIndent(2)
+	if err := enc.Encode(doc); err != nil {
+		panic("agent.yaml: " + err.Error())
+	}
+	_ = enc.Close()
+	return b.Bytes()
+}
+
 // journal — журнал установки экземпляра (/etc/agent[-ИМЯ]/install-state):
 // строки «вид значение». package — пакет поставлен установкой, requires —
 // пакет нужен воркерам экземпляра, user — пользователь службы создан
 // установкой, sysctl — параметр ядра агента, sysctl-prev — его значение до
-// установки, kill-mode — режим остановки службы, service-user — пользователь
+// установки, service-user — пользователь
 // службы.
 type journal struct {
 	path  string
 	lines []string
 }
 
-const journalHeader = "# Журнал установки агента: package — пакет поставлен установкой, requires — пакет нужен воркерам, user — пользователь службы создан установкой, sysctl — параметр ядра агента, sysctl-prev — его значение до установки, kill-mode — режим остановки службы, service-user — пользователь службы"
+const journalHeader = "# Журнал установки агента: package — пакет поставлен установкой, requires — пакет нужен воркерам, user — пользователь службы создан установкой, sysctl — параметр ядра агента, sysctl-prev — его значение до установки, service-user — пользователь службы"
 
 func loadJournal(path string) (*journal, error) {
 	j := &journal{path: path}

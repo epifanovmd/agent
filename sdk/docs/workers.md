@@ -35,8 +35,8 @@
   такой воркер получает настройки и запросы `agents.fetch(...)`, у него спрашивают метрики.
   `ok: false` в `GET /health` регистрации не мешает: это самочувствие воркера, а не ошибка ответа.
 - Ответ не подошёл (нет маршрута, не `2xx`, не JSON, нет `ok` или `version`, ошибка в манифесте) —
-  в `status` у воркера `state: invalid`, причина — в `status.workers[].message`, бэкенд видит
-  проблему `workerInvalid` ([observe.md](observe.md#проблемы)). Процесс работает дальше, но
+  в `status` у воркера `state: invalid`, причина — в `status.workers[].message`
+  ([observe.md](observe.md#проблемы)). Процесс работает дальше, но
   настроек и запросов не получает: `agents.fetch(...)` и применение настроек заканчиваются
   ошибкой `WORKER_INVALID`.
 - Агент пишет предупреждение в свой журнал и повторяет проверку с растущей паузой. Ответы стали
@@ -166,16 +166,16 @@ func main() {
 `GET /health` и `GET /manifest` — обязательно ([выше](#обязательный-минимум)). Остальное
 необязательно: нет маршрута — `404`, агент считает, что воркер этого не умеет.
 
-| Запрос                  | Когда                                                                     | Ответ                                                                                              |
-| ----------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `PUT /config/{key}`     | после запуска — все сохранённые ключи; потом — новые версии               | тело `{ version, data }`; `2xx` — применено (тело — итог или пусто), иначе `{ message }` или текст |
-| `DELETE /config/{key}`  | бэкенд удалил ключ                                                        | `2xx` (`404` — тоже успех)                                                                         |
-| `GET /metrics`          | раз в `metricsIntervalMs` (чаще — пока на узел смотрят)                   | любой JSON — до бэкенда дойдёт как есть                                                            |
-| `GET /health`           | обязательно: при регистрации, потом раз в 5 с                             | `{ ok, busy?, message?, info? }`                                                                   |
-| `POST /cleanup`         | удаление агента с узла (`agent uninstall`)                                | убрать всё, что воркер создал на узле; `2xx` — готово                                              |
-| `GET /manifest`         | обязательно: при регистрации после каждого запуска                        | что воркер умеет — [ниже](#манифест-что-воркер-умеет)                                              |
-| `POST /jobs`, `/jobs/*` | `agents.runJob(...)` с бэкенда; обязательно, если в манифесте есть `jobs` | [ниже](#задачи)                                                                                    |
-| маршруты из манифеста   | `agents.fetch(...)` с бэкенда; другие пути агент не пропускает            | что угодно                                                                                         |
+| Запрос                  | Когда                                                                    | Ответ                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `PUT /config/{key}`     | после запуска — все сохранённые ключи; потом — новые версии              | тело `{ version, data }`; `2xx` — применено (тело — итог или пусто), иначе `{ message }` или текст |
+| `DELETE /config/{key}`  | бэкенд удалил ключ                                                       | `2xx` (`404` — тоже успех)                                                                         |
+| `GET /metrics`          | раз в `metricsIntervalMs` (чаще — пока на узел смотрят)                  | любой JSON — до бэкенда дойдёт как есть                                                            |
+| `GET /health`           | обязательно: при регистрации, потом раз в 5 с                            | `{ ok, busy?, message?, info? }`                                                                   |
+| `POST /cleanup`         | удаление агента с узла (`agent uninstall`)                               | убрать всё, что воркер создал на узле; `2xx` — готово                                              |
+| `GET /manifest`         | обязательно: при регистрации после каждого запуска                       | что воркер умеет — [ниже](#манифест-что-воркер-умеет)                                              |
+| `POST /jobs`, `/jobs/*` | `agents.fetch(...)` с бэкенда; обязательно, если в манифесте есть `jobs` | [ниже](#задачи)                                                                                    |
+| маршруты из манифеста   | `agents.fetch(...)` с бэкенда; другие пути агент не пропускает           | что угодно                                                                                         |
 
 - **Настройки.** Агент передаёт только ключи, объявленные в манифесте (`configs`), по одному и
   ждёт ответа (до 30 с). Отказ (не `2xx`) — бэкенд увидит ошибку с текстом ответа, агент
@@ -207,12 +207,13 @@ func main() {
 чем воркер пользуется, нужно перечислить: агент пропускает только объявленное. Бэкенд видит
 манифест в `agent.workers[].manifest` и может:
 
-- узнать, что умеет воркер, — `agents.capabilities(agentId, worker)` и помощник `supports`
+- узнать, что умеет воркер, — помощник `workerManifest(agent, worker)`
   ([sdk/README.md](../README.md#манифест-воркера));
-- проверить значение по схеме до отправки — опция `validate`: `configs`
-  ([configs.md](configs.md#проверка-по-схеме)), `jobs`, `requests`
-  ([fetch.md](fetch.md#проверка-тела-по-схеме)) и `events`
-  ([observe.md](observe.md#проверка-data-по-схеме)).
+- проверить значение по схеме — помощник `schemaProblems`: настройки
+  ([configs.md](configs.md#проверка-по-схеме)), тело запроса и `data` задачи
+  ([fetch.md](fetch.md#проверка-тела-по-схеме)), `data` события
+  ([observe.md](observe.md#проверка-data-по-схеме)) и запроса к бэкенду
+  ([ниже](#запросы-к-бэкенду)).
 
 ```json
 {
@@ -295,12 +296,8 @@ func main() {
     `CONFIG_KEY_UNKNOWN` ([configs.md](configs.md#статус-применения)); агент проверит ключ снова,
     когда воркер зарегистрируется в следующий раз (например, после обновления);
   - запрос к бэкенду, типа которого нет в `requests`, — `400 REQUEST_UNDECLARED`.
-- **Что агент не проверяет.** Значения по схемам — это делает бэкенд (опция `validate`:
-  `configs`, `jobs`, `requests`, `events`), агент сверяет только имена, типы и пути.
-- **Проверку маршрутов можно выключить** для одного воркера — `routes: open` в его настройках в
-  `agent.yaml` ([ARCHITECTURE.md](../../docs/ARCHITECTURE.md#настройки)): агент пропускает любой
-  путь, кроме служебных, и не сверяет тип задачи. Это для воркера, который ещё не описал свои
-  маршруты; события, ключи и запросы к бэкенду проверяются и тогда.
+- **Что агент не проверяет.** Значения по схемам — это делает бэкенд (помощник
+  `schemaProblems`), агент сверяет только имена, типы и пути.
 
 Python (обработчик из [примера ниже](#python)):
 
@@ -427,9 +424,14 @@ if err == nil && resp.StatusCode == http.StatusOK {
 Бэкенд:
 
 ```ts
+import { Agents, AgentsError, schemaProblems } from "agent-sdk/server";
+
 const agents = new Agents({
   enrollToken,
   onWorkerRequest: async (req) => {
+    // data по requests[].schema манифеста воркера: не подошло — отказ воркеру
+    const problems = schemaProblems(req.agent, req.worker, { request: req.type }, req.data);
+    if (problems.length) throw new AgentsError("REQUEST_INVALID", problems.join("; "), 400);
     if (req.type === "example.lookup") return { prefix: `${req.agent.name}: ` };
     throw new AgentsError("REQUEST_UNHANDLED", `нет ответа на ${req.type}`, 404);
   },
@@ -437,10 +439,9 @@ const agents = new Agents({
 ```
 
 Запрос приходит в процесс бэкенда, с которым агент на связи, и обрабатывается там (с несколькими
-процессами — без пересылки). Ошибка обработчика уходит воркеру: у `AgentsError` — её код и текст,
+процессами — тоже там). Ошибка обработчика уходит воркеру: у `AgentsError` — её код и текст,
 у другой — `REQUEST_FAILED`; ответ больше 4 МБ — `BODY_TOO_LARGE`. `req.signal` прерывается, когда
-истёк срок или оборвалась связь. С опцией `validate.requests` бэкенд сам отклоняет `data` не по
-`requests[].schema` — `REQUEST_INVALID`, обработчик не вызывается.
+истёк срок или оборвалась связь.
 
 ## Python
 
@@ -763,32 +764,14 @@ workers:
   - name: echo # ^[a-z][a-z0-9-]{0,31}$
     command: ["python3", "/opt/example/echo.py"]
     env: { LOG_LEVEL: info }
-    user: example # по умолчанию — пользователь агента; другой — только у агента от root
-    lifecycle: # всё — необязательно; здесь — значения по умолчанию
-      onAgentExit: keep # перезапуск и остановка агента воркер не трогают (stop — остановить вместе с ним)
-      restart: on-failure # always | on-failure | never — после выхода процесса
-      backoff: { min: 1s, max: 30s } # пауза перед перезапуском после падения
-      maxRestarts: 0 # падений подряд не больше (0 — без предела)
-      startTimeout: 60s # сокет должен начать отвечать; новая сборка — ответить ok: true
-      stopTimeout: 30s
-      keepChildren: false # true — дочерние процессы переживают остановку воркера
-      busyTimeout: 24h # замена ждёт, пока GET /health отвечает busy: true; 0s — не ждать
-      # зависание — перезапуск через 15–20 с; timeout — ещё срок GET /manifest, GET /metrics и регистрации
-      health: { interval: 5s, timeout: 2s, failures: 3 }
-    logs: { maxSize: 10MB, maxFiles: 1 } # файлы вывода в <dataDir>/logs
+    lifecycle:
+      stopTimeout: 30s # по умолчанию; после SIGTERM — столько ждать выхода, потом SIGKILL
   - name: report
     release: true # сборка — с сервера (releases.md)
   - path: workers/scan # воркер из папки агента: ./run в ней, имя — имя папки
-  - name: netprobe
-    from: agent # сборка из релиза агента той же версии
 ```
 
-Быстрее всего — заготовка `agent worker new <имя> [--lang python|go]`: база `agent_worker.py` или `agent_worker.go`
-берёт на себя сокет, здоровье, манифест, настройки, задачи, события и запросы, а воркер —
-класс-наследник с одним только своим кодом
-([docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md#папка-агента)).
-
-Воркер проекта удобнее всего держать в папке агента (`agent init`): папка `workers/<имя>/` с
+Воркер проекта удобнее всего держать в папке агента: папка `workers/<имя>/` с
 исполняемым `run` и файлом `VERSION`, в настройках — `- path: workers/<имя>`. На своей машине
 агент запускает его прямо из папки, `agent pack` кладёт его в архив для узла сборкой с подписью,
 а `agent install` ставит на узле как воркер со сборкой — бэкенд потом обновляет его `updateWorker`
@@ -802,15 +785,15 @@ workers:
   stderr — `warn`; строка длиннее 16 КБ обрезается. Пишите в них построчно. Агент передаёт вывод
   как есть и не фильтрует: не печатайте значения настроек, тела запросов и токен воркера. Сам
   агент их в журнал не пишет — только имена, версии, размеры и коды.
-- **Остановка воркера** (перезапуск, обновление воркера) — `SIGTERM`; не вышел за `stopTimeout` —
-  `SIGKILL`. Копия воркера всегда одна: новая запускается после ухода прежней.
+- **Остановка воркера** (перезапуск, обновление воркера) — `SIGTERM` всей группе процессов
+  воркера; не вышел за `stopTimeout` — `SIGKILL`. Копия воркера всегда одна: новая запускается после ухода прежней.
 - **Перезапуск и обновление агента** воркер не трогают: он работает дальше, новый агент его
   подхватывает (тот же процесс, тот же токен). Пока агента нет, сокет агента не отвечает —
   повторяйте `POST /events` позже.
-- **Выход процесса** — по `lifecycle.restart`; перезапуск — с растущей паузой (1–30 с), в
-  `status` — `state: backoff`. Без перезапуска (или после `maxRestarts` падений подряд) —
-  `state: stopped` до перезапуска с бэкенда или изменения настроек воркера. В обоих случаях
-  бэкенд видит проблему `workerDown`.
+- **Выход процесса** — с кодом не 0, по сигналу или из-за зависания (3 раза подряд нет ответа на
+  `GET /health`, его агент спрашивает раз в 5 с) — перезапуск с растущей паузой (1–30 с), в
+  `status` — `state: backoff`. Вышел сам с кодом 0 — `state: stopped` до перезапуска с бэкенда или
+  изменения настроек воркера.
 - **Перезапуск с бэкенда** — `agents.restartWorker(agentId, "echo")`; пока воркер занят, замена
   ждёт ([ниже](#замена-занятого-воркера)), `{ force: true }` — сразу.
 
@@ -818,7 +801,7 @@ workers:
 
 Задача — общий вид работы, которую бэкенд поручает воркеру: «сделай и сообщи итог». Воркер
 объявляет типы задач в манифесте (`jobs`) и обслуживает три маршрута; бэкенд вызывает их через
-`agents.runJob`, `agents.jobStatus` и `agents.cancelJob`. Формат — [§12](../spec/README.md#12-воркер),
+`agents.fetch`. Формат — [§12](../spec/README.md#12-воркер),
 образцы — `worker.jobs.*` в [worker.json](../spec/examples/worker.json) и `event.job.*` в
 [events.json](../spec/examples/events.json).
 
@@ -842,39 +825,43 @@ message? }` (`progress` — от 0 до 1), в конце ровно одно и
   пределами `fetch`.
 - **Отказ** — `4xx { message }`: неизвестный тип, неверные `data`, воркер занят такой же задачей.
 
-Бэкенд:
+Бэкенд вызывает маршруты задач обычным `agents.fetch` ([fetch.md](fetch.md)), а ход и итог
+получает как обычные события воркера — в `onEvent` ([observe.md](observe.md#события-воркеров)):
 
 ```ts
-// Быстрая: итог сразу.
-const r = await agents.runJob(agentId, "echo", { type: "echo.quick", data: { text: "привет" } });
-// r = { jobId, state: "done", result: { text: "ПРИВЕТ" } }
-
-// Долгая: ждать итога не дольше timeoutMs (по умолчанию 30 с).
-const job = await agents.runJob(agentId, "report", {
-  type: "example.report",
-  jobId: order.id, // свой id: повтор вызова не начнёт вторую задачу
-  data: { days: 30 },
-  files: { outputs: { report: await storage.signedPutUrl(`reports/${order.id}.pdf`) } },
-  timeoutMs: 5 * 60_000,
-  signal, // отмена: ожидание прерывается, воркеру уходит POST /jobs/{id}/cancel
+// Ход и итог: job.progress, job.done, job.failed, job.cancelled (список — JOB_EVENTS).
+const agents = new Agents({
+  enrollToken,
+  onEvent: async (e) => {
+    if (e.type.startsWith("job.")) await db.jobs.update(e.agentId, e.type, e.data); // в data — jobId и id
+  },
 });
-// job.state: "done" (result) | "failed" (error) | "cancelled" | "running" — не дождались,
-// задача идёт: её итог придёт событием job.done / job.failed (onEvent), состояние —
-await agents.jobStatus(agentId, "report", job.id!); // { id, state, progress?, result?, error? }
-await agents.cancelJob(agentId, "report", job.id!);
 
-// Не ждать итога: долгая задача (202) — сразу { jobId, id, state: "running" }.
-const started = await agents.runJob(agentId, "report", { type: "example.report", data, wait: false });
+// Запуск. Тип агент сверяет с manifest.jobs (нет — AgentsError JOB_UNKNOWN), тело передаёт как есть.
+const res = await agents.fetch(agentId, "report", "/jobs", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({
+    type: "example.report",
+    jobId: order.id, // свой id: повтор запроса не начнёт вторую задачу
+    data: { days: 30 },
+    files: { outputs: { report: await storage.signedPutUrl(`reports/${order.id}.pdf`) } },
+  }),
+});
+const body = await res.json();
+if (!res.ok) throw new Error(`воркер отказал: ${res.status} ${body.message}`);
+// 200 { result? } — быстрая задача, итог сразу; 202 { id } — долгая, итог придёт событием
+
+// Состояние и отмена долгой задачи:
+await (await agents.fetch(agentId, "report", `/jobs/${body.id}`)).json(); // { id, state, progress?, result?, error? }
+await agents.fetch(agentId, "report", `/jobs/${body.id}/cancel`, { method: "POST" });
 ```
 
-- `runJob` проверяет тип по `manifest.jobs` воркера (нет — `JOB_UNKNOWN`), с опцией
-  `validate.jobs` — и `data` по схеме типа (`JOB_INVALID`); отказ воркера — `JOB_REJECTED` с его
-  статусом и текстом. Повторить ли вызов — `AgentsError.retryable`: `JOB_REJECTED` со статусом
-  5xx, 408, 409 или 429 — да (с тем же `jobId` повтор не начнёт вторую задачу).
-- Итог долгой задачи `runJob` ждёт по событиям `job.*` в копии бэкенда, где агент на связи (из
-  другой копии вызов пересылается туда — опция `relay`). События всё равно проходят через
-  `onEvent` и событие `event`: обработчик бэкенда видит каждое и сохраняет итог, даже если
-  `runJob` уже вернул `state: "running"`.
+- Повторить запуск после ошибки связи (`AgentsError.retryable`) безопасно с тем же `jobId`.
+- `data` задачи можно проверить по `jobs[].schema` до запуска — помощником `schemaProblems` с
+  `{ job: type }` ([fetch.md](fetch.md#проверка-тела-по-схеме)).
+- События задач хранятся на диске агента, пока бэкенд их не подтвердит: итог дойдёт и после обрыва
+  связи, в ту копию бэкенда, с которой агент на связи.
 
 Примеры — задачи `echo.quick` и `echo.long` воркеров echo и node-echo, `netprobe.run` воркера
 netprobe ([examples/workers](../../examples/workers)).
@@ -902,7 +889,7 @@ netprobe ([examples/workers](../../examples/workers)).
 ### Замена занятого воркера
 
 `worker.restart`, `worker.update` и изменение настроек воркера в `agent.yaml` ждут окончания
-работы (не дольше `lifecycle.busyTimeout`, по умолчанию 24 ч), в `status` — `pending: "restart"`
+работы (не дольше 24 ч), в `status` — `pending: "restart"`
 или `"update"`. Бэкенд не ждёт вместе с агентом:
 
 ```ts

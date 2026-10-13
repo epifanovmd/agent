@@ -130,7 +130,7 @@ func (s *stand) worker(name string) config.Worker {
 // stateDir — каталог состояния воркера name.
 func (s *stand) stateDir(name string) string { return filepath.Join(s.dir, name) }
 
-// config — настройки агента стенда: без метрик узла и обновлений, лог агента — только ошибки.
+// config — настройки агента стенда: без обновлений, лог агента — только ошибки.
 func (s *stand) config(workers ...config.Worker) config.Config {
 	cfg := config.Defaults()
 	cfg.Server.URL = s.http.URL
@@ -138,7 +138,6 @@ func (s *stand) config(workers ...config.Worker) config.Config {
 	cfg.Name = agentName
 	cfg.Enroll.Token = token
 	cfg.Update.Mode = config.UpdateDisabled
-	cfg.Telemetry.Metrics = []string{}
 	cfg.Log.Level = message.LogError
 	cfg.Workers = workers
 	return cfg

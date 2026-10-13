@@ -6,8 +6,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-
-	"gopkg.in/yaml.v3"
 )
 
 // writeFiles — файлы name → содержимое в новом каталоге; вернёт каталог.
@@ -28,12 +26,11 @@ func writeFiles(t *testing.T, files map[string]string) string {
 
 const baseLayer = `server:
   url: https://api.example.com
-telemetry:
-  metrics: [cpu, memory]
 labels: { zone: eu }
 workers:
   - name: echo
     command: ["./run"]
+    args: [a, b]
     dir: workers/echo
     env: { A: "1" }
   - name: probe
@@ -45,11 +42,10 @@ envFiles: [.env.dev, .env.local, none.env]
 server:
   url: http://localhost:${PORT}
 dataDir: ../data
-telemetry:
-  metrics: [cpu]
 labels: { env: dev }
 workers:
   - name: echo
+    args: [c]
     env: { B: "2" }
   - name: extra
     command: ["./extra"]
@@ -82,8 +78,8 @@ func TestLayers(t *testing.T) {
 	if cfg.Server.URL != "http://localhost:8080" || cfg.Enroll.Token != "from-file" {
 		t.Fatalf("переменные из файлов: %q %q", cfg.Server.URL, cfg.Enroll.Token)
 	}
-	if cfg.DataDir != filepath.Join(filepath.Dir(dir), "data") || !slices.Equal(cfg.Telemetry.Metrics, []string{"cpu"}) {
-		t.Fatalf("путь и список: %q %v", cfg.DataDir, cfg.Telemetry.Metrics)
+	if cfg.DataDir != filepath.Join(filepath.Dir(dir), "data") || !slices.Equal(cfg.Workers[0].Args, []string{"c"}) {
+		t.Fatalf("путь и список: %q %v", cfg.DataDir, cfg.Workers[0].Args)
 	}
 	if cfg.Labels["zone"] != "eu" || cfg.Labels["env"] != "dev" {
 		t.Fatalf("словарь: %v", cfg.Labels)
@@ -110,15 +106,6 @@ func TestLayers(t *testing.T) {
 	if len(src.Files) != 2 || filepath.Base(src.Files[0]) != "agent.yaml" || len(src.EnvFiles) != 2 {
 		t.Fatalf("цепочка: %v %v", src.Files, src.EnvFiles)
 	}
-	if p := src.Origin["server.url"]; filepath.Base(p.File) != "agent.dev.yaml" || p.Line != 4 {
-		t.Fatalf("server.url: %+v", p)
-	}
-	if p := src.Origin["workers[0].dir"]; filepath.Base(p.File) != "agent.yaml" || p.Line != 9 {
-		t.Fatalf("workers[0].dir: %+v", p)
-	}
-	if p := src.Origin["workers[0].env.B"]; filepath.Base(p.File) != "agent.dev.yaml" {
-		t.Fatalf("workers[0].env.B: %+v", p)
-	}
 	if len(src.Warnings) != 1 || !strings.Contains(src.Warnings[0].String(), "none.env") || filepath.Base(src.Warnings[0].File) != "agent.dev.yaml" {
 		t.Fatalf("нет файла переменных: %+v", src.Warnings)
 	}
@@ -140,11 +127,11 @@ func TestLayerErrors(t *testing.T) {
 	}
 }
 
-// config check по цепочке: ошибка и замечание — с файлом и строкой; итоговые
-// значения помечены, откуда они.
+// config check по цепочке: замечание — с файлом и строкой; ошибка значения —
+// с именем поля; переменные из файлов переменных и окружения учтены.
 func TestCheckLayers(t *testing.T) {
 	dir := writeFiles(t, map[string]string{
-		"agent.yaml": baseLayer + "    lifecycle: {maxRestarts: -1}\n",
+		"agent.yaml": baseLayer + "    path: workers/probe\n    release: true\n",
 		"agent.prod.yaml": `extends: agent.yaml
 envFiles: [.env.prod]
 log:
@@ -158,40 +145,23 @@ log:
 	if len(res.Warnings) != 1 || filepath.Base(res.Warnings[0].File) != "agent.prod.yaml" || res.Warnings[0].Line != 4 {
 		t.Fatalf("замечания: %+v", res.Warnings)
 	}
-	if len(res.Errors) != 1 || filepath.Base(res.Errors[0].File) != "agent.yaml" || res.Errors[0].Line != 13 ||
-		!strings.Contains(res.Errors[0].String(), "agent.yaml, строка 13: workers[1].lifecycle.maxRestarts") {
+	if len(res.Errors) != 1 || !strings.Contains(res.Errors[0].String(), "workers[1]: path") {
 		t.Fatalf("ошибки: %+v", res.Errors)
 	}
-	if !slices.Contains(res.FromEnvFiles, "AGENT_ENROLL_TOKEN") || !slices.Contains(res.FromEnv, "AGENT_NAME") {
-		t.Fatalf("переменные: %v %v", res.FromEnv, res.FromEnvFiles)
-	}
-
-	doc, err := res.Annotated(res.Config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, _ := yaml.Marshal(doc)
-	lines := strings.Split(string(out), "\n")
-	for _, want := range [][2]string{{"url: https://api.example.com # ", "agent.yaml:2"},
-		{"token: secret # ", "AGENT_ENROLL_TOKEN из файла переменных"}, {"name: from-env # ", "AGENT_NAME"}, {"metrics: # ", "agent.yaml:4"}} {
-		if !slices.ContainsFunc(lines, func(l string) bool {
-			l = strings.TrimSpace(l)
-			return strings.HasPrefix(l, want[0]) && strings.HasSuffix(l, want[1])
-		}) {
-			t.Errorf("нет %q…%q:\n%s", want[0], want[1], out)
-		}
+	if res.Config.Enroll.Token != "secret" || res.Config.Name != "from-env" {
+		t.Fatalf("переменные: %q %q", res.Config.Enroll.Token, res.Config.Name)
 	}
 }
 
-// Воркер из папки (path) и из релиза агента (from: agent).
-func TestWorkerPathAndFrom(t *testing.T) {
+// Воркер из папки (path) и со сборкой (release: true).
+func TestWorkerPathAndRelease(t *testing.T) {
 	dir := writeFiles(t, map[string]string{
 		"agent.yaml": `server: { url: https://api.example.com }
 dataDir: data
 workers:
   - path: workers/echo
   - name: probe
-    from: agent
+    release: true
 `,
 		"agent.prod.yaml": `extends: agent.yaml
 workers:
@@ -211,12 +181,11 @@ workers:
 		t.Fatalf("path: %+v", echo)
 	}
 	if !probe.Release || probe.ReleaseDir != filepath.Join(dir, "data", "workers", "probe") {
-		t.Fatalf("from: %+v", probe)
+		t.Fatalf("release: %+v", probe)
 	}
 	for _, w := range []Worker{
 		{Path: "/w/a", Release: true},
 		{Path: "/w/a", Dir: "/other"},
-		{Name: "b", From: "github"},
 	} {
 		c := Defaults()
 		c.Server.URL = "https://api.example.com"
@@ -244,7 +213,7 @@ workers:
   - path: workers/echo # воркер проекта
     env: { A: "1" }
   - name: probe
-    from: agent
+    release: true
 `,
 		"agent.prod.yaml": `extends: agent.yaml
 envFiles: [.env.prod]
@@ -290,12 +259,12 @@ log: { format: json }
 func TestVarsInFlowStyle(t *testing.T) {
 	dir := writeFiles(t, map[string]string{
 		"agent.yaml":      "server: { url: ${URL} }\nlabels: { zone: $ZONE }\n",
-		"agent.prod.yaml": "extends: agent.yaml\nenvFiles: [.env]\ntelemetry: { disks: [${DISK}] }\n",
+		"agent.prod.yaml": "extends: agent.yaml\nenvFiles: [.env]\nworkers: [{ name: w, command: [${DISK}] }]\n",
 		".env":            "URL=https://api.example.com\nZONE=eu\nDISK=/data\n",
 	})
 	unsetEnv(t, "URL", "ZONE", "DISK")
 	cfg, err := Load(filepath.Join(dir, "agent.prod.yaml"))
-	if err != nil || cfg.Server.URL != "https://api.example.com" || cfg.Labels["zone"] != "eu" || cfg.Telemetry.Disks[0] != "/data" {
+	if err != nil || cfg.Server.URL != "https://api.example.com" || cfg.Labels["zone"] != "eu" || cfg.Workers[0].Command[0] != "/data" {
 		t.Fatalf("%+v %v", cfg, err)
 	}
 	raw, err := Flatten(filepath.Join(dir, "agent.prod.yaml"), "/var/lib/agent", "")

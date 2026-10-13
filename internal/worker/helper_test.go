@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/epifanovmd/agent/internal/backoff"
 )
 
 // Тестовый воркер — этот же тестовый файл, запущенный с TEST_WORKER=режим:
@@ -40,6 +42,9 @@ func TestMain(m *testing.M) {
 		testWorker(mode)
 		return
 	}
+	// Короткие сроки жизни воркеров.
+	restartBackoff = backoff.Policy{Min: 20 * time.Millisecond, Max: 50 * time.Millisecond}
+	healthInterval, probeTimeout, startTimeout = 50*time.Millisecond, 200*time.Millisecond, 5*time.Second
 	os.Exit(m.Run())
 }
 

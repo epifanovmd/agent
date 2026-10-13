@@ -10,7 +10,6 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -46,7 +45,7 @@ workers:
 		t.Fatalf("метки: %v", cfg.Labels)
 	}
 	w := cfg.Workers[0]
-	if w.Command[0] != "/opt/venv/bin/python" || w.Lifecycle.StopTimeout.Std() != 10*time.Minute || w.Lifecycle.KeepChildren {
+	if w.Command[0] != "/opt/venv/bin/python" || w.Lifecycle.StopTimeout.Std() != 10*time.Minute {
 		t.Fatalf("воркер: %+v", w)
 	}
 }
@@ -97,66 +96,8 @@ func TestInsecure(t *testing.T) {
 	}
 }
 
-func TestTelemetryAndEnv(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "agent.yaml")
-	_ = os.WriteFile(path, []byte(`
-server: { url: https://api.example.com }
-dataDir: `+dir+`
-telemetry:
-  metrics: [load, swap, gpu]
-  disks: [all]
-  excludeInterfaces: [tun]
-`), 0o600)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tl := cfg.Telemetry
-	if strings.Join(tl.Metrics, ",") != "load,swap,gpu" || strings.Join(tl.Disks, ",") != "all" ||
-		len(tl.ExcludeInterfaces) != 1 || tl.ExcludeInterfaces[0] != "tun" {
-		t.Fatalf("из файла: %+v", tl)
-	}
-
-	def := Defaults()
-	if !slices.Equal(def.Telemetry.Metrics, DefaultMetrics) || strings.Join(def.Telemetry.Disks, ",") != "/" ||
-		len(def.Telemetry.ExcludeInterfaces) != len(DefaultExcludeInterfaces) || def.Update.Mode != UpdateSelf {
-		t.Fatalf("умолчания: %+v", def.Telemetry)
-	}
-
-	// Переменные окружения важнее файла.
-	t.Setenv("AGENT_TELEMETRY_METRICS", "sockets, fds")
-	t.Setenv("AGENT_TELEMETRY_DISKS", "/,/var/lib/example")
-	t.Setenv("AGENT_TELEMETRY_EXCLUDE_INTERFACES", "lo,docker")
-	cfg, err = Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tl = cfg.Telemetry
-	if strings.Join(tl.Metrics, ",") != "sockets,fds" || strings.Join(tl.Disks, ",") != "/,/var/lib/example" ||
-		strings.Join(tl.ExcludeInterfaces, ",") != "lo,docker" {
-		t.Fatalf("из окружения: %+v", tl)
-	}
-	// Пустая переменная — без метрик узла.
-	t.Setenv("AGENT_TELEMETRY_METRICS", "")
-	if cfg, err = Load(path); err != nil || cfg.Telemetry.Metrics == nil || len(cfg.Telemetry.Metrics) != 0 {
-		t.Fatalf("пустой список групп: %v %+v", err, cfg.Telemetry.Metrics)
-	}
-	t.Setenv("AGENT_TELEMETRY_METRICS", "load,nope")
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), `неизвестная группа "nope"`) {
-		t.Fatalf("неизвестная группа: %v", err)
-	}
+func TestNameAndLabels(t *testing.T) {
 	bad := Defaults()
-	bad.Server.URL = "https://x"
-	bad.Telemetry.Disks = []string{"all", "/"}
-	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), `"all" — только один`) {
-		t.Fatalf("all и пути: %v", err)
-	}
-	bad.Telemetry.Disks = []string{"var/lib"}
-	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "абсолютный путь") {
-		t.Fatalf("относительный путь диска: %v", err)
-	}
-	bad = Defaults()
 	bad.Server.URL = "https://x"
 	bad.Name = ""
 	bad.Labels = map[string]string{"": "x"}
@@ -167,23 +108,19 @@ telemetry:
 
 func TestTLSFiles(t *testing.T) {
 	dir := t.TempDir()
-	caPEM, certPEM, keyPEM := testCerts(t)
-	ca, cert, key := filepath.Join(dir, "ca.pem"), filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	caPEM, keyPEM := testCerts(t)
+	ca, key := filepath.Join(dir, "ca.pem"), filepath.Join(dir, "key.pem")
 	_ = os.WriteFile(ca, caPEM, 0o600)
-	_ = os.WriteFile(cert, certPEM, 0o600)
 	_ = os.WriteFile(key, keyPEM, 0o600)
 
 	s := Server{}
 	if c, err := s.TLSConfig(); c != nil || err != nil {
 		t.Fatalf("без файлов — умолчания Go: %v %v", c, err)
 	}
-	s = Server{CAFile: ca, CertFile: cert, KeyFile: key}
+	s = Server{CAFile: ca}
 	c, err := s.TLSConfig()
-	if err != nil || c.RootCAs == nil || len(c.Certificates) != 1 {
-		t.Fatalf("CA и клиентский сертификат: %v", err)
-	}
-	if _, err := (Server{CertFile: cert}).TLSConfig(); err == nil {
-		t.Fatal("certFile без keyFile — ошибка")
+	if err != nil || c.RootCAs == nil {
+		t.Fatalf("CA: %v", err)
 	}
 	if _, err := (Server{CAFile: key}).TLSConfig(); err == nil {
 		t.Fatal("caFile без сертификатов — ошибка")
@@ -195,21 +132,14 @@ func TestTLSFiles(t *testing.T) {
 	t.Setenv("AGENT_SERVER_URL", "https://api.example.com")
 	t.Setenv("AGENT_DATA_DIR", dir)
 	t.Setenv("AGENT_SERVER_CA_FILE", ca)
-	t.Setenv("AGENT_SERVER_CERT_FILE", cert)
-	t.Setenv("AGENT_SERVER_KEY_FILE", key)
 	cfg, err := Load("")
-	if err != nil || cfg.Server.CAFile != ca || cfg.Server.CertFile != cert || cfg.Server.KeyFile != key {
+	if err != nil || cfg.Server.CAFile != ca {
 		t.Fatalf("из окружения: %+v %v", cfg.Server, err)
-	}
-	t.Setenv("AGENT_SERVER_KEY_FILE", "")
-	os.Unsetenv("AGENT_SERVER_KEY_FILE")
-	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "оба или ни одного") {
-		t.Fatalf("certFile без keyFile: %v", err)
 	}
 }
 
-// testCerts — CA и подписанный им сертификат (PEM).
-func testCerts(t *testing.T) (caPEM, certPEM, keyPEM []byte) {
+// testCerts — сертификат CA и закрытый ключ (PEM).
+func testCerts(t *testing.T) (caPEM, keyPEM []byte) {
 	t.Helper()
 	caKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	caTpl := &x509.Certificate{
@@ -221,19 +151,8 @@ func testCerts(t *testing.T) (caPEM, certPEM, keyPEM []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	tpl := &x509.Certificate{
-		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "agent"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tpl, caTpl, &key.PublicKey, caKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyDER, _ := x509.MarshalECPrivateKey(key)
+	keyDER, _ := x509.MarshalECPrivateKey(caKey)
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 }
 
@@ -256,20 +175,19 @@ func TestCompare(t *testing.T) {
 	next.Update.Mode = "disabled"
 	next.Enroll.Token = "t"
 	next.Log.Level = "debug"
-	next.Telemetry.Metrics = []string{"load"}
 	next.Labels = map[string]string{"zone": "us"}
-	next.Workers = []Worker{{Name: "w", Command: []string{"x"}, Lifecycle: Lifecycle{KeepChildren: true, StopTimeout: Duration(30 * time.Second)}}}
+	next.Workers = []Worker{{Name: "w", Command: []string{"x"}, Lifecycle: Lifecycle{StopTimeout: Duration(time.Minute)}}}
 	d := Compare(base, next)
 	if strings.Join(d.Restart, ",") != "server.url,server.caFile,dataDir,update.mode,enroll.token" {
 		t.Fatalf("перезапуск: %v", d.Restart)
 	}
-	if !d.Log || !d.Telemetry || !d.Hello || !d.Workers {
+	if !d.Log || !d.Hello || !d.Workers {
 		t.Fatalf("на ходу: %+v", d)
 	}
 	kept := KeepRestartOnly(base, next)
 	if kept.Server.URL != base.Server.URL || kept.Server.CAFile != "" || kept.DataDir != base.DataDir ||
 		kept.Update.Mode != base.Update.Mode || kept.Enroll.Token != "" ||
-		kept.Log.Level != "debug" || kept.Labels["zone"] != "us" || !kept.Workers[0].Lifecycle.KeepChildren {
+		kept.Log.Level != "debug" || kept.Labels["zone"] != "us" || kept.Workers[0].Lifecycle.StopTimeout.Std() != time.Minute {
 		t.Fatalf("ключи перезапуска — прежние, остальное новое: %+v", kept)
 	}
 }
@@ -286,9 +204,9 @@ func TestCompareUpdateKeys(t *testing.T) {
 	next.Update.Releases = "https://releases.example.com/agent"
 	every := Duration(time.Hour)
 	next.Update.CheckInterval = &every
-	next.Server.StreamBuffer = base.Server.StreamBuffer + 1
+	next.Outbox.MaxMessages = base.Outbox.MaxMessages + 1
 	d := Compare(base, next)
-	if strings.Join(d.Restart, ",") != "server.streamBuffer,update.releases,update.checkInterval" {
+	if strings.Join(d.Restart, ",") != "update.releases,update.checkInterval,outbox.maxMessages" {
 		t.Fatalf("перезапуск: %v", d.Restart)
 	}
 }
@@ -308,9 +226,6 @@ workers:
     args: ["--verbose"]
   - name: plain
     command: ["/bin/echo", "a"]
-    lifecycle:
-      keepChildren: true
-      maxRestarts: 5
 `), 0o600)
 	cfg, err := Load(path)
 	if err != nil {
@@ -321,7 +236,7 @@ workers:
 	if !rel.Release || rel.ReleaseDir != wantDir || rel.Current() != filepath.Join(wantDir, "current") {
 		t.Fatalf("воркер со сборкой с сервера: %+v", rel)
 	}
-	if l := plain.Lifecycle; !l.KeepChildren || l.MaxRestarts != 5 || l.StopTimeout.Std() != DefaultStopTimeout || plain.ReleaseDir != "" {
+	if plain.Lifecycle.StopTimeout.Std() != DefaultStopTimeout || plain.ReleaseDir != "" {
 		t.Fatalf("воркер: %+v", plain)
 	}
 	// Повторная проверка не ломает уже проверенные настройки.
@@ -329,12 +244,10 @@ workers:
 		t.Fatal(err)
 	}
 	for name, w := range map[string]Worker{
-		"inheritEnv AGENT_": {Name: "x", Command: []string{"/bin/x"}, InheritEnv: []string{"AGENT_ENROLL_TOKEN"}},
-		"maxRestarts < 0":   {Name: "x", Command: []string{"/bin/x"}, Lifecycle: Lifecycle{MaxRestarts: -1}},
-		"имя с путём":       {Name: "../x", Release: true},
-		"заглавные":         {Name: "Report", Command: []string{"/bin/x"}},
-		"встроенный":        {Name: SysmetricsWorker, Command: []string{"/bin/x"}},
-		"без command":       {Name: "x"},
+		"имя с путём": {Name: "../x", Release: true},
+		"заглавные":   {Name: "Report", Command: []string{"/bin/x"}},
+		"встроенный":  {Name: SysmetricsWorker, Command: []string{"/bin/x"}},
+		"без command": {Name: "x"},
 	} {
 		c := Defaults()
 		c.Server.URL = "https://api.example.com"
@@ -377,106 +290,41 @@ func TestCompareRelease(t *testing.T) {
 	}
 }
 
-// server.urls (AGENT_SERVER_URLS) — адреса по порядку после server.url, без
-// повторов; каждый — http(s); небезопасный — хоть один. log.forward — warn по
-// умолчанию, AGENT_LOG_FORWARD, проверка значения.
-func TestServerURLsAndLogForward(t *testing.T) {
+// server.url — один адрес http(s). log.forward — warn по умолчанию,
+// AGENT_LOG_FORWARD, проверка значения.
+func TestServerURLAndLogForward(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "agent.yaml")
-	if err := os.WriteFile(path, []byte("server:\n  urls: [https://a.example.com, https://b.example.com]\ndataDir: "+dir+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	path := writeConfig(t, "server:\n  url: https://a.example.com\ndataDir: "+dir+"\n")
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Server.Addresses(); !slices.Equal(got, []string{"https://a.example.com", "https://b.example.com"}) || cfg.Log.Forward != "warn" {
-		t.Fatalf("адреса %v, forward %q", got, cfg.Log.Forward)
+	if cfg.Server.URL != "https://a.example.com" || cfg.Log.Forward != "warn" {
+		t.Fatalf("адрес %q, forward %q", cfg.Server.URL, cfg.Log.Forward)
 	}
-	t.Setenv("AGENT_SERVER_URL", "https://b.example.com")
-	t.Setenv("AGENT_SERVER_URLS", "https://c.example.com, http://10.0.0.1")
+	t.Setenv("AGENT_SERVER_URL", "http://10.0.0.1")
 	t.Setenv("AGENT_LOG_FORWARD", "debug")
-	cfg, err = Load(path)
-	if err != nil {
-		t.Fatal(err)
+	if cfg, err = Load(path); err != nil || cfg.Server.URL != "http://10.0.0.1" || cfg.Log.Forward != "debug" || !cfg.Insecure() {
+		t.Fatalf("из окружения: %+v %v", cfg.Server, err)
 	}
-	if got := cfg.Server.Addresses(); !slices.Equal(got, []string{"https://b.example.com", "https://c.example.com", "http://10.0.0.1"}) ||
-		cfg.Log.Forward != "debug" || !cfg.Insecure() {
-		t.Fatalf("из окружения: %v %q", got, cfg.Log.Forward)
-	}
-	t.Setenv("AGENT_SERVER_URLS", "https://c.example.com,ftp://x")
+	t.Setenv("AGENT_SERVER_URL", "ftp://x")
 	t.Setenv("AGENT_LOG_FORWARD", "громко")
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "ftp://x") || !strings.Contains(err.Error(), "log.forward") {
 		t.Fatalf("ошибки: %v", err)
 	}
 	old, next := Defaults(), Defaults()
-	next.Server.URLs = []string{"https://x.example.com"}
-	if d := Compare(old, next); !slices.Contains(d.Restart, "server.urls") {
-		t.Fatalf("server.urls — после перезапуска: %+v", d)
-	}
-	next = Defaults()
 	next.Log.Forward = "off"
-	if d := Compare(old, next); !d.Log {
+	if d := Compare(old, next); !d.Log || len(d.Restart) > 0 {
 		t.Fatal("log.forward — на ходу")
 	}
 }
 
-// Группы метрик и диски меняются на ходу: только Telemetry, без перезапуска.
-func TestCompareMetrics(t *testing.T) {
-	base := Defaults()
-	next := base
-	next.Telemetry.Metrics = []string{"load", "sockets"}
-	if d := Compare(base, next); !d.Telemetry || len(d.Restart) > 0 || d.Hello || d.Workers {
-		t.Fatalf("metrics: %+v", d)
-	}
-	next = base
-	next.Telemetry.Disks = []string{DisksAll}
-	if d := Compare(base, next); !d.Telemetry || len(d.Restart) > 0 {
-		t.Fatalf("disks: %+v", d)
-	}
-}
-
-// workers[].user читается из agent.yaml; user без root — ошибка конфигурации.
-func TestWorkerUser(t *testing.T) {
-	defer func(f func() int) { geteuid = f }(geteuid)
-	geteuid = func() int { return 0 }
-	dir := t.TempDir()
-	path := filepath.Join(dir, "agent.yaml")
-	_ = os.WriteFile(path, []byte(`
-server:
-  url: https://api.example.com
-workers:
-  - name: report
-    command: ["/bin/report"]
-    user: nobody
-`), 0o600)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w := cfg.Workers[0]
-	if w.User != "nobody" {
-		t.Fatalf("воркер: %+v", w)
-	}
-
-	geteuid = func() int { return 1000 }
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "workers[0].user") {
-		t.Fatalf("user без root: %v", err)
-	}
-	cfg.Workers[0].User = ""
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("без user: %v", err)
-	}
-}
-
-// lifecycle и logs: умолчания (и у воркера, собранного в коде), заданные
-// значения — в том числе 0 и false там, где это значение; неверные — ошибка
-// с именем поля.
+// lifecycle: stopTimeout — по умолчанию DefaultStopTimeout (и у воркера,
+// собранного в коде); прочие ключи lifecycle и воркера — неизвестные поля
+// (замечание, не ошибка).
 func TestLifecycle(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "agent.yaml")
-	_ = os.WriteFile(path, []byte(`
-server: { url: https://api.example.com }
+	path := writeConfig(t, `server: { url: https://api.example.com }
 dataDir: `+dir+`
 workers:
   - name: plain
@@ -484,92 +332,37 @@ workers:
   - name: tuned
     command: [x]
     lifecycle:
-      onAgentExit: stop
+      stopTimeout: 2m
       restart: never
-      backoff: {min: 2s, max: 1m}
-      startTimeout: 5s
-      busyTimeout: 0s
-      health: {interval: 0s, failures: 0}
-    logs: {maxSize: 1MB, maxFiles: 0}
     routes: open
-`), 0o600)
+`)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plain, tuned := cfg.Workers[0], cfg.Workers[1]
-	def := DefaultLifecycle()
-	if !reflect.DeepEqual(plain.Lifecycle, def) || !reflect.DeepEqual(plain.Logs, DefaultLogs()) {
-		t.Fatalf("умолчания: %+v %+v", plain.Lifecycle, plain.Logs)
-	}
-	if def.OnAgentExit != Keep || def.Restart != RestartFailure ||
-		def.BusyWait() != 24*time.Hour || def.HealthInterval() != 5*time.Second || def.HealthFailures() != 3 ||
-		def.StartTimeout.Std() != time.Minute || def.Backoff.Max.Std() != 30*time.Second || DefaultLogs().MaxSize != 10<<20 {
-		t.Fatalf("значения по умолчанию: %+v", def)
-	}
-	l := tuned.Lifecycle
-	if l.OnAgentExit != StopWorker || l.Restart != RestartNever || l.BusyWait() != 0 ||
-		l.HealthInterval() != 0 || l.HealthFailures() != 0 ||
-		l.Health.Timeout.Std() != 2*time.Second || l.Backoff.Min.Std() != 2*time.Second || l.StartTimeout.Std() != 5*time.Second ||
-		l.StopTimeout.Std() != DefaultStopTimeout || tuned.Logs.MaxSize != 1<<20 || tuned.Logs.Files() != 0 {
-		t.Fatalf("заданные: %+v %+v", l, tuned.Logs)
-	}
-	if plain.OpenRoutes() || !tuned.OpenRoutes() {
-		t.Fatalf("routes: %q %q", plain.Routes, tuned.Routes)
+	if cfg.Workers[0].Lifecycle.StopTimeout.Std() != DefaultStopTimeout || cfg.Workers[1].Lifecycle.StopTimeout.Std() != 2*time.Minute {
+		t.Fatalf("stopTimeout: %+v", cfg.Workers)
 	}
 	var coded Worker
 	coded.FillDefaults()
-	if !reflect.DeepEqual(coded.Lifecycle, def) {
+	if coded.Lifecycle.StopTimeout.Std() != DefaultStopTimeout {
 		t.Fatalf("воркер из кода: %+v", coded.Lifecycle)
 	}
-	for field, src := range map[string]string{
-		"lifecycle.onAgentExit":    "lifecycle: {onAgentExit: restart}",
-		"lifecycle.restart":        "lifecycle: {restart: sometimes}",
-		"lifecycle.backoff":        "lifecycle: {backoff: {min: 1m, max: 1s}}",
-		"lifecycle.health.timeout": "lifecycle: {health: {interval: 1s, timeout: 5s}}",
-		"logs.maxSize":             "logs: {maxSize: 1KB}",
-		"logs.maxFiles":            "logs: {maxFiles: -1}",
-		"routes":                   "routes: closed",
-	} {
-		res := Check(writeConfig(t, "server: {url: https://api.example.com}\nworkers:\n  - name: a\n    command: [a]\n    "+src+"\n"))
-		if len(res.Errors) != 1 || !strings.Contains(res.Errors[0].Text, "workers[0]."+field) || res.Errors[0].Line != 5 {
-			t.Errorf("%s: %+v", field, res.Errors)
-		}
-	}
-	if res := Check(writeConfig(t, "server: {url: https://api.example.com}\nworkers:\n  - name: a\n    command: [a]\n    logs: {maxSize: lots}\n")); len(res.Errors) != 1 || !strings.Contains(res.Errors[0].Text, "размер") {
-		t.Errorf("размер: %+v", res.Errors)
+	res := Check(path)
+	if len(res.Errors) != 0 || len(res.Warnings) != 2 {
+		t.Fatalf("замечания: %+v %+v", res.Warnings, res.Errors)
 	}
 }
 
-// Размеры: единицы, запись обратно.
-func TestByteSize(t *testing.T) {
-	for in, want := range map[string]ByteSize{"10MB": 10 << 20, "512kb": 512 << 10, "1GB": 1 << 30, "65536": 65536, "100B": 100} {
-		got, err := ParseByteSize(in)
-		if err != nil || got != want {
-			t.Errorf("%s: %d %v", in, got, err)
-		}
-	}
-	if _, err := ParseByteSize("-1MB"); err == nil {
-		t.Error("отрицательный размер")
-	}
-	if ByteSize(10<<20).String() != "10MB" || ByteSize(1500).String() != "1500B" {
-		t.Error("запись размера")
-	}
-}
-
-// Настройки агента целиком: переподключение, поток без связи, очередь
-// важных сообщений, журнал — умолчания, файл, окружение, проверка; их
-// изменение требует перезапуска агента.
+// Настройки агента целиком: очередь важных сообщений, журнал — умолчания,
+// файл, окружение, проверка; их изменение требует перезапуска агента.
 func TestAgentTuning(t *testing.T) {
 	def := Defaults()
-	if def.Server.Reconnect.Min.Std() != time.Second || def.Server.Reconnect.Max.Std() != time.Minute ||
-		def.Server.StreamBuffer != 600 || def.Outbox.MaxMessages != 10000 || def.Log.Buffer != 5000 {
-		t.Fatalf("умолчания: %+v %+v %+v", def.Server, def.Outbox, def.Log)
+	if def.Outbox.MaxMessages != 10000 || def.Log.Buffer != 5000 {
+		t.Fatalf("умолчания: %+v %+v", def.Outbox, def.Log)
 	}
 	path := writeConfig(t, `server:
   url: https://api.example.com
-  reconnect: {min: 2s, max: 5m}
-  streamBuffer: 100
 outbox: {maxMessages: 500}
 log: {buffer: 1000}
 `)
@@ -578,23 +371,23 @@ log: {buffer: 1000}
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Server.Reconnect.Max.Std() != 5*time.Minute || cfg.Server.StreamBuffer != 100 || cfg.Outbox.MaxMessages != 700 || cfg.Log.Buffer != 1000 {
-		t.Fatalf("файл и окружение: %+v %+v %+v", cfg.Server, cfg.Outbox, cfg.Log)
+	if cfg.Outbox.MaxMessages != 700 || cfg.Log.Buffer != 1000 {
+		t.Fatalf("файл и окружение: %+v %+v", cfg.Outbox, cfg.Log)
 	}
 	t.Setenv("AGENT_OUTBOX_MAX_MESSAGES", "много")
-	t.Setenv("AGENT_SERVER_RECONNECT_MAX", "1ms")
+	t.Setenv("AGENT_LOG_BUFFER", "1")
 	res := Check(path)
 	text := ""
 	for _, p := range res.Errors {
 		text += p.Text + "\n"
 	}
-	if !strings.Contains(text, "AGENT_OUTBOX_MAX_MESSAGES") || !strings.Contains(text, "server.reconnect") {
+	if !strings.Contains(text, "AGENT_OUTBOX_MAX_MESSAGES") || !strings.Contains(text, "log.buffer") {
 		t.Fatalf("ошибки: %s", text)
 	}
 	next := cfg
-	next.Server.StreamBuffer, next.Outbox.MaxMessages, next.Log.Buffer = 50, 10, 200
+	next.Outbox.MaxMessages, next.Log.Buffer = 10, 200
 	d := Compare(cfg, next)
-	if strings.Join(d.Restart, ",") != "server.streamBuffer,outbox.maxMessages,log.buffer" || d.Log {
+	if strings.Join(d.Restart, ",") != "outbox.maxMessages,log.buffer" || d.Log {
 		t.Fatalf("перезапуск: %+v", d)
 	}
 	if kept := KeepRestartOnly(cfg, next); kept.Outbox != cfg.Outbox || kept.Log.Buffer != cfg.Log.Buffer {

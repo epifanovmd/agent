@@ -6,5 +6,3 @@ package-lock.json
 go.sum
 .idea/
 .dev/
-# Шаблоны agent init и agent worker new: в них {{…}} text/template
-internal/scaffold/files/*.yaml

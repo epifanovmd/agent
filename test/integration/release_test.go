@@ -26,13 +26,15 @@ import (
 	"github.com/epifanovmd/agent/test/testserver"
 )
 
-// releaseKit — каталог сборок на сервере: сборки, подписанные своим ключом, и manifest.json.
+// releaseKit — каталог сборок воркеров на сервере (manifest.json) и каталог сборок агента,
+// устроенный как релизы (download/v<версия>/), — для update.releases; сборки подписаны своим
+// ключом.
 type releaseKit struct {
 	t       *testing.T
 	dir     string
+	catalog string
 	priv    ed25519.PrivateKey
 	pub     string
-	agent   map[string]any
 	workers []map[string]any
 }
 
@@ -41,30 +43,37 @@ func newReleaseKit(t *testing.T) *releaseKit {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &releaseKit{t: t, dir: t.TempDir(), priv: priv, pub: base64.StdEncoding.EncodeToString(pub)}
+	return &releaseKit{t: t, dir: t.TempDir(), catalog: t.TempDir(), priv: priv, pub: base64.StdEncoding.EncodeToString(pub)}
 }
 
-// build — сборка name версии version в каталоге сборок; запись для manifest.json.
-func (k *releaseKit) build(name, version string, content []byte) map[string]any {
+// build — сборка name версии version в каталоге dir; запись для manifest.json.
+func (k *releaseKit) build(dir, name, version string, content []byte) map[string]any {
 	sum := sha256.Sum256(content)
 	hash := hex.EncodeToString(sum[:])
 	file := fmt.Sprintf("%s-%s-%s-%s", name, version, runtime.GOOS, runtime.GOARCH)
-	if err := os.WriteFile(filepath.Join(k.dir, file), content, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, file), content, 0o644); err != nil {
 		k.t.Fatal(err)
 	}
 	sig := update.Sign(k.priv, update.Build{Name: name, Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH, SHA256: hash})
 	return map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "file": file, "sha256": hash, "signature": sig}
 }
 
-// setAgent, setWorker — сборка агента или воркера в каталоге сборок (заменяет прежнюю).
+// setAgent — версия агента в каталоге сборок агента (download/v<версия>/).
 func (k *releaseKit) setAgent(version string, content []byte) {
-	k.agent = k.build(update.AgentName, version, content)
-	k.agent["version"] = version
-	k.write()
+	dir := filepath.Join(k.catalog, "download", "v"+version)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		k.t.Fatal(err)
+	}
+	art := k.build(dir, update.AgentName, version, content)
+	raw, _ := json.Marshal(map[string]any{"version": version, "artifacts": []map[string]any{art}})
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0o644); err != nil {
+		k.t.Fatal(err)
+	}
 }
 
+// setWorker — сборка воркера в каталоге сборок на сервере (заменяет прежнюю).
 func (k *releaseKit) setWorker(name, version string, content []byte, tune ...func(map[string]any)) {
-	w := k.build(name, version, content)
+	w := k.build(k.dir, name, version, content)
 	w["name"], w["version"] = name, version
 	for _, fn := range tune {
 		fn(w)
@@ -74,13 +83,7 @@ func (k *releaseKit) setWorker(name, version string, content []byte, tune ...fun
 }
 
 func (k *releaseKit) write() {
-	version := "0.0.0"
-	artifacts := []map[string]any{}
-	if k.agent != nil {
-		version = k.agent["version"].(string)
-		artifacts = append(artifacts, k.agent)
-	}
-	raw, _ := json.Marshal(map[string]any{"version": version, "artifacts": artifacts, "workers": k.workers})
+	raw, _ := json.Marshal(map[string]any{"version": "0.0.0", "artifacts": []map[string]any{}, "workers": k.workers})
 	if err := os.WriteFile(filepath.Join(k.dir, "manifest.json"), raw, 0o644); err != nil {
 		k.t.Fatal(err)
 	}
@@ -251,8 +254,8 @@ name: %s
 enroll: {token: %s}
 log: {level: error}
 telemetry: {metrics: []}
-update: {mode: self, publicKey: %q}
-`, s.http.URL, filepath.Join(dir, "data"), agentName, token, kit.pub))
+update: {mode: self, publicKey: %q, releases: %q, checkInterval: 0s}
+`, s.http.URL, filepath.Join(dir, "data"), agentName, token, kit.pub, kit.catalog))
 	runAgent(t, bin, conf, filepath.Join(dir, "data"))
 
 	version := func(want string) testserver.Agent {
@@ -269,7 +272,7 @@ update: {mode: self, publicKey: %q}
 
 	kit.setAgent("1.1.0", testBinary(t, "1.1.0"))
 	var res testserver.UpdateResult
-	if err := s.server.Action("updateAgent", a.ID, &res, map[string]any{"timeoutMs": 120_000}); err != nil {
+	if err := s.server.Action("updateAgent", a.ID, &res, map[string]any{"version": "1.1.0", "timeoutMs": 120_000}); err != nil {
 		t.Fatal(err)
 	}
 	if res.Version != "1.1.0" || res.Previous != "1.0.0" {
@@ -281,7 +284,7 @@ update: {mode: self, publicKey: %q}
 	}
 
 	kit.setAgent("1.2.0", testBinary(t, broken))
-	err := s.server.Action("updateAgent", a.ID, nil, map[string]any{"timeoutMs": 120_000})
+	err := s.server.Action("updateAgent", a.ID, nil, map[string]any{"version": "1.2.0", "timeoutMs": 120_000})
 	if errorCode(err) != "UPDATE_FAILED" {
 		t.Fatalf("версия, не вышедшая на связь: %v", err)
 	}

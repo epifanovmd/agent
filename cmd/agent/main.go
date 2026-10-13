@@ -3,7 +3,7 @@
 //
 //	agent [run] [-config ФАЙЛ | --env ИМЯ]   работа (по умолчанию); SIGHUP — перечитать настройки,
 //	                                   SIGUSR1 — перезапуск, SIGTERM/SIGINT — остановка
-//	agent restart                      перезапустить работающего агента (воркеры — по lifecycle.onAgentExit)
+//	agent restart                      перезапустить работающего агента (воркеры работают дальше)
 //	agent stop-workers                 остановить воркеры, оставшиеся работать после остановки агента
 //	agent install --server URL --token ТОКЕН [флаги]   поставить службой systemd (Linux, root);
 //	                                   --rootless — агент пользователя без root
@@ -12,17 +12,13 @@
 //	                                   stop-workers, cleanup, config check — экземпляр агента на узле;
 //	                                   --env ИМЯ у run, status, restart, stop-workers, cleanup,
 //	                                   config check — файл agent.ИМЯ.yaml папки агента
-//	agent init [ПАПКА] [--server URL] [--token ТОКЕН]   папка агента: программа, настройки, воркеры
-//	                                   (-config ФАЙЛ — один файл настроек с пояснениями)
 //	agent config check                 проверить настройки и показать итоговые значения
 //	agent status [--json]              работает ли агент, связь, воркеры (код выхода 0 — работает)
 //	agent logs [-f] [-n N]             лог службы (journalctl)
 //	agent cleanup                      уборка воркеров перед удалением агента (без сервера; её вызывает uninstall)
 //	agent upgrade [--check] [--version X]   поставить новую версию агента из каталога сборок
 //	agent pack [--env ИМЯ] [--platform linux/amd64,…]   архив папки агента для узла
-//	agent keygen                       ключи подписи сборок (AGENT_SIGNING_KEY)
 //	agent manifest DIR VERSION [--worker NAME=VERSION[,…]]…   manifest.json сборок в DIR
-//	agent worker new|sync|list         воркеры папки агента: заготовка, обновление базы, список
 //	agent version                      версия
 //	agent boot-guard BINARY            откат версии, не дошедшей до связи (ExecStartPre)
 //	agent sysmetrics                   встроенный воркер метрик узла (агент запускает его сам)
@@ -80,28 +76,18 @@ const usage = `agent — агент для узлов: связь с серве�
                                  поставить службой systemd (Linux, sudo); --rootless — для пользователя
                                  без root (~/.agent); флаги — agent install -h
   agent uninstall [--purge]      удалить службу; --purge — ещё настройки и данные
-  agent init [ПАПКА] [--server URL] [--token ТОКЕН] [--force]
-                                 папка агента: программа, agent.yaml (эта машина), agent.prod.yaml
-                                 (боевые узлы), образцы .env, workers/, README.md;
-                                 -config ФАЙЛ [--name ИМЯ] [--data-dir КАТАЛОГ] — один файл настроек
   agent config check [-config ФАЙЛ | --env ИМЯ]
-                                 проверить настройки и показать итоговые значения и откуда они
+                                 проверить настройки и показать итоговые значения
   agent status [--json]          работает ли агент, связь, воркеры, последняя ошибка
   agent logs [-f] [-n N]         лог службы
-  agent restart                  перезапустить агента; воркеры работают дальше (lifecycle.onAgentExit)
+  agent restart                  перезапустить агента; воркеры работают дальше
   agent stop-workers             остановить воркеры, оставшиеся после остановки агента (агент не работает)
   agent cleanup                  воркеры убирают за собой (перед удалением агента)
   agent pack [--env ИМЯ | -config ФАЙЛ] [--platform linux/amd64,linux/arm64] [--out КАТАЛОГ] [--with-env]
                                  архив папки агента для узла: программа под его платформу, настройки,
                                  воркеры и их сборки; на узле — tar xzf …, sudo ./agent install
-  agent keygen                   ключи подписи сборок (AGENT_SIGNING_KEY — для agent pack и agent manifest)
   agent manifest КАТАЛОГ ВЕРСИЯ [--worker ИМЯ=ВЕРСИЯ[,stopTimeout=…][,command=…]]…
                                  manifest.json сборок агента и воркеров в каталоге (подпись — AGENT_SIGNING_KEY)
-  agent worker new ИМЯ [--lang python|go]
-                                 воркер из заготовки: база agent_worker.* и наследник (класс или тип),
-                                 run, VERSION; строка в agent.yaml
-  agent worker sync              обновить базы воркеров папки до версии этой программы
-  agent worker list              воркеры из настроек: откуда каждый, версия, где лежит
   agent upgrade [--check] [--version X] [--force]
                                  поставить новую версию агента (подпись проверяется); --check — только узнать
   agent version                  версия
@@ -130,8 +116,6 @@ func main() {
 		err = installCmd(args)
 	case "uninstall":
 		err = uninstallCmd(args)
-	case "init":
-		err = initCmd(args)
 	case "config":
 		err = configCmd(args)
 	case "status":
@@ -148,12 +132,8 @@ func main() {
 		err = upgradeCmd(args)
 	case "pack":
 		err = packCmd(args)
-	case "keygen":
-		err = keygenCmd(args)
 	case "manifest":
 		err = manifestCmd(args)
-	case "worker":
-		err = workerCmd(args)
 	case "version":
 		fmt.Println(version)
 	case "boot-guard":
@@ -332,7 +312,7 @@ func run(args []string) error {
 	cfg, err := config.Load(path)
 	if err != nil {
 		if path == "" {
-			return fmt.Errorf("%w\nфайла настроек нет (ни agent.yaml рядом с программой или в текущем каталоге, ни %s): создайте его — agent init --server URL --token ТОКЕН — или задайте AGENT_SERVER_URL", err, config.DefaultPath())
+			return fmt.Errorf("%w\nфайла настроек нет (ни agent.yaml рядом с программой или в текущем каталоге, ни %s): создайте его (server.url, enroll.token) или задайте AGENT_SERVER_URL и AGENT_ENROLL_TOKEN", err, config.DefaultPath())
 		}
 		return err
 	}
@@ -420,7 +400,7 @@ func bootGuard(args []string) error {
 
 // restartCmd — `agent restart`: SIGUSR1 работающему агенту (pid — из
 // отметки agent.status): он выходит, менеджер службы запускает его снова,
-// воркеры работают дальше (lifecycle.onAgentExit: keep).
+// воркеры работают дальше.
 func restartCmd(args []string) error {
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	flagPath := configFlag(fs)

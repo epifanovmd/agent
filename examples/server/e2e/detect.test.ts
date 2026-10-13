@@ -67,9 +67,5 @@ describe("обнаружение потери связи", () => {
     assert.ok(took <= 8000, `offline через ${took} мс`);
     assert.ok(a.lastSeenAt! <= killedAt + 100, "lastSeenAt — последняя весть");
     assert.ok(killedAt - a.lastSeenAt! < 6000, "lastSeenAt — недавняя");
-    assert.deepEqual(
-      a.alerts.map(x => x.type),
-      ["offline"],
-    );
   });
 });

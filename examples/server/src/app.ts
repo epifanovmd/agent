@@ -1,7 +1,7 @@
 // Сервер стенда на agent-sdk/server: связь с агентами (регистрация, WebSocket, запросы к
 // воркерам, настройки, метрики, события, действия, сборки) делает Agents; здесь — небольшой HTTP
-// API над ним (examples/API.md) и история в памяти (history.ts). Без авторизации — пример для
-// запуска у себя.
+// API над ним (examples/API.md), проверка значений по схемам манифестов (validate) и история в
+// памяти (history.ts). Без авторизации — пример для запуска у себя.
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
@@ -15,23 +15,20 @@ import { Readable } from "node:stream";
 import type { ReadableStream } from "node:stream/web";
 
 import {
-  type Actor,
   type AgentEvent,
   type Agents,
   AgentsError,
-  baseUrl,
-  LOG_LEVELS,
   type LogEvent,
   type LogLevel,
-  MAX_FETCH_BODY,
   type MetricsEvent,
-  readBody,
-  readJSON,
+  schemaProblems,
+  type SchemaTarget,
   sendJSON,
-  supports,
+  workerManifest,
 } from "agent-sdk/server";
 
 import { History } from "./history";
+import { baseUrl, LOG_LEVELS, readBody, readJSON } from "./http";
 
 export interface AppOptions {
   /** История событий, метрик и действий: её onEvent передан в Agents, follow — вызван. */
@@ -44,7 +41,15 @@ export interface AppOptions {
   releasesDir?: string;
   /** Ключи проверки подписи сборок — флагами --update-key в команде установки. */
   updateKeys?: string[];
+  /**
+   * Проверять значения по схемам манифеста воркера до отправки агенту: настройки (400
+   * CONFIG_INVALID) и тела запросов к воркерам (400 REQUEST_INVALID).
+   */
+  validate?: boolean;
 }
+
+/** Тело запроса к воркеру (fetch) — не больше 4 МБ (sdk/spec §16). */
+const MAX_FETCH_BODY = 4 * 1024 * 1024;
 
 /** Поток /watch: агент не присылает метрики чаще раза в секунду. */
 const WATCH = { metricsIntervalMs: 1000 };
@@ -99,16 +104,20 @@ const notFound = (res: ServerResponse) =>
 const agentNotFound = (res: ServerResponse) =>
   sendJSON(res, 404, { code: "AGENT_NOT_FOUND", message: "Агент не найден" });
 
-/** Что проверить в манифесте воркера: ?method=&path=, ?config=, ?event=. */
-const supportsQuery = (query: URLSearchParams) => {
-  const method = query.get("method");
-  const path = query.get("path");
+/** Значение по схеме из манифеста воркера: не подходит — AgentsError code (400). */
+const checkSchema = async (
+  agents: Agents,
+  id: string,
+  worker: string,
+  target: SchemaTarget,
+  data: unknown,
+  code: string,
+): Promise<void> => {
+  const agent = await agents.getAgent(id);
+  const problems = agent ? schemaProblems(agent, worker, target, data) : [];
 
-  return {
-    route: method && path ? { method, path } : undefined,
-    config: query.get("config") || undefined,
-    event: query.get("event") || undefined,
-  };
+  if (problems.length)
+    throw new AgentsError(code, `${worker}: ${problems.join("; ")}`, 400);
 };
 
 /** HTTP-сервер стенда: маршруты агентов, их WebSocket и API (examples/API.md). */
@@ -153,15 +162,13 @@ const handle = async (
   };
 
   if (call.parts[0] === "agents" && call.parts[1])
-    return agentRoute(agents, opts.history, call);
+    return agentRoute(agents, opts, call);
   const reply = (body: unknown) => sendJSON(res, 200, body);
   const { method, query } = call;
   const path = call.parts.join("/");
 
   if (method === "GET" && path === "agents")
     return reply(await agents.listAgents());
-  if (method === "GET" && path === "alerts")
-    return reply(await agents.listAlerts(query.get("agentId") || undefined));
   if (method === "GET" && path === "events")
     return reply(
       opts.history.listEvents({
@@ -173,10 +180,7 @@ const handle = async (
       }),
     );
   if (method === "GET" && path === "releases") {
-    const [release, candidates] = await Promise.all([
-      agents.release(),
-      agents.updateCandidates(),
-    ]);
+    const release = await agents.release();
     const server = opts.publicUrl || baseUrl(req);
     const flags = [
       "--server",
@@ -187,7 +191,7 @@ const handle = async (
     ];
     const installCommand = `curl -fsSL ${shellQuote(`${server}/install.sh`)} | sudo sh -s -- ${flags.map(shellQuote).join(" ")}`;
 
-    return reply({ release, candidates, installCommand });
+    return reply({ release, installCommand });
   }
   notFound(res);
 };
@@ -195,20 +199,17 @@ const handle = async (
 /** /api/agents/{id}/… */
 const agentRoute = async (
   agents: Agents,
-  history: History,
+  opts: AppOptions,
   call: Call,
 ): Promise<void> => {
   const { method, query, req, res } = call;
+  const { history } = opts;
   const [, id, section, worker, ...rest] = call.parts;
   const reply = (body: unknown) => sendJSON(res, 200, body);
-  // Кто действует: заголовок X-Actor (в примере без авторизации — как назвался), иначе "api".
-  const as = agents.by(String(req.headers["x-actor"] ?? "").trim() || "api");
   const route = `${method} ${section ?? ""}`;
 
   if (section === "workers" && worker && rest[0] === "fetch")
-    return proxy(as, call, id, worker, rest.slice(1));
-  if (section === "workers" && worker && rest[0] === "jobs")
-    return jobsRoute(as, call, id, worker, rest.slice(1));
+    return proxy(agents, opts, call, id, worker, rest.slice(1));
   if (
     section === "workers" &&
     worker &&
@@ -221,46 +222,49 @@ const agentRoute = async (
     const opts = { force: body?.force === true, wait: body?.wait === true };
 
     if (rest[0] === "restart")
-      return reply(await as.restartWorker(id, worker, opts));
+      return reply(await agents.restartWorker(id, worker, opts));
     if (rest[0] === "update")
-      return reply(await as.updateWorker(id, worker, opts));
+      return reply(await agents.updateWorker(id, worker, opts));
   }
   if (section === "configs" && worker && rest.length === 1) {
-    if (method === "PUT")
-      return reply(
-        await as.setConfig(id, worker, rest[0], await readJSON(req)),
-      );
-    if (method === "DELETE")
-      return reply({ deleted: await as.deleteConfig(id, worker, rest[0]) });
-  }
-  if (
-    section === "workers" &&
-    worker &&
-    rest.length === 1 &&
-    rest[0] === "capabilities" &&
-    method === "GET"
-  ) {
-    const caps = await agents.capabilities(id, worker);
+    if (method === "PUT") {
+      const data = await readJSON(req);
 
-    return caps
-      ? reply(caps)
-      : sendJSON(res, 404, {
-          code: "WORKER_UNKNOWN",
-          message: "воркер себя не описал (нет манифеста)",
-        });
+      if (opts.validate)
+        await checkSchema(
+          agents,
+          id,
+          worker,
+          { config: rest[0] },
+          data,
+          "CONFIG_INVALID",
+        );
+
+      return reply(await agents.setConfig(id, worker, rest[0], data));
+    }
+    if (method === "DELETE")
+      return reply({
+        deleted: await agents.deleteConfig(id, worker, rest[0]),
+      });
   }
   if (
     section === "workers" &&
     worker &&
     rest.length === 1 &&
-    rest[0] === "supports" &&
+    rest[0] === "manifest" &&
     method === "GET"
   ) {
     const agent = await agents.getAgent(id);
 
     if (!agent) return agentNotFound(res);
+    const manifest = workerManifest(agent, worker);
 
-    return reply({ supported: supports(agent, worker, supportsQuery(query)) });
+    return manifest
+      ? reply(manifest)
+      : sendJSON(res, 404, {
+          code: "WORKER_UNKNOWN",
+          message: "воркер себя не описал (нет манифеста)",
+        });
   }
   if (worker !== undefined) return notFound(res);
 
@@ -271,13 +275,28 @@ const agentRoute = async (
       return agent ? reply(agent) : agentNotFound(res);
     }
     case "DELETE ":
-      return (await as.deleteAgent(id), reply({}));
+      await agents.deleteAgent(id);
+      history.forget(id);
+
+      return reply({});
     case "POST revoke":
-      return reply(await as.revoke(id));
+      return reply(await agents.revoke(id));
     case "POST rotate-key":
-      return (await as.rotateKey(id), reply({}));
-    case "POST update":
-      return reply(await as.updateAgent(id));
+      return (await agents.rotateKey(id), reply({}));
+    case "POST update": {
+      // Тело { version } — до какой версии; без него — до новой версии, которую агент нашёл сам.
+      const { version } = await readJSON(req);
+      const target = version ?? (await agents.getAgent(id))?.update?.latest;
+
+      if (!target)
+        throw new AgentsError(
+          "UPDATE_NOT_AVAILABLE",
+          "агент не сообщал о новой версии — укажите version",
+          409,
+        );
+
+      return reply(await agents.updateAgent(id, { version: target }));
+    }
     case "GET actions":
       return reply(history.listActions(id, num(query.get("limit"))));
     case "GET configs": {
@@ -297,7 +316,7 @@ const agentRoute = async (
       );
     case "GET logs":
       return reply(
-        await as.logs(id, {
+        await agents.logs(id, {
           worker: query.get("worker") || undefined,
           lines: num(query.get("lines")),
         }),
@@ -310,48 +329,13 @@ const agentRoute = async (
 };
 
 /**
- * Задачи воркера: POST …/jobs { type, jobId?, data?, files?, timeoutMs? } — runJob; GET
- * …/jobs/{jobId} — состояние; POST …/jobs/{jobId}/cancel — прервать. Закрыли запрос — ожидание
- * итога прерывается, задаче уходит отмена.
- */
-const jobsRoute = async (
-  as: Actor,
-  call: Call,
-  id: string,
-  worker: string,
-  rest: string[],
-): Promise<void> => {
-  const { method, req, res } = call;
-  const reply = (body: unknown) => sendJSON(res, 200, body);
-
-  if (method === "POST" && rest.length === 0) {
-    const abort = new AbortController();
-
-    res.on("close", () => {
-      if (!res.writableFinished) abort.abort();
-    });
-
-    return reply(
-      await as.runJob(id, worker, {
-        ...(await readJSON(req)),
-        signal: abort.signal,
-      }),
-    );
-  }
-  if (method === "GET" && rest.length === 1)
-    return reply(await as.jobStatus(id, worker, rest[0]));
-  if (method === "POST" && rest.length === 2 && rest[1] === "cancel")
-    return reply(await as.cancelJob(id, worker, rest[0]));
-  notFound(res);
-};
-
-/**
  * Запрос к воркеру как есть: метод, путь после /fetch с параметрами, тело и Content-Type; срок —
  * заголовок X-Timeout-Ms. Ответ воркера передаётся потоком; закрыли запрос — запрос к воркеру
  * отменяется.
  */
 const proxy = async (
-  as: Actor,
+  agents: Agents,
+  opts: AppOptions,
   call: Call,
   id: string,
   worker: string,
@@ -362,7 +346,30 @@ const proxy = async (
   const body =
     method === "GET" || method === "HEAD"
       ? undefined
-      : new Uint8Array(await readBody(req, MAX_FETCH_BODY));
+      : await readBody(req, MAX_FETCH_BODY);
+  const target = `/${path.join("/")}${search}`;
+
+  if (opts.validate && body?.length) {
+    let value: unknown;
+
+    try {
+      value = JSON.parse(body.toString());
+    } catch {
+      throw new AgentsError(
+        "REQUEST_INVALID",
+        `${worker}: тело — не JSON`,
+        400,
+      );
+    }
+    await checkSchema(
+      agents,
+      id,
+      worker,
+      { route: { method, path: target } },
+      value,
+      "REQUEST_INVALID",
+    );
+  }
   const abort = new AbortController();
   const headers: Record<string, string> = {};
 
@@ -371,10 +378,10 @@ const proxy = async (
   res.on("close", () => {
     if (!res.writableFinished) abort.abort();
   });
-  const reply = await as.fetch(id, worker, `/${path.join("/")}${search}`, {
+  const reply = await agents.fetch(id, worker, target, {
     method,
     headers,
-    body: body?.length ? body : undefined,
+    body: body?.length ? new Uint8Array(body) : undefined,
     timeoutMs: num(String(req.headers["x-timeout-ms"] ?? "")),
     signal: abort.signal,
   });

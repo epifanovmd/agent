@@ -21,7 +21,6 @@ export const publicAgent = (r: AgentRecord): Agent => {
     revoked: r.revoked,
     enrolledAt: r.enrolledAt,
     workers,
-    alerts: [...r.alerts],
   };
   const put = <K extends keyof Agent>(k: K, v: Agent[K] | undefined) => {
     if (v !== undefined) a[k] = v;

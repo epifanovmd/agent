@@ -18,7 +18,7 @@ import (
 // manifest.json (старшая версия; sha256 и, если есть ключ, подпись
 // сверяются) кладётся в <dataDir>/workers/<name>/current (+ version); архив
 // .tar.gz распаковывается в каталог current. Вернёт записи для agent.yaml.
-func installWorkers(ctx context.Context, s *System, l Paths, o Options, user string) ([]config.TemplateWorker, error) {
+func installWorkers(ctx context.Context, s *System, l Paths, o Options, user string) ([]newWorker, error) {
 	if len(o.Workers) == 0 {
 		return nil, nil
 	}
@@ -49,7 +49,7 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 	if err := s.own(root, user); err != nil {
 		return nil, err
 	}
-	var out []config.TemplateWorker
+	var out []newWorker
 	for _, name := range o.Workers {
 		releaseDir := filepath.Join(root, name)
 		placed, err := releases.PlaceWorker(ctx, client, dir, manifest, name, "linux", s.Arch, releaseDir, keys)
@@ -63,7 +63,10 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 			return nil, err
 		}
 		s.say("Воркер %s %s поставлен: %s", name, placed.Version, filepath.Join(config.ReleasesDir(l.DataDir), name, config.ReleaseCurrent))
-		w := config.TemplateWorker{Name: name, Release: true, StopTimeout: placed.StopTimeout}
+		w := newWorker{Name: name, Release: true}
+		if placed.StopTimeout != "" {
+			w.Lifecycle = &newLifecycle{StopTimeout: placed.StopTimeout}
+		}
 		if placed.Command != "" {
 			w.Command = []string{"./" + strings.TrimPrefix(placed.Command, "./")}
 		}

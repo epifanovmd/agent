@@ -59,9 +59,6 @@ export const sample = (name: string): Envelope => {
   return structuredClone(s.message);
 };
 
-/** Маршрут пересылки вызовов между процессами (handleRelay). */
-export const RELAY_PATH = "/internal/agents/relay";
-
 export interface TestServer {
   agents: Agents;
   url: string;
@@ -79,8 +76,6 @@ export const startServer = async (
     ...opts,
   });
   const server = createServer(async (req, res) => {
-    if (req.method === "POST" && req.url === RELAY_PATH)
-      return agents.handleRelay(req, res);
     if (await agents.handle(req, res)) return;
     res.writeHead(404).end();
   });

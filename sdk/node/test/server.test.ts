@@ -1,5 +1,5 @@
 // Сценарии серверной части с фейковым агентом: регистрация, связь, поток и важное, fetch,
-// настройки, watch, метрики, проблемы, смена ключа, сборки.
+// настройки, watch, метрики, смена ключа, сборки.
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
@@ -16,12 +16,13 @@ import {
   Agents,
   AgentsError,
   type AgentsOptions,
-  type AlertEvent,
   type ConfigStatus,
-  MAX_CONFIG_BYTES,
-  MAX_FETCH_BODY,
   type MetricsEvent,
 } from "../src/server/index";
+import {
+  MAX_CONFIG_BYTES,
+  MAX_FETCH_BODY,
+} from "../src/server/protocol/constants";
 import { transportDefaults } from "../src/server/transport/transport";
 import {
   enroll,
@@ -201,7 +202,7 @@ describe("связь", () => {
     assert.equal(ag?.address, "127.0.0.1");
     assert.equal(ag?.version, "1.0.0");
     assert.equal(ag?.workers.find(w => w.name === "report")?.release, true);
-    await s.agents.by("admin").revoke(c.agentId);
+    await s.agents.revoke(c.agentId);
     assert.equal((await a2.closed).code, 4401);
     await assert.rejects(FakeAgent.open(s.ws, c), /HTTP 401/);
   });
@@ -216,30 +217,18 @@ describe("связь", () => {
     assert.equal((await s.agents.getAgent(c.agentId))?.online, false);
   });
 
-  it("offline после обрыва и проблема offline; переподключение её заканчивает", async () => {
+  it("offline после обрыва; переподключение — снова online", async () => {
     const s = await server({ offlineGraceMs: 0 });
     const c = await enroll(s.url);
-    const alerts: AlertEvent[] = [];
-
-    s.agents.on("alert", a => alerts.push(a));
     const fa = await FakeAgent.connect(s.ws, c);
 
     await fa.close();
     await until(
       async () => (await s.agents.getAgent(c.agentId))?.online === false,
     );
-    assert.deepEqual(
-      (await s.agents.listAlerts()).map(a => a.type),
-      ["offline"],
-    );
     await FakeAgent.connect(s.ws, c);
-    await until(() => alerts.length === 2);
-    assert.deepEqual(
-      alerts.map(a => [a.type, a.active]),
-      [
-        ["offline", true],
-        ["offline", false],
-      ],
+    await until(
+      async () => (await s.agents.getAgent(c.agentId))?.online === true,
     );
   });
 
@@ -568,12 +557,9 @@ describe("настройки", () => {
     const events: ConfigStatus[] = [];
 
     s.agents.on("config", e => events.push(e));
-    const r1 = await s.agents
-      .by("admin")
-      .setConfig(c.agentId, "echo", "main", { a: 1 });
+    const r1 = await s.agents.setConfig(c.agentId, "echo", "main", { a: 1 });
 
     assert.equal(r1.version, 1);
-    assert.equal(r1.actor, "admin");
     assert.equal((await s.agents.configStatus(c.agentId))[0].state, "pending");
 
     const fa = await FakeAgent.connect(s.ws, c, { configs: {} });
@@ -663,7 +649,7 @@ describe("настройки", () => {
     );
   });
 
-  it("отказ воркера — проблема configFailed; успешная версия её заканчивает", async () => {
+  it("отказ воркера — failed; успешная версия — applied", async () => {
     const s = await server();
     const c = await enroll(s.url);
     const fa = await FakeAgent.connect(s.ws, c, { configs: {} });
@@ -675,12 +661,7 @@ describe("настройки", () => {
     bad.data.version = 1;
     fa.send(bad);
     await fa.ackOf(bad.id!);
-    let alerts = await s.agents.listAlerts(c.agentId);
-
-    assert.deepEqual(
-      alerts.map(a => [a.type, a.worker, a.configKey]),
-      [["configFailed", "report", "main"]],
-    );
+    assert.equal((await s.agents.configStatus(c.agentId))[0].state, "failed");
     await s.agents.setConfig(c.agentId, "report", "main", { intervalSec: 60 });
     await fa.next("config.put");
     fa.send({
@@ -689,8 +670,6 @@ describe("настройки", () => {
       data: { worker: "report", key: "main", version: 2, ok: true },
     });
     await fa.ackOf("ok-2");
-    alerts = await s.agents.listAlerts(c.agentId);
-    assert.deepEqual(alerts, []);
     const st = (await s.agents.configStatus(c.agentId))[0];
 
     assert.equal(st.state, "applied");
@@ -808,45 +787,6 @@ describe("наблюдение", () => {
     assert.deepEqual(got[3].workers, { echo: { n: 11_200 } });
     assert.equal((await s.agents.getAgent(c.agentId))?.metrics?.at, 11_200);
   });
-
-  it("проблемы воркеров по status", async () => {
-    const s = await server();
-    const c = await enroll(s.url);
-    const fa = await FakeAgent.connect(s.ws, c);
-
-    fa.stream("status", sample("status").data);
-    await fa.ackSeq(1);
-    const first = await s.agents.listAlerts(c.agentId);
-
-    assert.deepEqual(first.map(a => a.key).sort(), [
-      "configFailed:report/limits",
-      "workerDown:echo",
-      "workerInvalid:legacy",
-    ]);
-    // Причина invalid — из status.workers[].message.
-    assert.match(
-      first.find(a => a.type === "workerInvalid")?.message ?? "",
-      /^воркер legacy не зарегистрирован: GET \/manifest: HTTP 404/,
-    );
-    fa.stream("status", {
-      workers: [
-        {
-          name: "report",
-          state: "running",
-          health: { ok: false, message: "нет связи с example.com" },
-        },
-        { name: "echo", state: "running", health: { ok: true } },
-      ],
-    });
-    await fa.ackSeq(2);
-    const list = await s.agents.listAlerts(c.agentId);
-
-    assert.deepEqual(
-      list.map(a => a.key),
-      ["workerUnhealthy:report"],
-    );
-    assert.match(list[0].message, /example\.com/);
-  });
 });
 
 describe("смена ключа", () => {
@@ -859,7 +799,7 @@ describe("смена ключа", () => {
     const acts: ActionRecord[] = [];
 
     s.agents.on("action", a => acts.push(a));
-    const p = s.agents.by("admin").rotateKey(c.agentId);
+    const p = s.agents.rotateKey(c.agentId);
     const act = await fa.next("action");
 
     assert.equal(act.data.name, "agent.rotateKey");
@@ -876,8 +816,8 @@ describe("смена ключа", () => {
     });
     await p;
     assert.deepEqual(
-      acts.map(a => [a.name, a.actor, a.status, a.agentId]),
-      [["agent.rotateKey", "admin", "done", c.agentId]],
+      acts.map(a => [a.name, a.status, a.agentId]),
+      [["agent.rotateKey", "done", c.agentId]],
     );
     assert.equal((await fa.closed).code, 1012);
     // Старый ещё принимается (агент мог не сохранить новый).
@@ -1102,15 +1042,11 @@ describe("сборки", () => {
       ],
     });
     await fa.ackSeq(1);
-    assert.deepEqual(
-      (await s.agents.updateCandidates()).agents.map(x => [
-        x.current,
-        x.target,
-        x.source,
-      ]),
-      [["1.0.0", "1.1.0", "server"]],
+    assert.equal(
+      (await s.agents.release())?.workers?.[0].url,
+      "/api/v1/agent-link/releases/report-1.4.0.tar.gz",
     );
-    // Агент, который себя не обновляет (в контейнере), — не кандидат; hello хранит, как он поставлен.
+    // hello хранит, как агент поставлен и обновляется.
     const c2 = await enroll(s.url);
     const fa2 = await FakeAgent.connect(s.ws, c2, {
       agent: {
@@ -1123,23 +1059,14 @@ describe("сборки", () => {
       workers: [],
     });
 
-    assert.deepEqual(
-      (await s.agents.updateCandidates()).agents.map(x => x.agentId),
-      [c.agentId],
-    );
-    assert.equal(
-      (await s.agents.getAgent(c2.agentId))?.hello?.agent.install,
-      "user",
-    );
+    assert.deepEqual((await s.agents.getAgent(c2.agentId))?.hello?.agent, {
+      version: "1.0.0",
+      bootId: "b2",
+      startedAt: 1,
+      updateMode: "external",
+      install: "user",
+    });
     await fa2.close();
-    assert.deepEqual(
-      (await s.agents.updateCandidates()).workers.map(x => [
-        x.worker,
-        x.current,
-        x.target,
-      ]),
-      [["report", "1.4.0", "1.10.0"]],
-    );
     const p = s.agents.updateWorker(c.agentId, "report");
     const act = await fa.next("action");
 
@@ -1161,31 +1088,45 @@ describe("сборки", () => {
     });
   });
 
-  it("неверный путь к файлу сборок — 404; сборка без file — не кандидат", async () => {
+  it("неверный путь к файлу сборок — 404", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-release-"));
-    const manifest = {
-      version: "1.1.0",
-      artifacts: [{ os: "linux", arch: "amd64", sha256: "aa" }],
-    };
 
-    writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest));
+    writeFileSync(
+      join(dir, "manifest.json"),
+      JSON.stringify({ version: "1.1.0", artifacts: [] }),
+    );
     const s = await server({ releasesDir: dir });
 
     assert.equal(
       (await fetch(`${s.url}/api/v1/agent-link/releases/%E0%A4%A`)).status,
       404,
     );
-    const c = await enroll(s.url);
+  });
 
-    await FakeAgent.connect(s.ws, c);
-    // Сборка сервера без file — не цель; в hello образца агент сам нашёл 1.1.0.
-    assert.deepEqual(
-      (await s.agents.updateCandidates()).agents.map(x => [x.target, x.source]),
-      [["1.1.0", "agent"]],
-    );
-    await assert.rejects(s.agents.updateAgent(c.agentId), {
-      code: "UPDATE_NOT_AVAILABLE",
+  it("updateAgent — только версия: сборку агент берёт из своего каталога сборок", async () => {
+    const s = await server();
+    const c = await enroll(s.url);
+    const fa = await FakeAgent.connect(s.ws, c);
+
+    for (const version of [undefined, "latest"])
+      await assert.rejects(
+        s.agents.updateAgent(c.agentId, { version } as { version: string }),
+        { code: "MESSAGE_INVALID" },
+      );
+    const p = s.agents.updateAgent(c.agentId, { version: "v1.1.0" });
+    const act = await fa.next("action");
+
+    assert.deepEqual(act.data, {
+      name: "agent.update",
+      args: { version: "1.1.0" },
     });
+    fa.send({
+      type: "action.result",
+      id: "u1",
+      re: act.id,
+      data: { ok: true, result: { version: "1.1.0", previous: "1.0.0" } },
+    });
+    assert.deepEqual(await p, { version: "1.1.0", previous: "1.0.0" });
   });
 
   it("без каталога сборок — UPDATE_NOT_AVAILABLE", async () => {
@@ -1193,10 +1134,11 @@ describe("сборки", () => {
     const c = await enroll(s.url);
 
     await FakeAgent.connect(s.ws, c);
-    await assert.rejects(s.agents.updateAgent(c.agentId), {
+    await assert.rejects(s.agents.updateWorker(c.agentId, "report"), {
       code: "UPDATE_NOT_AVAILABLE",
       status: 409,
     });
+    assert.equal(await s.agents.release(), null);
     assert.equal(
       (await fetch(`${s.url}/api/v1/agent-link/releases/manifest.json`)).status,
       404,
@@ -1208,11 +1150,7 @@ describe("опции", () => {
   it("незнакомая опция — ошибка при создании Agents, а не молчание", () => {
     for (const [opts, name] of [
       [{ validateConfigs: true }, "validateConfigs"],
-      [{ validate: { config: true } }, "validate.config"],
-      [
-        { agentReleases: { url: "https://example.com/r", publicKey: "k" } },
-        "agentReleases.publicKey",
-      ],
+      [{ validate: { configs: true } }, "validate"],
     ] as const) {
       assert.throws(
         () => new Agents(opts as unknown as AgentsOptions),
@@ -1220,7 +1158,7 @@ describe("опции", () => {
           e.code === "MESSAGE_INVALID" && e.message.includes(name),
       );
     }
-    const ok = new Agents({ validate: { configs: true }, log: () => {} });
+    const ok = new Agents({ trustProxy: true, log: () => {} });
 
     void ok.close();
   });

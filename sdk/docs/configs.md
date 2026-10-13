@@ -15,38 +15,38 @@ const rec = await agents.setConfig(agentId, "report", "main", {
 });
 rec.version; // 42 — растёт с каждым setConfig по этому ключу
 
-await agents.getConfig(agentId, "report", "main"); // { agentId, worker, key, version, data, updatedAt, actor? }
+await agents.getConfig(agentId, "report", "main"); // { agentId, worker, key, version, data, updatedAt }
 await agents.listConfigs(agentId); // все ключи агента
 await agents.deleteConfig(agentId, "report", "limits"); // true — был
-await agents.by("admin@example.com").setConfig(agentId, "report", "main", { intervalSec: 30 }); // с автором (actor)
 ```
 
 Имя воркера и ключа — `^[a-z][a-z0-9-]{0,31}$` (иначе `MESSAGE_INVALID`), значение — до 4 МБ JSON
 (`BODY_TOO_LARGE`). Агент должен быть зарегистрирован (`AGENT_NOT_FOUND`) и не отозван
-(`AGENT_REVOKED`); на связи ли он — неважно. Каждое изменение попадает в событие `audit`
-(`config.set`, `config.delete`); с `by(actor)` — с автором.
+(`AGENT_REVOKED`); на связи ли он — неважно. Кто изменил настройку, бэкенд знает сам и
+записывает в свой журнал ([observe.md](observe.md#итоги-действий-и-аудит)).
 
 ## Проверка по схеме
 
 Если воркер описал ключ в манифесте со схемой значения
-([workers.md](workers.md#манифест-что-воркер-умеет)), `Agents` может проверить значение сам —
-до записи в Store и отправки агенту:
+([workers.md](workers.md#манифест-что-воркер-умеет)), бэкенд может проверить значение до
+`setConfig` помощником `schemaProblems`:
 
 ```ts
-const agents = new Agents({ enrollToken, validate: { configs: true } });
+import { schemaProblems } from "agent-sdk/server";
 
-await agents.setConfig(agentId, "echo", "settings", { prefix: 5, extra: 1 });
-// AgentsError CONFIG_INVALID (400): "echo/settings: prefix: ожидается строка; extra: лишнее поле"
+const agent = await agents.getAgent(agentId);
+const problems = agent ? schemaProblems(agent, "echo", { config: "settings" }, value) : [];
+if (problems.length) throw new Error(problems.join("; ")); // ["prefix: ожидается строка", "extra: лишнее поле"]
+await agents.setConfig(agentId, "echo", "settings", value);
 ```
 
-- Опция `validate.configs` по умолчанию выключена: значение проверяет только воркер (отказ
-  придёт как `CONFIG_REJECTED`, см. ниже). Агент значение по схеме не проверяет — он смотрит
-  только, есть ли ключ в манифесте ([ниже](#как-доходит-до-воркера)).
-- Схема берётся из манифеста воркера в последнем `status` агента (или в `hello`). Нет манифеста или у ключа нет
-  схемы — значение уходит без проверки.
-- В тексте ошибки — до трёх замечаний вида «поле: что не так». Схему, которую нельзя применить
-  (например, со ссылкой `$ref` на внешний документ), SDK пропускает и пишет об этом в журнал
-  (опция `log`).
+- Без проверки на бэкенде значение проверяет только воркер (отказ придёт как
+  `CONFIG_REJECTED`, см. ниже). Агент значение по схеме не проверяет — он смотрит только, есть ли
+  ключ в манифесте ([ниже](#как-доходит-до-воркера)).
+- Схема берётся из манифеста воркера в последнем `status` агента (или в `hello`). Нет манифеста
+  или у ключа нет схемы — пустой список, проверять нечем.
+- Замечаний — до трёх, вида «поле: что не так». Схему, которую нельзя применить (например, со
+  ссылкой `$ref` на внешний документ), `schemaProblems` не применяет — бросает исключение.
 - Схема — JSON Schema версии 2020-12 или той, что указана в `$schema` (draft-04, draft-07,
   2019-09). Проверку делает библиотека `@cfworker/json-schema`: она не создаёт код из схемы, а
   схема приходит с узла.
@@ -137,8 +137,8 @@ agents.on("config", (s) => ui.push(s.agentId, s)); // ConfigStatus
 подтвердил удаление (ключа больше нет в `status.workers[].configs`; `version: null`). После
 `deleted` ключа нет и в `configStatus`.
 
-Отказ — ещё и проблема `configFailed` ([observe.md](observe.md#проблемы)); заканчивается, когда
-воркер применит версию.
+Отказ (`state: failed`) — повод показать проблему узла ([observe.md](observe.md#проблемы)); она
+заканчивается, когда воркер применит версию или ключ удалят.
 
 ## Воркер сам читает свои настройки
 

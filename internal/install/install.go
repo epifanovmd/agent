@@ -125,13 +125,10 @@ type Options struct {
 	// Config — свой agent.yaml вместо создаваемого.
 	Config string
 	CAFile string
-	// User — пользователь службы (по умолчанию agent; --privileged — root).
-	User        string
-	Privileged  bool
-	RWPaths     []string
-	KillMode    string
-	StopTimeout string
-	Packages    []string
+	// Privileged — агент и воркеры — root без ограничений (служба — от root,
+	// а не от пользователя экземпляра).
+	Privileged bool
+	Packages   []string
 	// PackagesBy — пакеты под менеджер (apt, dnf, yum, apk, zypper): на узле с
 	// ним заменяют Packages.
 	PackagesBy map[string][]string
@@ -160,7 +157,6 @@ type Options struct {
 var (
 	reSysctl = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_./-]*=.*$`)
 	rePkg    = regexp.MustCompile(`^[A-Za-z0-9.+_:-]+$`)
-	reUser   = regexp.MustCompile(`^[a-z_][a-z0-9_-]*\$?$`)
 )
 
 // Managers — менеджеры пакетов: имя для флага --packages-<имя> → программа.
@@ -181,12 +177,6 @@ func (o *Options) check() error {
 		if u, err := url.Parse(o.Server); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			errs = append(errs, fmt.Errorf("--server: %q — нужен адрес http(s)://", o.Server))
 		}
-	}
-	if o.KillMode != "" && o.KillMode != "process" && o.KillMode != "mixed" {
-		errs = append(errs, fmt.Errorf("--kill-mode: process | mixed, а не %q", o.KillMode))
-	}
-	if o.User != "" && !reUser.MatchString(o.User) {
-		errs = append(errs, fmt.Errorf("--user: %q — не имя пользователя", o.User))
 	}
 	for _, kv := range o.Sysctls {
 		if !reSysctl.MatchString(kv) {
@@ -215,11 +205,6 @@ func (o *Options) check() error {
 	}
 	if _, err := update.ParseKeys(o.PublicKeys...); err != nil {
 		errs = append(errs, fmt.Errorf("--update-key: %w", err))
-	}
-	for _, p := range o.RWPaths {
-		if !filepath.IsAbs(p) || strings.ContainsAny(p, " \t\n\"'") {
-			errs = append(errs, fmt.Errorf("--rw-path: %q — нужен абсолютный путь без пробелов и кавычек", p))
-		}
 	}
 	return errors.Join(errs...)
 }
@@ -307,7 +292,7 @@ func Install(ctx context.Context, s *System, o Options) error {
 	// Пользователь службы — у системного агента; агент пользователя работает от него самого.
 	user := ""
 	if !l.Home {
-		user = cmpOr(o.User, l.User)
+		user = l.User
 		if o.Privileged {
 			user = "root"
 		}
@@ -325,19 +310,7 @@ func Install(ctx context.Context, s *System, o Options) error {
 	if err != nil {
 		return err
 	}
-	// Режим остановки службы: заданный запоминается, без --kill-mode — прежний (или process:
-	// systemd останавливает только агента, воркеры переживают его перезапуск).
-	killMode := o.KillMode
-	if killMode == "" {
-		killMode = j.last("kill-mode")
-	}
-	if killMode != "mixed" {
-		killMode = "process"
-	}
 	j.set("mode", mode)
-	if mode == ModeSystemd || mode == ModeUser {
-		j.set("kill-mode", killMode)
-	}
 	if user != "" {
 		j.set("service-user", user)
 	}
@@ -380,18 +353,7 @@ func Install(ctx context.Context, s *System, o Options) error {
 	if err := writeEnv(s, l, user, vars); err != nil {
 		return err
 	}
-	if !o.Privileged {
-		for _, p := range o.RWPaths {
-			if err := os.MkdirAll(s.p(p), 0o755); err != nil {
-				return err
-			}
-			if err := s.own(s.p(p), user); err != nil {
-				return err
-			}
-		}
-	}
-	stopTimeout := cmpOr(o.StopTimeout, "15min")
-	unit := Unit(UnitOptions{Paths: l, User: user, KillMode: killMode, StopTimeout: stopTimeout, Privileged: o.Privileged, RWPaths: o.RWPaths})
+	unit := Unit(UnitOptions{Paths: l, User: user, Privileged: o.Privileged})
 	if err := os.MkdirAll(filepath.Dir(s.p(l.UnitFile)), 0o755); err != nil {
 		return err
 	}
@@ -505,9 +467,9 @@ func installBinary(s *System, l Paths, src, user string) error {
 	return os.Symlink(l.Binary, link)
 }
 
-// writeConfig — свой файл (--config), созданный по шаблону (если его нет) или
+// writeConfig — свой файл (--config), созданный установкой (если его нет) или
 // прежний без изменений — с подсказками, если в нём чего-то не хватает.
-func writeConfig(s *System, l Paths, mode string, o Options, workers []config.TemplateWorker, exists bool) error {
+func writeConfig(s *System, l Paths, mode string, o Options, workers []newWorker, exists bool) error {
 	switch {
 	case o.Config != "":
 		raw, err := os.ReadFile(o.Config)
@@ -522,11 +484,11 @@ func writeConfig(s *System, l Paths, mode string, o Options, workers []config.Te
 		}
 		return writeFileAtomic(s.p(l.ConfigFile), raw, 0o644)
 	case !exists:
-		t := config.TemplateOptions{ServerURL: o.Server, Name: o.Name, DataDir: l.DataDir, LogFormat: "json", Workers: workers}
+		ca := ""
 		if o.CAFile != "" {
-			t.CAFile = l.CAFile
+			ca = l.CAFile
 		}
-		return writeFileAtomic(s.p(l.ConfigFile), config.Template(t), 0o644)
+		return writeFileAtomic(s.p(l.ConfigFile), newConfig(o.Server, ca, o.Name, l.DataDir, workers), 0o644)
 	}
 	cfg := config.Defaults()
 	raw, _ := os.ReadFile(s.p(l.ConfigFile))
@@ -615,19 +577,14 @@ func writeEnv(s *System, l Paths, user string, vars map[string]string) error {
 // UnitOptions — служба systemd.
 type UnitOptions struct {
 	// Paths — экземпляр (Layout).
-	Paths       Paths
-	User        string
-	KillMode    string
-	StopTimeout string
-	Privileged  bool
-	RWPaths     []string
+	Paths      Paths
+	User       string
+	Privileged bool
 }
 
 // Unit — файл службы. SIGHUP (systemctl reload) — агент перечитывает
 // agent.yaml на ходу; SIGTERM — только агенту (KillMode=process): воркеры
-// работают дальше по lifecycle.onAgentExit, новый запуск их подхватывает;
-// KillMode=mixed — systemd завершает и воркеры (они не переживают
-// перезапуск агента). Откат обновления делает прежняя версия до запуска
+// работают дальше, новый запуск их подхватывает. Откат обновления делает прежняя версия до запуска
 // новой (ExecStartPre); перезапуск — всегда. Служба агента пользователя
 // (Paths.Home, systemd --user) — от него самого, без ограничений файловой
 // системы (в службах пользователя они работают не везде).
@@ -657,7 +614,7 @@ func ensureUser(ctx context.Context, s *System, l Paths, j *journal, user string
 		return nil
 	}
 	if !s.has("useradd") {
-		return fmt.Errorf("--user %s: нет useradd — создайте пользователя заранее", user)
+		return fmt.Errorf("пользователь службы %s: нет useradd — создайте пользователя заранее", user)
 	}
 	shell := "/bin/false"
 	for _, f := range []string{"/usr/sbin/nologin", "/sbin/nologin", "/usr/bin/nologin"} {
@@ -671,11 +628,4 @@ func ensureUser(ctx context.Context, s *System, l Paths, j *journal, user string
 	}
 	j.add("user", user)
 	return j.save()
-}
-
-func cmpOr(v, def string) string {
-	if v != "" {
-		return v
-	}
-	return def
 }

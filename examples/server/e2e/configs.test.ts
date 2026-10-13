@@ -50,16 +50,10 @@ describe("настройки и доставка", () => {
 
     assert.match(c.error?.message ?? "", /prefix/);
     assert.equal(c.result, undefined);
-    const alerts = await s.api<{ type: string }[]>(
-      "GET",
-      `/api/alerts?agentId=${s.agentId}`,
-    );
-
-    assert.ok(alerts.some(a => a.type === "configFailed"));
     assert.equal(await s.echo("echo", "a"), "> A");
   });
 
-  it("следующая версия применяется, проблема снимается", async () => {
+  it("следующая версия применяется", async () => {
     const rec = await s.api<ConfigRecord>("PUT", path(), {
       prefix: "# ",
       upper: false,
@@ -67,14 +61,6 @@ describe("настройки и доставка", () => {
 
     await waitState("applied", rec.version);
     assert.equal(await s.echo("echo", "b"), "# b");
-    await waitFor("проблема configFailed снята", async () => {
-      const alerts = await s.api<{ type: string }[]>(
-        "GET",
-        `/api/alerts?agentId=${s.agentId}`,
-      );
-
-      return !alerts.some(a => a.type === "configFailed");
-    });
   });
 
   it("перезапуск воркера: настройка передаётся новому процессу", async () => {
@@ -126,7 +112,6 @@ describe("настройки и доставка", () => {
     const { jobId } = await s.job("echo", {
       type: "echo.long",
       data: { steps: 4, delayMs: 300 },
-      timeoutMs: 1,
     });
 
     await s.stopServer();

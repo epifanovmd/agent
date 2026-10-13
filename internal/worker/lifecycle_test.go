@@ -58,9 +58,11 @@ func (h *harness) journalHas(name, text string) bool {
 // Вывод воркера — в файлах <dataDir>/logs (stdout и stderr отдельно), агент
 // читает их в журнал с уровнями; большой файл переносится в .1 и очищается.
 func TestOutputFiles(t *testing.T) {
-	w := spec("echo", "ok", "")
-	w.Logs = config.Logs{MaxSize: 2048}
-	h := start(t, w)
+	// Прежнее значение — после остановки воркера (очистки идут в обратном порядке).
+	prev := logMaxSize
+	t.Cleanup(func() { logMaxSize = prev })
+	logMaxSize = 2048
+	h := start(t, spec("echo", "ok", ""))
 	<-h.started
 	files := LogFiles(filepath.Join(h.dir, LogsDir), "echo")
 	eventually(t, "строка запуска в файле и журнале", func() bool {
@@ -88,7 +90,7 @@ func TestOutputFiles(t *testing.T) {
 	eventually(t, "все строки в журнале", func() bool { return h.journalHas("echo", strings.Repeat("x", 100)+"39") })
 }
 
-// Агент перезапускается (ExitRestart, onAgentExit: keep): воркер
+// Агент перезапускается (ExitRestart): воркер
 // работает дальше; следующий агент подхватывает тот же процесс с тем же
 // токеном, читает его вывод (и написанное, пока агента не было), следит за
 // ним; остановка агента без SetExit останавливает воркер.
@@ -140,24 +142,20 @@ func TestAdoptAfterAgentRestart(t *testing.T) {
 	}
 }
 
-// onAgentExit: stop — воркер останавливается вместе с агентом (перезапуск
-// и остановка); keep — работает дальше.
+// Перезапуск и остановка агента (ExitRestart, ExitStop) — воркер работает
+// дальше; без SetExit — останавливается вместе с агентом.
 func TestExitPolicies(t *testing.T) {
 	for _, c := range []struct {
 		name  string
 		exit  Exit
-		tune  func(*config.Lifecycle)
 		alive bool
 	}{
-		{"restart-keep", ExitRestart, func(*config.Lifecycle) {}, true},
-		{"restart-stop", ExitRestart, func(l *config.Lifecycle) { l.OnAgentExit = config.StopWorker }, false},
-		{"stop-keep", ExitStop, func(*config.Lifecycle) {}, true},
-		{"stop-stop", ExitStop, func(l *config.Lifecycle) { l.OnAgentExit = config.StopWorker }, false},
+		{"restart", ExitRestart, true},
+		{"stop", ExitStop, true},
+		{"shutdown", ExitShutdown, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			w := spec("echo", "ok", "")
-			c.tune(&w.Lifecycle)
-			h := start(t, w)
+			h := start(t, spec("echo", "ok", ""))
 			<-h.started
 			pid := h.pid(t, "echo")
 			defer syscall.Kill(pid, syscall.SIGKILL)
@@ -188,7 +186,7 @@ func TestAdoptRejectsReusedPID(t *testing.T) {
 	states := filepath.Join(dir, ProcessesDir)
 	_ = writeState(states, "echo", procState{PID: stranger.Process.Pid, Start: "не то", Socket: filepath.Join(dir, "x.sock"), Token: "t"})
 	start, _ := procStart(orphan.Process.Pid)
-	_ = writeState(states, "gone", procState{PID: orphan.Process.Pid, Start: start, StopTimeout: config.Duration(time.Second), KeepChildren: true})
+	_ = writeState(states, "gone", procState{PID: orphan.Process.Pid, Start: start, StopTimeout: config.Duration(time.Second)})
 
 	h := startIn(t, dir, spec("echo", "ok", ""))
 	<-h.started
@@ -270,11 +268,8 @@ func TestBusyDefersReplace(t *testing.T) {
 	}
 
 	// busyTimeout — дольше не ждать.
-	next := w
-	next.Lifecycle = life()
-	busyFor := config.Duration(300 * time.Millisecond)
-	next.Lifecycle.BusyTimeout = &busyFor
-	h.sup.Apply([]config.Worker{next}) // меняется только lifecycle — без замены
+	defer func(d time.Duration) { busyTimeout = d }(busyTimeout)
+	busyTimeout = 300 * time.Millisecond
 	eventually(t, "занят", func() bool { st := h.status("echo"); return st.Health != nil && st.Health.Busy })
 	pid = h.pid(t, "echo")
 	began := time.Now()
@@ -311,22 +306,15 @@ func TestBusyHangRestarts(t *testing.T) {
 	}
 }
 
-// lifecycle.restart: on-failure — выход с кодом 0 без перезапуска; always —
-// перезапуск; never — падение без перезапуска.
-func TestRestartPolicy(t *testing.T) {
+// Выход с кодом 0 — без перезапуска (до worker.restart); падение —
+// перезапуск.
+func TestRestartAfterExit(t *testing.T) {
 	for _, c := range []struct {
-		mode, policy string
-		restarted    bool
-	}{
-		{"exit0", config.RestartFailure, false},
-		{"exit0", config.RestartAlways, true},
-		{"crash", config.RestartNever, false},
-		{"crash", config.RestartFailure, true},
-	} {
-		t.Run(c.mode+"-"+c.policy, func(t *testing.T) {
-			w := spec("w", c.mode, "")
-			w.Lifecycle.Restart = c.policy
-			h := start(t, w)
+		mode      string
+		restarted bool
+	}{{"exit0", false}, {"crash", true}} {
+		t.Run(c.mode, func(t *testing.T) {
+			h := start(t, spec("w", c.mode, ""))
 			if c.mode == "exit0" {
 				<-h.started
 			}
@@ -336,7 +324,8 @@ func TestRestartPolicy(t *testing.T) {
 			}
 			eventually(t, "остановлен", func() bool {
 				st := h.status("w")
-				return st.State == message.WorkerStopped && st.Restarts == 0 && h.journalHas(message.LogSourceAgent, "воркер не перезапускается (lifecycle.restart: "+c.policy+") — до worker.restart или изменения настроек")
+				return st.State == message.WorkerStopped && st.Restarts == 0 &&
+					h.journalHas(message.LogSourceAgent, "воркер завершился сам (exit 0) — не перезапускается до worker.restart или изменения настроек")
 			})
 			time.Sleep(200 * time.Millisecond)
 			if st := h.status("w"); st.State != message.WorkerStopped || st.Restarts != 0 {
@@ -344,31 +333,10 @@ func TestRestartPolicy(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			if err := h.sup.Restart(ctx, "w", false); c.mode == "exit0" && err != nil {
+			if err := h.sup.Restart(ctx, "w", false); err != nil {
 				t.Fatalf("worker.restart запускает снова: %v", err)
 			}
 		})
-	}
-}
-
-// health.failures: 0 — не отвечающий воркер не перезапускается; interval: 0
-// — GET /health не вызывается.
-func TestHealthDisabled(t *testing.T) {
-	deaf := spec("deaf", "deaf", "")
-	zero := 0
-	deaf.Lifecycle.Health.Failures = &zero
-	off := spec("off", "ok", "")
-	var none config.Duration
-	off.Lifecycle.Health.Interval = &none
-	h := start(t, deaf, off)
-	<-h.started
-	time.Sleep(600 * time.Millisecond)
-	// Не отвечает — не зарегистрирован (invalid), но и не перезапускается.
-	if st := h.status("deaf"); st.Restarts != 0 || st.State != message.WorkerInvalid {
-		t.Fatalf("failures: 0: %+v", st)
-	}
-	if st := h.status("off"); st.Health != nil {
-		t.Fatalf("interval: 0: %+v", st)
 	}
 }
 

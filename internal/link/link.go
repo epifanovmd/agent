@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,9 +63,8 @@ type Auth interface {
 
 // Options — настройки связи.
 type Options struct {
-	// ServerURLs — адреса сервера: связь с первым доступным, при обрыве или
-	// отказе — со следующим по кругу.
-	ServerURLs []string
+	// ServerURL — адрес сервера.
+	ServerURL  string
 	Auth       Auth
 	Outbox     *outbox.Outbox
 	Stream     *stream.Buffer
@@ -101,9 +99,6 @@ type Link struct {
 	// (нулевое — ждут ack).
 	inflight map[string]time.Time
 
-	urls []string
-	cur  atomic.Int64
-
 	renew    chan struct{}
 	renewGen atomic.Int64
 
@@ -124,14 +119,6 @@ func New(opts Options, handler Handler) *Link {
 	}
 	l := &Link{opts: opts, handler: handler, renew: make(chan struct{}, 1),
 		welcomeTimeout: welcomeTimeout, pingInterval: pingInterval, pongTimeout: pongTimeout, retryImportant: retryImportant}
-	for _, u := range opts.ServerURLs {
-		if u != "" && !slices.Contains(l.urls, u) {
-			l.urls = append(l.urls, u)
-		}
-	}
-	if len(l.urls) == 0 {
-		l.urls = []string{""}
-	}
 	return l
 }
 
@@ -142,15 +129,8 @@ func (l *Link) Session() *Session {
 	return l.session
 }
 
-// ServerURL — адрес сервера, с которым связь сейчас (или будет следующей).
-func (l *Link) ServerURL() string { return l.urls[int(l.cur.Load())%len(l.urls)] }
-
-// nextURL — перейти к следующему адресу; true — начат новый круг.
-func (l *Link) nextURL() bool {
-	next := (int(l.cur.Load()) + 1) % len(l.urls)
-	l.cur.Store(int64(next))
-	return next == 0
-}
+// ServerURL — адрес сервера.
+func (l *Link) ServerURL() string { return l.opts.ServerURL }
 
 // Connected — соединение открыто (после welcome).
 func (l *Link) Connected() bool {
@@ -258,34 +238,11 @@ func (l *Link) delay(ctx context.Context, err error, failures int) time.Duration
 	case dialed && de.Status == http.StatusUpgradeRequired:
 		l.opts.Log.Error("link: сервер не поддерживает формат " + message.Subprotocol + " — нужно обновление агента или сервера")
 		return l.opts.Backoff.Max
-	case len(l.urls) > 1 && switchable(err):
-		from := l.ServerURL()
-		if !l.nextURL() {
-			delay = 0 // следующий адрес — сразу, пауза — после круга
-		}
-		l.opts.Log.Warn("link: сервер недоступен — следующий адрес", "err", err, "from", from, "to", l.ServerURL(),
-			"retryIn", delay.Round(time.Millisecond))
-		return delay
 	}
 	if err != nil {
 		l.opts.Log.Warn("link: связь потеряна", "err", err, "retryIn", delay.Round(time.Millisecond))
 	}
 	return delay
-}
-
-// switchable — после такой ошибки есть смысл пробовать другой адрес: сервер
-// недоступен (сеть, нет welcome, 5xx). Закрытие кодом и отказ 4xx — сервер
-// жив и ответил.
-func switchable(err error) bool {
-	var ce *CloseError
-	var de *DialError
-	switch {
-	case err == nil, errors.As(err, &ce):
-		return false
-	case errors.As(err, &de):
-		return de.Status >= 500
-	}
-	return true
 }
 
 // retryAfter — через сколько сервер просит подключиться: 4429 (секунды в
@@ -308,7 +265,7 @@ func retryAfter(err error) time.Duration {
 func (l *Link) connect(ctx context.Context) (greeted bool, err error) {
 	dialCtx, cancelDial := context.WithTimeout(ctx, 15*time.Second)
 	authz := l.opts.Auth.Authorization()
-	serverURL := l.ServerURL()
+	serverURL := l.opts.ServerURL
 	c, err := dialWS(dialCtx, l.opts.HTTPClient, serverURL, authz)
 	cancelDial()
 	if err != nil {

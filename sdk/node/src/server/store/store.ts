@@ -39,8 +39,6 @@ export interface Store {
 }
 
 export interface SetConfigOptions {
-  /** Кто изменил (agents.by). */
-  actor?: string;
   /** Версия не меньше этой: на агенте уже есть версия новее счётчика (хранилище сброшено). */
   minVersion?: number;
 }

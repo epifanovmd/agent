@@ -16,7 +16,6 @@ const record = (patch: Partial<AgentRecord>): AgentRecord => ({
   secretHash: "x",
   lastSeq: 0,
   configs: {},
-  alerts: [],
   rev: 1,
   ...patch,
 });

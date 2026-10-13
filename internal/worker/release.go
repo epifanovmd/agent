@@ -17,7 +17,7 @@ import (
 // Update — worker.update (§11): fetch кладёт проверенную сборку в dst
 // (файл или каталог распакованного архива); воркер заменяется (сначала
 // уходит прежний процесс), текущая сборка откладывается как previous, новая
-// становится current. Новая не ответила ok: true на GET /health за lifecycle.startTimeout —
+// становится current. Новая не ответила ok: true на GET /health за startTimeout —
 // previous возвращается, воркер перезапускается с ней, итог —
 // UPDATE_FAILED. Без force замена ждёт, пока воркер занят (§13). Ошибки —
 // *message.ErrorInfo.
@@ -114,8 +114,7 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, force boo
 	}
 	cause := startErr
 	if cause == nil {
-		life := w.life()
-		cause = s.waitHealthy(ctx, name, life.StartTimeout.Std(), life.Health.Timeout.Std())
+		cause = s.waitHealthy(ctx, name, startTimeout, probeTimeout)
 	}
 	if cause == nil {
 		log.Info("воркер работает на новой сборке", "version", version)

@@ -200,29 +200,41 @@ func SameHash(a, b string) bool {
 	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }
 
-// Download — скачать url в dst (0755) и сверить sha256; при ошибке dst удаляется.
+// Download — скачать url (ссылку http(s):// или путь к локальному файлу) в dst
+// (0755) и сверить sha256; при ошибке dst удаляется.
 func Download(ctx context.Context, client *http.Client, auth, url, dst, sha256hex string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
+	var body io.ReadCloser
+	if strings.Contains(url, "://") {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("update: загрузка: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return fmt.Errorf("update: загрузка: HTTP %d", resp.StatusCode)
+		}
+		body = resp.Body
+	} else {
+		in, err := os.Open(url)
+		if err != nil {
+			return fmt.Errorf("update: %w", err)
+		}
+		body = in
 	}
-	if auth != "" {
-		req.Header.Set("Authorization", auth)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("update: загрузка: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("update: загрузка: HTTP %d", resp.StatusCode)
-	}
+	defer body.Close()
 	f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 	if err != nil {
 		return fmt.Errorf("update: %w", err)
 	}
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(f, h), resp.Body); err != nil {
+	if _, err := io.Copy(io.MultiWriter(f, h), body); err != nil {
 		f.Close()
 		os.Remove(dst)
 		return fmt.Errorf("update: загрузка: %w", err)

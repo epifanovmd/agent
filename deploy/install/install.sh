@@ -16,8 +16,8 @@
 #
 # Свои флаги:
 #   --server URL      адрес сервера
-#   --releases URL    откуда скачать сборку (по умолчанию <server>/api/v1/agent-link/releases);
-#                     передаётся и agent install (оттуда же — сборки воркеров)
+#   --releases URL    откуда скачать сборку агента (по умолчанию — последний релиз агента на GitHub,
+#                     $GITHUB_RELEASES); передаётся и agent install (оттуда же — сборки воркеров)
 #   --ca-file ПУТЬ    свой корневой сертификат сервера для загрузки; передаётся и agent install
 #   --binary ПУТЬ     не скачивать, а поставить сборку из файла
 #   --bundle URL      архив папки агента проекта (agent pack) по ссылке; {arch} в ссылке — amd64
@@ -37,6 +37,9 @@
 # Без скрипта — то же самое вручную: скачать agent-linux-<arch> и выполнить
 #   sudo ./agent-linux-<arch> install --server URL --token <токен>
 set -eu
+
+# Каталог сборок агента по умолчанию — последний релиз агента на GitHub.
+GITHUB_RELEASES=https://github.com/epifanovmd/agent/releases/latest/download
 
 die() {
   echo "install.sh: $*" >&2
@@ -100,7 +103,7 @@ while [ "$n" -gt 0 ]; do
   esac
 done
 
-[ "$(uname -s)" = Linux ] || die "установка — только Linux; на других системах: agent init (папка агента), затем agent run"
+[ "$(uname -s)" = Linux ] || die "установка — только Linux; на других системах — agent run с файлом настроек agent.yaml"
 [ "$(id -u)" -eq 0 ] || [ -n "$ROOTLESS" ] || [ -n "$RUN" ] || [ -n "$UNINSTALL" ] ||
   die "нужны права root (sudo); без root — агент пользователя (--rootless) или без установки (--run)"
 
@@ -135,12 +138,14 @@ fetch_agent() {
     [ -f "$BINARY" ] || die "--binary: нет файла $BINARY"
     cp "$BINARY" "$TMP/agent"
   else
-    [ -n "$SERVER" ] || [ -n "$RELEASES" ] || die "--server: адрес сервера (или --binary ПУТЬ к сборке)"
     command -v curl >/dev/null || die "нужен curl"
     ARCH=$(arch)
-    RELEASES="${RELEASES:-$SERVER/api/v1/agent-link/releases}"
+    # Свой корневой сертификат — только для своего каталога (--releases), не для GitHub.
+    CA=""
+    if [ -n "$RELEASES" ]; then CA=$CA_FILE; fi
+    RELEASES="${RELEASES:-$GITHUB_RELEASES}"
     RELEASES="${RELEASES%/}"
-    MANIFEST="$(curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$RELEASES/manifest.json")" || die "манифест сборок не получен: $RELEASES/manifest.json"
+    MANIFEST="$(curl -fsSL ${CA:+--cacert "$CA"} "$RELEASES/manifest.json")" || die "манифест сборок не получен: $RELEASES/manifest.json"
     # Без jq: каждый объект манифеста (записи плоские) — отдельной строкой; сборки агента — записи
     # без "name" (у воркеров он есть).
     ENTRY="$(printf '%s' "$MANIFEST" | tr -d '\n\r\t ' | sed 's/{/\n{/g' | grep '"os":"linux"' | grep "\"arch\":\"$ARCH\"" | grep -v '"name":' | head -n 1)" || true
@@ -159,7 +164,7 @@ fetch_agent() {
       */* | *:*) die "сборка $FILE: нужно имя файла или ссылка https://" ;;
       *) URL="$RELEASES/$FILE" ;;
     esac
-    curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$URL" -o "$TMP/agent" || die "сборка $FILE не скачана"
+    curl -fsSL ${CA:+--cacert "$CA"} "$URL" -o "$TMP/agent" || die "сборка $FILE не скачана"
     GOT="$(sha256sum "$TMP/agent" | cut -d' ' -f1)"
     [ "$GOT" = "$SUM" ] || die "sha256 сборки не сходится: $GOT"
   fi

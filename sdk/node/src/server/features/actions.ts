@@ -51,10 +51,9 @@ export interface ActionOptions {
 export interface UpdateAgentOptions extends ActionOptions {
   /**
    * Версия из каталога сборок агента (релизы агента на GitHub или его `update.releases`): агент
-   * сам берёт сборку под свою платформу и сверяет подпись (§10). Без неё — сборка с сервера
-   * (`releasesDir`, `agentReleases`).
+   * сам берёт сборку под свою платформу и сверяет подпись (§11).
    */
-  version?: string;
+  version: string;
 }
 
 /**
@@ -92,10 +91,9 @@ export type RestartResult = { deferred: false } | Deferred;
 export type WorkerUpdateResult =
   (UpdateResult & { deferred: false }) | Deferred;
 
-/** Что нужно действиям от других частей: аргументы обновлений и приём нового ключа. */
+/** Что нужно действиям от других частей: аргументы обновления воркера и приём нового ключа. */
 export interface ActionDeps {
-  /** Аргументы agent.update и worker.update (версия, адрес сборки, хеш, подпись). */
-  agentUpdate(agent: AgentRecord): Promise<Record<string, unknown>>;
+  /** Аргументы worker.update (версия, адрес сборки, хеш, подпись). */
   workerUpdate(
     agent: AgentRecord,
     name: string,
@@ -141,14 +139,12 @@ export class Actions {
   }
 
   async restartWorker(
-    actor: string,
     agentId: string,
     name: string,
     opts: WorkerActionOptions,
   ): Promise<RestartResult> {
     valid(parseName("name", name));
     const r = await this.run(
-      actor,
       agentId,
       "worker.restart",
       withForce({ name }, opts),
@@ -160,7 +156,6 @@ export class Actions {
   }
 
   async updateWorker(
-    actor: string,
     agentId: string,
     name: string,
     opts: WorkerActionOptions,
@@ -171,7 +166,6 @@ export class Actions {
       name,
     );
     const r = await this.run(
-      actor,
       agentId,
       "worker.update",
       withForce(args, opts),
@@ -183,37 +177,23 @@ export class Actions {
   }
 
   async updateAgent(
-    actor: string,
     agentId: string,
     opts: UpdateAgentOptions,
   ): Promise<UpdateResult> {
     if (
-      opts.version !== undefined &&
+      typeof opts?.version !== "string" ||
       !/^v?\d+(\.\d+)*([-+].*)?$/.test(opts.version)
     )
-      throw invalid(`version: "${opts.version}" — нужна версия вида 1.2.0`);
-    const args = opts.version
-      ? { version: opts.version.replace(/^v/, "") }
-      : await this.deps.agentUpdate(await this.ctx.agent(agentId));
+      throw invalid(`version: "${opts?.version}" — нужна версия вида 1.2.0`);
+    const args = { version: opts.version.replace(/^v/, "") };
 
     return (
-      await this.run(
-        actor,
-        agentId,
-        "agent.update",
-        args,
-        this.updateTimeout(opts),
-      )
+      await this.run(agentId, "agent.update", args, this.updateTimeout(opts))
     ).result as UpdateResult;
   }
 
-  async rotateKey(
-    actor: string,
-    agentId: string,
-    opts: ActionOptions,
-  ): Promise<void> {
+  async rotateKey(agentId: string, opts: ActionOptions): Promise<void> {
     await this.run(
-      actor,
       agentId,
       "agent.rotateKey",
       undefined,
@@ -221,18 +201,13 @@ export class Actions {
     );
   }
 
-  async logs(
-    actor: string,
-    agentId: string,
-    opts: LogsOptions,
-  ): Promise<LogEntry[]> {
+  async logs(agentId: string, opts: LogsOptions): Promise<LogEntry[]> {
     const args: Record<string, unknown> = {
       ...valid(parse(logsOptionsSchema, opts, "logs")),
     };
     const r = parseLog(
       (
         await this.run(
-          actor,
           agentId,
           "agent.logs",
           args,
@@ -361,7 +336,6 @@ export class Actions {
    * action.done.
    */
   private async run(
-    actor: string,
     agentId: string,
     name: ActionName,
     args: Record<string, unknown> | undefined,
@@ -377,11 +351,6 @@ export class Actions {
     };
 
     if (args) action.args = args;
-    if (actor) action.actor = actor;
-    this.ctx.audit(actor, name, agentId, {
-      actionId: action.id,
-      ...(args ?? {}),
-    });
     const done = new Promise<ActionRecord>((resolve, reject) => {
       const expire = () => {
         this.pending.delete(action.id);

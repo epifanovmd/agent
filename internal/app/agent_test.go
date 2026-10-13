@@ -292,7 +292,6 @@ func TestAgent(t *testing.T) {
 	cfg.Labels = map[string]string{"zone": "eu"}
 	cfg.Enroll.Token = "good"
 	cfg.Log.Level = "error"
-	cfg.Telemetry.Metrics = []string{message.MetricsMemory, message.MetricsUptime}
 	cfg.Workers = []config.Worker{{Name: "echo", Command: []string{os.Args[0]}, Env: map[string]string{"TEST_WORKER": "1"},
 		Lifecycle: config.Lifecycle{StopTimeout: config.Duration(2 * time.Second)}}}
 	if err := cfg.Validate(); err != nil {
@@ -403,7 +402,7 @@ func TestAgent(t *testing.T) {
 		m := decode[message.Metrics](e)
 		return e.Type == message.TypeMetrics && m.Host != nil && m.Workers["echo"] != nil
 	}))
-	if m.Host.MemTotalBytes == nil || m.Host.CPUPercent != nil || string(m.Workers["echo"]) != `{"sent":1}` || m.Workers["sysmetrics"] != nil {
+	if m.Host.MemTotalBytes == nil || string(m.Workers["echo"]) != `{"sent":1}` || m.Workers["sysmetrics"] != nil {
 		t.Fatalf("metrics: %+v", m)
 	}
 
@@ -444,7 +443,7 @@ func TestAgent(t *testing.T) {
 		res.Error.Code != message.CodeWorkerNotReleased {
 		t.Fatalf("без release: true: %+v", res)
 	}
-	if res := s.action("x7", "agent.update", message.AgentUpdateArgs{Version: "9", URL: "/x", SHA256: "00"}); res.Error == nil ||
+	if res := s.action("x7", "agent.update", message.AgentUpdateArgs{Version: "9"}); res.Error == nil ||
 		res.Error.Code != message.CodeUpdateNotVerified {
 		t.Fatalf("нет ключа: %+v", res)
 	}
@@ -665,10 +664,7 @@ func TestAgentUpdateRefusedWithoutConfig(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	_, err = a.agentUpdate(context.Background(), "u1", message.AgentUpdateArgs{
-		Version: "9.9.9",
-		URL:     "https://example.invalid/agent-linux-amd64",
-	})
+	_, err = a.agentUpdate(context.Background(), "u1", message.AgentUpdateArgs{Version: "9.9.9"})
 	var me *message.ErrorInfo
 	if !errors.As(err, &me) || me.Code != message.CodeUpdateFailed || !strings.Contains(me.Message, "agent.yaml") {
 		t.Fatalf("ожидался UPDATE_FAILED с путём настроек, а не %v", err)

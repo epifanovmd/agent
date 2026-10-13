@@ -16,7 +16,6 @@
 //   agentLogs(agentId, opts)         — Agents.logs: действие agent.logs (журнал на узле)
 //   metrics(agentId)                 — все принятые точки метрик (событие metrics), по порядку
 //   configEvents(agentId)            — события config (статусы ключей), по порядку
-//   alerts(agentId)                  — события alert, по порядку
 //   actions(agentId)                 — события action (итоги действий), по порядку
 //   workerRequests(agentId)          — запросы воркеров к серверу (onWorkerRequest), по порядку:
 //                                      example.ask — ответ {worker, echo: data, agent: имя};
@@ -29,7 +28,7 @@
 //                                      прочитано, время — мс Unix) или {error: {code, message}} —
 //                                      ошибка после заголовка
 import http from "node:http";
-import { Agents, AgentsError, readJSON, sendJSON } from "../../sdk/node/dist/server/index.js";
+import { Agents, AgentsError, sendJSON } from "../../sdk/node/dist/server/index.js";
 
 const options = JSON.parse(process.argv[2] ?? "{}");
 
@@ -40,7 +39,6 @@ const kept = {
   logs: new Map(),
   metrics: new Map(),
   configEvents: new Map(),
-  alerts: new Map(),
   actions: new Map(),
   workerRequests: new Map(),
 };
@@ -75,14 +73,12 @@ const agents = new Agents({
 agents.on("log", (e) => keep("logs", e.agentId, e.entries));
 agents.on("metrics", (m) => keep("metrics", m.agentId, [m]));
 agents.on("config", (c) => keep("configEvents", c.agentId, [c]));
-agents.on("alert", (a) => keep("alerts", a.agentId, [a]));
 agents.on("action", (a) => keep("actions", a.agentId, [a]));
 
 /** Методы Agents, доступные тестам. */
 const methods = new Set([
   "listAgents",
   "getAgent",
-  "listAlerts",
   "revoke",
   "deleteAgent",
   "setConfig",
@@ -96,10 +92,6 @@ const methods = new Set([
   "updateWorker",
   "updateAgent",
   "rotateKey",
-  "updateCandidates",
-  "runJob",
-  "jobStatus",
-  "cancelJob",
 ]);
 
 /** Свои методы теста. */
@@ -111,7 +103,6 @@ const own = {
   agentLogs: (agentId, opts) => agents.logs(agentId, opts),
   metrics: (agentId) => kept.metrics.get(agentId) ?? [],
   configEvents: (agentId) => kept.configEvents.get(agentId) ?? [],
-  alerts: (agentId) => kept.alerts.get(agentId) ?? [],
   actions: (agentId) => kept.actions.get(agentId) ?? [],
   workerRequests: (agentId) => kept.workerRequests.get(agentId) ?? [],
   async fetch(agentId, worker, path, init = {}) {
@@ -135,6 +126,13 @@ const own = {
     out.bodyBase64 = buf.toString("base64");
     return out;
   },
+};
+
+/** Тело запроса как JSON. */
+const readJSON = async (req) => {
+  const parts = [];
+  for await (const part of req) parts.push(part);
+  return JSON.parse(Buffer.concat(parts).toString("utf8") || "null");
 };
 
 async function control(req, res, method) {

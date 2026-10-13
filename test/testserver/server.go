@@ -358,7 +358,7 @@ func (s *Server) Actions(agentID string) []ActionRecord {
 }
 
 // Action — встроенное действие методом Agents (restartWorker, updateWorker, updateAgent,
-// rotateKey), agentLogs или runJob с аргументами после agentId; итог — в out.
+// rotateKey) или agentLogs с аргументами после agentId; итог — в out.
 func (s *Server) Action(method, agentID string, out any, args ...any) error {
 	return s.Call(method, out, append([]any{agentID}, args...)...)
 }

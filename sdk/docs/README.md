@@ -119,13 +119,12 @@ Server(path, Handler).serve_forever()
 
 ## Шаг 3. Агент
 
-Скачайте агента под свою машину и разверните папку агента — программа, настройки и воркеры в
-одном месте:
+Скачайте агента под свою машину в папку агента — программа, настройки и воркеры в одном месте:
 
 ```bash
+mkdir agent && cd agent
 curl -fLo agent "https://github.com/epifanovmd/agent/releases/latest/download/agent-$(uname -s | tr A-Z a-z)-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
-chmod +x agent
-./agent init agent --server http://127.0.0.1:8080 --token demo-token
+chmod +x agent && cd ..
 ```
 
 Положите воркер в папку агента — `agent/workers/echo/`: `echo.py`, исполняемый `run` и `VERSION`:
@@ -138,6 +137,13 @@ chmod +x agent/workers/echo/run && echo 1.0.0 > agent/workers/echo/VERSION
 
 ```yaml
 # agent/agent.yaml
+server:
+  url: http://127.0.0.1:8080
+enroll:
+  token: demo-token
+dataDir: .data
+update:
+  mode: disabled
 workers:
   - path: workers/echo
 ```
@@ -146,7 +152,7 @@ workers:
 agent/agent run
 ```
 
-Агент регистрируется по токену из `agent/.env`, сохраняет свой ключ в `agent/.data`, подключается
+Агент регистрируется по токену из `agent.yaml`, сохраняет свой ключ в `agent/.data`, подключается
 и запускает воркер. Собрать агента из исходников — `make build` в корне репозитория (Go не нужен,
 сборка идёт в контейнере). Все настройки агента — [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md). Готовый
 стенд со сквозными тестами — [examples/README.md](../../examples/README.md).
@@ -191,12 +197,12 @@ curl -fsSL "$I" | sudo sh -s -- --bundle 'https://files.example.com/agent-prod-l
 
 ## Разделы
 
-| Раздел                         | О чём                                                                           |
-| ------------------------------ | ------------------------------------------------------------------------------- |
-| [connection.md](connection.md) | регистрация, связь, отзыв, смена ключа, несколько копий и пересылка, фреймворки |
-| [workers.md](workers.md)       | как написать воркер без SDK на Python, Node и Go; задачи; долгая работа         |
-| [fetch.md](fetch.md)           | запросы к воркеру: поток, отмена, сроки, ошибки                                 |
-| [configs.md](configs.md)       | настройки воркеров: версии, доставка, статус применения                         |
-| [observe.md](observe.md)       | метрики, наблюдение (watch), журнал, события, проблемы                          |
-| [releases.md](releases.md)     | сборки, установка, обновление агента и воркеров, удаление                       |
-| [store.md](store.md)           | хранилище: свой Store, пример на Postgres                                       |
+| Раздел                         | О чём                                                                   |
+| ------------------------------ | ----------------------------------------------------------------------- |
+| [connection.md](connection.md) | регистрация, связь, отзыв, смена ключа, несколько копий, фреймворки     |
+| [workers.md](workers.md)       | как написать воркер без SDK на Python, Node и Go; задачи; долгая работа |
+| [fetch.md](fetch.md)           | запросы к воркеру: поток, отмена, сроки, ошибки                         |
+| [configs.md](configs.md)       | настройки воркеров: версии, доставка, статус применения                 |
+| [observe.md](observe.md)       | метрики, наблюдение (watch), журнал, события, проблемы                  |
+| [releases.md](releases.md)     | сборки, установка, обновление агента и воркеров, удаление               |
+| [store.md](store.md)           | хранилище: свой Store, пример на Postgres                               |

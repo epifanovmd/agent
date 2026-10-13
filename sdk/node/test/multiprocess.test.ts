@@ -31,11 +31,11 @@ const pair = async (link = true): Promise<[TestServer, TestServer]> => {
 
   running.push(a, b);
   if (link) {
-    const relay = (to: TestServer) => (e: ChangeEvent) =>
+    const notify = (to: TestServer) => (e: ChangeEvent) =>
       void to.agents.refresh(e.agentId);
 
-    a.agents.on("change", relay(b));
-    b.agents.on("change", relay(a));
+    a.agents.on("change", notify(b));
+    b.agents.on("change", notify(a));
   }
 
   return [a, b];
@@ -172,10 +172,6 @@ describe("несколько процессов", () => {
     assert.ok(await store.updateAgent(rec));
     await until(
       async () => (await b.agents.getAgent(c.agentId))?.online === false,
-    );
-    assert.deepEqual(
-      (await b.agents.listAlerts(c.agentId)).map(x => x.type),
-      ["offline"],
     );
   });
 });

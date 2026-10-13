@@ -164,18 +164,16 @@ func TestInstallFromBundle(t *testing.T) {
 // root, пропускается — в Ignored; служба получает всё.
 func TestApplyRootless(t *testing.T) {
 	in := config.Install{
-		Packages: []string{"jq"}, Privileged: true, User: "svc", RWPaths: []string{"/srv/example"},
-		Sysctl: map[string]string{"vm.max_map_count": "262144"}, KillMode: "mixed", StopTimeout: "1min",
+		Packages: []string{"jq"}, Privileged: true, Sysctl: map[string]string{"vm.max_map_count": "262144"},
 	}
 	home := install.Options{Rootless: true, Home: "/home/u"}
 	apply(&home, in)
-	if len(home.Packages) != 0 || home.Privileged || home.User != "" || len(home.RWPaths) != 0 || len(home.Sysctls) != 0 ||
-		home.KillMode != "mixed" || home.StopTimeout != "1min" || len(home.Ignored) != 5 {
+	if len(home.Packages) != 0 || home.Privileged || len(home.Sysctls) != 0 || len(home.Ignored) != 3 {
 		t.Fatalf("агент пользователя: %+v", home)
 	}
 	system := install.Options{}
 	apply(&system, in)
-	if len(system.Packages) != 1 || !system.Privileged || system.User != "svc" || system.KillMode != "mixed" || len(system.Ignored) != 0 {
+	if len(system.Packages) != 1 || !system.Privileged || len(system.Sysctls) != 1 || len(system.Ignored) != 0 {
 		t.Fatalf("служба: %+v", system)
 	}
 }

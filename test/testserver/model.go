@@ -23,7 +23,6 @@ type Agent struct {
 	Workers []AgentWorker     `json:"workers"`
 	Hello   *message.Hello    `json:"hello,omitempty"`
 	Status  *message.Status   `json:"status,omitempty"`
-	Alerts  []Alert           `json:"alerts"`
 	Events  []AgentEvent      `json:"events,omitempty"`
 }
 
@@ -39,13 +38,6 @@ func (a Agent) Worker(name string) (AgentWorker, bool) {
 
 // AgentWorker — воркер агента: из hello и последнего status.
 type AgentWorker = message.WorkerStatus
-
-// Alert — проблема агента.
-type Alert struct {
-	Key    string `json:"key"`
-	Type   string `json:"type"`
-	Worker string `json:"worker,omitempty"`
-}
 
 // AgentEvent — событие воркера.
 type AgentEvent struct {
@@ -153,16 +145,6 @@ type ActionRecord struct {
 	Name     string             `json:"name"`
 	Status   string             `json:"status"`
 	Deferred bool               `json:"deferred,omitempty"`
-	Result   json.RawMessage    `json:"result,omitempty"`
-	Error    *message.ErrorInfo `json:"error,omitempty"`
-}
-
-// JobResult — итог runJob.
-type JobResult struct {
-	JobID    string             `json:"jobId"`
-	ID       string             `json:"id,omitempty"`
-	State    string             `json:"state"`
-	Progress *float64           `json:"progress,omitempty"`
 	Result   json.RawMessage    `json:"result,omitempty"`
 	Error    *message.ErrorInfo `json:"error,omitempty"`
 }

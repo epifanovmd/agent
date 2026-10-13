@@ -191,27 +191,11 @@ func apply(o *install.Options, in config.Install) {
 	if !skip(in.Privileged, "privileged") {
 		o.Privileged = o.Privileged || in.Privileged
 	}
-	if !skip(in.User != "", "user") && o.User == "" {
-		o.User = in.User
-	}
-	if !skip(len(in.RWPaths) > 0, "rwPaths") {
-		for _, p := range in.RWPaths {
-			if !slices.Contains(o.RWPaths, p) {
-				o.RWPaths = append(o.RWPaths, p)
-			}
-		}
-	}
 	if !skip(len(in.Sysctl) > 0, "sysctl") {
 		for _, k := range slices.Sorted(maps.Keys(in.Sysctl)) {
 			if !slices.ContainsFunc(o.Sysctls, func(s string) bool { return strings.HasPrefix(s, k+"=") }) {
 				o.Sysctls = append(o.Sysctls, k+"="+in.Sysctl[k])
 			}
 		}
-	}
-	if o.KillMode == "" {
-		o.KillMode = in.KillMode
-	}
-	if o.StopTimeout == "" {
-		o.StopTimeout = in.StopTimeout
 	}
 }

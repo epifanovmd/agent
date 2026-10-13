@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/logx"
@@ -64,7 +63,7 @@ func (a *App) warnUnknown(path string) {
 }
 
 // Reload — применить новые настройки без перезапуска агента: лог — сразу,
-// воркеры и метрики узла — заменой изменённых воркеров, имя и метки — новым
+// воркеры — заменой изменённых, имя и метки — новым
 // hello. Ключи, которые на ходу не меняются, остаются прежними до перезапуска.
 func (a *App) Reload(next config.Config) {
 	a.reloadMu.Lock()
@@ -87,21 +86,11 @@ func (a *App) Reload(next config.Config) {
 		a.logCtl.Set(logx.Options{Level: next.Log.Level, Format: next.Log.Format})
 		a.forward.SetLevel(next.Log.Forward)
 	}
-	if diff.Workers || diff.Telemetry {
-		if err := prepareRunDir(next, a.runDir); err != nil {
-			a.log.Error("каталог сокетов", "err", err)
-		}
+	if diff.Workers {
 		a.workers.Apply(workerSpecs(next, a.sysmetricsCmd))
 	}
-	a.log.Info("настройки перечитаны и применены", "log", diff.Log, "telemetry", diff.Telemetry,
+	a.log.Info("настройки перечитаны и применены", "log", diff.Log,
 		"workers", diff.Workers, "hello", diff.Hello || diff.Workers)
-	if diff.Workers {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			defer cancel()
-			a.fetchAgentWorkers(ctx, next)
-		}()
-	}
 	if diff.Hello || diff.Workers {
 		// hello несёт имя, метки и список воркеров: серверу нужен новый.
 		a.link.Reconnect()
@@ -109,9 +98,9 @@ func (a *App) Reload(next config.Config) {
 }
 
 // Serve — работать как служба до сигнала (§13): SIGTERM и SIGINT —
-// остановка (воркеры — по lifecycle.onAgentExit), SIGUSR1 (`agent restart`)
-// — выход для перезапуска менеджером службы (ErrRestart; воркеры — по
-// lifecycle.onAgentExit), SIGHUP — перечитать настройки из path.
+// остановка (воркеры работают дальше), SIGUSR1 (`agent restart`) — выход
+// для перезапуска менеджером службы (ErrRestart; воркеры работают дальше),
+// SIGHUP — перечитать настройки из path.
 func (a *App) Serve(path string) error {
 	a.configPath = path
 	if path != "" {

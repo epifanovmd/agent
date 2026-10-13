@@ -26,7 +26,6 @@ import (
 type workers struct {
 	client   *http.Client
 	running  bool
-	open     bool
 	manifest *message.WorkerManifest
 	// calls — запросы, дошедшие до воркера: метод и путь.
 	mu    sync.Mutex
@@ -40,7 +39,6 @@ var testManifest = &message.WorkerManifest{Version: "1", Routes: []message.Worke
 }, Jobs: []message.WorkerManifestJob{{Type: "example.build"}}}
 
 func (w *workers) Manifest(string) *message.WorkerManifest { return w.manifest }
-func (w *workers) OpenRoutes(string) bool                  { return w.open }
 
 func (w *workers) called() []string {
 	w.mu.Lock()
@@ -346,8 +344,7 @@ func TestFetchTimeoutCancelDisconnectBusy(t *testing.T) {
 // Маршруты — только из манифеста (§7): необъявленный путь или метод —
 // ROUTE_UNDECLARED без обращения к воркеру; {name} — один сегмент, query не
 // учитывается; задачи — только у воркера с jobs, тип POST /jobs — из
-// манифеста (JOB_UNKNOWN); GET /manifest — всегда; routes: open — любой путь,
-// кроме служебных.
+// манифеста (JOB_UNKNOWN); GET /manifest — всегда; служебные пути — никогда.
 func TestFetchRoutes(t *testing.T) {
 	w := testWorker(t)
 	tun := New(w, logx.Discard())
@@ -398,19 +395,9 @@ func TestFetchRoutes(t *testing.T) {
 		t.Fatalf("задачи без jobs: %+v", r)
 	}
 
-	// routes: open — любой путь и тип задачи, служебные — по-прежнему нет.
-	w.open = true
-	for id, f := range map[string]message.Fetch{
-		"open-hidden": {Method: "GET", Path: "/hidden"},
-		"open-job":    {Method: "POST", Path: "/jobs", Body: job("example.other")},
-	} {
-		tun.Handle(s, request(id, f))
-		if r := s.wait(t, id); endError(t, r[len(r)-1]) != nil || r[0].Type != message.TypeFetchHead {
-			t.Errorf("%s: %+v", id, r)
-		}
-	}
-	tun.Handle(s, request("open-metrics", message.Fetch{Path: "/metrics"}))
-	if r := s.wait(t, "open-metrics"); endError(t, r[0]).Code != message.CodePathForbidden {
-		t.Fatalf("служебный путь при routes: open: %+v", r)
+	// Служебный путь — запрещён.
+	tun.Handle(s, request("service", message.Fetch{Path: "/metrics"}))
+	if r := s.wait(t, "service"); endError(t, r[0]).Code != message.CodePathForbidden {
+		t.Fatalf("служебный путь: %+v", r)
 	}
 }

@@ -1,12 +1,10 @@
 // Package releases — каталог сборок (manifest.json и файлы сборок, §11): с
-// сервера, из релиза агента на GitHub или из локальной папки; установка
-// сборки воркера в его каталог <dataDir>/workers/<name>.
+// сервера, каталог сборок агента (релизы на GitHub, зеркало) или локальная
+// папка; установка сборки воркера в его каталог <dataDir>/workers/<name>.
 package releases
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -133,31 +131,8 @@ func IsArchive(rawURL string) bool {
 
 // fetch — сборка src (ссылка или локальный файл) в dst со сверкой sha256.
 func fetch(ctx context.Context, client *http.Client, src, dst, sha256hex string) error {
-	if remote(src) {
-		return update.Download(ctx, client, "", src, dst, sha256hex)
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(out, h), in); err != nil {
-		out.Close()
-		os.Remove(dst)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(dst)
-		return err
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); !update.SameHash(got, sha256hex) {
-		os.Remove(dst)
-		return fmt.Errorf("%s: sha256 не сходится: %s", filepath.Base(src), got)
+	if err := update.Download(ctx, client, "", src, dst, sha256hex); err != nil {
+		return fmt.Errorf("%s: %w", filepath.Base(src), err)
 	}
 	return nil
 }

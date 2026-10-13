@@ -112,25 +112,19 @@ func TestWorkerHealthAndCrash(t *testing.T) {
 	})
 }
 
-// keepChildren: с true дочерние процессы воркера переживают его перезапуск, без него —
-// завершаются вместе с ним.
-func TestKeepChildren(t *testing.T) {
+// Дочерние процессы воркера завершаются вместе с ним при перезапуске.
+func TestChildrenStopped(t *testing.T) {
 	t.Parallel()
 	s := newStand(t)
-	keep := s.worker("keep")
-	keep.Lifecycle.KeepChildren = true
-	s.start(s.config(keep, s.worker("plain")))
-	s.running("keep")
-	a := s.running("plain")
+	s.start(s.config(s.worker("w")))
+	a := s.running("w")
 
-	child := func(w string) int {
-		res := s.fetch(a.ID, w, "/child", testserver.FetchInit{Method: "POST"})
-		pid, err := strconv.Atoi(res.Body)
-		if err != nil {
-			t.Fatalf("%s /child: %+v", w, res)
-		}
-		return pid
+	res := s.fetch(a.ID, "w", "/child", testserver.FetchInit{Method: "POST"})
+	child, err := strconv.Atoi(res.Body)
+	if err != nil {
+		t.Fatalf("/child: %+v", res)
 	}
+	t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
 	alive := func(pid int) bool {
 		if syscall.Kill(pid, 0) != nil {
 			return false
@@ -139,17 +133,10 @@ func TestKeepChildren(t *testing.T) {
 		raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 		return err != nil || !containsState(string(raw), "Z")
 	}
-	kept, plain := child("keep"), child("plain")
-	t.Cleanup(func() { _ = syscall.Kill(kept, syscall.SIGKILL) })
-	for _, w := range []string{"keep", "plain"} {
-		if err := s.server.Action("restartWorker", a.ID, nil, w); err != nil {
-			t.Fatal(err)
-		}
+	if err := s.server.Action("restartWorker", a.ID, nil, "w"); err != nil {
+		t.Fatal(err)
 	}
-	eventually(t, "потомок воркера без keepChildren завершён", func() bool { return !alive(plain) })
-	if !alive(kept) {
-		t.Fatal("потомок воркера с keepChildren завершён при перезапуске")
-	}
+	eventually(t, "потомок воркера завершён", func() bool { return !alive(child) })
 }
 
 // containsState — состояние процесса в /proc/<pid>/stat (поле после имени в скобках).

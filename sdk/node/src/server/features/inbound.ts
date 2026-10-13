@@ -3,7 +3,6 @@
 // подтверждением по id.
 import type { Context } from "../core/context";
 import type { Session } from "../core/session";
-import { recheckAlerts } from "../model/alerts";
 import { changedKeys, reportedFromStatus } from "../model/config-report";
 import type { AgentRecord, MetricsPoint } from "../model/types";
 import {
@@ -146,7 +145,6 @@ export class Inbound {
     a.statusAt = now;
     a.configs = reportedFromStatus(before, st.value, now);
     const keys = changedKeys(before, a.configs);
-    const alerts = recheckAlerts(a, now);
 
     this.deps.statusSeen(a.id, st.value.workers);
 
@@ -154,7 +152,6 @@ export class Inbound {
       then: async agent => {
         this.ctx.emitAgent(agent);
         await this.deps.configsChanged(agent, keys);
-        this.ctx.emitAlerts(alerts);
       },
     };
   }
