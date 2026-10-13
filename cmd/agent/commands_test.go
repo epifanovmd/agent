@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/epifanovmd/agent/internal/app"
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // agent status: работает — версия, связь, воркеры, последняя ошибка связи;
@@ -21,21 +21,19 @@ func TestPrintStatus(t *testing.T) {
 	var out bytes.Buffer
 	printStatus(&out, statusReport{Running: true, DataDir: "/var/lib/agent", Status: &app.AgentStatus{
 		PID: 42, Version: "1.0.0", Name: "node-01", AgentID: "ag-1", Online: false, Server: "https://api.example.com",
-		StartedAt: now.Add(-3 * time.Hour).UnixMilli(), Outbox: 2,
-		Workers: []message.WorkerStatus{
-			{Name: "sysmetrics", State: message.WorkerRunning, Builtin: true},
-			{Name: "report", State: message.WorkerBackoff, Version: "1.2.0", Release: true, Restarts: 3,
-				Health: &message.Health{OK: false, Message: "нет связи"},
-				Configs: map[string]message.ConfigStatus{"main": {Version: 4, OK: &yes}, "limits": {Version: 2, OK: &no,
-					Error: message.NewError(message.CodeConfigRejected, "x")}}},
-		},
+		StartedAt: now.Add(-3 * time.Hour).UnixMilli(), State: protocol.State{Outbox: 2, DesiredRev: 7, Workers: []protocol.WorkerState{
+			{Name: "report", State: protocol.WorkerBackoff, Version: "1.2.0", Release: true, Restarts: 3,
+				Health: &protocol.Health{OK: false, Message: "нет связи"},
+				Configs: map[string]protocol.AppliedStatus{"main": {Version: 4, OK: &yes}, "limits": {Version: 2, OK: &no,
+					Error: protocol.NewError(protocol.CodeConfigRejected, "x")}}},
+		}},
 		LastError: "dial: connection refused", LastErrorAt: now.Add(-5 * time.Minute).UnixMilli(),
 	}}, now)
 	text := out.String()
 	for _, want := range []string{
 		"Агент работает: pid 42, версия 1.0.0, запущен 2026-01-02 12:00:00 (3 ч 0 мин назад)",
 		"node-01 (id ag-1)", "Связь:      нет — подключается к https://api.example.com",
-		"ждут подтверждения сервера: 2", "sysmetrics     running   встроенный",
+		"ждут подтверждения бэкенда: 2; желаемое rev 7",
 		"report         backoff   версия 1.2.0, сборка с сервера, перезапусков: 3, нездоров нет связи, limits v2 ошибка CONFIG_REJECTED, main v4 применено",
 		"Последняя ошибка связи или регистрации 2026-01-02 14:55:00 (5 мин назад):\n  dial: connection refused",
 	} {

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -26,9 +28,9 @@ import (
 	"github.com/epifanovmd/agent/internal/bundle"
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/install"
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/releases"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 func installCmd(args []string) error {
@@ -331,12 +333,19 @@ func printStatus(w io.Writer, rep statusReport, now time.Time) {
 		name += " (ещё не зарегистрирован)"
 	}
 	fmt.Fprintln(w, "Имя:       ", name)
-	if st.Online {
+	switch {
+	case st.Server == "":
+		fmt.Fprintln(w, "Связь:      без бэкенда — желаемое из файлов desired/")
+	case st.Revoked:
+		fmt.Fprintln(w, "Связь:      прекращена — агент отозван бэкендом", st.Server)
+	case st.Online:
 		fmt.Fprintln(w, "Связь:      есть —", st.Server)
-	} else {
+	default:
 		fmt.Fprintln(w, "Связь:      нет — подключается к", st.Server)
 	}
-	fmt.Fprintf(w, "Outbox:     важных сообщений ждут подтверждения сервера: %d\n", st.Outbox)
+	if st.Server != "" {
+		fmt.Fprintf(w, "Очередь:    итогов и событий ждут подтверждения бэкенда: %d; желаемое rev %d\n", st.Outbox, st.DesiredRev)
+	}
 	if len(st.Workers) > 0 {
 		fmt.Fprintln(w, "Воркеры:")
 		for _, wk := range st.Workers {
@@ -349,13 +358,10 @@ func printStatus(w io.Writer, rep statusReport, now time.Time) {
 	fmt.Fprintln(w, "Каталог данных:", rep.DataDir)
 }
 
-func workerNote(w message.WorkerStatus) string {
+func workerNote(w protocol.WorkerState) string {
 	var parts []string
 	if w.Version != "" {
 		parts = append(parts, "версия "+w.Version)
-	}
-	if w.Builtin {
-		parts = append(parts, "встроенный")
 	}
 	if w.Release {
 		parts = append(parts, "сборка с сервера")
@@ -413,9 +419,13 @@ func logs(args []string) error {
 	set := flag.NewFlagSet("logs", flag.ContinueOnError)
 	follow := set.Bool("f", false, "следить за новыми записями")
 	lines := set.Int("n", 100, "сколько последних записей показать")
+	name := set.String("worker", "", "последние записи журнала воркера (через локальный API агента)")
 	flagPath := configFlag(set)
 	if err := set.Parse(args); err != nil {
 		return err
+	}
+	if *name != "" {
+		return workerLogs(flagPath, *name, *lines)
 	}
 	l, err := flagPath.layout()
 	if err != nil {
@@ -443,4 +453,25 @@ func logs(args []string) error {
 		return errQuiet
 	}
 	return syscall.Exec(prog, argv, os.Environ())
+}
+
+// workerLogs — последние записи журнала воркера name из памяти агента.
+func workerLogs(t target, name string, lines int) error {
+	cfg, _, err := loadForTool(t)
+	if err != nil {
+		return err
+	}
+	c, err := app.NewAdmin(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("агент не работает: %w", err)
+	}
+	var res protocol.LogsResult
+	q := url.Values{"worker": {name}, "lines": {strconv.Itoa(lines)}}
+	if err := c.Do(context.Background(), http.MethodGet, "/logs?"+q.Encode(), nil, &res); err != nil {
+		return err
+	}
+	for _, e := range res.Entries {
+		fmt.Printf("%s %-5s %s\n", time.UnixMilli(e.At).Format("2006-01-02 15:04:05"), e.Level, e.Msg)
+	}
+	return nil
 }

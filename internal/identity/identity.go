@@ -22,13 +22,13 @@ import (
 	"time"
 
 	"github.com/epifanovmd/agent/internal/fsutil"
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 const fileName = "credentials.json"
 
 // Credentials — учётные данные агента. PendingSecret — новый секрет после
-// agent.rotateKey, ещё не признанный сервером (§10).
+// agent.rotateKey, ещё не признанный бэкендом (§4).
 type Credentials struct {
 	AgentID       string `json:"agentId"`
 	Secret        string `json:"secret"`
@@ -107,10 +107,10 @@ func (e *RateLimited) Error() string {
 	return fmt.Sprintf("identity: регистрация: много попыток, повтор через %s", e.After)
 }
 
-// Enroll — обменять токен регистрации на ключ агента (§2).
-func Enroll(ctx context.Context, client *http.Client, baseURL string, req message.Enroll) (Credentials, error) {
+// Enroll — обменять токен регистрации на ключ агента (§4).
+func Enroll(ctx context.Context, client *http.Client, baseURL string, req protocol.Enroll) (Credentials, error) {
 	body, _ := json.Marshal(req)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+message.EnrollPath, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+protocol.BackendPrefix+protocol.PathEnroll, bytes.NewReader(body))
 	if err != nil {
 		return Credentials{}, err
 	}
@@ -121,11 +121,11 @@ func Enroll(ctx context.Context, client *http.Client, baseURL string, req messag
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var e message.ErrorInfo
+	var e protocol.ErrorInfo
 	_ = json.Unmarshal(raw, &e)
 	switch {
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
-		var r message.EnrollResult
+		var r protocol.EnrollReply
 		if err := json.Unmarshal(raw, &r); err != nil || r.AgentID == "" || r.Secret == "" {
 			// Тело не выводится: в нём может быть секрет агента.
 			return Credentials{}, fmt.Errorf("identity: неожиданный ответ регистрации (HTTP %d, %d байт)", resp.StatusCode, len(raw))

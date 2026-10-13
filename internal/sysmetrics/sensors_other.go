@@ -14,7 +14,7 @@ func temperatures(ctx context.Context) ([]sensors.TemperatureStat, error) {
 	return sensors.TemperaturesWithContext(ctx)
 }
 
-// PrintSensors — на этой системе датчики читаются в процессе воркера.
+// PrintSensors — на этой системе датчики читаются в процессе агента.
 func PrintSensors(context.Context) error {
 	return errors.New("команда нужна только на macOS")
 }

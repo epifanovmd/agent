@@ -22,8 +22,8 @@ import (
 	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // fake — узел для установки: каталог вместо корня, программы записываются.
@@ -243,9 +243,9 @@ func TestInstallUninstall(t *testing.T) {
 	if err := Uninstall(ctx, s, "", false, ""); err != nil {
 		t.Fatal(err)
 	}
-	cleanup := "[agent] " + filepath.Join(f.root, Binary) + " cleanup -config /etc/agent/agent.yaml"
-	f.ran(t, "systemctl disable --now agent.service", cleanup, "systemctl daemon-reload", "sysctl -q -w vm.max_map_count=65530")
-	if env := f.envs[cleanup]; !slices.Contains(env, "AGENT_ENROLL_TOKEN=tok2") {
+	stop := "[agent] " + filepath.Join(f.root, Binary) + " stop-workers --cleanup -config /etc/agent/agent.yaml"
+	f.ran(t, "systemctl disable --now agent.service", stop, "systemctl daemon-reload", "sysctl -q -w vm.max_map_count=65530")
+	if env := f.envs[stop]; !slices.Contains(env, "AGENT_ENROLL_TOKEN=tok2") {
 		t.Errorf("уборка без agent.env: %v", env)
 	}
 	for _, p := range []string{UnitFile, OptDir, Link, SysctlFile} {
@@ -264,7 +264,7 @@ func TestInstallUninstall(t *testing.T) {
 	if err := Uninstall(ctx, s, "", true, self); err != nil {
 		t.Fatal(err)
 	}
-	f.ran(t, "[agent] "+self+" cleanup -config /etc/agent/agent.yaml", "apt-get remove -y -qq curl", "userdel agent")
+	f.ran(t, "[agent] "+self+" stop-workers --cleanup -config /etc/agent/agent.yaml", "apt-get remove -y -qq curl", "userdel agent")
 	if f.exists(EtcDir) || f.exists(DataDir) {
 		t.Fatal("--purge: настройки и данные")
 	}
@@ -283,6 +283,13 @@ func TestInstallPrivileged(t *testing.T) {
 	unit := f.read(t, UnitFile)
 	if !strings.Contains(unit, "User=root\n") || strings.Contains(unit, "ProtectSystem") {
 		t.Fatalf("служба:\n%s", unit)
+	}
+	// Повторная установка без --privileged права службы не понижает.
+	if err := Install(ctx, s, Options{Binary: binary(t, "v2")}); err != nil {
+		t.Fatal(err)
+	}
+	if unit := f.read(t, UnitFile); !strings.Contains(unit, "User=root\n") {
+		t.Fatalf("повторная установка понизила права:\n%s", unit)
 	}
 	if f.read(t, ConfigFile) != "server:\n  url: https://api.example.com\n# своё\n" || f.read(t, EnvFile) != "AGENT_ENROLL_TOKEN=tok\n" {
 		t.Fatal("--config, --token-file")
@@ -398,7 +405,7 @@ func TestInstances(t *testing.T) {
 	}
 	f.ran(t, "systemctl disable --now agent-b.service", "apt-get remove -y -qq jq curl",
 		"sysctl -q -w vm.max_map_count=65530", "userdel agent-b",
-		"[agent-b] "+filepath.Join(f.root, l.Binary)+" cleanup -config /etc/agent-b/agent.yaml")
+		"[agent-b] "+filepath.Join(f.root, l.Binary)+" stop-workers --cleanup -config /etc/agent-b/agent.yaml")
 	for _, p := range []string{l.EtcDir, l.OptDir, l.DataDir, l.UnitFile, l.Link, l.SysctlFile} {
 		if f.exists(p) {
 			t.Errorf("%s остался", p)
@@ -471,16 +478,16 @@ func TestInstallWorkers(t *testing.T) {
 			"bin/report": "#!/bin/sh\n", "lib/x.py": "x",
 		}),
 	}
-	entry := func(name, version, file, command string) message.WorkerArtifact {
+	entry := func(name, version, file, command string) protocol.WorkerArtifact {
 		sum := sha256.Sum256(files[file])
 		hexSum := hex.EncodeToString(sum[:])
-		return message.WorkerArtifact{
+		return protocol.WorkerArtifact{
 			Name: name, Version: version, OS: "linux", Arch: "amd64", File: file, SHA256: hexSum, Command: command,
 			Signature:   update.Sign(priv, update.Build{Name: name, Version: version, OS: "linux", Arch: "amd64", SHA256: hexSum}),
 			StopTimeout: map[bool]string{true: "45s"}[name == "collector"],
 		}
 	}
-	manifest := message.Manifest{Version: "1.0.0", Workers: []message.WorkerArtifact{
+	manifest := protocol.Manifest{Version: "1.0.0", Workers: []protocol.WorkerArtifact{
 		entry("collector", "1.0.0", "collector-1.0.0-linux-amd64", ""),
 		entry("collector", "1.2.0", "collector-1.2.0-linux-amd64", ""),
 		entry("report", "2.0.0", "report-2.0.0-linux-amd64.tar.gz", "bin/report"),
@@ -519,18 +526,30 @@ func TestInstallWorkers(t *testing.T) {
 		t.Fatalf("agent.yaml: %+v %v", cfg.Workers, err)
 	}
 
-	// Готовый agent.yaml не меняется — подсказка; чужая подпись — ошибка.
+	// Готовый agent.yaml: новый воркер дописывается в workers (комментарии и прочие ключи
+	// остаются, прежний файл — .bak), уже описанный не трогается.
 	f.out.Reset()
-	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n"), 0o644)
+	own := "# свои настройки\nserver:\n  url: " + srv.URL + "\n  allowInsecure: true\nworkers:\n  - name: mine # своё\n    command: [/bin/true]\n"
+	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte(own), 0o644)
 	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKeys: []string{key}, Workers: []string{"collector"}, Server: srv.URL}); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(f.out.String(), "server.url") {
 		t.Fatalf("адрес тот же — без подсказки:\n%s", f.out.String())
 	}
-	if !strings.Contains(f.out.String(), "  - name: collector\n    release: true") {
-		t.Fatalf("подсказка:\n%s", f.out.String())
+	got := f.read(t, ConfigFile)
+	cfg, err = config.Load(filepath.Join(f.root, ConfigFile))
+	if err != nil || len(cfg.Workers) != 2 || cfg.Workers[0].Name != "mine" || cfg.Workers[1].Name != "collector" || !cfg.Workers[1].Release ||
+		!strings.Contains(got, "# свои настройки") || !strings.Contains(got, "# своё") || f.read(t, ConfigFile+".bak") != own {
+		t.Fatalf("воркер дописан:\n%s\n%v", got, err)
 	}
+	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKeys: []string{key}, Workers: []string{"collector"}, Server: srv.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if f.read(t, ConfigFile) != got {
+		t.Fatal("уже описанный воркер — файл не меняется")
+	}
+	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n"), 0o644)
 	// Повторная установка без --server: адрес — из agent.yaml, затем из agent.env.
 	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKeys: []string{key}, Workers: []string{"collector"}}); err != nil {
 		t.Fatalf("адрес из agent.yaml: %v", err)
@@ -542,6 +561,12 @@ func TestInstallWorkers(t *testing.T) {
 	}
 	_ = os.Remove(filepath.Join(f.root, EnvFile))
 	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n"), 0o644)
+	// Та же версия уже стоит — сборка не скачивается и не меняется.
+	if !strings.Contains(f.out.String(), "Воркер collector 1.2.0 уже стоит") {
+		t.Fatalf("повторная установка той же версии:\n%s", f.out.String())
+	}
+	// Дальше — как будто стоит старая версия: сборка ставится заново и проверяется.
+	_ = os.WriteFile(filepath.Join(f.root, dir, "collector/version"), []byte("1.0.0\n"), 0o644)
 	other, _, _ := ed25519.GenerateKey(rand.Reader)
 	err = Install(ctx, s, Options{Binary: o.Binary, Server: srv.URL, PublicKeys: []string{base64.StdEncoding.EncodeToString(other)}, Workers: []string{"collector"}})
 	if err == nil || !strings.Contains(err.Error(), "подпись") {
@@ -637,7 +662,7 @@ func TestInstallWorkersAbsoluteURL(t *testing.T) {
 		_, _ = w.Write(body)
 	}))
 	defer cdn.Close()
-	manifest := message.Manifest{Version: "1.0.0", Workers: []message.WorkerArtifact{{
+	manifest := protocol.Manifest{Version: "1.0.0", Workers: []protocol.WorkerArtifact{{
 		Name: "probe", Version: "2.0.0", OS: "linux", Arch: "amd64", File: cdn.URL + "/download/v2.0.0/probe-2.0.0-linux-amd64", SHA256: hexSum,
 		Signature: update.Sign(project, update.Build{Name: "probe", Version: "2.0.0", OS: "linux", Arch: "amd64", SHA256: hexSum}),
 	}}}
@@ -656,6 +681,7 @@ func TestInstallWorkersAbsoluteURL(t *testing.T) {
 		t.Fatalf("agent.env: %q", f.read(t, EnvFile))
 	}
 	o.PublicKeys = []string{enc(authorPub)}
+	_ = os.WriteFile(filepath.Join(f.root, DataDir, "workers/probe/version"), []byte("0.1.0\n"), 0o644)
 	if err := Install(ctx, s, o); err == nil || !strings.Contains(err.Error(), "подпись") {
 		t.Fatalf("подпись ключом, которого нет: %v", err)
 	}

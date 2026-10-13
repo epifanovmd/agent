@@ -1,8 +1,7 @@
-# Публикация версии по тегу v*: проверки → подписанные сборки агента (scripts/release.sh) и архив
-# серверного SDK (npm pack) → один GitHub Release — каталог сборок агента по умолчанию
-# (update.releases): агенты находят новую версию в нём сами. Образы в GHCR: agent:<версия> (минимальный),
-# agent:<версия>-python (с python3 для воркеров), agent-dist:<версия>. Всё ставится с GitHub —
-# без npm. Тег с «-» (v1.2.0-rc.1) — предварительная версия.
+# Публикация версии по тегу v*: проверки → подписанные сборки агента (scripts/release.sh) → GitHub
+# Release — каталог сборок агента по умолчанию (update.releases): агенты находят новую версию в
+# нём сами. Образы в GHCR: agent:<версия> (минимальный), agent:<версия>-python (с python3 для
+# воркеров), agent-dist:<версия>. Тег с «-» (v1.2.0-rc.1) — предварительная версия.
 # Нужны в настройках репозитория (пара ключей — docs/ARCHITECTURE.md, «Ключи подписи»):
 #   секрет AGENT_SIGNING_KEY — закрытый ключ подписи (base64 seed Ed25519);
 #   переменная AGENT_UPDATE_PUBLIC_KEY — открытый ключ (base64): вшивается в сборки агента,
@@ -17,34 +16,24 @@ permissions:
   contents: read
 
 jobs:
-  # То же, что make vet, race, sdk-test, examples-test, e2e, — и версия совпадает с тегом.
+  # То же, что make vet, race, examples-test, e2e, — и версия совпадает с тегом.
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Версия совпадает с тегом и везде одинаковая
+      - name: Версия совпадает с тегом
         run: test "v$(cat VERSION)" = "$GITHUB_REF_NAME" && scripts/version.sh check
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "24"
-      - name: SDK Node
-        working-directory: sdk/node
-        run: npm ci && npm run lint && npm run typecheck && npm test && npm run build
-      - name: Примеры
-        run: |
-          (cd examples/server && npm ci && npm run lint && npm run typecheck)
-          node --check examples/workers/node-echo/main.mjs
-          python3 -m py_compile examples/workers/echo/main.py
-      - run: go vet ./...
+      - name: Синтаксис примеров на Python
+        run: python3 -c 'import ast, sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' examples/workers/echo/main.py examples/server/server.py
+      - run: go vet -tags e2e ./...
       - name: Известные уязвимости (код и стандартная библиотека Go)
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-      # Агент, образцы сообщений, integration (сервер на agent-sdk/server).
       - run: go test -race ./...
-      - name: Сквозные тесты стенда
-        run: scripts/e2e.sh
+      - name: Сквозные тесты
+        run: go test -tags e2e -count=1 -timeout 10m ./test/e2e/
 
   # Сборки агента linux/darwin × amd64/arm64 (agent-<os>-<arch>), manifest.json с подписями и
   # его publicKey, install.sh.
@@ -72,29 +61,9 @@ jobs:
           path: out/*
           if-no-files-found: error
 
-  # Серверный SDK — архив npm (agent-sdk-<версия>.tgz, с собранным dist).
-  sdk:
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "24"
-      - name: SDK Node
-        working-directory: sdk/node
-        run: |
-          npm ci && npm run lint && npm run typecheck && npm test
-          mkdir -p ../../out && npm pack --pack-destination ../../out
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: sdk
-          path: out/*
-          if-no-files-found: error
-
   publish:
     runs-on: ubuntu-latest
-    needs: [build, sdk]
+    needs: build
     permissions:
       contents: write
     steps:
@@ -102,10 +71,6 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agent
-          path: out
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: sdk
           path: out
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:

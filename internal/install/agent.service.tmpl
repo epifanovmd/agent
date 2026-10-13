@@ -4,13 +4,17 @@
 */ -}}
 [Unit]
 Description=Agent{{ with .Paths.Instance }} {{ . }}{{ end }}
+# Перезапуск без предела числа попыток.
+StartLimitIntervalSec=0
 {{- if not .Paths.Home }}
 Wants=network-online.target
 After=network-online.target
 {{- end }}
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
 {{- if not .Paths.Home }}
 User={{ .User }}
 {{- end }}
@@ -21,7 +25,6 @@ ExecStart={{ .Paths.Binary }} run -config {{ .Paths.ConfigFile }}
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=0
 KillMode=process
 TimeoutStopSec=15min
 {{- if .Paths.Home }}

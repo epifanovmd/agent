@@ -15,8 +15,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // folder — папка агента: agent.yaml (воркер из папки), agent.prod.yaml поверх,
@@ -92,7 +92,7 @@ func TestPack(t *testing.T) {
 	if info.Version != "1.2.0" || info.Config != "agent.prod.yaml" || info.Env != "prod" || !slices.Equal(info.Workers, []string{"echo"}) || len(info.PublicKeys) != 1 {
 		t.Fatalf("bundle.json: %+v", info)
 	}
-	var m message.Manifest
+	var m protocol.Manifest
 	raw, _ = os.ReadFile(filepath.Join(root, "release/manifest.json"))
 	_ = json.Unmarshal(raw, &m)
 	echo := m.Worker("echo", runtime.GOOS, runtime.GOARCH)
@@ -106,7 +106,7 @@ func TestPack(t *testing.T) {
 	}
 
 	// Общий каталог сборок для бэкенда — только воркеры из папки, подписанные.
-	var sm message.Manifest
+	var sm protocol.Manifest
 	raw, _ = os.ReadFile(filepath.Join(shared, "manifest.json"))
 	_ = json.Unmarshal(raw, &sm)
 	if len(sm.Workers) != 1 || sm.Workers[0].Name != "echo" || sm.Workers[0].Signature == "" || sm.PublicKey == "" {
@@ -149,7 +149,7 @@ func TestPackOtherPlatform(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/download/v1.2.0/manifest.json":
-			_ = json.NewEncoder(w).Encode(message.Manifest{Version: "1.2.0", Artifacts: []message.Artifact{
+			_ = json.NewEncoder(w).Encode(protocol.Manifest{Version: "1.2.0", Artifacts: []protocol.Artifact{
 				{OS: other.OS, Arch: other.Arch, File: "agent-" + other.OS + "-" + other.Arch, SHA256: hash, Signature: signature},
 			}})
 		case "/download/v1.2.0/agent-" + other.OS + "-" + other.Arch:
@@ -228,7 +228,7 @@ func TestPackBuildAndIgnore(t *testing.T) {
 	if v, _ := os.ReadFile(filepath.Join(root, "workers/gow/VERSION")); strings.TrimSpace(string(v)) != "2.0.0" {
 		t.Fatalf("VERSION сборки: %q", v)
 	}
-	var m message.Manifest
+	var m protocol.Manifest
 	raw, _ := os.ReadFile(filepath.Join(root, "release/manifest.json"))
 	_ = json.Unmarshal(raw, &m)
 	gow := m.Worker("gow", runtime.GOOS, runtime.GOARCH)

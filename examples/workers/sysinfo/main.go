@@ -1,15 +1,11 @@
 //go:build unix
 
-// Пример воркера на Go без SDK: HTTP-сервис на unix-сокете AGENT_WORKER_SOCKET
-// (sdk/spec §12).
+// Пример воркера на Go с клиентом github.com/epifanovmd/agent/worker (docs/PROTOCOL.md, §11–§17):
 //
-//   - GET /info — сведения о процессе и баннер (запрос сервера fetch);
-//   - PUT /config/banner {version, data: {text}} — баннер; DELETE /config/banner — сброс;
-//   - GET /metrics — горутины, память, аптайм;
-//   - GET /health — {ok, info: {version}};
-//   - POST /cleanup — уборка перед удалением агента: сброс баннера;
-//   - GET /manifest — что воркер умеет: версия, ключ banner со схемой, маршрут, событие;
-//   - событие sys.started через сокет агента после запуска.
+//   - настройка banner {text} — текст в итоге команды sys.info;
+//   - команда sys.info — процесс, узел, версия, баннер;
+//   - событие sys.started после запуска;
+//   - метрики процесса (горутины, память, время работы) — в пульсе.
 //
 // Запускает агент (workers). Сборка под эту машину (Go — в контейнере):
 //
@@ -21,17 +17,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	goruntime "runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/epifanovmd/agent/protocol"
+	"github.com/epifanovmd/agent/worker"
 )
 
 // version — версия воркера; сборка может задать свою: -ldflags "-X main.version=…".
@@ -40,153 +35,90 @@ var version = "1.0.0"
 // maxBanner — длина баннера, символов.
 const maxBanner = 200
 
-// manifest — самоописание воркера (sdk/spec §12).
-var manifest = map[string]any{
-	"version":     version,
-	"description": "Сведения о процессе воркера и баннер",
-	"configs": []any{map[string]any{
-		"key":         "banner",
-		"description": "Текст баннера в ответе GET /info",
-		"schema": map[string]any{
-			"type":                 "object",
-			"properties":           map[string]any{"text": map[string]any{"type": "string", "maxLength": maxBanner}},
-			"additionalProperties": false,
-		},
-	}},
-	"routes": []any{map[string]any{"method": "GET", "path": "/info", "description": "Процесс, узел и баннер",
-		"response": map[string]any{"type": "object", "properties": map[string]any{
-			"pid": map[string]any{"type": "integer"}, "host": map[string]any{"type": "string"},
-			"version": map[string]any{"type": "string"}, "banner": map[string]any{"type": "string"},
-		}},
-	}},
-	"events": []any{map[string]any{"type": "sys.started", "description": "Воркер запущен",
-		"schema": map[string]any{"type": "object"}}},
+func schema(raw string) json.RawMessage { return json.RawMessage(raw) }
+
+// manifest — что воркер умеет (§13).
+var manifest = protocol.WorkerManifest{
+	Description: "Сведения о процессе воркера и баннер",
+	Configs: []protocol.ManifestConfig{{Key: "banner", Description: "Текст баннера в итоге sys.info",
+		Schema: schema(fmt.Sprintf(`{"type":"object","properties":{"text":{"type":"string","maxLength":%d}},"additionalProperties":false}`, maxBanner))}},
+	Commands: []protocol.ManifestCommand{{Type: "sys.info", Description: "Процесс, узел и баннер",
+		Schema: schema(`{"type":"object"}`),
+		Result: schema(`{"type":"object","properties":{"pid":{"type":"integer"},"host":{"type":"string"},"version":{"type":"string"},"banner":{"type":"string"}}}`)}},
+	Events: []protocol.ManifestEvent{{Type: "sys.started", Description: "Воркер запущен", Schema: schema(`{"type":"object"}`)}},
 }
 
 type sysinfo struct {
 	started time.Time
 	mu      sync.Mutex
 	banner  string
-	applied int64
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func (s *sysinfo) handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /info", func(w http.ResponseWriter, _ *http.Request) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		host, _ := os.Hostname()
-		writeJSON(w, http.StatusOK, map[string]any{
-			"pid": os.Getpid(), "host": host, "go": goruntime.Version(), "version": version,
-			"banner": s.banner, "bannerVersion": s.applied,
-		})
-	})
-	mux.HandleFunc("PUT /config/banner", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Version int64 `json:"version"`
-			Data    struct {
-				Text string `json:"text"`
-			} `json:"data"`
+// configure — ключ banner: {text} не длиннее maxBanner; удалён — пустой баннер.
+func (s *sysinfo) configure(_ context.Context, key string, data json.RawMessage) error {
+	if key != "banner" {
+		return nil
+	}
+	var v struct {
+		Text string `json:"text"`
+	}
+	if data != nil {
+		if err := json.Unmarshal(data, &v); err != nil {
+			return protocol.NewError(protocol.CodeConfigRejected, "banner: нужен объект {text}")
 		}
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"message": err.Error()})
-			return
+		if utf8.RuneCountInString(v.Text) > maxBanner {
+			return protocol.NewError(protocol.CodeConfigRejected, fmt.Sprintf("banner.text: не длиннее %d символов", maxBanner))
 		}
-		if utf8.RuneCountInString(body.Data.Text) > maxBanner {
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"message": fmt.Sprintf("text: не длиннее %d символов", maxBanner)})
-			return
-		}
-		s.mu.Lock()
-		s.banner, s.applied = body.Data.Text, body.Version
-		s.mu.Unlock()
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("DELETE /config/banner", func(w http.ResponseWriter, _ *http.Request) {
-		s.reset()
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
-		var m goruntime.MemStats
-		goruntime.ReadMemStats(&m)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"goroutines": goruntime.NumGoroutine(), "heapBytes": m.HeapAlloc, "uptimeSec": int(time.Since(s.started).Seconds()),
-		})
-	})
-	mux.HandleFunc("GET /manifest", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, manifest)
-	})
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "info": map[string]string{"version": version}})
-	})
-	mux.HandleFunc("POST /cleanup", func(w http.ResponseWriter, _ *http.Request) {
-		s.reset()
-		w.WriteHeader(http.StatusNoContent)
-	})
-	return mux
-}
-
-func (s *sysinfo) reset() {
+	}
 	s.mu.Lock()
-	s.banner, s.applied = "", 0
+	s.banner = v.Text
 	s.mu.Unlock()
-}
-
-// event — событие серверу через сокет агента (POST /events).
-func event(typ string, data any) error {
-	agent := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", os.Getenv("AGENT_SOCKET"))
-		}}}
-	body, _ := json.Marshal(map[string]any{"type": typ, "data": data})
-	req, _ := http.NewRequest(http.MethodPost, "http://agent/events", strings.NewReader(string(body)))
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("AGENT_WORKER_TOKEN"))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := agent.Do(req)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("POST /events: HTTP %d", resp.StatusCode)
-	}
 	return nil
 }
 
+func (s *sysinfo) info(context.Context, *worker.Call) (any, error) {
+	host, _ := os.Hostname()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return map[string]any{"pid": os.Getpid(), "host": host, "version": version, "go": goruntime.Version(), "banner": s.banner}, nil
+}
+
+func (s *sysinfo) health() protocol.Health {
+	var mem goruntime.MemStats
+	goruntime.ReadMemStats(&mem)
+	metrics, _ := json.Marshal(map[string]any{
+		"goroutines": goruntime.NumGoroutine(), "heapBytes": mem.HeapAlloc,
+		"uptimeSec": int(time.Since(s.started).Seconds()),
+	})
+	return protocol.Health{OK: true, Metrics: metrics}
+}
+
 func main() {
-	socket := os.Getenv("AGENT_WORKER_SOCKET")
-	if socket == "" {
-		fmt.Fprintln(os.Stderr, "sysinfo: нет AGENT_WORKER_SOCKET — воркер запускает агент")
-		os.Exit(2)
+	s := &sysinfo{started: time.Now()}
+	w, err := worker.New(worker.Options{
+		Version: version, Manifest: manifest, Configure: s.configure, Health: s.health,
+		Commands: map[string]worker.CommandFunc{"sys.info": s.info},
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sysinfo:", err)
+		os.Exit(1)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	s := &sysinfo{started: time.Now()}
-	_ = os.Remove(socket)
-	ln, err := net.Listen("unix", socket)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "sysinfo:", err)
-		os.Exit(2)
-	}
-	srv := &http.Server{Handler: s.handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
-		<-ctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(sctx)
-	}()
-	go func() {
-		if err := event("sys.started", map[string]any{"pid": os.Getpid(), "version": version}); err != nil {
-			fmt.Fprintln(os.Stderr, "sysinfo: событие не отправлено:", err)
+		// Событие — когда агент примет (он может ещё запускаться).
+		for ctx.Err() == nil {
+			err := w.Emit(ctx, "sys.started", map[string]any{"pid": os.Getpid(), "version": version})
+			var ei *protocol.ErrorInfo
+			if err == nil || errors.As(err, &ei) && ei.Code == protocol.CodeEventUndeclared {
+				return
+			}
+			time.Sleep(time.Second)
 		}
 	}()
-	if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+	fmt.Println("sysinfo", version, "запущен")
+	if err := w.Run(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "sysinfo:", err)
-		os.Exit(2)
+		os.Exit(1)
 	}
 }

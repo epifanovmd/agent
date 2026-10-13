@@ -10,7 +10,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,7 +19,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // Duration — длительность в YAML строкой: "30s", "10m".
@@ -98,8 +97,11 @@ type Outbox struct {
 }
 
 type Server struct {
-	// URL бэкенда: https://api.example.com.
+	// URL бэкенда: https://api.example.com; пусто — работа без бэкенда.
 	URL string `yaml:"url"`
+	// AllowInsecure — разрешить http:// (стенд, локальная сеть): ключ агента и данные идут
+	// открытым текстом.
+	AllowInsecure bool `yaml:"allowInsecure"`
 	// CAFile — PEM с корневыми сертификатами в дополнение к системным.
 	CAFile string `yaml:"caFile"`
 }
@@ -140,7 +142,7 @@ type Update struct {
 	// (<адрес>/latest/download/…, <адрес>/download/v<версия>/…): адрес http(s)://
 	// или абсолютный путь к папке; пусто — релизы агента на GitHub.
 	Releases string `yaml:"releases,omitempty"`
-	// CheckInterval — как часто проверять новую версию в каталоге сборок (§11);
+	// CheckInterval — как часто проверять новую версию в каталоге сборок (§10);
 	// nil — DefaultCheckInterval, 0s — не проверять.
 	CheckInterval *Duration `yaml:"checkInterval,omitempty"`
 }
@@ -168,10 +170,7 @@ func (u Update) Keys() []string {
 	return out
 }
 
-// SysmetricsWorker — имя встроенного воркера метрик узла; в workers это имя занято.
-const SysmetricsWorker = message.BuiltinSysmetrics
-
-// Worker — воркер: HTTP-сервис на unix-сокете, который запускает агент.
+// Worker — воркер: процесс, который запускает агент; с агентом он говорит через его сокет.
 type Worker struct {
 	Name    string   `yaml:"name"`
 	Command []string `yaml:"command"`
@@ -188,13 +187,11 @@ type Worker struct {
 	// Path — папка воркера (путь — от файла настроек): агент запускает в ней
 	// command, по умолчанию ./run; имя по умолчанию — имя папки.
 	Path string `yaml:"path,omitempty"`
-	// Lifecycle — остановка воркера (§13); изменение применяется без
+	// Lifecycle — установка зависимостей и остановка воркера (§11); изменение применяется без
 	// перезапуска воркера.
 	Lifecycle Lifecycle `yaml:"lifecycle"`
 	// ReleaseDir — <dataDir>/workers/<name>; заполняет Validate для release.
 	ReleaseDir string `yaml:"-"`
-	// Builtin — встроенный воркер агента (sysmetrics), в agent.yaml его нет.
-	Builtin bool `yaml:"-"`
 }
 
 // Файлы сборки воркера в его каталоге ReleaseDir.
@@ -205,22 +202,35 @@ const (
 	ReleasePreviousVersion = "previous.version"
 	// ReleaseRun — что запускать в сборке-архиве, если command не задан.
 	ReleaseRun = "run"
+	// Setup — установка зависимостей воркера: исполняемый файл в его рабочем каталоге (каталог
+	// сборки-архива или папка воркера); агент выполняет его один раз до запуска воркера.
+	Setup = "setup"
+	// Cleanup — уборка воркера перед удалением агента: исполняемый файл в рабочем каталоге
+	// воркера; его выполняет agent uninstall (agent stop-workers --cleanup).
+	Cleanup = "cleanup"
 )
 
-// Lifecycle — остановка воркера (§13).
+// Lifecycle — установка зависимостей и остановка воркера (§11).
 type Lifecycle struct {
-	// StopTimeout — сколько ждать выхода после SIGTERM, потом SIGKILL; ещё
-	// — срок POST /cleanup. 0 — DefaultStopTimeout.
+	// StopTimeout — сколько ждать выхода после SIGTERM, потом SIGKILL. 0 — DefaultStopTimeout.
 	StopTimeout Duration `yaml:"stopTimeout"`
+	// SetupTimeout — срок ./setup (установка зависимостей). 0 — DefaultSetupTimeout.
+	SetupTimeout Duration `yaml:"setupTimeout"`
 }
 
-// DefaultStopTimeout — lifecycle.stopTimeout по умолчанию.
-const DefaultStopTimeout = 30 * time.Second
+// Сроки lifecycle по умолчанию.
+const (
+	DefaultStopTimeout  = 30 * time.Second
+	DefaultSetupTimeout = 10 * time.Minute
+)
 
 // FillDefaults — значения по умолчанию незаданных полей воркера.
 func (w *Worker) FillDefaults() {
 	if w.Lifecycle.StopTimeout <= 0 {
 		w.Lifecycle.StopTimeout = Duration(DefaultStopTimeout)
+	}
+	if w.Lifecycle.SetupTimeout <= 0 {
+		w.Lifecycle.SetupTimeout = Duration(DefaultSetupTimeout)
 	}
 }
 
@@ -237,8 +247,8 @@ func Defaults() Config {
 		DataDir: DefaultDataDir(),
 		Name:    host,
 		Labels:  map[string]string{},
-		Log:     Log{Level: "info", Format: "text", Forward: message.LogWarn, Buffer: message.MaxLogLines},
-		Outbox:  Outbox{MaxMessages: message.MaxOutbox},
+		Log:     Log{Level: "info", Format: "text", Forward: protocol.LogWarn, Buffer: protocol.MaxLogLines},
+		Outbox:  Outbox{MaxMessages: protocol.MaxOutbox},
 		Update:  Update{Mode: UpdateSelf},
 	}
 }
@@ -275,12 +285,16 @@ func (c *Config) Validate() error {
 	for _, e := range c.envErrs {
 		errs = append(errs, errors.New(e))
 	}
-	if addr := c.Server.URL; addr == "" {
-		errs = append(errs, errors.New("server.url (AGENT_SERVER_URL): нужен адрес http(s)://"))
-	} else if u, err := url.Parse(addr); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		errs = append(errs, fmt.Errorf("server.url (AGENT_SERVER_URL): %q — нужен адрес http(s)://", addr))
+	if addr := c.Server.URL; addr != "" {
+		u, err := url.Parse(addr)
+		switch {
+		case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
+			errs = append(errs, fmt.Errorf("server.url (AGENT_SERVER_URL): %q — нужен адрес https://", addr))
+		case u.Scheme == "http" && !c.Server.AllowInsecure:
+			errs = append(errs, fmt.Errorf("server.url (AGENT_SERVER_URL): %q — без шифрования; нужен https:// или server.allowInsecure: true (AGENT_SERVER_ALLOW_INSECURE)", addr))
+		}
 	}
-	if !slices.Contains([]string{"off", message.LogError, message.LogWarn, message.LogInfo, message.LogDebug}, c.Log.Forward) {
+	if !slices.Contains([]string{"off", protocol.LogError, protocol.LogWarn, protocol.LogInfo, protocol.LogDebug}, c.Log.Forward) {
 		errs = append(errs, fmt.Errorf("log.forward (AGENT_LOG_FORWARD): off | error | warn | info | debug, а не %q", c.Log.Forward))
 	}
 	if !slices.Contains([]string{UpdateSelf, UpdateExternal, UpdateDisabled}, c.Update.Mode) {
@@ -297,19 +311,19 @@ func (c *Config) Validate() error {
 	if n := c.Outbox.MaxMessages; n < 1 || n > 1_000_000 {
 		errs = append(errs, fmt.Errorf("outbox.maxMessages (AGENT_OUTBOX_MAX_MESSAGES): от 1 до 1000000, а не %d", n))
 	}
-	if n := c.Log.Buffer; n < 100 || n > message.MaxLogLines {
-		errs = append(errs, fmt.Errorf("log.buffer (AGENT_LOG_BUFFER): от 100 до %d, а не %d", message.MaxLogLines, n))
+	if n := c.Log.Buffer; n < 100 || n > protocol.MaxLogLines {
+		errs = append(errs, fmt.Errorf("log.buffer (AGENT_LOG_BUFFER): от 100 до %d, а не %d", protocol.MaxLogLines, n))
 	}
 	if c.DataDir == "" {
 		errs = append(errs, errors.New("dataDir (AGENT_DATA_DIR) обязателен"))
 	}
-	if !message.ValidAgentName(c.Name) {
-		errs = append(errs, fmt.Errorf("name (AGENT_NAME): непустое, до %d символов", message.MaxAgentName))
+	if !protocol.ValidAgentName(c.Name) {
+		errs = append(errs, fmt.Errorf("name (AGENT_NAME): непустое, до %d символов", protocol.MaxAgentName))
 	}
-	if err := message.CheckLabels(c.Labels); err != nil {
+	if err := protocol.CheckLabels(c.Labels); err != nil {
 		errs = append(errs, fmt.Errorf("labels (AGENT_LABELS): %w", err))
 	}
-	if c.Instance != "" && !message.ValidName(c.Instance) {
+	if c.Instance != "" && !protocol.ValidName(c.Instance) {
 		errs = append(errs, fmt.Errorf("instance: %q — строчная латиница, цифры и «-», первая — буква, до 32 символов", c.Instance))
 	}
 	if r := c.Update.Releases; r != "" && !filepath.IsAbs(r) {
@@ -351,10 +365,8 @@ func (c *Config) checkWorkers() []error {
 			}
 		}
 		switch {
-		case !message.ValidName(w.Name):
+		case !protocol.ValidName(w.Name):
 			errs = append(errs, fmt.Errorf("workers[%d]: имя %q — строчная латиница, цифры и «-», начало — буква, до 32 символов", i, w.Name))
-		case w.Name == SysmetricsWorker:
-			errs = append(errs, fmt.Errorf("workers[%d]: имя %q занято встроенным воркером агента", i, w.Name))
 		case names[w.Name]:
 			errs = append(errs, fmt.Errorf("workers: имя %q повторяется", w.Name))
 		}
@@ -391,27 +403,4 @@ func (s Server) TLSConfig() (*tls.Config, error) {
 	}
 	cfg.RootCAs = pool
 	return cfg, nil
-}
-
-// Insecure — связь без шифрования (http://) не с этой машиной: ключ агента и
-// настройки воркеров идут открытым текстом. Локальные — localhost,
-// 127.0.0.0/8, ::1.
-func (c *Config) Insecure() bool {
-	return Insecure(c.Server.URL)
-}
-
-// Insecure — адрес http:// на нелокальный хост (см. Config.Insecure).
-func Insecure(serverURL string) bool {
-	u, err := url.Parse(serverURL)
-	if err != nil || !strings.EqualFold(u.Scheme, "http") {
-		return false
-	}
-	host := strings.ToLower(u.Hostname())
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
-		return false
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		return false
-	}
-	return true
 }

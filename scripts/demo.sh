@@ -1,38 +1,26 @@
 #!/usr/bin/env bash
-# Стенд целиком на этой машине: сервер на Node.js (agent-sdk/server и HTTP API над ним), агент
-# с воркерами-примерами без SDK (echo — Python, node-echo — Node.js, sysinfo — Go).
-# Go — в контейнере (scripts/go.sh), Node ≥ 24 и python3 — на машине. Сквозные тесты того же
-# стенда — scripts/e2e.sh.
-#   scripts/demo.sh build        # агент и sysinfo под эту машину (.dev/bin); сборки агента
-#                                # (dist/<VERSION>: сборки, manifest.json, install.sh); agent-sdk
-#                                # (sdk/node), зависимости сервера
+# Стенд целиком на этой машине: сервер examples/server/server.py (Python, стандартная
+# библиотека) и агент с воркерами-примерами echo (Python) и sysinfo (Go). Go — в контейнере
+# (scripts/go.sh), python3 — на машине.
+#   scripts/demo.sh build        # агент и sysinfo под эту машину (.dev/bin)
 #   scripts/demo.sh server       # сервер: http://localhost:8080 (PORT — другой порт)
 #   scripts/demo.sh agent [N]    # агент demo-N (по умолчанию 1); второй терминал — второй агент
 #   scripts/demo.sh status [N]   # agent status агента N: связь, воркеры, последняя ошибка
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="$(cat "$ROOT/VERSION")"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$(uname -m)" in arm64 | aarch64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
 BIN="${DEMO_BIN:-$ROOT/.dev/bin}"
-RELEASE="$ROOT/dist/$VERSION"
 PORT="${PORT:-8080}"
 TOKEN="${DEMO_TOKEN:-demo-token}"
 
 case "${1:-}" in
   build)
-    # Агент и Go-воркеры для запуска на этой машине — отдельно от каталога сборок.
     BUILD_DIR=.dev/bin "$ROOT/scripts/go.sh" build "$OS" "$ARCH" agent
-    BUILD_DIR=.dev/bin "$ROOT/scripts/go.sh" build "$OS" "$ARCH" sysinfo ./examples/workers/sysinfo
-    # Сборки агента linux/darwin × amd64/arm64, manifest.json (подпись — AGENT_SIGNING_KEY), install.sh.
-    "$ROOT/scripts/go.sh" release
-    # agent-sdk собирается в dist: сервер подключает его как file:-зависимость.
-    (cd "$ROOT/sdk/node" && npm ci --no-audit --no-fund && npm run build)
-    (cd "$ROOT/examples/server" && npm ci --no-audit --no-fund) ;;
+    BUILD_DIR=.dev/bin "$ROOT/scripts/go.sh" build "$OS" "$ARCH" sysinfo ./examples/workers/sysinfo ;;
   server)
-    cd "$ROOT/examples/server"
-    # Сборки агента — из dist/<VERSION> (scripts/demo.sh build); PUBLIC_KEY — ключ проверки их подписи.
-    RELEASES_DIR="${RELEASES_DIR:-$RELEASE}" PORT="$PORT" ENROLL_TOKEN="$TOKEN" exec node --import tsx src/main.ts ;;
+    cd "$ROOT"
+    PORT="$PORT" ENROLL_TOKEN="$TOKEN" DATA_FILE="$ROOT/.dev/server.json" exec python3 examples/server/server.py ;;
   status)
     DEMO_ROOT="$ROOT" DEMO_AGENT="${2:-1}" exec "$BIN/agent-$OS-$ARCH" status -config "$ROOT/examples/agent.demo.yaml" ;;
   agent)

@@ -4,31 +4,25 @@ package app
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
 	"sync"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/config"
-	"github.com/epifanovmd/agent/internal/message"
-	"github.com/epifanovmd/agent/internal/worker"
+	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
-// Частоты до первого welcome и задержка внеочередного status; переменные —
-// для тестов.
+// Частоты до первого hello и задержка внеочередного состояния; переменные — для тестов.
 var (
-	defaultMetricsInterval = time.Minute
-	defaultStatusInterval  = time.Minute
-	statusDebounce         = 200 * time.Millisecond
-	logEvery               = message.LogBatchInterval
+	statusDebounce = 200 * time.Millisecond
+	logEvery       = time.Second
 )
 
-// observer — частоты метрик и status (welcome, watch) и сигналы циклам.
+// observer — частоты метрик и состояния (hello, watch) и сигналы циклам.
 type observer struct {
-	mu      sync.Mutex
-	welcome message.Welcome
-	watch   message.Watch
-	timer   *time.Timer
+	mu    sync.Mutex
+	hello protocol.HelloReply
+	watch *protocol.Watch
+	timer *time.Timer
 	// metricsKick — изменилась частота метрик; statusKick — изменилось состояние.
 	metricsKick chan struct{}
 	statusKick  chan struct{}
@@ -46,47 +40,40 @@ func kick(ch chan struct{}) {
 	}
 }
 
-func (o *observer) setWelcome(w message.Welcome) {
-	o.mu.Lock()
-	o.welcome = w
-	o.mu.Unlock()
-	kick(o.metricsKick)
-	kick(o.statusKick)
-}
-
-// metricsInterval — из watch, но не чаще MinWatchInterval и не реже, чем в welcome (§9).
+// metricsInterval — из watch, но не чаще MinWatchInterval и не реже, чем в hello (§7).
 func (o *observer) metricsInterval() time.Duration {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	base := defaultMetricsInterval
-	if o.welcome.MetricsIntervalMs > 0 {
-		base = time.Duration(o.welcome.MetricsIntervalMs) * time.Millisecond
+	base := protocol.DefaultMetricsEvery
+	if o.hello.MetricsMs > 0 {
+		base = time.Duration(o.hello.MetricsMs) * time.Millisecond
 	}
-	if o.watch.MetricsIntervalMs > 0 {
-		base = min(base, max(time.Duration(o.watch.MetricsIntervalMs)*time.Millisecond, message.MinWatchInterval))
+	if o.watch != nil && o.watch.MetricsIntervalMs > 0 {
+		base = min(base, max(time.Duration(o.watch.MetricsIntervalMs)*time.Millisecond, protocol.MinWatchInterval))
 	}
 	return base
 }
 
-func (o *observer) statusInterval() time.Duration {
+func (o *observer) stateInterval() time.Duration {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.welcome.StatusIntervalMs > 0 {
-		return time.Duration(o.welcome.StatusIntervalMs) * time.Millisecond
+	if o.hello.StateMs > 0 {
+		return time.Duration(o.hello.StateMs) * time.Millisecond
 	}
-	return defaultStatusInterval
+	return protocol.DefaultStateInterval
 }
 
-// setWatch — новый watch целиком заменяет прежний; {} или наступивший
-// untilMs — снять (§9).
-func (a *App) setWatch(w message.Watch) {
+// setWatch — наблюдение из желаемого (§7): nil или наступивший until — снять.
+func (a *App) setWatch(w *protocol.Watch) {
 	o := &a.obs
-	if !w.Empty() && w.UntilMs > 0 && time.UnixMilli(w.UntilMs).Before(time.Now()) {
-		w = message.Watch{}
+	if w != nil && w.Until > 0 && time.UnixMilli(w.Until).Before(time.Now()) {
+		w = nil
 	}
-	if w.LogLevel != "" && message.LogLevelRank(w.LogLevel) < 0 {
-		a.log.Warn("watch: незнакомый уровень лога — пропущен", "logLevel", w.LogLevel)
-		w.LogLevel = ""
+	if w != nil && w.LogLevel != "" && protocol.LogLevelRank(w.LogLevel) < 0 {
+		a.log.Warn("watch: незнакомый уровень журнала — пропущен", "logLevel", w.LogLevel)
+		c := *w
+		c.LogLevel = ""
+		w = &c
 	}
 	o.mu.Lock()
 	o.watch = w
@@ -94,31 +81,43 @@ func (a *App) setWatch(w message.Watch) {
 		o.timer.Stop()
 		o.timer = nil
 	}
-	if !w.Empty() && w.UntilMs > 0 {
-		o.timer = time.AfterFunc(time.Until(time.UnixMilli(w.UntilMs)), func() { a.setWatch(message.Watch{}) })
+	if w != nil && w.Until > 0 {
+		o.timer = time.AfterFunc(time.Until(time.UnixMilli(w.Until)), func() { a.setWatch(nil) })
 	}
 	o.mu.Unlock()
-	_ = a.forward.Override(w.LogLevel)
+	level := ""
+	if w != nil {
+		level = w.LogLevel
+	}
+	_ = a.forward.Override(level)
 	kick(o.metricsKick)
 }
 
-// statusChanged — изменилось то, что видно в status: внеочередной status.
+// statusChanged — изменилось то, что видно в состоянии: внеочередное состояние.
 func (a *App) statusChanged() { kick(a.obs.statusKick) }
 
-// status — состояние воркеров и outbox (§6).
-func (a *App) status() message.Status {
+// state — состояние агента и воркеров (§9).
+func (a *App) state() protocol.State {
+	applied, err := a.store.Applied()
+	if err != nil {
+		a.log.Warn("итоги настроек не прочитаны", "err", err)
+	}
 	ws := a.workers.Status()
 	for i := range ws {
-		ws[i].Configs = a.configs.Status(ws[i].Name)
+		ws[i].Configs = a.configsStatus(ws[i].Name, applied[ws[i].Name])
 	}
-	return message.Status{Workers: ws, Outbox: a.outbox.Len(), Update: a.latest.Load()}
+	if ws == nil {
+		ws = []protocol.WorkerState{}
+	}
+	return protocol.State{DesiredRev: a.currentDesired().Rev, Outbox: a.store.Len(), Update: a.latest.Load(), Workers: ws}
 }
 
-func (a *App) sendStatus() { a.link.Stream(message.TypeStatus, a.status()) }
-
-// statusLoop — status раз в statusIntervalMs и при изменении, пока есть связь.
-func (a *App) statusLoop(ctx context.Context) {
-	timer := time.NewTimer(a.obs.statusInterval())
+// stateLoop — состояние бэкенду раз в stateMs и при изменении.
+func (a *App) stateLoop(ctx context.Context) {
+	if a.backend == nil {
+		return
+	}
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
 		select {
@@ -126,23 +125,24 @@ func (a *App) statusLoop(ctx context.Context) {
 			return
 		case <-timer.C:
 		case <-a.obs.statusKick:
-			// Несколько изменений подряд — одним сообщением.
+			// Несколько изменений подряд — одним состоянием.
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(statusDebounce):
 			}
 		}
-		if a.link.Connected() {
-			a.sendStatus()
-		}
-		timer.Reset(a.obs.statusInterval())
+		a.backend.SetState(a.state())
+		timer.Reset(a.obs.stateInterval())
 	}
 }
 
-// metricsLoop — точка метрик раз в metricsInterval (и без связи: поток
-// держит последние сообщения до подключения).
+// metricsLoop — точка метрик раз в metricsInterval: узел и метрики из пульса воркеров (и без
+// связи: последние точки ждут её в памяти).
 func (a *App) metricsLoop(ctx context.Context) {
+	if a.backend == nil {
+		return
+	}
 	interval := a.obs.metricsInterval()
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
@@ -158,63 +158,23 @@ func (a *App) metricsLoop(ctx context.Context) {
 			continue
 		case <-timer.C:
 		}
-		if m, ok := a.collect(ctx); ok {
-			a.link.Stream(message.TypeMetrics, m)
+		m := protocol.Metrics{At: time.Now().UnixMilli(), Host: a.metrics.Collect(ctx)}
+		if ws := a.workers.Metrics(); len(ws) > 0 {
+			m.Workers = ws
+		}
+		if m.Host != nil || len(m.Workers) > 0 {
+			a.backend.AddMetrics(m)
 		}
 		interval = a.obs.metricsInterval()
 		timer.Reset(interval)
 	}
 }
 
-// collect — GET /metrics всех запущенных воркеров сразу (срок —
-// message.ProbeTimeout); ответ
-// sysmetrics — host, остальных — workers как есть (§9).
-func (a *App) collect(ctx context.Context) (message.Metrics, bool) {
-	m := message.Metrics{CollectedAt: time.Now().UnixMilli()}
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for _, name := range a.workers.Running() {
-		client, err := a.workers.Client(name)
-		if err != nil {
-			continue
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			raw, ok := probeMetrics(ctx, client, message.ProbeTimeout)
-			if !ok {
-				return
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			if name == config.SysmetricsWorker {
-				var h message.HostMetrics
-				if json.Unmarshal(raw, &h) == nil {
-					m.Host = &h
-				}
-				return
-			}
-			if m.Workers == nil {
-				m.Workers = map[string]json.RawMessage{}
-			}
-			m.Workers[name] = raw
-		}()
-	}
-	wg.Wait()
-	return m, m.Host != nil || len(m.Workers) > 0
-}
-
-// probeMetrics — GET /metrics: 2xx и JSON до 1 МБ; иначе воркера в точке нет.
-func probeMetrics(ctx context.Context, client *http.Client, timeout time.Duration) (json.RawMessage, bool) {
-	status, raw, err := worker.Get(ctx, client, message.MetricsPath, timeout, message.MaxMetricsBytes)
-	if err != nil || status/100 != 2 || !json.Valid(raw) {
-		return nil, false
-	}
-	return raw, true
-}
-
-// logLoop — пачки лога серверу не чаще раза в секунду (§9).
+// logLoop — записи журнала бэкенду пачками раз в logEvery (§9).
 func (a *App) logLoop(ctx context.Context) {
+	if a.backend == nil {
+		return
+	}
 	t := time.NewTicker(logEvery)
 	defer t.Stop()
 	for {
@@ -223,8 +183,53 @@ func (a *App) logLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		if batch := a.forward.Take(); batch != nil {
-			a.link.Stream(message.TypeLog, message.Log{Entries: batch})
-		}
+		a.backend.AddLogs(a.forward.Take())
 	}
 }
+
+// ─── связь с бэкендом ──────────────────────────────────────────────────
+
+// backendHandler — что приходит от бэкенда (backend.Handler).
+type backendHandler struct{ a *App }
+
+func (h backendHandler) Hello() protocol.Hello {
+	a := h.a
+	cfg := a.config()
+	workers := a.workers.Info()
+	if workers == nil {
+		workers = []protocol.HelloWorker{}
+	}
+	return protocol.Hello{
+		Agent: protocol.HelloAgent{Version: a.version, BootID: a.bootID, StartedAt: a.started.UnixMilli(),
+			UpdateMode: cfg.Update.Mode, Install: InstallMode},
+		Host: a.host, Name: cfg.Name, Labels: cfg.Labels, Workers: workers,
+	}
+}
+
+// OnHello — hello принят: частоты, отметка «новая версия вышла на связь», итог agent.update.
+func (h backendHandler) OnHello(r protocol.HelloReply) {
+	a := h.a
+	a.obs.mu.Lock()
+	a.obs.hello = r
+	a.obs.mu.Unlock()
+	kick(a.obs.metricsKick)
+	if a.update.Marker != "" {
+		update.Healthy(a.update)
+	}
+	a.finishAgentUpdate()
+	a.statusChanged()
+}
+
+func (h backendHandler) OnDesired(d protocol.Desired) {
+	if err := h.a.store.SaveDesired(d); err != nil {
+		h.a.log.Error("желаемое не сохранено", "rev", d.Rev, "err", err)
+	}
+	h.a.log.Debug("желаемое", "rev", d.Rev)
+	h.a.setDesired(d)
+}
+
+func (h backendHandler) OnCommand(cmd protocol.Command) { h.a.command(cmd) }
+
+func (h backendHandler) Rev() int64 { return h.a.currentDesired().Rev }
+
+func (h backendHandler) OnOnline(on bool) { h.a.statusChanged() }

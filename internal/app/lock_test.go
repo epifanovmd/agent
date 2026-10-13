@@ -4,26 +4,21 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/identity"
 	"github.com/epifanovmd/agent/internal/logx"
-	"github.com/epifanovmd/agent/internal/message"
 )
 
-// Один агент на dataDir: второй New (или agent cleanup) — ErrLocked; после
+// Один агент на dataDir: второй New (или agent stop-workers) — ErrLocked; после
 // Close — можно.
 func TestDataDirLock(t *testing.T) {
 	cfg := config.Defaults()
-	cfg.Server.URL = "http://127.0.0.1:1"
+	cfg.Server.URL, cfg.Server.AllowInsecure = "http://127.0.0.1:1", true
 	cfg.DataDir = t.TempDir()
 	cfg.Log.Level = "error"
 	first, err := New(cfg, "test")
@@ -44,8 +39,8 @@ func TestDataDirLock(t *testing.T) {
 	lock.Unlock()
 }
 
-// agent status: не запущен — ErrNotRunning; запущен и отмечался — ок;
-// отметка устарела — ошибка.
+// agent status: не запущен — ErrNotRunning; блокировка взята, но API не отвечает — ошибка;
+// ошибка завершения хранится в каталоге данных.
 func TestStatus(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := Status(dir); !errors.Is(err, ErrNotRunning) {
@@ -56,39 +51,12 @@ func TestStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lock.Unlock()
-	if _, err := Status(dir); err == nil {
-		t.Fatal("без отметки — ошибка")
+	if _, err := Status(dir); err == nil || errors.Is(err, ErrNotRunning) {
+		t.Fatalf("не отвечает — ошибка: %v", err)
 	}
-	// Ошибка завершения видна, пока агент снова не отметился.
 	RecordExit(dir, errors.New("токен отклонён"))
 	if e := LastExit(dir); e == nil || e.Error != "токен отклонён" || e.At == 0 {
 		t.Fatalf("ошибка завершения: %+v", e)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		_ = heartbeat{path: filepath.Join(dir, StatusFile), snapshot: func() AgentStatus {
-			return AgentStatus{Online: true, Version: "test", Workers: []message.WorkerStatus{{Name: "echo", State: message.WorkerRunning}}}
-		}}.run(ctx)
-		close(done)
-	}()
-	var st AgentStatus
-	deadline := time.Now().Add(3 * time.Second)
-	for st, err = Status(dir); err != nil && time.Now().Before(deadline); st, err = Status(dir) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if err != nil || !st.Online || st.PID != os.Getpid() || st.Version != "test" || len(st.Workers) != 1 {
-		t.Fatalf("работает: %+v %v", st, err)
-	}
-	if LastExit(dir) != nil {
-		t.Fatal("агент работает — ошибки завершения нет")
-	}
-	cancel()
-	<-done
-	old, _ := json.Marshal(AgentStatus{PID: 1, At: time.Now().Add(-time.Hour).UnixMilli()})
-	_ = os.WriteFile(filepath.Join(dir, StatusFile), old, 0o600)
-	if _, err := Status(dir); err == nil {
-		t.Fatal("старая отметка — завис")
 	}
 }
 

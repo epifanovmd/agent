@@ -1,13 +1,9 @@
 //go:build unix
 
-// Package worker — воркеры агента (§12, §13): одна копия процесса на
-// воркер, запуск с переменными окружения, выводом в файлы и ожиданием
-// сокета, перезапуск после сбоя с растущей паузой,
-// регистрация (GET /health и GET /manifest после каждого запуска, §12),
-// проверка GET /health, замена «сначала
-// остановить» с ожиданием, пока воркер занят, подхват воркеров, переживших
-// перезапуск агента, обновление сборки с сервера с возвратом прежней сборки,
-// уборка перед удалением агента.
+// Package worker — воркеры агента (§11–§16): запуск процессов по настройкам, подхват
+// переживших перезапуск агента, перезапуск после падения с растущей паузой, регистрация и
+// пульс от самих воркеров (через сокет агента), плановая замена с ожиданием занятого воркера,
+// обновление сборки с возвратом прежней.
 package worker
 
 import (
@@ -18,51 +14,46 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/epifanovmd/agent/internal/backoff"
 	"github.com/epifanovmd/agent/internal/config"
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // Сроки; переменные — для тестов.
 var (
 	// stableRun — проработал столько — счётчик падений подряд сбрасывается.
 	stableRun = time.Minute
-	// busyPoll — как часто отложенная замена спрашивает GET /health.
+	// busyPoll — как часто отложенная замена смотрит, занят ли воркер.
 	busyPoll = time.Second
-	// restartBackoff — пауза перед перезапуском упавшего воркера и перед
-	// повтором проверки регистрации.
+	// watchEvery — как часто агент проверяет регистрацию и пульс.
+	watchEvery = time.Second
+	// restartBackoff — пауза перед перезапуском упавшего воркера.
 	restartBackoff = backoff.Policy{Min: time.Second, Max: 30 * time.Second}
-	// startTimeout — сколько ждать, пока сокет воркера начнёт отвечать.
-	startTimeout = message.WorkerStartTimeout
-	// healthInterval — как часто агент спрашивает GET /health; healthMisses
-	// пропусков подряд — воркер завис и перезапускается.
-	healthInterval = message.HealthInterval
-	// probeTimeout — срок ответа GET /health, GET /manifest и GET /metrics.
-	probeTimeout = message.ProbeTimeout
-	// busyTimeout — плановая замена занятого воркера (GET /health → busy:
-	// true) ждёт окончания работы не дольше.
-	busyTimeout = 24 * time.Hour
+	// registerTimeout — сколько ждать регистрации после запуска.
+	registerTimeout = protocol.RegisterTimeout
+	// healthSilence — пульса нет дольше — воркер нездоров; ещё healthRestart — перезапуск.
+	healthSilence = protocol.HealthSilence
+	healthRestart = protocol.HealthRestartAfter
+	// adoptRetry — как часто повторять подхват процесса, который агент не может остановить.
+	adoptRetry = 10 * time.Second
+	// busyTimeout — плановая замена занятого воркера ждёт не дольше.
+	busyTimeout = protocol.BusyTimeout
+	// startTimeout — новая сборка воркера должна заработать за это время.
+	startTimeout = time.Minute
 )
-
-// healthMisses — пропусков GET /health подряд до перезапуска.
-const healthMisses = message.HealthMisses
 
 // Ошибки доступа к воркеру.
 var (
-	ErrUnknown     = errors.New("воркера нет в настройках агента")
-	ErrUnavailable = errors.New("воркер не запущен")
-	// ErrInvalid — воркер не зарегистрирован (state: invalid, §12).
-	ErrInvalid = errors.New("воркер не зарегистрирован")
+	ErrUnknown       = errors.New("воркера нет в настройках агента")
+	ErrUnavailable   = errors.New("воркер не запущен")
+	ErrNotRegistered = errors.New("воркер не зарегистрирован")
 )
 
 // Exit — почему агент останавливает воркеры (Run завершается).
@@ -79,23 +70,20 @@ const (
 
 // Options — что нужно воркерам от агента.
 type Options struct {
-	// RunDir — каталог сокетов воркеров.
-	RunDir string
-	// DataDir — каталог данных агента: файлы процессов (ProcessesDir) и
-	// вывода (LogsDir) воркеров.
-	DataDir      string
-	AgentSocket  string
-	AgentVersion string
+	// DataDir — каталог данных агента: файлы процессов, вывода и данных воркеров.
+	DataDir     string
+	AgentSocket string
 	// Env — переменные агента для всех воркеров (KEY=VALUE).
 	Env []string
 	Log *slog.Logger
-	// OnStarted — запущенный воркер зарегистрирован (агент передаёт ему настройки).
-	OnStarted func(name string)
-	// OnAdopted — зарегистрирован подхваченный воркер, переживший перезапуск агента.
-	OnAdopted func(name string)
-	// OnChange — изменилось то, что видно в status.
+	// OnRegistered — воркер зарегистрировался (после запуска или переподключения).
+	OnRegistered func(name string)
+	// OnChange — изменилось то, что видно в состоянии.
 	OnChange func()
 }
+
+// StateDir — каталог своих данных воркера (WORKER_STATE_DIR).
+func StateDir(dataDir, name string) string { return filepath.Join(dataDir, "state", name) }
 
 // Supervisor — все воркеры агента.
 type Supervisor struct {
@@ -112,7 +100,7 @@ type Supervisor struct {
 	wg      sync.WaitGroup
 }
 
-// Worker — один воркер: настройки, текущий процесс, состояние для status.
+// Worker — один воркер: настройки, текущий процесс, регистрация и пульс.
 type Worker struct {
 	sup  *Supervisor
 	name string
@@ -124,32 +112,34 @@ type Worker struct {
 	// reason — причина состояния invalid.
 	reason   string
 	restarts int
-	health   *message.Health
-	manifest *message.WorkerManifest
+	health   *protocol.Health
+	// beat — время последнего пульса (или регистрации).
+	beat     time.Time
+	manifest *protocol.WorkerManifest
+	version  string
 	proc     *process
-	updating bool
+	// registered — закрыт, когда текущий процесс зарегистрировался.
+	registered chan struct{}
+	updating   bool
 	// removed — воркер удалён из настроек: останавливается всегда.
 	removed bool
-	// gen — номер запуска процесса (растёт с каждым запуском и подхватом).
+	// gen — номер запуска процесса.
 	gen int
 	// waiting — сколько замен каждого вида ждут, пока воркер занят.
 	waiting map[string]int
-	// settled — закрыт, когда первая проверка регистрации текущего запуска
-	// закончилась (или запуска нет): по нему события ждут манифест.
-	settled chan struct{}
 
 	requests chan request
 	cancel   context.CancelFunc
 	done     chan struct{}
 }
 
-// request — заменить процесс: остановить текущий, выполнить swap (смена
-// сборки), запустить новый; done — итог запуска.
+// request — заменить процесс: остановить текущий, выполнить swap (смена сборки), запустить
+// новый; done — итог (регистрация нового).
 type request struct {
 	swap func() error
 	done chan error
-	// gen — перезапуск запуска номер gen: процесс с тех пор уже запущен
-	// заново — заменять нечего (0 — заменить в любом случае).
+	// gen — перезапуск запуска номер gen: процесс с тех пор уже запущен заново — заменять
+	// нечего (0 — заменить в любом случае).
 	gen int
 }
 
@@ -161,11 +151,8 @@ func (r *request) reply(err error) {
 
 // New — воркеры по настройкам specs (запускаются Run).
 func New(specs []config.Worker, opts Options) *Supervisor {
-	if opts.OnStarted == nil {
-		opts.OnStarted = func(string) {}
-	}
-	if opts.OnAdopted == nil {
-		opts.OnAdopted = opts.OnStarted
+	if opts.OnRegistered == nil {
+		opts.OnRegistered = func(string) {}
 	}
 	if opts.OnChange == nil {
 		opts.OnChange = func() {}
@@ -180,9 +167,9 @@ func New(specs []config.Worker, opts Options) *Supervisor {
 
 func (s *Supervisor) add(spec config.Worker) *Worker {
 	spec.FillDefaults()
-	w := &Worker{sup: s, name: spec.Name, token: newToken(), spec: spec, state: message.WorkerStopped,
-		waiting: map[string]int{}, requests: make(chan request), done: make(chan struct{}), settled: make(chan struct{})}
-	close(w.settled)
+	w := &Worker{sup: s, name: spec.Name, token: newToken(), spec: spec, state: protocol.WorkerStopped,
+		waiting: map[string]int{}, requests: make(chan request), done: make(chan struct{}),
+		registered: make(chan struct{})}
 	s.workers[spec.Name] = w
 	s.order = append(s.order, spec.Name)
 	return w
@@ -197,9 +184,8 @@ func newToken() string {
 // SetExit — почему агент сейчас остановит воркеры (до отмены ctx Run).
 func (s *Supervisor) SetExit(e Exit) { s.exit.Store(int32(e)) }
 
-// Run — запустить воркеры (подхватив переживших перезапуск агента) и держать
-// их до отмены ctx; возвращается, когда процессы остановлены или оставлены
-// работать (SetExit).
+// Run — запустить воркеры (подхватив переживших перезапуск агента) и держать их до отмены ctx;
+// возвращается, когда процессы остановлены или оставлены работать (SetExit).
 func (s *Supervisor) Run(ctx context.Context) {
 	s.mu.Lock()
 	s.ctx = ctx
@@ -216,8 +202,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 	s.wg.Wait()
 }
 
-// stopOrphans — процессы воркеров, которых больше нет в настройках,
-// останавливаются (в фоне).
+// stopOrphans — процессы воркеров, которых больше нет в настройках, останавливаются (в фоне).
 func (s *Supervisor) stopOrphans(known map[string]bool) {
 	for _, name := range stateNames(s.stateDir) {
 		if known[name] {
@@ -229,6 +214,11 @@ func (s *Supervisor) stopOrphans(known map[string]bool) {
 			defer s.wg.Done()
 			if ok && stopOrphan(st) {
 				s.opts.Log.Info("воркера нет в настройках — его процесс остановлен", "worker", name, "pid", st.PID)
+			}
+			if ok && st.alive() {
+				s.opts.Log.Error("воркера нет в настройках, но его процесс не остановлен (нет прав) — остановите его сами",
+					"worker", name, "pid", st.PID)
+				return
 			}
 			removeState(s.stateDir, name)
 		}()
@@ -246,14 +236,12 @@ func (s *Supervisor) startLoop(w *Worker) {
 	}()
 }
 
-// Apply — новые настройки воркеров (перечитывание agent.yaml): новые
-// запускаются, удалённые останавливаются сразу, изменённые заменяются
-// плановой заменой (ждёт, пока воркер занят); изменение только lifecycle
-// и logs применяется без замены.
+// Apply — новые настройки воркеров (перечитывание agent.yaml): новые запускаются, удалённые
+// останавливаются сразу, изменённые заменяются плановой заменой (ждёт, пока воркер занят);
+// изменение только stopTimeout применяется без замены.
 func (s *Supervisor) Apply(specs []config.Worker) {
 	s.mu.Lock()
-	var stop []*Worker
-	var replace []*Worker
+	var stop, replace []*Worker
 	keep := map[string]bool{}
 	for _, spec := range specs {
 		spec.FillDefaults()
@@ -293,7 +281,7 @@ func (s *Supervisor) Apply(specs []config.Worker) {
 	}
 	for _, w := range replace {
 		w.opts().Log.Info("настройки воркера изменились — замена", "worker", w.name)
-		go func() { _ = w.replace(context.Background(), nil, message.PendingRestart, false) }()
+		go func() { _ = w.replace(context.Background(), nil, protocol.PendingRestart, false) }()
 	}
 	s.opts.OnChange()
 }
@@ -307,7 +295,6 @@ func (w *Worker) life() config.Lifecycle {
 	return w.spec.Lifecycle
 }
 
-// get — воркер по имени.
 func (s *Supervisor) get(name string) *Worker {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -347,48 +334,28 @@ func (s *Supervisor) ByToken(token string) (string, bool) {
 	}
 	s.mu.Unlock()
 	for _, w := range ws {
-		if w.getToken() == token {
+		w.mu.Lock()
+		ok := w.token == token
+		w.mu.Unlock()
+		if ok {
 			return w.name, true
 		}
 	}
 	return "", false
 }
 
-func (w *Worker) getToken() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.token
-}
-
 // Token — токен воркера name.
 func (s *Supervisor) Token(name string) string {
 	if w := s.get(name); w != nil {
-		return w.getToken()
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.token
 	}
 	return ""
 }
 
-// Client — HTTP-клиент к сокету запущенного воркера (адрес — http://worker/…).
-func (s *Supervisor) Client(name string) (*http.Client, error) {
-	w := s.get(name)
-	if w == nil {
-		return nil, ErrUnknown
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	switch {
-	case w.proc == nil:
-		return nil, ErrUnavailable
-	case w.state == message.WorkerInvalid:
-		return nil, fmt.Errorf("%w: %s", ErrInvalid, w.reason)
-	case w.state != message.WorkerRunning:
-		return nil, ErrUnavailable
-	}
-	return w.proc.client, nil
-}
-
-// Manifest — манифест воркера из последней регистрации (nil — нет).
-func (s *Supervisor) Manifest(name string) *message.WorkerManifest {
+// Manifest — манифест из последней регистрации (nil — нет).
+func (s *Supervisor) Manifest(name string) *protocol.WorkerManifest {
 	w := s.get(name)
 	if w == nil {
 		return nil
@@ -398,63 +365,140 @@ func (s *Supervisor) Manifest(name string) *message.WorkerManifest {
 	return w.manifest
 }
 
-// WaitManifest — манифест воркера после окончания первой проверки
-// регистрации текущего запуска (§12): событие, присланное воркером сразу
-// после запуска, ждёт её итога, но не дольше ctx.
-func (s *Supervisor) WaitManifest(ctx context.Context, name string) *message.WorkerManifest {
+// Ready — воркер запущен и зарегистрирован; иначе — ошибка с причиной.
+func (s *Supervisor) Ready(name string) error {
 	w := s.get(name)
 	if w == nil {
-		return nil
+		return ErrUnknown
 	}
 	w.mu.Lock()
-	settled := w.settled
-	w.mu.Unlock()
-	select {
-	case <-settled:
-	case <-ctx.Done():
+	defer w.mu.Unlock()
+	switch {
+	case w.proc == nil:
+		return ErrUnavailable
+	case w.state != protocol.WorkerRunning:
+		return ErrNotRegistered
 	}
-	return s.Manifest(name)
+	return nil
 }
 
-// Running — зарегистрированные воркеры.
-func (s *Supervisor) Running() []string {
-	var out []string
+// Register — регистрация воркера (§13): манифест и версия; воркер работает.
+func (s *Supervisor) Register(name string, reg protocol.Register) error {
+	w := s.get(name)
+	if w == nil {
+		return ErrUnknown
+	}
+	w.mu.Lock()
+	if w.proc == nil {
+		w.mu.Unlock()
+		return ErrUnavailable
+	}
+	m := reg.Manifest
+	w.manifest, w.version = &m, reg.Version
+	w.state, w.reason = protocol.WorkerRunning, ""
+	w.beat = time.Now()
+	select {
+	case <-w.registered:
+	default:
+		close(w.registered)
+	}
+	w.mu.Unlock()
+	w.opts().Log.Info("воркер зарегистрирован", "worker", name, "version", reg.Version)
+	w.opts().OnChange()
+	w.opts().OnRegistered(name)
+	return nil
+}
+
+// Heartbeat — пульс воркера (§16).
+func (s *Supervisor) Heartbeat(name string, h protocol.Health) error {
+	w := s.get(name)
+	if w == nil {
+		return ErrUnknown
+	}
+	w.mu.Lock()
+	switch {
+	case w.proc == nil:
+		w.mu.Unlock()
+		return ErrUnavailable
+	case w.state != protocol.WorkerRunning:
+		// Агент перезапущен или воркер не зарегистрирован: воркеру — зарегистрироваться.
+		w.mu.Unlock()
+		return ErrNotRegistered
+	}
+	changed := w.health == nil || w.health.OK != h.OK || w.health.Busy != h.Busy || w.health.Message != h.Message
+	w.health, w.beat = &h, time.Now()
+	w.mu.Unlock()
+	if changed {
+		w.opts().OnChange()
+	}
+	return nil
+}
+
+// Metrics — metrics из последнего пульса зарегистрированных воркеров.
+func (s *Supervisor) Metrics() map[string]json.RawMessage {
+	out := map[string]json.RawMessage{}
 	for _, name := range s.Names() {
-		if _, err := s.Client(name); err == nil {
-			out = append(out, name)
+		w := s.get(name)
+		if w == nil {
+			continue
 		}
+		w.mu.Lock()
+		if w.state == protocol.WorkerRunning && w.health != nil && len(w.health.Metrics) > 0 {
+			out[name] = w.health.Metrics
+		}
+		w.mu.Unlock()
 	}
 	return out
 }
 
-// Status — состояние воркеров для status (configs заполняет агент).
-func (s *Supervisor) Status() []message.WorkerStatus {
-	s.mu.Lock()
-	ws := make([]*Worker, 0, len(s.order))
-	for _, name := range s.order {
-		ws = append(ws, s.workers[name])
-	}
-	s.mu.Unlock()
-	out := make([]message.WorkerStatus, 0, len(ws))
-	for _, w := range ws {
+// Info — воркер для hello: версия, сборка, манифест.
+func (s *Supervisor) Info() []protocol.HelloWorker {
+	var out []protocol.HelloWorker
+	for _, name := range s.Names() {
+		w := s.get(name)
+		if w == nil {
+			continue
+		}
 		w.mu.Lock()
-		st := message.WorkerStatus{Name: w.name, State: w.state, Release: w.spec.Release, Builtin: w.spec.Builtin,
-			Restarts: w.restarts, Health: w.health, Manifest: w.manifest}
-		if w.state == message.WorkerInvalid {
+		out = append(out, protocol.HelloWorker{Name: name, Version: w.versionLocked(), Release: w.spec.Release,
+			Manifest: w.manifest})
+		w.mu.Unlock()
+	}
+	return out
+}
+
+// versionLocked — версия сборки (у воркера со сборкой) или из регистрации.
+func (w *Worker) versionLocked() string {
+	if w.spec.Release {
+		return cmp.Or(releaseVersion(w.spec), w.version)
+	}
+	return w.version
+}
+
+// Status — состояние воркеров (Configs заполняет агент).
+func (s *Supervisor) Status() []protocol.WorkerState {
+	var out []protocol.WorkerState
+	for _, name := range s.Names() {
+		w := s.get(name)
+		if w == nil {
+			continue
+		}
+		w.mu.Lock()
+		st := protocol.WorkerState{Name: name, State: w.state, Version: w.versionLocked(), Release: w.spec.Release,
+			Restarts: w.restarts, Health: w.health}
+		if w.health != nil {
+			h := *w.health
+			h.Metrics = nil
+			st.Health = &h
+		}
+		if w.state == protocol.WorkerInvalid {
 			st.Message = w.reason
 		}
 		switch {
-		case w.waiting[message.PendingUpdate] > 0:
-			st.Pending = message.PendingUpdate
-		case w.waiting[message.PendingRestart] > 0:
-			st.Pending = message.PendingRestart
-		}
-		if w.manifest != nil {
-			st.Version = w.manifest.Version
-		}
-		if w.spec.Release {
-			// У воркера со сборкой с сервера — версия сборки; манифест передаётся как есть.
-			st.Version = cmp.Or(releaseVersion(w.spec), st.Version)
+		case w.waiting[protocol.PendingUpdate] > 0:
+			st.Pending = protocol.PendingUpdate
+		case w.waiting[protocol.PendingRestart] > 0:
+			st.Pending = protocol.PendingRestart
 		}
 		w.mu.Unlock()
 		out = append(out, st)
@@ -462,39 +506,34 @@ func (s *Supervisor) Status() []message.WorkerStatus {
 	return out
 }
 
+// Restart — worker.restart: остановить и запустить заново; итог — регистрация нового
+// процесса. Без force замена ждёт, пока воркер занят; отсрочку видит контекст WithDeferred.
+func (s *Supervisor) Restart(ctx context.Context, name string, force bool) error {
+	w := s.get(name)
+	if w == nil {
+		return ErrUnknown
+	}
+	return w.replace(ctx, nil, protocol.PendingRestart, force)
+}
+
 // deferredKey — ключ контекста: кому сообщить, что замена отложена.
 type deferredKey struct{}
 
-// WithDeferred — контекст замены (Restart, Update), в котором fn узнаёт, что
-// воркер занят и замена отложена до окончания его работы (pending —
-// message.PendingRestart или PendingUpdate). fn вызывается не больше раза,
-// до итога замены.
+// WithDeferred — контекст замены (Restart, Update), в котором fn узнаёт, что воркер занят и
+// замена отложена до окончания его работы (pending — PendingRestart или PendingUpdate).
 func WithDeferred(ctx context.Context, fn func(pending string)) context.Context {
 	var once sync.Once
 	return context.WithValue(ctx, deferredKey{}, func(pending string) { once.Do(func() { fn(pending) }) })
 }
 
-// notifyDeferred — сообщить контексту замены, что она отложена.
 func notifyDeferred(ctx context.Context, pending string) {
 	if fn, ok := ctx.Value(deferredKey{}).(func(string)); ok {
 		fn(pending)
 	}
 }
 
-// Restart — worker.restart: остановить и запустить заново; итог — запуск.
-// Без force замена ждёт, пока воркер занят (§13); отсрочку видит контекст
-// WithDeferred.
-func (s *Supervisor) Restart(ctx context.Context, name string, force bool) error {
-	w := s.get(name)
-	if w == nil {
-		return ErrUnknown
-	}
-	return w.replace(ctx, nil, message.PendingRestart, force)
-}
-
-// replace — заменить процесс (§13: сначала уходит прежний) и дождаться
-// итога запуска нового. Без force сначала ждёт, пока воркер занят; kind —
-// какая замена ждёт (status.workers[].pending).
+// replace — заменить процесс (сначала уходит прежний) и дождаться регистрации нового. Без
+// force сначала ждёт, пока воркер занят; kind — какая замена ждёт.
 func (w *Worker) replace(ctx context.Context, swap func() error, kind string, force bool) error {
 	w.mu.Lock()
 	gen := w.gen
@@ -503,7 +542,7 @@ func (w *Worker) replace(ctx context.Context, swap func() error, kind string, fo
 		return nil
 	}
 	req := request{swap: swap, done: make(chan error, 1)}
-	if kind == message.PendingRestart && swap == nil && gen > 0 {
+	if kind == protocol.PendingRestart && swap == nil && gen > 0 {
 		req.gen = gen
 	}
 	select {
@@ -521,9 +560,8 @@ func (w *Worker) replace(ctx context.Context, swap func() error, kind string, fo
 	}
 }
 
-// waitIdle — плановая замена ждёт, пока воркер отвечает busy: true на
-// GET /health (не дольше busyTimeout). true — ждать не нужно и заменять
-// тоже: это перезапуск, а воркер за время ожидания уже запущен заново.
+// waitIdle — плановая замена ждёт, пока воркер занят по пульсу (не дольше busyTimeout). true
+// — заменять не нужно: это перезапуск, а воркер за время ожидания уже запущен заново.
 func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 	w.mu.Lock()
 	gen := w.gen
@@ -531,7 +569,7 @@ func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 	restarted := func() bool {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		return kind == message.PendingRestart && w.gen != gen
+		return kind == protocol.PendingRestart && w.gen != gen
 	}
 	log := w.opts().Log.With("worker", w.name, "pending", kind)
 	var deadline time.Time
@@ -544,25 +582,26 @@ func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 		}
 	}()
 	for {
-		client, err := w.sup.Client(w.name)
-		if err != nil {
-			return restarted()
+		w.mu.Lock()
+		busy := w.proc != nil && w.health != nil && w.health.Busy
+		message := ""
+		if w.health != nil {
+			message = w.health.Message
 		}
-		h, err := probeHealth(ctx, client, probeTimeout)
-		if err != nil || h == nil || !h.Busy {
+		w.mu.Unlock()
+		if !busy {
 			if !deadline.IsZero() {
 				log.Info("воркер освободился — замена")
 			}
 			return restarted()
 		}
-		w.setHealth(h)
 		if deadline.IsZero() {
 			deadline = time.Now().Add(busyTimeout)
 			w.mu.Lock()
 			w.waiting[kind]++
 			w.mu.Unlock()
 			w.opts().OnChange()
-			log.Info("воркер занят — замена отложена до окончания работы", "busyTimeout", busyTimeout, "message", h.Message)
+			log.Info("воркер занят — замена отложена до окончания работы", "busyTimeout", busyTimeout, "message", message)
 			notifyDeferred(ctx, kind)
 		} else if time.Now().After(deadline) {
 			log.Warn("воркер занят дольше busyTimeout — замена", "busyTimeout", busyTimeout)
@@ -578,12 +617,11 @@ func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 	}
 }
 
-func (w *Worker) setState(state string) {
+func (w *Worker) setState(state, reason string) {
 	w.mu.Lock()
-	changed := w.state != state
-	w.state = state
-	w.reason = ""
-	if state != message.WorkerRunning && state != message.WorkerInvalid {
+	changed := w.state != state || w.reason != reason
+	w.state, w.reason = state, reason
+	if state != protocol.WorkerRunning && state != protocol.WorkerInvalid {
 		w.health = nil
 	}
 	w.mu.Unlock()
@@ -592,34 +630,12 @@ func (w *Worker) setState(state string) {
 	}
 }
 
-// unsettle — начался запуск: события ждут итога регистрации.
-func (w *Worker) unsettle() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	select {
-	case <-w.settled:
-		w.settled = make(chan struct{})
-	default:
-	}
-}
-
-// settle — первая проверка регистрации закончилась (или запуска не будет).
-func (w *Worker) settle() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	select {
-	case <-w.settled:
-	default:
-		close(w.settled)
-	}
-}
-
-// keepOnExit — агент уходит, а воркер работает дальше (SetExit);
-// встроенный и удалённый из настроек — никогда.
+// keepOnExit — агент уходит, а воркер работает дальше (SetExit); удалённый из настроек —
+// никогда.
 func (w *Worker) keepOnExit() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.spec.Builtin || w.removed {
+	if w.removed {
 		return false
 	}
 	switch Exit(w.sup.exit.Load()) {
@@ -629,16 +645,14 @@ func (w *Worker) keepOnExit() bool {
 	return false
 }
 
-// loop — жизнь воркера до отмены ctx: подхват или запуск, ожидание сокета,
-// работа, перезапуск после выхода, замена по запросу.
+// loop — жизнь воркера до отмены ctx: подхват или запуск, ожидание регистрации, работа,
+// перезапуск после выхода, замена по запросу.
 func (w *Worker) loop(ctx context.Context) {
 	defer close(w.done)
-	defer w.settle()
 	log := w.opts().Log.With("worker", w.name)
 	failures := 0
 	first := true
 	var pending *request
-	// stale — перезапуск, а процесс уже запущен заново после запроса.
 	stale := func(req request) bool {
 		w.mu.Lock()
 		defer w.mu.Unlock()
@@ -647,7 +661,7 @@ func (w *Worker) loop(ctx context.Context) {
 	defer func() { pending.reply(errors.New("агент останавливается")) }()
 	for {
 		if ctx.Err() != nil {
-			w.setState(message.WorkerStopped)
+			w.setState(protocol.WorkerStopped, "")
 			return
 		}
 		w.mu.Lock()
@@ -657,24 +671,30 @@ func (w *Worker) loop(ctx context.Context) {
 		var st procState
 		var err error
 		adopted := false
-		w.unsettle()
 		if first {
+			var blocked error
+			p, st, blocked = w.adopt(spec)
+			if blocked != nil {
+				log.Error("воркер не запущен", "err", blocked)
+				w.setState(protocol.WorkerInvalid, blocked.Error())
+				select {
+				case <-ctx.Done():
+				case <-time.After(adoptRetry):
+				}
+				continue
+			}
 			first = false
-			p, st = w.adopt(ctx, spec)
 			adopted = p != nil
 		}
 		if p == nil {
-			w.setState(message.WorkerStarting)
+			w.setState(protocol.WorkerStarting, "")
 			p, err = w.start(ctx, spec)
 		}
+		failed := true
 		if err != nil {
-			w.settle()
 			pending.reply(err)
 			pending = nil
-		}
-		failed := true
-		if err == nil {
-			// procSpec — отпечаток настроек, с которыми процесс запущен.
+		} else {
 			started, procSpec := time.Now(), specHash(spec)
 			if adopted {
 				started, procSpec = time.UnixMilli(st.StartedAt), st.Spec
@@ -682,27 +702,25 @@ func (w *Worker) loop(ctx context.Context) {
 			w.mu.Lock()
 			w.proc = p
 			w.gen++
+			w.registered = make(chan struct{})
+			registered := w.registered
+			if adopted {
+				// Подхваченный воркер переподключится и зарегистрируется заново.
+				w.state = protocol.WorkerStarting
+			}
 			token := w.token
 			w.mu.Unlock()
 			w.saveState(p, token, procSpec, started, p.out.start)
-			hctx, stopHealth := context.WithCancel(ctx)
-			go w.healthLoop(hctx, p)
-			// Регистрация (§12): первая проверка — до итога запуска, повтор — в фоне.
-			registered := w.register(hctx, p)
-			w.settle()
-			pending.reply(nil)
+			wctx, stopWatch := context.WithCancel(ctx)
+			go w.watch(wctx, p, registered)
+			go func(req *request) {
+				req.reply(w.awaitRegistration(wctx, p, registered))
+			}(pending)
 			pending = nil
-			if registered {
-				go w.registered(adopted)
-			} else {
-				go w.retryRegister(hctx, p, adopted)
-			}
 			if adopted && (st.Spec != specHash(spec) || st.Version != releaseVersion(spec)) {
 				log.Info("воркер подхвачен, но его настройки или сборка изменились — замена")
-				go func() { _ = w.replace(ctx, nil, message.PendingRestart, false) }()
+				go func() { _ = w.replace(ctx, nil, protocol.PendingRestart, false) }()
 			}
-			// Работа до отмены, запроса замены или выхода процесса. Запрос
-			// перезапуска процесса, который уже запущен заново, выполнен.
 			var req *request
 			exited := false
 			for req == nil && !exited && ctx.Err() == nil {
@@ -718,7 +736,7 @@ func (w *Worker) loop(ctx context.Context) {
 					exited = true
 				}
 			}
-			stopHealth()
+			stopWatch()
 			switch {
 			case req != nil:
 				log.Info("замена воркера: остановка прежнего процесса")
@@ -738,7 +756,7 @@ func (w *Worker) loop(ctx context.Context) {
 					removeState(w.sup.stateDir, w.name)
 				}
 				w.clearProc()
-				w.setState(message.WorkerStopped)
+				w.setState(protocol.WorkerStopped, "")
 				return
 			}
 			removeState(w.sup.stateDir, w.name)
@@ -748,11 +766,12 @@ func (w *Worker) loop(ctx context.Context) {
 			}
 			failed = p.failed()
 			log.Warn("воркер завершился", "reason", p.exitReason())
-		} else if ctx.Err() == nil {
+		}
+		if err != nil && ctx.Err() == nil {
 			log.Error("воркер не запустился", "err", err)
 		}
 		if ctx.Err() != nil {
-			w.setState(message.WorkerStopped)
+			w.setState(protocol.WorkerStopped, "")
 			return
 		}
 		var wait <-chan time.Time
@@ -761,15 +780,15 @@ func (w *Worker) loop(ctx context.Context) {
 			w.mu.Lock()
 			w.restarts++
 			w.mu.Unlock()
-			w.setState(message.WorkerBackoff)
+			w.setState(protocol.WorkerBackoff, "")
 			wait = time.After(restartBackoff.Delay(failures - 1))
 		} else {
 			log.Info("воркер завершился сам (exit 0) — не перезапускается до worker.restart или изменения настроек")
-			w.setState(message.WorkerStopped)
+			w.setState(protocol.WorkerStopped, "")
 		}
 		select {
 		case <-ctx.Done():
-			w.setState(message.WorkerStopped)
+			w.setState(protocol.WorkerStopped, "")
 			return
 		case req := <-w.requests:
 			pending = w.swap(req)
@@ -779,45 +798,101 @@ func (w *Worker) loop(ctx context.Context) {
 	}
 }
 
-// adopt — подхватить процесс воркера, переживший перезапуск агента (§13):
-// файл процесса есть, процесс жив, это он (время запуска совпадает) и
-// сокет отвечает. Иначе — nil (обычный запуск); процесс, который нельзя
-// подхватить (встроенный воркер, сокет не ответил), останавливается.
-func (w *Worker) adopt(ctx context.Context, spec config.Worker) (*process, procState) {
+// awaitRegistration — итог запуска: регистрация процесса p; не зарегистрировался за
+// registerTimeout или завершился раньше — ошибка.
+func (w *Worker) awaitRegistration(ctx context.Context, p *process, registered chan struct{}) error {
+	timer := time.NewTimer(registerTimeout)
+	defer timer.Stop()
+	select {
+	case <-registered:
+		return nil
+	case <-p.exited:
+		return fmt.Errorf("завершился до регистрации: %s", p.exitReason())
+	case <-timer.C:
+		return fmt.Errorf("не зарегистрировался за %s", registerTimeout)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// watch — регистрация и пульс текущего процесса: не зарегистрировался за registerTimeout —
+// invalid; пульса нет дольше healthSilence — нездоров, ещё healthRestart — перезапуск.
+func (w *Worker) watch(ctx context.Context, p *process, registered chan struct{}) {
+	started := time.Now()
+	t := time.NewTicker(watchEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		select {
+		case <-registered:
+		default:
+			if time.Since(started) >= registerTimeout {
+				w.mu.Lock()
+				invalid := w.state == protocol.WorkerStarting
+				w.mu.Unlock()
+				if invalid {
+					p.log.Warn("воркер не зарегистрировался — работает, но команды и настройки ему не передаются",
+						"timeout", registerTimeout)
+					w.setState(protocol.WorkerInvalid, fmt.Sprintf("не зарегистрировался за %s после запуска", registerTimeout))
+				}
+			}
+			continue
+		}
+		w.mu.Lock()
+		silent := time.Since(w.beat)
+		unhealthy := (w.health == nil || w.health.OK) && silent >= healthSilence
+		if unhealthy {
+			w.health = &protocol.Health{OK: false, Message: fmt.Sprintf("нет пульса %s", silent.Round(time.Second))}
+		}
+		w.mu.Unlock()
+		if unhealthy {
+			p.log.Warn("нет пульса воркера", "silent", silent.Round(time.Second))
+			w.opts().OnChange()
+		}
+		if silent >= healthSilence+healthRestart {
+			p.log.Error("воркер завис: нет пульса — перезапуск", "silent", silent.Round(time.Second))
+			p.kill("воркер завис: нет пульса")
+			return
+		}
+	}
+}
+
+// adopt — подхватить процесс воркера, переживший перезапуск агента: файл процесса есть,
+// процесс жив и это он (время запуска совпадает). Иначе — nil (обычный запуск).
+//
+// Не подхвачен и не остановлен (процесс другого пользователя: служба сменила пользователя) —
+// ошибка: вторую копию воркера агент не запускает.
+func (w *Worker) adopt(spec config.Worker) (*process, procState, error) {
 	dir := w.sup.stateDir
 	st, ok := readState(dir, w.name)
 	if !ok {
-		return nil, st
+		return nil, st, nil
 	}
 	log := w.opts().Log.With("worker", w.name, "pid", st.PID)
 	if !st.alive() {
 		removeState(dir, w.name)
-		return nil, st
-	}
-	if spec.Builtin {
-		stopOrphan(st)
-		removeState(dir, w.name)
-		return nil, st
+		return nil, st, nil
 	}
 	p, err := adoptProcess(st, spec, w.sup.logDir, w.opts().Log, w.life)
 	if err != nil {
-		log.Warn("воркер не подхвачен — запуск заново", "err", err)
+		log.Warn("воркер не подхвачен — остановка прежнего процесса и запуск заново", "err", err)
 		stopOrphan(st)
+		if st.alive() {
+			return nil, st, fmt.Errorf("прежний процесс воркера (pid %d) работает, но агент не может ни подхватить, ни остановить его (%v): "+
+				"остановите его сами (kill %d) — вторую копию агент не запускает", st.PID, err, st.PID)
+		}
 		removeState(dir, w.name)
-		return nil, st
-	}
-	if err := p.waitReady(ctx, startTimeout); err != nil {
-		log.Warn("воркер не подхвачен: сокет не отвечает — запуск заново", "err", err)
-		p.detach()
-		stopOrphan(st)
-		removeState(dir, w.name)
-		return nil, st
+		return nil, st, nil
 	}
 	w.mu.Lock()
 	w.token = st.Token
 	w.mu.Unlock()
-	log.Info("воркер подхвачен после перезапуска агента")
-	return p, st
+	log.Info("воркер подхвачен после перезапуска агента — ждём его переподключения")
+	return p, st, nil
 }
 
 // saveState — файл процесса для следующего запуска агента.
@@ -828,8 +903,8 @@ func (w *Worker) saveState(p *process, token, spec string, started time.Time, ou
 	}
 }
 
-// swap — смена сборки между остановкой и запуском; ошибка — итог запроса
-// сразу, запуск идёт с тем, что есть.
+// swap — смена сборки между остановкой и запуском; ошибка — итог запроса сразу, запуск идёт
+// с тем, что есть.
 func (w *Worker) swap(req request) *request {
 	if req.swap != nil {
 		if err := req.swap(); err != nil {
@@ -843,226 +918,46 @@ func (w *Worker) swap(req request) *request {
 func (w *Worker) clearProc() {
 	w.mu.Lock()
 	w.proc = nil
+	w.health = nil
 	w.mu.Unlock()
 }
 
-// start — процесс и ожидание сокета; не дождались — процесс останавливается.
+// start — новый процесс воркера (с новым токеном).
 func (w *Worker) start(ctx context.Context, spec config.Worker) (*process, error) {
 	o := w.opts()
-	p, err := startProcess(spec, o.RunDir, w.sup.logDir,
-		env{agentSocket: o.AgentSocket, agentVersion: o.AgentVersion, token: w.getToken(), extra: o.Env}, o.Log, w.life)
-	if err != nil {
-		return nil, err
-	}
-	if err := p.waitReady(ctx, startTimeout); err != nil {
-		p.stop()
-		return nil, err
-	}
-	return p, nil
-}
-
-// healthLoop — GET /health раз в healthInterval (первый — сразу);
-// healthMisses раз подряд без ответа — воркер завис и перезапускается, даже
-// если он был занят.
-func (w *Worker) healthLoop(ctx context.Context, p *process) {
-	misses := 0
-	for {
-		h, err := probeHealth(ctx, p.client, probeTimeout)
-		if ctx.Err() != nil {
-			return
-		}
-		if errors.Is(err, errNoResponse) {
-			misses++
-			p.log.Warn("воркер не ответил на GET /health", "misses", misses)
-			if misses >= healthMisses {
-				p.log.Error("воркер завис: нет ответа на GET /health — перезапуск", "misses", misses)
-				p.kill("воркер завис: нет ответа на GET /health")
-				return
-			}
-		} else {
-			misses = 0
-			w.setHealth(h)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(healthInterval):
-		}
-	}
-}
-
-func (w *Worker) setHealth(h *message.Health) {
 	w.mu.Lock()
-	changed := (w.health == nil) != (h == nil) || (h != nil && (w.health.OK != h.OK || w.health.Busy != h.Busy))
-	w.health = h
+	w.token = newToken()
+	token := w.token
 	w.mu.Unlock()
-	if changed {
-		w.opts().OnChange()
-	}
+	return startProcess(ctx, spec, w.sup.logDir, env{agentSocket: o.AgentSocket, token: token,
+		stateDir: StateDir(o.DataDir, spec.Name), extra: o.Env}, o.Log, w.life)
 }
 
-// register — проверка регистрации (§12): GET /health и GET /manifest
-// корректны — state: running, иначе — invalid с причиной. Манифест
-// обновляется при каждой проверке. true — зарегистрирован.
-func (w *Worker) register(ctx context.Context, p *process) bool {
-	m, reason := probeRegistration(ctx, p.client, probeTimeout)
-	if ctx.Err() != nil {
-		return false
-	}
-	state := message.WorkerRunning
-	if reason != "" {
-		state = message.WorkerInvalid
-	}
-	w.mu.Lock()
-	if w.proc != p {
-		w.mu.Unlock()
-		return false // процесс уже заменён
-	}
-	before, _ := json.Marshal(w.manifest)
-	after, _ := json.Marshal(m)
-	changed := w.state != state || w.reason != reason || string(before) != string(after)
-	w.manifest, w.state, w.reason = m, state, reason
-	w.mu.Unlock()
-	if changed {
-		w.opts().OnChange()
-	}
-	if reason != "" {
-		p.log.Warn("воркер не зарегистрирован: нужны корректные GET /health и GET /manifest — настройки и запросы ему не передаются", "reason", reason)
-	}
-	return reason == ""
-}
-
-// retryRegister — повтор проверки регистрации с растущей паузой
-// (restartBackoff), пока воркер не зарегистрируется или процесс не
-// сменится.
-func (w *Worker) retryRegister(ctx context.Context, p *process, adopted bool) {
-	for attempt := 0; ; attempt++ {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(restartBackoff.Delay(attempt)):
-		}
-		if w.register(ctx, p) {
-			p.log.Info("воркер зарегистрирован")
-			w.registered(adopted)
-			return
-		}
-		if ctx.Err() != nil {
-			return
-		}
-	}
-}
-
-// registered — воркер зарегистрирован: агент передаёт ему настройки.
-func (w *Worker) registered(adopted bool) {
-	if adopted {
-		w.opts().OnAdopted(w.name)
-	} else {
-		w.opts().OnStarted(w.name)
-	}
-}
-
-// probeRegistration — GET /health и GET /manifest (§12): манифест (nil — нет
-// корректного) и причина, почему воркер не зарегистрирован ("" —
-// зарегистрирован).
-func probeRegistration(ctx context.Context, client *http.Client, timeout time.Duration) (*message.WorkerManifest, string) {
-	var problems []string
-	status, raw, err := Get(ctx, client, message.HealthPath, timeout, message.MaxHealthBytes)
-	switch {
-	case err != nil:
-		problems = append(problems, err.Error())
-	case status/100 != 2:
-		problems = append(problems, fmt.Sprintf("GET /health: HTTP %d", status))
-	default:
-		var h struct {
-			OK *bool `json:"ok"`
-		}
-		if json.Unmarshal(raw, &h) != nil || h.OK == nil {
-			problems = append(problems, "GET /health: нужен JSON с полем ok (true или false)")
-		}
-	}
-	var m *message.WorkerManifest
-	status, raw, err = Get(ctx, client, message.WorkerManifestPath, timeout, message.MaxManifestBytes)
-	switch {
-	case err != nil:
-		problems = append(problems, err.Error())
-	case status/100 != 2:
-		problems = append(problems, fmt.Sprintf("GET /manifest: HTTP %d", status))
-	default:
-		if m, err = message.ParseWorkerManifest(raw); err != nil {
-			problems = append(problems, "GET /manifest: "+err.Error())
-		}
-	}
-	return m, strings.Join(problems, "; ")
-}
-
-// Get — GET path у воркера: код ответа и тело (не больше limit); нет ответа
-// — ошибка errNoResponse, тело больше limit — errTooLarge.
-func Get(ctx context.Context, client *http.Client, path string, timeout time.Duration, limit int) (int, []byte, error) {
+// waitHealthy — воркер name зарегистрирован и пульс ok: true не позже timeout.
+func (s *Supervisor) waitHealthy(ctx context.Context, name string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://worker"+path, nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, nil, fmt.Errorf("GET %s: %w за %s: %v", path, errNoResponse, timeout, err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
-	if err != nil {
-		return 0, nil, fmt.Errorf("GET %s: %w: %v", path, errNoResponse, err)
-	}
-	if len(raw) > limit {
-		return resp.StatusCode, nil, fmt.Errorf("GET %s: %w %d байт", path, errTooLarge, limit)
-	}
-	return resp.StatusCode, raw, nil
-}
-
-// errTooLarge — ответ воркера больше предела.
-var errTooLarge = errors.New("ответ больше")
-
-// probeHealth — GET /health (§9): nil, nil — не поддерживается (404);
-// не-2xx или неверное тело — ok: false; нет ответа — errNoResponse.
-func probeHealth(ctx context.Context, client *http.Client, timeout time.Duration) (*message.Health, error) {
-	status, raw, err := Get(ctx, client, message.HealthPath, timeout, message.MaxHealthBytes)
-	var h message.Health
-	switch {
-	case errors.Is(err, errNoResponse):
-		return nil, err
-	case status == http.StatusNotFound:
-		return nil, nil
-	case status/100 != 2:
-		return &message.Health{OK: false, Message: fmt.Sprintf("GET /health: HTTP %d", status)}, nil
-	case err != nil || json.Unmarshal(raw, &h) != nil:
-		return &message.Health{OK: false, Message: "GET /health: неверное тело ответа"}, nil
-	}
-	return &h, nil
-}
-
-// waitHealthy — воркер name ответил ok: true на GET /health не позже timeout.
-func (s *Supervisor) waitHealthy(ctx context.Context, name string, timeout, probe time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	last := "нет ответа"
+	last := "не зарегистрировался"
 	for {
-		if client, err := s.Client(name); err == nil {
-			h, err := probeHealth(ctx, client, probe)
+		if w := s.get(name); w != nil {
+			w.mu.Lock()
 			switch {
-			case err != nil:
-				last = err.Error()
-			case h == nil:
-				last = "воркер не отвечает на GET /health (404)"
-			case h.OK:
-				return nil
+			case w.state != protocol.WorkerRunning:
+				last = "не зарегистрировался"
+			case w.health == nil:
+				last = "нет пульса"
+			case !w.health.OK:
+				last = "ok: false " + w.health.Message
 			default:
-				last = "ok: false " + h.Message
+				w.mu.Unlock()
+				return nil
 			}
-		} else {
-			last = err.Error()
+			w.mu.Unlock()
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("новая сборка не ответила ok: true на GET /health за %s: %s", timeout, last)
-		case <-time.After(time.Second):
+			return fmt.Errorf("новая сборка не заработала за %s: %s", timeout, last)
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
 }

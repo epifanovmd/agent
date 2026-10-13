@@ -10,8 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  # Агент, образцы сообщений, integration (сервер на agent-sdk/server). Без node или
-  # собранного sdk/node интеграционные тесты в CI падают.
+  # Агент: gofmt, vet, тесты с race-детектором.
   go:
     runs-on: ubuntu-latest
     steps:
@@ -19,17 +18,16 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "24"
-      - run: npm ci && npm run build
-        working-directory: sdk/node
       - name: gofmt
         run: |
           out=$(gofmt -l .)
           if [ -n "$out" ]; then echo "gofmt: не отформатированы:"; echo "$out"; exit 1; fi
-      - run: go vet ./...
+      - run: go vet -tags e2e ./...
       - run: go test -race ./...
+      - name: Версия
+        run: scripts/version.sh check
+      - name: Синтаксис примеров на Python
+        run: python3 -c 'import ast, sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' examples/workers/echo/main.py examples/server/server.py
 
   # Младшая версия Go из строки go в go.mod: модуль собирается ей.
   go-min:
@@ -53,26 +51,7 @@ jobs:
           go-version-file: go.mod
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
-  # Серверный SDK, стенд, версия, форматирование.
-  node:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "24"
-      - name: Версия везде одинаковая
-        run: scripts/version.sh check
-      - name: Prettier
-        run: npm ci && npx prettier --check .
-      - run: npm ci && npm run lint && npm run typecheck && npm test && npm run build
-        working-directory: sdk/node
-      - run: npm ci && npm run lint && npm run typecheck
-        working-directory: examples/server
-      - name: Синтаксис воркеров стенда на Node и Python
-        run: node --check examples/workers/node-echo/main.mjs && python3 -m py_compile examples/workers/echo/main.py
-
-  # Сквозные тесты стенда: сервер на agent-sdk/server, настоящий агент, воркеры-примеры.
+  # Сквозные тесты: настоящий агент, воркеры-примеры (Python и Go), бэкенд в процессе теста.
   e2e:
     runs-on: ubuntu-latest
     steps:
@@ -80,12 +59,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "24"
-      - run: npm ci && npm run build
-        working-directory: sdk/node
-      - run: scripts/e2e.sh
+      - run: go test -tags e2e -count=1 -timeout 10m ./test/e2e/
 
   shellcheck:
     runs-on: ubuntu-latest

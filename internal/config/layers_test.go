@@ -41,6 +41,7 @@ const devLayer = `extends: agent.yaml
 envFiles: [.env.dev, .env.local, none.env]
 server:
   url: http://localhost:${PORT}
+  allowInsecure: true
 dataDir: ../data
 labels: { env: dev }
 workers:

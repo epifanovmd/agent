@@ -3,13 +3,11 @@
 # Образ — golang:<ветка>-bookworm, ветка — из строки toolchain в go.mod (go1.26.0 → 1.26),
 # без неё — из строки go; GO_IMAGE задаёт образ явно (проверка на младшей версии Go:
 # GOTOOLCHAIN=local GO_IMAGE=golang:1.24-bookworm scripts/go.sh vet).
-# Тесты (test, race) — в образе agent-go-test: golang + node (сервер интеграционных тестов на
-# agent-sdk/server, нужен собранный sdk/node); образ собирается здесь же, повторная сборка — из
-# кеша Docker. С GO_IMAGE тесты идут в нём.
+# Тесты (test, race) — в том же образе: в нём есть python3 для воркера-примера сквозных тестов.
 # Контейнер работает от пользователя машины: файлы в dist/ — его, а не root. Кеши модулей
 # и сборки — в томах agent-gomod и agent-gocache.
 # AGENT_UPDATE_PUBLIC_KEY (build, release) — открытый ключ проверки обновлений, вшивается в агента.
-#   scripts/go.sh test | race [аргументы go test, по умолчанию ./...] | vet | tidy | fmt | fmt-check
+#   scripts/go.sh test | race [аргументы go test, по умолчанию ./...] | e2e | vet | tidy | fmt | fmt-check
 #   scripts/go.sh build [os] [arch] [cmd] [pkg]  # <BUILD_DIR>/<cmd>-<os>-<arch>; по умолчанию — эта машина,
 #                                           # agent, ./cmd/<cmd>; BUILD_DIR (от корня) — по умолчанию dist/<VERSION>
 #   scripts/go.sh release [--worker NAME=VERSION[,stopTimeout=…][,command=…]]…
@@ -35,20 +33,8 @@ docker run --rm -v agent-gomod:/gomod -v agent-gocache:/gocache "$IMAGE" sh -c \
 run() {
   docker run --rm --init --user "$OWNER" -v "$ROOT:/src" -w /src \
     -v agent-gomod:/gomod -v agent-gocache:/gocache \
-    -e HOME=/tmp -e GOMODCACHE=/gomod -e GOCACHE=/gocache -e GOTOOLCHAIN \
+    -e HOME=/tmp -e GOMODCACHE=/gomod -e GOCACHE=/gocache -e GOTOOLCHAIN -e PYTHONDONTWRITEBYTECODE=1 \
     -e CGO_ENABLED=0 ${AGENT_SIGNING_KEY:+-e AGENT_SIGNING_KEY} ${AGENT_UPDATE_PUBLIC_KEY:+-e AGENT_UPDATE_PUBLIC_KEY} "$@"
-}
-
-# test_image — образ для тестов: GO_IMAGE или golang с node.
-test_image() {
-  if [ -n "${GO_IMAGE:-}" ]; then echo "$GO_IMAGE"; return; fi
-  local image="agent-go-test:$GO_VERSION"
-  docker build -q -t "$image" - >/dev/null <<EOF
-FROM node:24-bookworm-slim AS node
-FROM golang:$GO_VERSION-bookworm
-COPY --from=node /usr/local/bin/node /usr/local/bin/node
-EOF
-  echo "$image"
 }
 
 host_os() { case "$(uname -s)" in Darwin) echo darwin ;; *) echo linux ;; esac; }
@@ -64,9 +50,11 @@ build() {
 }
 
 case "${1:-test}" in
-  test) shift; run "$(test_image)" go test "${@:-./...}" ;;
-  race) shift; run -e CGO_ENABLED=1 "$(test_image)" go test -race "${@:-./...}" ;;
-  vet) run "$IMAGE" go vet ./... ;;
+  test) shift; run "$IMAGE" go test "${@:-./...}" ;;
+  race) shift; run -e CGO_ENABLED=1 "$IMAGE" go test -race "${@:-./...}" ;;
+  # Сквозные тесты (test/e2e, тег e2e): настоящий агент, воркеры-примеры, бэкенд в процессе теста.
+  e2e) shift; run "$IMAGE" go test -tags e2e -count=1 -timeout 10m "$@" ./test/e2e/ ;;
+  vet) run "$IMAGE" go vet -tags e2e ./... ;;
   tidy) run "$IMAGE" go mod tidy ;;
   fmt) run "$IMAGE" gofmt -l -w . ;;
   fmt-check)

@@ -10,21 +10,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/releases"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // manifestCmd — agent manifest: manifest.json для сборок agent-<os>-<arch> в каталоге и
 // сборок воркеров: `--worker NAME=VERSION[,stopTimeout=…]`
 // (повторяемый) берёт файлы DIR/<name>-<version>-<os>-<arch> или архивы
 // DIR/<name>-<version>-<os>-<arch>.tar.gz. Подпись — AGENT_SIGNING_KEY над
-// строкой сборки (§11: имя, версия, os, arch, sha256), publicKey — её
+// строкой сборки (§10: имя, версия, os, arch, sha256), publicKey — её
 // открытый ключ. Сборок агента нет, но есть --worker — только сборки воркеров.
 func manifestCmd(args []string) error {
 	usage := errors.New("agent manifest DIR VERSION [--worker NAME=VERSION[,stopTimeout=30s][,command=bin/report]]…")
 	var positional []string
-	var workers []message.WorkerArtifact
+	var workers []protocol.WorkerArtifact
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		value, isWorker := strings.CutPrefix(arg, "--worker=")
@@ -63,7 +63,7 @@ func manifestCmd(args []string) error {
 		return update.Sign(priv, b)
 	}
 	files, _ := filepath.Glob(filepath.Join(dir, "agent-*-*"))
-	m := message.Manifest{Version: ver, Artifacts: []message.Artifact{}}
+	m := protocol.Manifest{Version: ver, Artifacts: []protocol.Artifact{}}
 	if priv != nil {
 		m.PublicKey = releases.PublicKeyOf(priv)
 	}
@@ -77,7 +77,7 @@ func manifestCmd(args []string) error {
 			return err
 		}
 		b := update.Build{Name: update.AgentName, Version: ver, OS: parts[1], Arch: parts[2], SHA256: hash}
-		m.Artifacts = append(m.Artifacts, message.Artifact{OS: parts[1], Arch: parts[2], File: filepath.Base(file), SHA256: hash, Signature: sign(b)})
+		m.Artifacts = append(m.Artifacts, protocol.Artifact{OS: parts[1], Arch: parts[2], File: filepath.Base(file), SHA256: hash, Signature: sign(b)})
 	}
 	if len(m.Artifacts) == 0 && len(workers) == 0 {
 		return fmt.Errorf("в %s нет сборок agent-<os>-<arch> (и не задан --worker)", dir)
@@ -123,11 +123,11 @@ func manifestCmd(args []string) error {
 }
 
 // parseWorkerFlag — NAME=VERSION[,stopTimeout=…][,command=…].
-func parseWorkerFlag(value string) (message.WorkerArtifact, error) {
+func parseWorkerFlag(value string) (protocol.WorkerArtifact, error) {
 	parts := strings.Split(value, ",")
 	name, ver, ok := strings.Cut(parts[0], "=")
-	var w message.WorkerArtifact
-	if !ok || !message.ValidName(name) || ver == "" || strings.ContainsAny(ver, "/ ") {
+	var w protocol.WorkerArtifact
+	if !ok || !protocol.ValidName(name) || ver == "" || strings.ContainsAny(ver, "/ ") {
 		return w, fmt.Errorf("--worker %q: нужно NAME=VERSION (имя — строчная латиница, цифры и «-», начало — буква)", value)
 	}
 	w.Name, w.Version = name, ver

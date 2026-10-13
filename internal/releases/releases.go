@@ -1,4 +1,4 @@
-// Package releases — каталог сборок (manifest.json и файлы сборок, §11): с
+// Package releases — каталог сборок (manifest.json и файлы сборок, §10): с
 // сервера, каталог сборок агента (релизы на GitHub, зеркало) или локальная
 // папка; установка сборки воркера в его каталог <dataDir>/workers/<name>.
 package releases
@@ -19,8 +19,8 @@ import (
 	"strings"
 
 	"github.com/epifanovmd/agent/internal/config"
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // DefaultBase — каталог сборок агента: его релизы на GitHub.
@@ -54,7 +54,7 @@ func remote(dir string) bool {
 }
 
 // Manifest — manifest.json каталога dir.
-func Manifest(ctx context.Context, client *http.Client, dir string) (*message.Manifest, error) {
+func Manifest(ctx context.Context, client *http.Client, dir string) (*protocol.Manifest, error) {
 	where := strings.TrimRight(dir, "/") + "/" + ManifestFile
 	var body io.ReadCloser
 	if remote(dir) {
@@ -80,14 +80,14 @@ func Manifest(ctx context.Context, client *http.Client, dir string) (*message.Ma
 		body = f
 	}
 	defer body.Close()
-	var m message.Manifest
+	var m protocol.Manifest
 	if err := json.NewDecoder(body).Decode(&m); err != nil {
 		return nil, fmt.Errorf("манифест сборок %s: %w", where, err)
 	}
 	return &m, nil
 }
 
-// BuildURL — где взять сборку по записи manifest.json (§11): имя файла — в
+// BuildURL — где взять сборку по записи manifest.json (§10): имя файла — в
 // каталоге dir; абсолютная ссылка https:// — как есть; http:// — только если
 // и каталог http://. У локальной папки — только имя файла в ней.
 func BuildURL(dir, file string) (string, error) {
@@ -151,7 +151,7 @@ type Placed struct {
 // PlaceWorker — сборка воркера name под goos/arch из каталога dir (старшая
 // версия; sha256 и, если есть ключи, подпись сверяются) в releaseDir/current
 // (+ version); архив .tar.gz распаковывается в каталог current.
-func PlaceWorker(ctx context.Context, client *http.Client, dir string, m *message.Manifest, name, goos, arch, releaseDir string, keys update.Keys) (Placed, error) {
+func PlaceWorker(ctx context.Context, client *http.Client, dir string, m *protocol.Manifest, name, goos, arch, releaseDir string, keys update.Keys) (Placed, error) {
 	a := m.Worker(name, goos, arch)
 	if a == nil {
 		return Placed{}, fmt.Errorf("в каталоге сборок %s нет сборки воркера %s под %s/%s", dir, name, goos, arch)
@@ -218,7 +218,7 @@ func AgentBuild(ctx context.Context, client *http.Client, base, version, goos, a
 	if err != nil {
 		return update.Release{}, err
 	}
-	if m.Version != "" && message.CompareVersions(m.Version, version) != 0 {
+	if m.Version != "" && protocol.CompareVersions(m.Version, version) != 0 {
 		return update.Release{}, fmt.Errorf("в каталоге %s версия %s, а не %s", dir, m.Version, version)
 	}
 	for _, a := range m.Artifacts {

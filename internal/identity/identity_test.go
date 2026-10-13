@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 func TestStoreRoundTripAndPermissions(t *testing.T) {
@@ -46,10 +46,10 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 // 429 — подождать Retry-After; 5xx — обычный повтор.
 func TestEnroll(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req message.Enroll
+		var req protocol.Enroll
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch {
-		case r.URL.Path != message.EnrollPath:
+		case r.URL.Path != protocol.BackendPrefix+protocol.PathEnroll:
 			w.WriteHeader(http.StatusNotFound)
 		case req.Token == "busy":
 			w.Header().Set("Retry-After", "7")
@@ -71,26 +71,26 @@ func TestEnroll(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	host := message.Host{OS: "linux", Arch: "amd64", Hostname: "node-01"}
-	c, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: "good", Name: "n", Host: host})
+	host := protocol.Host{OS: "linux", Arch: "amd64", Hostname: "node-01"}
+	c, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: "good", Name: "n", Host: host})
 	if err != nil || c.AgentID != "id-1" || c.Secret != "sec" {
 		t.Fatalf("%v %v", c, err)
 	}
-	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: "bad", Host: host}); !errors.Is(err, ErrTokenRejected) ||
+	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: "bad", Host: host}); !errors.Is(err, ErrTokenRejected) ||
 		!strings.Contains(err.Error(), "ENROLL_DENIED") {
 		t.Fatalf("плохой токен: %v", err)
 	}
 	var rl *RateLimited
-	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: "busy", Host: host}); !errors.As(err, &rl) || rl.After != 7*time.Second {
+	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: "busy", Host: host}); !errors.As(err, &rl) || rl.After != 7*time.Second {
 		t.Fatalf("429: %v", err)
 	}
-	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: "down", Host: host}); err == nil ||
+	if _, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: "down", Host: host}); err == nil ||
 		errors.Is(err, ErrTokenRejected) || errors.As(err, &rl) {
 		t.Fatalf("5xx — обычная ошибка: %v", err)
 	}
 	// Тело ответа в текст ошибки не попадает: в нём может быть токен или секрет.
 	for _, tok := range []string{"proxy-SECRET-CANARY", "half-SECRET-CANARY"} {
-		_, err := Enroll(context.Background(), srv.Client(), srv.URL, message.Enroll{Token: tok, Host: host})
+		_, err := Enroll(context.Background(), srv.Client(), srv.URL, protocol.Enroll{Token: tok, Host: host})
 		if err == nil || strings.Contains(err.Error(), "SECRET-CANARY") {
 			t.Fatalf("%s: %v", tok, err)
 		}

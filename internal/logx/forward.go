@@ -7,12 +7,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // ForwardBuffer — записей ждут отправки не больше; лишние отбрасываются с
 // пометкой «пропущено N».
-const ForwardBuffer = 2 * message.MaxLogBatch
+const ForwardBuffer = 2 * protocol.MaxBatch
 
 // levelOff — порог «не слать ничего».
 const levelOff = slog.Level(1 << 20)
@@ -22,13 +22,13 @@ func ParseForward(name string) (slog.Level, error) {
 	switch strings.ToLower(name) {
 	case "off":
 		return levelOff, nil
-	case message.LogError:
+	case protocol.LogError:
 		return slog.LevelError, nil
-	case message.LogWarn:
+	case protocol.LogWarn:
 		return slog.LevelWarn, nil
-	case message.LogInfo:
+	case protocol.LogInfo:
 		return slog.LevelInfo, nil
-	case message.LogDebug:
+	case protocol.LogDebug:
 		return slog.LevelDebug, nil
 	}
 	return 0, fmt.Errorf("уровень %q: off | error | warn | info | debug", name)
@@ -36,13 +36,13 @@ func ParseForward(name string) (slog.Level, error) {
 
 // Forwarder — записи лога агента и вывода воркеров для сервера: порог
 // (log.forward или подробнее — из watch), буфер до ForwardBuffer записей и
-// пачки до message.MaxLogBatch. Безопасен для вызова из любых горутин; сам
+// пачки до protocol.MaxBatch. Безопасен для вызова из любых горутин; сам
 // ничего не логирует.
 type Forwarder struct {
 	mu       sync.Mutex
 	base     slog.Level
 	override *slog.Level
-	buf      []message.LogEntry
+	buf      []protocol.LogEntry
 	dropped  int
 }
 
@@ -96,7 +96,7 @@ func (f *Forwarder) Enabled(level slog.Level) bool {
 }
 
 // Add — запись в буфер (буфер полон — счётчик пропущенных).
-func (f *Forwarder) Add(e message.LogEntry) {
+func (f *Forwarder) Add(e protocol.LogEntry) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.buf) >= ForwardBuffer {
@@ -106,21 +106,21 @@ func (f *Forwarder) Add(e message.LogEntry) {
 	f.buf = append(f.buf, e)
 }
 
-// Take — следующая пачка (не больше message.MaxLogBatch, с пометкой о
+// Take — следующая пачка (не больше protocol.MaxBatch, с пометкой о
 // пропущенных в конце); nil — отправлять нечего.
-func (f *Forwarder) Take() []message.LogEntry {
+func (f *Forwarder) Take() []protocol.LogEntry {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	limit := message.MaxLogBatch
+	limit := protocol.MaxBatch
 	if f.dropped > 0 {
 		limit--
 	}
 	n := min(len(f.buf), limit)
-	batch := append([]message.LogEntry(nil), f.buf[:n]...)
+	batch := append([]protocol.LogEntry(nil), f.buf[:n]...)
 	f.buf = append(f.buf[:0], f.buf[n:]...)
 	if f.dropped > 0 {
-		batch = append(batch, message.LogEntry{
-			At: time.Now().UnixMilli(), Level: message.LogWarn, Source: message.LogSourceAgent,
+		batch = append(batch, protocol.LogEntry{
+			At: time.Now().UnixMilli(), Level: protocol.LogWarn, Source: protocol.LogSourceAgent,
 			Msg:   fmt.Sprintf("пропущено %d записей лога: буфер отправки переполнен", f.dropped),
 			Attrs: map[string]any{"skipped": f.dropped},
 		})

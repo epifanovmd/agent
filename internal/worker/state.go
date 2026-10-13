@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,14 +27,13 @@ const (
 )
 
 // procState — запущенный процесс воркера на диске: по нему следующий
-// запуск агента подхватывает воркер (§13).
+// запуск агента подхватывает воркер (§11).
 type procState struct {
 	PID int `json:"pid"`
 	// Start — время запуска процесса по данным системы (procStart): pid,
 	// выданный системой другому процессу, не подходит.
-	Start  string `json:"start"`
-	Socket string `json:"socket"`
-	Token  string `json:"token"`
+	Start string `json:"start"`
+	Token string `json:"token"`
 	// Version — версия сборки воркера с сервера.
 	Version string `json:"version,omitempty"`
 	// Spec — отпечаток настроек, с которыми процесс запущен (specHash).
@@ -92,30 +93,56 @@ func specHash(spec config.Worker) string {
 	return hex.EncodeToString(sum[:12])
 }
 
-// stopOrphan — остановить процесс из файла, за которым никто не следит
-// (воркера нет в настройках, встроенный): SIGTERM, не вышел за stopTimeout
-// — SIGKILL. Чужой процесс с тем же pid не трогается.
+// stopOrphan — остановить процесс из файла, за которым никто не следит (воркера нет в
+// настройках, не подхвачен): SIGTERM, не вышел за stopTimeout — SIGKILL. Чужой процесс с тем
+// же pid не трогается. false — процесса нет или нет прав на сигнал.
 func stopOrphan(st procState) bool {
 	if !st.alive() {
 		return false
 	}
-	signal := func(sig syscall.Signal) {
-		if !st.alive() {
-			return
+	// signal — сигнал группе процессов, иначе самому процессу; false — нет прав.
+	signal := func(sig syscall.Signal) bool {
+		if !st.alive() || syscall.Kill(-st.PID, sig) == nil {
+			return true
 		}
-		if syscall.Kill(-st.PID, sig) == nil {
-			return
-		}
-		_ = syscall.Kill(st.PID, sig)
+		return !errors.Is(syscall.Kill(st.PID, sig), syscall.EPERM)
 	}
-	signal(syscall.SIGTERM)
-	deadline := time.Now().Add(max(st.StopTimeout.Std(), time.Second))
-	for st.alive() {
-		if time.Now().After(deadline) {
-			signal(syscall.SIGKILL)
-			break
+	wait := func(d time.Duration) bool {
+		deadline := time.Now().Add(d)
+		for st.alive() {
+			if time.Now().After(deadline) {
+				return false
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
-		time.Sleep(50 * time.Millisecond)
+		return true
+	}
+	if !signal(syscall.SIGTERM) {
+		return false
+	}
+	if !wait(max(st.StopTimeout.Std(), time.Second)) {
+		signal(syscall.SIGKILL)
+		wait(2 * time.Second)
 	}
 	return true
+}
+
+// StopProcesses — `agent stop-workers`: остановить процессы воркеров,
+// оставшиеся работать после остановки агента (файлы dataDir/processes):
+// SIGTERM, не вышел за stopTimeout — SIGKILL. Итог — имена остановленных и тех, кого
+// остановить не удалось (нет прав: процесс другого пользователя) — их файлы остаются.
+func StopProcesses(dataDir string) (stopped, failed []string) {
+	dir := filepath.Join(dataDir, ProcessesDir)
+	for _, name := range stateNames(dir) {
+		st, ok := readState(dir, name)
+		if ok && stopOrphan(st) {
+			stopped = append(stopped, name)
+		}
+		if ok && st.alive() {
+			failed = append(failed, fmt.Sprintf("%s (pid %d)", name, st.PID))
+			continue
+		}
+		removeState(dir, name)
+	}
+	return stopped, failed
 }

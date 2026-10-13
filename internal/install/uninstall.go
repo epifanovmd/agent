@@ -10,7 +10,7 @@ import (
 )
 
 // Uninstall — удалить экземпляр агента instance ("" — по умолчанию):
-// воркеры убирают за собой (agent cleanup), затем служба, программа, файл параметров ядра (с возвратом прежних значений). purge —
+// воркеры, оставшиеся после остановки службы, останавливаются и убирают за собой — ./cleanup (agent stop-workers --cleanup), затем служба, программа, файл параметров ядра (с возвратом прежних значений). purge —
 // ещё настройки, данные, пакеты и пользователь службы, если их создала
 // установка (root и пользователей, которые уже были, не трогает). Другие
 // экземпляры не затрагиваются: нужные им пакеты, параметры ядра и
@@ -66,8 +66,8 @@ func Uninstall(ctx context.Context, s *System, instance string, purge bool, self
 		if runAs == "root" {
 			runAs = ""
 		}
-		if err := s.Run(ctx, Cmd{Args: []string{bin, "cleanup", "-config", l.ConfigFile}, Env: env, User: runAs}); err != nil {
-			s.warn("воркеры убрали за собой не всё (agent cleanup) — удаление продолжается")
+		if err := s.Run(ctx, Cmd{Args: []string{bin, "stop-workers", "--cleanup", "-config", l.ConfigFile}, Env: env, User: runAs}); err != nil {
+			s.warn("воркеры остановлены или убрали за собой не всё (agent stop-workers --cleanup) — удаление продолжается")
 		}
 	}
 	if fsutil.IsFile(s.p(l.UnitFile)) {

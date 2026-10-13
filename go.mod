@@ -6,16 +6,14 @@ go 1.25.0
 
 toolchain go1.26.9
 
-// npm-зависимости SDK и примеров (в некоторых пакетах есть Go-код) — не часть модуля.
-ignore node_modules
-
 require gopkg.in/yaml.v3 v3.0.1
-
-require github.com/coder/websocket v1.8.15
 
 require github.com/shirou/gopsutil/v4 v4.25.10
 
-require golang.org/x/sys v0.37.0
+require (
+	go.etcd.io/bbolt v1.4.3
+	golang.org/x/sys v0.37.0
+)
 
 require (
 	github.com/ebitengine/purego v0.9.0 // indirect

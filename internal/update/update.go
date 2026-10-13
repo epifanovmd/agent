@@ -67,7 +67,7 @@ func Local(name, version, sha256hex string) Build {
 	return Build{Name: name, Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH, SHA256: sha256hex}
 }
 
-// Payload — подписываемая строка (§11): agent-release/1, имя, версия, os,
+// Payload — подписываемая строка (§10): agent-release/1, имя, версия, os,
 // arch, sha256 строчными — через \n.
 func (b Build) Payload() string {
 	return strings.Join([]string{"agent-release/1", b.Name, b.Version, b.OS, b.Arch, strings.ToLower(b.SHA256)}, "\n")
@@ -195,7 +195,7 @@ func FetchArchive(ctx context.Context, client *http.Client, auth string, keys Ke
 	return Extract(archive, dst)
 }
 
-// SameHash — одна ли сумма sha256 (hex): регистр букв не важен (§11).
+// SameHash — одна ли сумма sha256 (hex): регистр букв не важен (§10).
 func SameHash(a, b string) bool {
 	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }

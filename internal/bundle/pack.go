@@ -1,6 +1,6 @@
 // Package bundle — архив папки агента для узла (agent pack) и установка из
 // него (agent install): программа под платформу узла, файлы настроек, воркеры
-// из папки и сборки воркеров в каталоге release/ (manifest.json, §11).
+// из папки и сборки воркеров в каталоге release/ (manifest.json, §10).
 package bundle
 
 import (
@@ -20,9 +20,9 @@ import (
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/fsutil"
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/releases"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // Файлы архива.
@@ -96,7 +96,7 @@ type Options struct {
 	// Warn — замечание для человека.
 	Warn func(string)
 
-	share func(a message.WorkerArtifact, file string) error
+	share func(a protocol.WorkerArtifact, file string) error
 }
 
 // Pack — архивы папки агента, по одному на платформу. Вернёт их пути.
@@ -142,12 +142,12 @@ func Pack(ctx context.Context, o Options) ([]string, error) {
 		return nil, err
 	}
 	var out []string
-	var shared []message.WorkerArtifact
+	var shared []protocol.WorkerArtifact
 	if o.ReleaseOut != "" {
 		if err := os.MkdirAll(o.ReleaseOut, 0o755); err != nil {
 			return nil, err
 		}
-		o.share = func(a message.WorkerArtifact, file string) error {
+		o.share = func(a protocol.WorkerArtifact, file string) error {
 			shared = append(shared, a)
 			return copyFile(file, filepath.Join(o.ReleaseOut, a.File))
 		}
@@ -160,7 +160,7 @@ func Pack(ctx context.Context, o Options) ([]string, error) {
 		out = append(out, archive)
 	}
 	if o.ReleaseOut != "" {
-		m := message.Manifest{Version: strings.TrimPrefix(o.Version, "v"), Artifacts: []message.Artifact{}, Workers: shared}
+		m := protocol.Manifest{Version: strings.TrimPrefix(o.Version, "v"), Artifacts: []protocol.Artifact{}, Workers: shared}
 		if o.Signing != nil {
 			m.PublicKey = releases.PublicKeyOf(o.Signing)
 		}
@@ -190,7 +190,7 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 			return err
 		}
 	}
-	m := message.Manifest{Version: strings.TrimPrefix(o.Version, "v"), Artifacts: []message.Artifact{}}
+	m := protocol.Manifest{Version: strings.TrimPrefix(o.Version, "v"), Artifacts: []protocol.Artifact{}}
 	info := Info{Version: m.Version, Config: main, Env: o.Env, OS: p.OS, Arch: p.Arch, CreatedAt: time.Now().UnixMilli()}
 	if o.Signing != nil {
 		m.PublicKey = releases.PublicKeyOf(o.Signing)
@@ -222,7 +222,7 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 			if err != nil {
 				return fmt.Errorf("воркер %s: %w", w.Name, err)
 			}
-			a := message.WorkerArtifact{Name: w.Name, Version: version, OS: p.OS, Arch: p.Arch, File: file, SHA256: hash}
+			a := protocol.WorkerArtifact{Name: w.Name, Version: version, OS: p.OS, Arch: p.Arch, File: file, SHA256: hash}
 			if o.Signing != nil {
 				a.Signature = update.Sign(o.Signing, update.Build{Name: w.Name, Version: version, OS: p.OS, Arch: p.Arch, SHA256: hash})
 			}

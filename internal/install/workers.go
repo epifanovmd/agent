@@ -12,6 +12,7 @@ import (
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/releases"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // installWorkers — воркеры со сборкой с сервера (--worker): сборка под эту машину из
@@ -52,6 +53,16 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 	var out []newWorker
 	for _, name := range o.Workers {
 		releaseDir := filepath.Join(root, name)
+		// Уже стоит та же или более новая сборка (например, после worker.update) — не трогать.
+		if art := manifest.Worker(name, "linux", s.Arch); art != nil {
+			cur := readVersion(filepath.Join(releaseDir, config.ReleaseVersion))
+			if _, err := os.Stat(filepath.Join(releaseDir, config.ReleaseCurrent)); err == nil && cur != "" &&
+				protocol.CompareVersions(cur, art.Version) >= 0 {
+				s.say("Воркер %s %s уже стоит (в каталоге — %s) — не меняется", name, cur, art.Version)
+				out = append(out, workerEntry(name, art.StopTimeout, art.Command))
+				continue
+			}
+		}
 		placed, err := releases.PlaceWorker(ctx, client, dir, manifest, name, "linux", s.Arch, releaseDir, keys)
 		if err != nil {
 			return nil, fmt.Errorf("--worker %s: %w", name, err)
@@ -63,16 +74,30 @@ func installWorkers(ctx context.Context, s *System, l Paths, o Options, user str
 			return nil, err
 		}
 		s.say("Воркер %s %s поставлен: %s", name, placed.Version, filepath.Join(config.ReleasesDir(l.DataDir), name, config.ReleaseCurrent))
-		w := newWorker{Name: name, Release: true}
-		if placed.StopTimeout != "" {
-			w.Lifecycle = &newLifecycle{StopTimeout: placed.StopTimeout}
-		}
-		if placed.Command != "" {
-			w.Command = []string{"./" + strings.TrimPrefix(placed.Command, "./")}
-		}
-		out = append(out, w)
+		out = append(out, workerEntry(name, placed.StopTimeout, placed.Command))
 	}
 	return out, nil
+}
+
+// workerEntry — запись воркера со сборкой для agent.yaml.
+func workerEntry(name, stopTimeout, command string) newWorker {
+	w := newWorker{Name: name, Release: true}
+	if stopTimeout != "" {
+		w.Lifecycle = &newLifecycle{StopTimeout: stopTimeout}
+	}
+	if command != "" {
+		w.Command = []string{"./" + strings.TrimPrefix(command, "./")}
+	}
+	return w
+}
+
+// readVersion — версия из файла ("" — нет файла).
+func readVersion(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(raw))
 }
 
 func caIfSet(s *System, l Paths, o Options) string {

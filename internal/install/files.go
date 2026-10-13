@@ -46,8 +46,9 @@ type newLifecycle struct {
 // значений по умолчанию (их показывает agent config check).
 func newConfig(server, caFile, name, dataDir string, workers []newWorker) []byte {
 	type srv struct {
-		URL    string `yaml:"url"`
-		CAFile string `yaml:"caFile,omitempty"`
+		URL           string `yaml:"url"`
+		AllowInsecure bool   `yaml:"allowInsecure,omitempty"`
+		CAFile        string `yaml:"caFile,omitempty"`
 	}
 	type logs struct {
 		Format string `yaml:"format"`
@@ -58,7 +59,7 @@ func newConfig(server, caFile, name, dataDir string, workers []newWorker) []byte
 		DataDir string      `yaml:"dataDir"`
 		Log     logs        `yaml:"log"`
 		Workers []newWorker `yaml:"workers,omitempty"`
-	}{srv{server, caFile}, name, dataDir, logs{"json"}, workers}
+	}{srv{server, strings.HasPrefix(strings.ToLower(server), "http://"), caFile}, name, dataDir, logs{"json"}, workers}
 	var b bytes.Buffer
 	b.WriteString("# Настройки агента; итоговые значения — agent config check.\n")
 	enc := yaml.NewEncoder(&b)

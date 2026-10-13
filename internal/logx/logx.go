@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // OutputKey — атрибут записи с выводом воркера: значение — имя воркера, оно
@@ -22,7 +22,7 @@ import (
 const OutputKey = "output"
 
 // JournalSize — записей в журнале одного источника.
-const JournalSize = message.MaxLogLines
+const JournalSize = protocol.MaxLogLines
 
 // Journal — последние записи лога по источникам: агент и каждый воркер
 // отдельно, чтобы шумный источник не вытеснял другие.
@@ -33,7 +33,7 @@ type Journal struct {
 }
 
 type ring struct {
-	items []message.LogEntry
+	items []protocol.LogEntry
 	next  int
 	full  bool
 }
@@ -42,12 +42,12 @@ type ring struct {
 func NewJournal(size int) *Journal { return &Journal{size: size, rings: map[string]*ring{}} }
 
 // Add — дописать запись в журнал её источника.
-func (j *Journal) Add(e message.LogEntry) {
+func (j *Journal) Add(e protocol.LogEntry) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	r := j.rings[e.Source]
 	if r == nil {
-		r = &ring{items: make([]message.LogEntry, j.size)}
+		r = &ring{items: make([]protocol.LogEntry, j.size)}
 		j.rings[e.Source] = r
 	}
 	r.items[r.next] = e
@@ -58,12 +58,12 @@ func (j *Journal) Add(e message.LogEntry) {
 }
 
 // Tail — последние n записей источника source, старые первыми.
-func (j *Journal) Tail(source string, n int) []message.LogEntry {
+func (j *Journal) Tail(source string, n int) []protocol.LogEntry {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	r := j.rings[source]
 	if r == nil {
-		return []message.LogEntry{}
+		return []protocol.LogEntry{}
 	}
 	size := r.next
 	if r.full {
@@ -72,7 +72,7 @@ func (j *Journal) Tail(source string, n int) []message.LogEntry {
 	if n <= 0 || n > size {
 		n = size
 	}
-	out := make([]message.LogEntry, 0, n)
+	out := make([]protocol.LogEntry, 0, n)
 	for i := size - n; i < size; i++ {
 		idx := i
 		if r.full {
@@ -112,7 +112,13 @@ func New(out io.Writer, journal *Journal, opts Options) (*slog.Logger, *Control)
 // Set — новые уровень и формат.
 func (c *Control) Set(opts Options) {
 	c.level.Set(ParseLevel(opts.Level))
-	handlerOpts := &slog.HandlerOptions{Level: &c.level}
+	// Сроки — строкой (30s), а не числом наносекунд.
+	handlerOpts := &slog.HandlerOptions{Level: &c.level, ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+		if a.Value.Kind() == slog.KindDuration {
+			a.Value = slog.StringValue(a.Value.Duration().String())
+		}
+		return a
+	}}
 	var h slog.Handler
 	if opts.Format == "json" {
 		h = slog.NewJSONHandler(c.out, handlerOpts)
@@ -209,12 +215,12 @@ func ParseLevel(name string) slog.Level {
 func Discard() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 // entry — запись лога из slog: источник — атрибут OutputKey (вывод воркера) или agent.
-func entry(r slog.Record, attrs []slog.Attr, group string) message.LogEntry {
+func entry(r slog.Record, attrs []slog.Attr, group string) protocol.LogEntry {
 	at := r.Time
 	if at.IsZero() {
 		at = time.Now()
 	}
-	e := message.LogEntry{At: at.UnixMilli(), Level: LevelName(r.Level), Source: message.LogSourceAgent, Msg: r.Message}
+	e := protocol.LogEntry{At: at.UnixMilli(), Level: LevelName(r.Level), Source: protocol.LogSourceAgent, Msg: r.Message}
 	add := func(prefix string, a slog.Attr) {
 		flatten(prefix, a, func(key string, v any) {
 			if key == OutputKey {
@@ -284,11 +290,11 @@ func flatten(prefix string, a slog.Attr, put func(string, any)) {
 func LevelName(l slog.Level) string {
 	switch {
 	case l >= slog.LevelError:
-		return message.LogError
+		return protocol.LogError
 	case l >= slog.LevelWarn:
-		return message.LogWarn
+		return protocol.LogWarn
 	case l >= slog.LevelInfo:
-		return message.LogInfo
+		return protocol.LogInfo
 	}
-	return message.LogDebug
+	return protocol.LogDebug
 }

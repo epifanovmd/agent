@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // manifest: сборки агента и воркеров (--worker) с подписью ключом подписи сборок.
@@ -29,7 +29,7 @@ func TestReleaseManifestWorkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(filepath.Join(dir, "manifest.json"))
-	var m message.Manifest
+	var m protocol.Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatal(err)
 	}

@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/epifanovmd/agent/internal/fsutil"
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // Paths — раскладка одного агента на узле. Несколько агентов на одном узле
@@ -119,7 +119,7 @@ func Self(exe, home string) (Paths, bool) {
 	switch base := filepath.Base(dir); {
 	case base == ".agent":
 		return HomeLayout(home, ""), true
-	case strings.HasPrefix(base, ".agent-") && message.ValidName(strings.TrimPrefix(base, ".agent-")):
+	case strings.HasPrefix(base, ".agent-") && protocol.ValidName(strings.TrimPrefix(base, ".agent-")):
 		return HomeLayout(home, strings.TrimPrefix(base, ".agent-")), true
 	}
 	return Paths{}, false
@@ -128,7 +128,7 @@ func Self(exe, home string) (Paths, bool) {
 // CheckInstance — имя экземпляра: как имя воркера (строчная латиница, цифры
 // и «-», первая — буква, до 32 символов).
 func CheckInstance(name string) error {
-	if name != "" && !message.ValidName(name) {
+	if name != "" && !protocol.ValidName(name) {
 		return fmt.Errorf("--instance: имя экземпляра — строчная латиница, цифры и «-», первая — буква, до 32 символов, а не %q", name)
 	}
 	return nil
@@ -144,7 +144,7 @@ func InstanceOf(exe string) (string, bool) {
 	}
 	opt := filepath.Dir(dir)
 	name, ok := strings.CutPrefix(filepath.Base(opt), "agent-")
-	if !ok || filepath.Dir(opt) != "/opt" || !message.ValidName(name) {
+	if !ok || filepath.Dir(opt) != "/opt" || !protocol.ValidName(name) {
 		return "", false
 	}
 	return name, true
@@ -184,7 +184,7 @@ func (s *System) others(self Paths) []*journal {
 	add(Layout(""))
 	dirs, _ := filepath.Glob(s.p("/etc/agent-*"))
 	for _, d := range dirs {
-		if name := strings.TrimPrefix(filepath.Base(d), "agent-"); message.ValidName(name) {
+		if name := strings.TrimPrefix(filepath.Base(d), "agent-"); protocol.ValidName(name) {
 			add(Layout(name))
 		}
 	}

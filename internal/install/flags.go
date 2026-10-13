@@ -62,7 +62,7 @@ agent.yaml и agent.env сохраняются (переданные --token и 
                           сюда — ключи проекта) → agent.env AGENT_UPDATE_PUBLIC_KEYS;
                           --public-key — то же
   --worker ИМЯ            воркер со сборкой с сервера (можно несколько раз)
-  --releases URL          откуда брать воркеры (по умолчанию <server>/api/v1/agent-link/releases)
+  --releases URL          откуда брать воркеры (по умолчанию <server>/agent/v1/releases)
   --privileged            агент и воркеры — root без ограничений (воркеры настраивают узел)
   --packages "…"          системные пакеты для воркеров (apt, dnf, yum, apk, zypper)
   --packages-apt "…"      свои имена пакетов для менеджера (также -dnf, -yum, -apk, -zypper)

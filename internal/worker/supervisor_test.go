@@ -20,7 +20,8 @@ import (
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/logx"
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/internal/workerapi"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // fast — короткие сроки опроса для тестов.
@@ -50,7 +51,6 @@ type harness struct {
 	sup     *Supervisor
 	journal *logx.Journal
 	started chan string
-	adopted chan string
 	changes atomic.Int32
 	cancel  context.CancelFunc
 	done    chan struct{}
@@ -72,23 +72,54 @@ func start(t *testing.T, specs ...config.Worker) *harness {
 	return startIn(t, tempDir(t), specs...)
 }
 
-// startIn — воркеры с каталогами сокетов и данных в dir (тот же dir —
-// следующий запуск «агента»).
+// sockAgent — сокет агента для тестов: регистрация и пульс — в Supervisor.
+type sockAgent struct{ sup *Supervisor }
+
+func (a sockAgent) ByToken(token string) (string, bool) { return a.sup.ByToken(token) }
+func (a sockAgent) Register(name string, reg protocol.Register) error {
+	return asInfo(a.sup.Register(name, reg))
+}
+func (a sockAgent) Heartbeat(name string, h protocol.Health) error {
+	return asInfo(a.sup.Heartbeat(name, h))
+}
+func (sockAgent) Applied(string, []protocol.Applied) error    { return nil }
+func (sockAgent) Results(string, []protocol.Result) error     { return nil }
+func (sockAgent) Progress(string, protocol.Progress) error    { return nil }
+func (sockAgent) Events(string, []protocol.WorkerEvent) error { return nil }
+func (sockAgent) StreamOpened(string) error                   { return nil }
+func (sockAgent) Request(context.Context, string, protocol.Request) protocol.RequestReply {
+	return protocol.RequestReply{}
+}
+
+func asInfo(err error) error {
+	if err != nil {
+		return protocol.NewError(protocol.CodeWorkerInvalid, err.Error())
+	}
+	return nil
+}
+
+// startIn — воркеры с каталогом данных и сокетом агента в dir (тот же dir — следующий запуск
+// «агента»).
 func startIn(t *testing.T, dir string, specs ...config.Worker) *harness {
 	t.Helper()
 	fast(t)
-	h := &harness{dir: dir, journal: logx.NewJournal(100), started: make(chan string, 16), adopted: make(chan string, 16), done: make(chan struct{})}
+	h := &harness{dir: dir, journal: logx.NewJournal(100), started: make(chan string, 16), done: make(chan struct{})}
 	log, _ := logx.New(&bytes.Buffer{}, h.journal, logx.Options{Level: "debug"})
+	sock := filepath.Join(dir, "agent.sock")
 	h.sup = New(specs, Options{
-		RunDir: filepath.Join(dir, "run"), DataDir: dir, AgentSocket: filepath.Join(dir, "agent.sock"), AgentVersion: "1.0.0-test", Log: log,
-		OnStarted: func(name string) { h.started <- name },
-		OnAdopted: func(name string) { h.adopted <- name },
-		OnChange:  func() { h.changes.Add(1) },
+		DataDir: dir, AgentSocket: sock, Log: log,
+		OnRegistered: func(name string) { h.started <- name },
+		OnChange:     func() { h.changes.Add(1) },
 	})
+	srv, err := workerapi.Listen(sock, sockAgent{h.sup}, log)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 	go func() {
 		h.sup.Run(ctx)
+		srv.Close()
 		close(h.done)
 	}()
 	t.Cleanup(h.stop)
@@ -100,70 +131,84 @@ func (h *harness) stop() {
 	<-h.done
 }
 
-func (h *harness) status(name string) message.WorkerStatus {
+func (h *harness) status(name string) protocol.WorkerState {
 	for _, st := range h.sup.Status() {
 		if st.Name == name {
 			return st
 		}
 	}
-	return message.WorkerStatus{}
+	return protocol.WorkerState{}
 }
 
-func (h *harness) get(t *testing.T, name, path string, v any) {
+// pid — процесс воркера по его последней регистрации.
+func (h *harness) pid(t *testing.T, name string) int {
 	t.Helper()
-	client, err := h.sup.Client(name)
+	m := h.sup.Manifest(name)
+	if m == nil {
+		t.Fatalf("%s не зарегистрирован", name)
+	}
+	pid, err := strconv.Atoi(strings.TrimPrefix(m.Description, "pid "))
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := client.Get("http://worker" + path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
-		t.Fatal(err)
-	}
+	return pid
 }
 
-// Запуск (§12): переменные окружения, сокет в своём каталоге 0700, ожидание
-// сокета, OnStarted, GET /health в status, вывод — в журнал воркера.
+// env — окружение воркера из его каталога данных.
+func (h *harness) env(t *testing.T, name string) map[string]string {
+	t.Helper()
+	var env map[string]string
+	eventually(t, "окружение воркера", func() bool {
+		raw, err := os.ReadFile(filepath.Join(StateDir(h.dir, name), "env.json"))
+		return err == nil && json.Unmarshal(raw, &env) == nil
+	})
+	return env
+}
+
+// Запуск (§11): переменные окружения, каталог данных воркера 0700, регистрация — OnRegistered,
+// пульс — в состоянии, метрики пульса — в Metrics, вывод — в журнал воркера.
 func TestStartEnvHealthOutput(t *testing.T) {
 	events := filepath.Join(t.TempDir(), "events")
-	h := start(t, spec("echo", "ok", events))
+	w := spec("echo", "ok", events)
+	w.Env["TEST_VERSION"] = "1.2.3"
+	h := start(t, w)
 	if name := <-h.started; name != "echo" {
 		t.Fatal(name)
 	}
-	var env map[string]string
-	h.get(t, "echo", "/env", &env)
-	sock := env[message.EnvWorkerSocket]
-	if env[message.EnvWorker] != "echo" || env[message.EnvVersion] != "1.0.0-test" || !strings.HasSuffix(env[message.EnvSocket], "agent.sock") ||
-		env[message.EnvWorkerToken] != h.sup.Token("echo") || len(env[message.EnvWorkerToken]) < 32 || filepath.Base(sock) != SocketName {
+	env := h.env(t, "echo")
+	if env[protocol.EnvWorkerName] != "echo" || env[protocol.EnvAgentSocket] != filepath.Join(h.dir, "agent.sock") ||
+		env[protocol.EnvWorkerToken] != h.sup.Token("echo") || len(env[protocol.EnvWorkerToken]) < 32 ||
+		env[protocol.EnvStateDir] != StateDir(h.dir, "echo") {
 		t.Fatalf("окружение: %v", env)
 	}
-	if info, err := os.Stat(filepath.Dir(sock)); err != nil || info.Mode().Perm() != 0o700 {
-		t.Fatalf("каталог сокета: %v %v", info.Mode(), err)
+	if info, err := os.Stat(StateDir(h.dir, "echo")); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("каталог данных: %v", err)
 	}
-	if name, ok := h.sup.ByToken(env[message.EnvWorkerToken]); !ok || name != "echo" {
+	if name, ok := h.sup.ByToken(env[protocol.EnvWorkerToken]); !ok || name != "echo" {
 		t.Fatal("токен воркера не узнан")
 	}
 	if _, ok := h.sup.ByToken(""); ok {
 		t.Fatal("пустой токен")
 	}
-	eventually(t, "health в status", func() bool {
+	eventually(t, "пульс в состоянии", func() bool {
 		st := h.status("echo")
-		return st.State == message.WorkerRunning && st.Health != nil && st.Health.OK && string(st.Health.Info) == `{"version":""}`
+		return st.State == protocol.WorkerRunning && st.Health != nil && st.Health.OK && st.Version == "1.2.3" && st.Health.Metrics == nil
 	})
-	eventually(t, "вывод воркера в журнале", func() bool {
-		lines := h.journal.Tail("echo", 10)
-		return len(lines) > 0 && lines[0].Msg == "воркер слушает сокет" && lines[0].Level == "info"
-	})
-	if _, err := h.sup.Client("nope"); !errors.Is(err, ErrUnknown) {
+	eventually(t, "метрики из пульса", func() bool { return string(h.sup.Metrics()["echo"]) == `{"n":1}` })
+	if err := h.sup.Ready("echo"); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.sup.Ready("nope"); !errors.Is(err, ErrUnknown) {
+		t.Fatal(err)
+	}
+	eventually(t, "вывод воркера в журнале", func() bool {
+		lines := h.journal.Tail("echo", 10)
+		return len(lines) > 0 && lines[0].Msg == "воркер запущен" && lines[0].Level == "info"
+	})
 }
 
-// Падение (§13): перезапуск с растущей паузой, state backoff, счётчик
-// restarts без предела, stderr — warn.
+// Падение (§11): перезапуск с растущей паузой, state backoff, счётчик restarts без предела,
+// stderr — warn.
 func TestCrashBackoff(t *testing.T) {
 	events := filepath.Join(t.TempDir(), "events")
 	h := start(t, spec("crash", "crash", events))
@@ -179,8 +224,8 @@ func TestCrashBackoff(t *testing.T) {
 	}
 }
 
-// Замена (§13): сначала уходит прежний процесс, потом запускается новый;
-// копия всегда одна.
+// Замена (§11): сначала уходит прежний процесс, потом запускается новый; копия всегда одна;
+// итог — после регистрации нового.
 func TestRestartStopFirst(t *testing.T) {
 	events := filepath.Join(t.TempDir(), "events")
 	h := start(t, spec("echo", "ok", events))
@@ -190,14 +235,14 @@ func TestRestartStopFirst(t *testing.T) {
 	if err := h.sup.Restart(ctx, "echo", false); err != nil {
 		t.Fatal(err)
 	}
+	if st := h.status("echo"); st.State != protocol.WorkerRunning || st.Restarts != 0 {
+		t.Fatalf("после замены — зарегистрирован, не падение: %+v", st)
+	}
 	<-h.started
 	got := readEvents(events)
 	if len(got) != 3 || !strings.HasPrefix(got[0], "start ") || got[1] != "stop "+strings.TrimPrefix(got[0], "start ") ||
 		!strings.HasPrefix(got[2], "start ") || got[2] == got[0] {
 		t.Fatalf("порядок: %v", got)
-	}
-	if st := h.status("echo"); st.State != message.WorkerRunning || st.Restarts != 0 {
-		t.Fatalf("замена — не падение: %+v", st)
 	}
 	if err := h.sup.Restart(ctx, "nope", false); !errors.Is(err, ErrUnknown) {
 		t.Fatal(err)
@@ -217,8 +262,7 @@ func childPid(t *testing.T, path string) int {
 	return pid
 }
 
-// Остановка завершает всю группу процессов воркера: потомки не переживают
-// его перезапуск.
+// Остановка завершает всю группу процессов воркера: потомки не переживают его перезапуск.
 func TestChildrenStopped(t *testing.T) {
 	dir := t.TempDir()
 	w := spec("parent", "children", filepath.Join(dir, "events"))
@@ -239,8 +283,7 @@ func TestChildrenStopped(t *testing.T) {
 	})
 }
 
-// zombie — процесс завершился, но не убран родителем (в контейнере его
-// убирает init).
+// zombie — процесс завершился, но не убран родителем (в контейнере его убирает init).
 func zombie(pid int) bool {
 	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
@@ -250,11 +293,20 @@ func zombie(pid int) bool {
 	return len(fields) > 2 && fields[2] == "Z"
 }
 
-// Нет ответа на GET /health три раза подряд — воркер завис и перезапускается.
-func TestHealthMissesRestart(t *testing.T) {
-	events := filepath.Join(t.TempDir(), "events")
-	h := start(t, spec("deaf", "deaf", events))
-	eventually(t, "перезапуск зависшего", func() bool { return h.status("deaf").Restarts >= 1 && len(readEvents(events)) >= 2 })
+// Пульса нет healthSilence — воркер нездоров; ещё healthRestart — перезапуск (§16).
+func TestHeartbeatSilenceRestart(t *testing.T) {
+	dir := t.TempDir()
+	events, hang := filepath.Join(dir, "events"), filepath.Join(dir, "hang")
+	w := spec("echo", "ok", events)
+	w.Env["TEST_HANG"] = hang
+	h := start(t, w)
+	<-h.started
+	_ = os.WriteFile(hang, []byte(strconv.Itoa(h.pid(t, "echo"))), 0o600)
+	eventually(t, "нездоров", func() bool {
+		st := h.status("echo")
+		return st.Health != nil && !st.Health.OK && strings.HasPrefix(st.Health.Message, "нет пульса")
+	})
+	eventually(t, "перезапуск зависшего", func() bool { return h.status("echo").Restarts >= 1 && len(readEvents(events)) >= 2 })
 }
 
 // Не вышел за stopTimeout после SIGTERM — SIGKILL.
@@ -269,20 +321,18 @@ func TestStopTimeoutKill(t *testing.T) {
 	if d := time.Since(began); d < 300*time.Millisecond || d > 5*time.Second {
 		t.Fatalf("остановка: %v", d)
 	}
-	if st := h.status("stubborn"); st.State != message.WorkerStopped {
+	if st := h.status("stubborn"); st.State != protocol.WorkerStopped {
 		t.Fatalf("состояние: %+v", st)
 	}
 }
 
-// Apply: новый воркер запускается, удалённый останавливается, изменённый
-// перезапускается.
+// Apply: новый воркер запускается, удалённый останавливается, изменённый перезапускается.
 func TestApply(t *testing.T) {
 	dir := t.TempDir()
 	a, b := spec("a", "ok", filepath.Join(dir, "a")), spec("b", "ok", filepath.Join(dir, "b"))
 	h := start(t, a)
 	<-h.started
-	b2 := b
-	h.sup.Apply([]config.Worker{b2})
+	h.sup.Apply([]config.Worker{b})
 	if name := <-h.started; name != "b" {
 		t.Fatal(name)
 	}
@@ -293,145 +343,71 @@ func TestApply(t *testing.T) {
 	if h.sup.Has("a") || len(h.sup.Status()) != 1 {
 		t.Fatal("a удалён из настроек")
 	}
-	b3 := b
-	b3.Env = map[string]string{"TEST_WORKER": "ok", "TEST_EVENTS": b.Env["TEST_EVENTS"], "X": "1"}
-	h.sup.Apply([]config.Worker{b3})
+	b2 := b
+	b2.Env = map[string]string{"TEST_WORKER": "ok", "TEST_EVENTS": b.Env["TEST_EVENTS"], "X": "1"}
+	h.sup.Apply([]config.Worker{b2})
 	<-h.started
 	if ev := readEvents(filepath.Join(dir, "b")); len(ev) != 3 {
 		t.Fatalf("b перезапущен: %v", ev)
 	}
 }
 
-// Манифест (§12): GET /manifest после запуска — в status, version — из
-// манифеста (у воркера со сборкой с сервера — версия сборки, манифест как есть); новый
-// запуск — новый манифест.
-func TestManifest(t *testing.T) {
+// Регистрация (§13): манифест и версия — из регистрации (у воркера со сборкой — версия сборки);
+// новый запуск — новая регистрация; изменение — внеочередное состояние.
+func TestRegisterVersion(t *testing.T) {
 	dir := t.TempDir()
 	described := spec("described", "ok", filepath.Join(dir, "described"))
-	described.Env["TEST_MANIFEST"] = `{"version":"3.1.0","extra":true,"routes":[{"method":"POST","path":"/echo"}]}`
-	rel := config.Worker{Name: "report", Release: true, ReleaseDir: filepath.Join(dir, "workers", "report"),
-		Lifecycle: life(), Env: map[string]string{"TEST_MANIFEST": `{"version":"9.9.9"}`}}
+	described.Env["TEST_VERSION"] = "3.1.0"
+	rel := config.Worker{Name: "report", Release: true, ReleaseDir: filepath.Join(dir, "workers", "report"), Lifecycle: life()}
 	_ = os.MkdirAll(rel.ReleaseDir, 0o755)
-	writeBuild(t, rel.Current(), releaseScript("ok", "1.0.0", filepath.Join(dir, "report")))
+	writeBuild(t, rel.Current(), releaseScript("ok", "9.9.9", filepath.Join(dir, "report")))
 	_ = os.WriteFile(filepath.Join(rel.ReleaseDir, config.ReleaseVersion), []byte("1.0.0\n"), 0o644)
 	h := start(t, described, rel)
-
-	eventually(t, "манифест в status", func() bool {
-		st := h.status("described")
-		return st.Manifest != nil && st.Version == "3.1.0" && len(st.Manifest.Routes) == 1 && st.Manifest.Routes[0].Path == "/echo"
+	eventually(t, "версии", func() bool {
+		return h.status("described").Version == "3.1.0" && h.status("report").Version == "1.0.0"
 	})
-	eventually(t, "у воркера со сборкой с сервера — версия сборки", func() bool {
-		st := h.status("report")
-		return st.Version == "1.0.0" && st.Manifest != nil && st.Manifest.Version == "9.9.9"
-	})
-
+	info := h.sup.Info()
+	if len(info) != 2 || info[0].Manifest == nil || !info[1].Release || info[1].Version != "1.0.0" {
+		t.Fatalf("hello: %+v", info)
+	}
 	changes := h.changes.Load()
 	next := described
-	next.Env = map[string]string{"TEST_WORKER": "ok", "TEST_EVENTS": described.Env["TEST_EVENTS"],
-		"TEST_MANIFEST": `{"version":"3.2.0"}`}
+	next.Env = map[string]string{"TEST_WORKER": "ok", "TEST_EVENTS": described.Env["TEST_EVENTS"], "TEST_VERSION": "3.2.0"}
 	h.sup.Apply([]config.Worker{next, rel})
-	eventually(t, "новый манифест после перезапуска", func() bool {
-		st := h.status("described")
-		return st.Manifest != nil && st.Version == "3.2.0" && st.Manifest.Routes == nil
-	})
+	eventually(t, "новая регистрация после перезапуска", func() bool { return h.status("described").Version == "3.2.0" })
 	if h.changes.Load() <= changes {
-		t.Fatal("изменение манифеста — внеочередной status")
+		t.Fatal("изменение — внеочередное состояние")
 	}
 }
 
-// Регистрация (§12): без GET /manifest, с неверным манифестом или без
-// GET /health воркер — invalid с причиной, настроек (OnStarted) и запросов
-// (Client → ErrInvalid) не получает, процесс не перезапускается; ответы
-// стали корректными — повтор проверки регистрирует его: running, OnStarted.
-func TestRegistration(t *testing.T) {
+// Не зарегистрировался за registerTimeout — invalid с причиной, процесс работает; пульс
+// незарегистрированного не принимается; поздняя регистрация — running.
+func TestRegisterTimeout(t *testing.T) {
 	dir := t.TempDir()
-	missing := spec("missing", "ok", filepath.Join(dir, "missing"))
-	missing.Env["TEST_MANIFEST_FILE"] = filepath.Join(dir, "manifest.json")
-	broken := spec("broken", "ok", filepath.Join(dir, "broken"))
-	broken.Env["TEST_MANIFEST"] = `{"routes":[{"method":"get","path":"echo"}]}`
-	nohealth := spec("nohealth", "nohealth", filepath.Join(dir, "nohealth"))
-	h := start(t, missing, broken, nohealth)
-
-	for name, want := range map[string]string{
-		"missing":  "GET /manifest: HTTP 404",
-		"broken":   "GET /manifest: version: обязательно",
-		"nohealth": "GET /health: HTTP 404",
-	} {
-		eventually(t, name+" — invalid", func() bool {
-			st := h.status(name)
-			return st.State == message.WorkerInvalid && strings.Contains(st.Message, want)
-		})
-		if _, err := h.sup.Client(name); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("%s: Client: %v", name, err)
-		}
-	}
-	if st := h.status("broken"); st.Manifest != nil || st.Version != "" {
-		t.Fatalf("неверный манифест не хранится: %+v", st)
-	}
-	if st := h.status("nohealth"); st.Manifest == nil || st.Manifest.Version != "1.0.0" {
-		t.Fatalf("корректный манифест хранится и у invalid: %+v", st)
-	}
-	eventually(t, "предупреждение в логе", func() bool {
-		for _, e := range h.journal.Tail(message.LogSourceAgent, 200) {
-			if strings.HasPrefix(e.Msg, "воркер не зарегистрирован") && e.Attrs["worker"] == "missing" {
-				return true
-			}
-		}
-		return false
+	h := start(t, spec("silent", "noregister", filepath.Join(dir, "events")))
+	eventually(t, "invalid", func() bool {
+		st := h.status("silent")
+		return st.State == protocol.WorkerInvalid && strings.Contains(st.Message, "не зарегистрировался")
 	})
-	select {
-	case name := <-h.started:
-		t.Fatalf("незарегистрированный %s получил настройки", name)
-	default:
-	}
-
-	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(`{"version":"2.0.0","events":[{"type":"item.done"}]}`), 0o600); err != nil {
+	if err := h.sup.Ready("silent"); !errors.Is(err, ErrNotRegistered) {
 		t.Fatal(err)
 	}
-	eventually(t, "missing — зарегистрирован", func() bool {
-		st := h.status("missing")
-		return st.State == message.WorkerRunning && st.Message == "" && st.Version == "2.0.0"
-	})
-	select {
-	case name := <-h.started:
-		if name != "missing" {
-			t.Fatalf("OnStarted: %s", name)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("после регистрации нет OnStarted")
-	}
-	if _, err := h.sup.Client("missing"); err != nil {
+	if err := h.sup.Heartbeat("silent", protocol.Health{OK: true}); !errors.Is(err, ErrNotRegistered) {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if m := h.sup.WaitManifest(ctx, "missing"); !m.DeclaresEvent("item.done") {
-		t.Fatalf("WaitManifest: %+v", m)
-	}
-	if ev := readEvents(filepath.Join(dir, "missing")); len(ev) != 1 {
+	if ev := readEvents(filepath.Join(dir, "events")); len(ev) != 1 {
 		t.Fatalf("invalid-воркер не перезапускается: %v", ev)
 	}
-}
-
-// Уборка (§13): воркер запускается, получает POST /cleanup и останавливается.
-func TestCleanup(t *testing.T) {
-	fast(t)
-	dir := t.TempDir()
-	run := tempDir(t)
-	sup := New([]config.Worker{spec("echo", "ok", filepath.Join(dir, "events")), spec("crash", "crash", "")},
-		Options{RunDir: run, DataDir: run, Log: logx.Discard()})
-	res := sup.Cleanup(context.Background())
-	if len(res) != 2 || res[0].Err != nil || res[1].Err == nil {
-		t.Fatalf("итог: %+v", res)
+	if err := h.sup.Register("silent", protocol.Register{Version: "1"}); err != nil {
+		t.Fatal(err)
 	}
-	got := readEvents(filepath.Join(dir, "events"))
-	if len(got) != 3 || !strings.HasPrefix(got[1], "cleanup ") || !strings.HasPrefix(got[2], "stop ") {
-		t.Fatalf("порядок: %v", got)
+	if st := h.status("silent"); st.State != protocol.WorkerRunning || st.Message != "" {
+		t.Fatalf("поздняя регистрация: %+v", st)
 	}
 }
 
-// release — тестовый воркер со сборкой с сервера: сборка — скрипт, запускающий
-// тестовый файл в режиме mode с версией version.
+// releaseScript — тестовый воркер со сборкой: скрипт, запускающий тестовый файл в режиме mode
+// с версией version.
 func releaseScript(mode, version, events string) string {
 	return fmt.Sprintf("#!/bin/sh\nTEST_WORKER=%s TEST_VERSION=%s TEST_EVENTS=%s exec %s\n", mode, version, events, os.Args[0])
 }
@@ -443,14 +419,13 @@ func writeBuild(t *testing.T, path, script string) {
 	}
 }
 
-// worker.update (§11): новая сборка здорова — она остаётся, итог {version,
-// previous}; не здорова за срок — возврат прежней, UPDATE_FAILED; уже
-// обновляется — BUSY; без release: true — WORKER_NOT_RELEASED.
+// worker.update (§10): новая сборка зарегистрировалась с ok: true — она остаётся, итог
+// {version, previous}; нездорова за срок — возврат прежней, UPDATE_FAILED; уже обновляется —
+// BUSY; без release: true — WORKER_NOT_RELEASED.
 func TestUpdateAndRollback(t *testing.T) {
 	dir := t.TempDir()
 	events := filepath.Join(dir, "events")
-	rel := config.Worker{Name: "report", Release: true, ReleaseDir: filepath.Join(dir, "workers", "report"),
-		Lifecycle: life()}
+	rel := config.Worker{Name: "report", Release: true, ReleaseDir: filepath.Join(dir, "workers", "report"), Lifecycle: life()}
 	_ = os.MkdirAll(rel.ReleaseDir, 0o755)
 	writeBuild(t, rel.Current(), releaseScript("ok", "1.0.0", events))
 	_ = os.WriteFile(filepath.Join(rel.ReleaseDir, config.ReleaseVersion), []byte("1.0.0\n"), 0o644)
@@ -461,45 +436,31 @@ func TestUpdateAndRollback(t *testing.T) {
 		t.Fatalf("версия: %+v", st)
 	}
 	ctx := context.Background()
+	before := h.pid(t, "report")
 
 	res, err := h.sup.Update(ctx, "report", "1.1.0", false, func(dst string) error {
 		writeBuild(t, dst, releaseScript("ok", "1.1.0", events))
 		return nil
 	})
-	if err != nil || res != (message.UpdateResult{Version: "1.1.0", Previous: "1.0.0"}) {
+	if err != nil || res != (protocol.UpdateResult{Version: "1.1.0", Previous: "1.0.0"}) {
 		t.Fatalf("обновление: %+v %v", res, err)
 	}
-	if st := h.status("report"); st.Version != "1.1.0" {
+	if st := h.status("report"); st.Version != "1.1.0" || h.pid(t, "report") == before {
 		t.Fatalf("после обновления: %+v", st)
 	}
-	var health message.Health
-	h.get(t, "report", "/health", &health)
-	if string(health.Info) != `{"version":"1.1.0"}` {
-		t.Fatalf("работает новая сборка: %s", health.Info)
-	}
 
-	// Новая сборка не здорова — возврат 1.1.0.
+	// Новая сборка нездорова — возврат 1.1.0.
 	_, err = h.sup.Update(ctx, "report", "1.2.0", false, func(dst string) error {
 		writeBuild(t, dst, releaseScript("unhealthy", "1.2.0", events))
 		return nil
 	})
-	var ei *message.ErrorInfo
-	if !errors.As(err, &ei) || ei.Code != message.CodeUpdateFailed || !strings.Contains(ei.Message, "возвращена прежняя сборка 1.1.0") {
+	var ei *protocol.ErrorInfo
+	if !errors.As(err, &ei) || ei.Code != protocol.CodeUpdateFailed || !strings.Contains(ei.Message, "возвращена прежняя сборка 1.1.0") {
 		t.Fatalf("откат: %v", err)
 	}
 	eventually(t, "прежняя сборка работает", func() bool {
-		var h2 message.Health
-		client, err := h.sup.Client("report")
-		if err != nil {
-			return false
-		}
-		resp, err := client.Get("http://worker/health")
-		if err != nil {
-			return false
-		}
-		defer resp.Body.Close()
-		_ = json.NewDecoder(resp.Body).Decode(&h2)
-		return h2.OK && string(h2.Info) == `{"version":"1.1.0"}`
+		st := h.status("report")
+		return st.State == protocol.WorkerRunning && st.Health != nil && st.Health.OK
 	})
 	if st := h.status("report"); st.Version != "1.1.0" {
 		t.Fatalf("версия после отката: %+v", st)
@@ -515,22 +476,22 @@ func TestUpdateAndRollback(t *testing.T) {
 		_, first = h.sup.Update(ctx, "report", "1.3.0", false, func(string) error {
 			close(inFetch)
 			<-block
-			return message.NewError(message.CodeUpdateNotVerified, "нет ключа")
+			return protocol.NewError(protocol.CodeUpdateNotVerified, "нет ключа")
 		})
 	}()
 	<-inFetch
-	if _, err := h.sup.Update(ctx, "report", "1.3.0", false, nil); !errors.As(err, &ei) || ei.Code != message.CodeBusy {
+	if _, err := h.sup.Update(ctx, "report", "1.3.0", false, nil); !errors.As(err, &ei) || ei.Code != protocol.CodeBusy {
 		t.Fatalf("уже обновляется: %v", err)
 	}
 	close(block)
 	wg.Wait()
-	if !errors.As(first, &ei) || ei.Code != message.CodeUpdateNotVerified {
+	if !errors.As(first, &ei) || ei.Code != protocol.CodeUpdateNotVerified {
 		t.Fatalf("ошибка загрузки — как есть: %v", first)
 	}
-	if _, err := h.sup.Update(ctx, "plain", "1", false, nil); !errors.As(err, &ei) || ei.Code != message.CodeWorkerNotReleased {
+	if _, err := h.sup.Update(ctx, "plain", "1", false, nil); !errors.As(err, &ei) || ei.Code != protocol.CodeWorkerNotReleased {
 		t.Fatalf("без release: true: %v", err)
 	}
-	if _, err := h.sup.Update(ctx, "nope", "1", false, nil); !errors.As(err, &ei) || ei.Code != message.CodeWorkerUnknown {
+	if _, err := h.sup.Update(ctx, "nope", "1", false, nil); !errors.As(err, &ei) || ei.Code != protocol.CodeWorkerUnknown {
 		t.Fatalf("неизвестный: %v", err)
 	}
 }
@@ -538,16 +499,12 @@ func TestUpdateAndRollback(t *testing.T) {
 // Сборка-архив: каталог current, без command — запускается ./run.
 func TestReleaseArchiveRun(t *testing.T) {
 	dir := t.TempDir()
-	rel := config.Worker{Name: "packed", Release: true, ReleaseDir: filepath.Join(dir, "workers", "packed"),
-		Lifecycle: life()}
+	rel := config.Worker{Name: "packed", Release: true, ReleaseDir: filepath.Join(dir, "workers", "packed"), Lifecycle: life()}
 	_ = os.MkdirAll(rel.Current(), 0o755)
 	writeBuild(t, filepath.Join(rel.Current(), config.ReleaseRun), releaseScript("ok", "2.0.0", filepath.Join(dir, "events")))
 	h := start(t, rel)
-	<-h.started
-	var health message.Health
-	h.get(t, "packed", "/health", &health)
-	if !health.OK {
-		t.Fatalf("%+v", health)
+	if name := <-h.started; name != "packed" {
+		t.Fatal(name)
 	}
 	// Нет сборки — воркер не запускается, ошибка в журнале агента.
 	missing := config.Worker{Name: "missing", Release: true, ReleaseDir: filepath.Join(dir, "workers", "missing")}
@@ -567,5 +524,114 @@ func TestLineLogTruncates(t *testing.T) {
 	if len(got) != 3 || !strings.HasSuffix(got[0].Msg, truncatedMark) || len(got[0].Msg) > lineMax+len(truncatedMark) ||
 		got[1].Msg != "вторая" || got[2].Msg != "хвост" {
 		t.Fatalf("%d %+v", len(got), got[1:])
+	}
+}
+
+// ./setup (§11): выполняется до первого запуска один раз — повторный запуск воркера его не
+// вызывает, изменённый setup или файл зависимостей (requirements.txt) — снова; вывод — в журнал воркера; ошибка — воркер не
+// запускается (повтор с паузой); срок — lifecycle.setupTimeout.
+func TestSetup(t *testing.T) {
+	dir := t.TempDir()
+	runs := filepath.Join(dir, "runs")
+	rel := config.Worker{Name: "packed", Release: true, ReleaseDir: filepath.Join(dir, "workers", "packed"), Lifecycle: life()}
+	_ = os.MkdirAll(rel.Current(), 0o755)
+	writeBuild(t, filepath.Join(rel.Current(), config.ReleaseRun), releaseScript("ok", "1.0.0", filepath.Join(dir, "events")))
+	setup := filepath.Join(rel.Current(), config.Setup)
+	writeBuild(t, setup, "#!/bin/sh\necho ставлю\necho \"$WORKER_STATE_DIR\" >> "+runs+"\n")
+	h := start(t, rel)
+	<-h.started
+	if got := readEvents(runs); len(got) != 1 || got[0] != StateDir(h.dir, "packed") {
+		t.Fatalf("setup до запуска, с окружением воркера: %v", got)
+	}
+	if !journalHasMsg(h, "packed", "ставлю") {
+		t.Fatal("вывод setup — в журнале воркера")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := h.sup.Restart(ctx, "packed", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEvents(runs); len(got) != 1 {
+		t.Fatalf("повторный запуск — без setup: %v", got)
+	}
+	writeBuild(t, setup, "#!/bin/sh\necho second >> "+runs+"\n")
+	if err := h.sup.Restart(ctx, "packed", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEvents(runs); len(got) != 2 || got[1] != "second" {
+		t.Fatalf("изменённый setup — снова: %v", got)
+	}
+	// Изменился файл зависимостей — снова; другой файл рядом — нет.
+	_ = os.WriteFile(filepath.Join(rel.Current(), "requirements.txt"), []byte("x==1\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(rel.Current(), "notes.txt"), []byte("x\n"), 0o644)
+	if err := h.sup.Restart(ctx, "packed", true); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(rel.Current(), "notes.txt"), []byte("y\n"), 0o644)
+	if err := h.sup.Restart(ctx, "packed", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := readEvents(runs); len(got) != 3 {
+		t.Fatalf("requirements.txt изменён — setup снова, notes.txt — нет: %v", got)
+	}
+
+	writeBuild(t, setup, "#!/bin/sh\necho сломано >&2\nexit 3\n")
+	if err := h.sup.Restart(ctx, "packed", true); err == nil || !strings.Contains(err.Error(), "./setup") {
+		t.Fatalf("ошибка setup: %v", err)
+	}
+	eventually(t, "повторы после ошибки setup", func() bool { return h.status("packed").Restarts >= 2 })
+	if _, err := os.Stat(filepath.Join(rel.Current(), setupMark)); err != nil {
+		t.Fatal("отметка прежнего успешного setup на месте")
+	}
+
+	slow := filepath.Join(t.TempDir(), "slow")
+	_ = os.MkdirAll(slow, 0o755)
+	writeBuild(t, filepath.Join(slow, config.Setup), "#!/bin/sh\nsleep 30\n")
+	began := time.Now()
+	err := runSetup(context.Background(), "slow", slow, nil, 200*time.Millisecond, logx.Discard())
+	if err == nil || !strings.Contains(err.Error(), "setupTimeout") || time.Since(began) > 10*time.Second {
+		t.Fatalf("срок setup: %v за %s", err, time.Since(began))
+	}
+	if err := os.Chmod(filepath.Join(slow, config.Setup), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := runSetup(context.Background(), "slow", slow, nil, time.Second, logx.Discard()); err == nil || !strings.Contains(err.Error(), "chmod") {
+		t.Fatalf("неисполняемый setup: %v", err)
+	}
+}
+
+func journalHasMsg(h *harness, name, text string) bool {
+	for _, e := range h.journal.Tail(name, 100) {
+		if e.Msg == text {
+			return true
+		}
+	}
+	return false
+}
+
+// ./cleanup (agent stop-workers --cleanup): выполняется в каталоге воркера с его окружением;
+// воркер без cleanup пропускается; ошибка — в итоге.
+func TestCleanup(t *testing.T) {
+	dir := t.TempDir()
+	done := filepath.Join(dir, "done")
+	good := filepath.Join(dir, "good")
+	bad := filepath.Join(dir, "bad")
+	none := filepath.Join(dir, "none")
+	for _, d := range []string{good, bad, none} {
+		_ = os.MkdirAll(d, 0o755)
+	}
+	writeBuild(t, filepath.Join(good, config.Cleanup), "#!/bin/sh\necho \"$AGENT_WORKER_NAME $WORKER_STATE_DIR\" > "+done+"\n")
+	writeBuild(t, filepath.Join(bad, config.Cleanup), "#!/bin/sh\nexit 2\n")
+	specs := []config.Worker{
+		{Name: "good", Command: []string{"x"}, Dir: good},
+		{Name: "bad", Command: []string{"x"}, Dir: bad},
+		{Name: "none", Command: []string{"x"}, Dir: none},
+	}
+	res := Cleanup(context.Background(), specs, dir, logx.Discard())
+	if len(res) != 2 || res[0].Worker != "good" || res[0].Err != nil || res[1].Worker != "bad" || res[1].Err == nil {
+		t.Fatalf("итоги: %+v", res)
+	}
+	if raw, _ := os.ReadFile(done); strings.TrimSpace(string(raw)) != "good "+StateDir(dir, "good") {
+		t.Fatalf("окружение: %q", raw)
 	}
 }

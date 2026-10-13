@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 func TestSwitchable(t *testing.T) {
@@ -46,7 +46,7 @@ func TestJournal(t *testing.T) {
 	if got := j.Tail("echo", 1); len(got) != 1 || got[0].Msg != "строка 4" {
 		t.Fatalf("хвост: %+v", got)
 	}
-	agent := j.Tail(message.LogSourceAgent, 0)
+	agent := j.Tail(protocol.LogSourceAgent, 0)
 	if len(agent) != 1 || agent[0].Msg != "агент" || agent[0].Attrs["worker"] != "echo" {
 		t.Fatalf("журнал агента: %+v", agent)
 	}
@@ -115,10 +115,10 @@ func TestForward(t *testing.T) {
 func TestForwardBuffer(t *testing.T) {
 	f := NewForwarder("info")
 	for i := range ForwardBuffer + 7 {
-		f.Add(message.LogEntry{Msg: fmt.Sprint(i)})
+		f.Add(protocol.LogEntry{Msg: fmt.Sprint(i)})
 	}
 	first := f.Take()
-	if len(first) != message.MaxLogBatch || first[0].Msg != "0" {
+	if len(first) != protocol.MaxBatch || first[0].Msg != "0" {
 		t.Fatalf("первая пачка: %d", len(first))
 	}
 	last := first[len(first)-1]
@@ -126,7 +126,7 @@ func TestForwardBuffer(t *testing.T) {
 		t.Fatalf("пометка: %+v", last)
 	}
 	second := f.Take()
-	if len(second) != message.MaxLogBatch || second[0].Msg != fmt.Sprint(message.MaxLogBatch-1) {
+	if len(second) != protocol.MaxBatch || second[0].Msg != fmt.Sprint(protocol.MaxBatch-1) {
 		t.Fatalf("вторая пачка: %d %s", len(second), second[0].Msg)
 	}
 	if third := f.Take(); len(third) != 1 {

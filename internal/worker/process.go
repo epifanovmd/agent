@@ -4,11 +4,8 @@ package worker
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,11 +17,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/epifanovmd/agent/internal/config"
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
-
-// SocketName — файл сокета воркера в его каталоге.
-const SocketName = "http.sock"
 
 // lineMax — строка вывода воркера длиннее обрезается.
 const lineMax = 16 << 10
@@ -33,22 +27,21 @@ const lineMax = 16 << 10
 // (своего потомка он ждёт через wait); переменная — для тестов.
 var adoptPoll = 250 * time.Millisecond
 
-// env — что агент передаёт процессу воркера (§12).
+// env — что агент передаёт процессу воркера (§11).
 type env struct {
-	agentSocket  string
-	agentVersion string
-	token        string
+	agentSocket string
+	token       string
+	// stateDir — каталог своих данных воркера.
+	stateDir string
 	// extra — переменные агента для всех воркеров (KEY=VALUE).
 	extra []string
 }
 
 // process — процесс воркера: запущенный этим агентом или подхваченный после
-// перезапуска агента (§13).
+// перезапуска агента (§11).
 type process struct {
-	name   string
-	socket string
-	log    *slog.Logger
-	client *http.Client
+	name string
+	log  *slog.Logger
 	// version — версия сборки воркера на момент запуска.
 	version string
 	pid     int
@@ -109,51 +102,27 @@ func releaseVersion(spec config.Worker) string {
 	return readVersion(filepath.Join(spec.ReleaseDir, config.ReleaseVersion))
 }
 
-// socketDir — каталог сокета воркера (0700).
-func socketDir(runDir string, spec config.Worker) (string, error) {
-	dir := filepath.Join(runDir, spec.Name)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return "", err
-	}
-	return dir, nil
-}
-
-// unixClient — HTTP-клиент к сокету воркера; адрес запроса — http://worker/путь.
-func unixClient(socket string) *http.Client {
-	return &http.Client{Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", socket)
-		},
-		MaxIdleConnsPerHost: 8,
-		IdleConnTimeout:     30 * time.Second,
-	}}
-}
-
-// startProcess — запустить процесс воркера (не дожидаясь сокета): свой сеанс
-// и группа процессов (воркер не получает сигналов терминала и переживает
-// выход агента), вывод — в файлы logDir.
-func startProcess(spec config.Worker, runDir, logDir string, e env, log *slog.Logger, life func() config.Lifecycle) (*process, error) {
+// startProcess — запустить процесс воркера: сначала, если нужно, ./setup (установка
+// зависимостей), затем сам воркер — свой сеанс и группа процессов (воркер не получает
+// сигналов терминала и переживает выход агента), вывод — в файлы logDir.
+func startProcess(ctx context.Context, spec config.Worker, logDir string, e env, log *slog.Logger, life func() config.Lifecycle) (*process, error) {
 	args, dir, err := argv(spec)
 	if err != nil {
 		return nil, err
 	}
-	sockDir, err := socketDir(runDir, spec)
-	if err != nil {
-		return nil, fmt.Errorf("каталог сокета: %w", err)
+	if err := os.MkdirAll(e.stateDir, 0o700); err != nil {
+		return nil, fmt.Errorf("каталог данных воркера: %w", err)
 	}
-	socket := filepath.Join(sockDir, SocketName)
-	_ = os.Remove(socket)
 	set := map[string]string{
-		message.EnvWorker:       spec.Name,
-		message.EnvWorkerSocket: socket,
-		message.EnvSocket:       e.agentSocket,
-		message.EnvWorkerToken:  e.token,
-		message.EnvVersion:      e.agentVersion,
+		protocol.EnvWorkerName:  spec.Name,
+		protocol.EnvAgentSocket: e.agentSocket,
+		protocol.EnvWorkerToken: e.token,
+		protocol.EnvStateDir:    e.stateDir,
 		"PYTHONUNBUFFERED":      "1",
+	}
+	environ := workerEnv(os.Environ(), spec, e.extra, set)
+	if err := runSetup(ctx, spec.Name, dir, environ, life().SetupTimeout.Std(), log); err != nil {
+		return nil, err
 	}
 	out, files, err := openOutput(logDir, spec, nil, log)
 	if err != nil {
@@ -161,9 +130,7 @@ func startProcess(spec config.Worker, runDir, logDir string, e env, log *slog.Lo
 	}
 	p := &process{
 		name:    spec.Name,
-		socket:  socket,
 		log:     log.With("worker", spec.Name),
-		client:  unixClient(socket),
 		version: releaseVersion(spec),
 		life:    life,
 		out:     out,
@@ -171,7 +138,7 @@ func startProcess(spec config.Worker, runDir, logDir string, e env, log *slog.Lo
 	}
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = dir
-	cmd.Env = workerEnv(os.Environ(), spec, e.extra, set)
+	cmd.Env = environ
 	cmd.Stdout, cmd.Stderr = files[0], files[1]
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	err = cmd.Start()
@@ -208,7 +175,7 @@ func adoptProcess(st procState, spec config.Worker, logDir string, log *slog.Log
 	files[0].Close()
 	files[1].Close()
 	p := &process{
-		name: spec.Name, socket: st.Socket, log: log.With("worker", spec.Name), client: unixClient(st.Socket),
+		name: spec.Name, log: log.With("worker", spec.Name),
 		version: st.Version, pid: st.PID, start: st.Start, adopted: true, life: life, out: out,
 		exited: make(chan struct{}),
 	}
@@ -236,7 +203,6 @@ func adoptProcess(st procState, spec config.Worker, logDir string, log *slog.Log
 func (p *process) exit() {
 	_ = syscall.Kill(-p.pid, syscall.SIGKILL)
 	p.out.close(true)
-	p.client.CloseIdleConnections()
 	close(p.exited)
 }
 
@@ -248,7 +214,7 @@ func (p *process) alive() bool {
 
 // state — файл процесса для следующего запуска агента.
 func (p *process) state(token, spec string, startedAt time.Time, output [2]int64) procState {
-	return procState{PID: p.pid, Start: p.start, Socket: p.socket, Token: token, Version: p.version, Spec: spec,
+	return procState{PID: p.pid, Start: p.start, Token: token, Version: p.version, Spec: spec,
 		StartedAt: startedAt.UnixMilli(), Output: output, StopTimeout: p.life().StopTimeout}
 }
 
@@ -259,30 +225,6 @@ func (p *process) detach() [2]int64 {
 	p.detached = true
 	p.mu.Unlock()
 	return p.out.close(false)
-}
-
-// waitReady — ждать, пока сокет воркера примет соединение (не дольше
-// wait); процесс завершился раньше — ошибка.
-func (p *process) waitReady(ctx context.Context, wait time.Duration) error {
-	deadline := time.NewTimer(wait)
-	defer deadline.Stop()
-	tick := time.NewTicker(50 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		if c, err := net.DialTimeout("unix", p.socket, time.Second); err == nil {
-			c.Close()
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-p.exited:
-			return fmt.Errorf("завершился до готовности: %s", p.exitReason())
-		case <-deadline.C:
-			return fmt.Errorf("сокет %s не ответил за %s", p.socket, wait)
-		case <-tick.C:
-		}
-	}
 }
 
 // signal — сигнал всей группе процессов воркера. Подхваченному — только
@@ -346,9 +288,6 @@ func (p *process) failed() bool {
 	defer p.mu.Unlock()
 	return p.adopted || p.reason != "" || p.exitErr != nil
 }
-
-// errNoResponse — воркер не ответил (нет соединения, срок истёк).
-var errNoResponse = errors.New("воркер не ответил")
 
 // lineLog — вывод воркера построчно в лог агента (stdout — info, stderr —
 // warn); строка длиннее lineMax обрезается с пометкой.

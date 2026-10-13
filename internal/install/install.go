@@ -23,10 +23,12 @@ import (
 	"strings"
 	"text/template"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/fsutil"
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // Пути установки экземпляра по умолчанию (остальные — Layout).
@@ -47,7 +49,7 @@ const (
 	// Service — имя службы systemd.
 	Service = "agent.service"
 	// ReleasesPath — каталог сборок на сервере (от адреса сервера).
-	ReleasesPath = "/api/v1/agent-link/releases"
+	ReleasesPath = "/agent/v1/releases"
 )
 
 // Cmd — запуск программы.
@@ -135,7 +137,7 @@ type Options struct {
 	Sysctls    []string
 	Workers    []string
 	// Releases — адрес каталога сборок для --worker (по умолчанию
-	// <server>/api/v1/agent-link/releases).
+	// <server>/agent/v1/releases).
 	Releases string
 	// Instance — экземпляр (несколько агентов на узле, см. Layout); "" — по умолчанию.
 	Instance string
@@ -184,7 +186,7 @@ func (o *Options) check() error {
 		}
 	}
 	for _, w := range o.Workers {
-		if !message.ValidName(w) {
+		if !protocol.ValidName(w) {
 			errs = append(errs, fmt.Errorf("--worker: имя воркера — строчная латиница, цифры и «-», первая — буква, до 32 символов, а не %q", w))
 		}
 	}
@@ -289,6 +291,19 @@ func Install(ctx context.Context, s *System, o Options) error {
 	for _, x := range o.Ignored {
 		s.warn("%s", x)
 	}
+	if err := os.MkdirAll(s.p(l.EtcDir), 0o755); err != nil {
+		return err
+	}
+	j, err := loadJournal(s.p(l.JournalFile))
+	if err != nil {
+		return err
+	}
+	// Повторная установка — прежним способом: без --privileged права службы не понижаются
+	// (иначе воркеры, работающие от root, остались бы без присмотра агента).
+	if !o.Privileged && j.last("privileged") == "yes" {
+		o.Privileged = true
+		s.warn("служба поставлена с --privileged — так и остаётся (сменить: agent uninstall, затем install)")
+	}
 	// Пользователь службы — у системного агента; агент пользователя работает от него самого.
 	user := ""
 	if !l.Home {
@@ -297,20 +312,15 @@ func Install(ctx context.Context, s *System, o Options) error {
 			user = "root"
 		}
 	}
-
-	if err := os.MkdirAll(s.p(l.EtcDir), 0o755); err != nil {
-		return err
-	}
 	if o.CAFile != "" {
 		if err := installCA(s, l, o.CAFile); err != nil {
 			return err
 		}
 	}
-	j, err := loadJournal(s.p(l.JournalFile))
-	if err != nil {
-		return err
-	}
 	j.set("mode", mode)
+	if o.Privileged {
+		j.set("privileged", "yes")
+	}
 	if user != "" {
 		j.set("service-user", user)
 	}
@@ -499,14 +509,79 @@ func writeConfig(s *System, l Paths, mode string, o Options, workers []newWorker
 		if o.Server != "" && cfg.Server.URL != "" && strings.TrimRight(cfg.Server.URL, "/") != o.Server {
 			s.warn("%s не менялся: в нём server.url = %s, а не %s — поправьте файл, если адрес сменился", l.ConfigFile, cfg.Server.URL, o.Server)
 		}
-		for _, w := range workers {
-			if !slices.ContainsFunc(cfg.Workers, func(c config.Worker) bool { return c.Name == w.Name && c.Release }) {
-				s.warn("сборка воркера %s поставлена, но %s не менялся — добавьте в workers:\n  - name: %s\n    release: true\nи примените: %s",
-					w.Name, l.ConfigFile, w.Name, ReloadHint(l, mode))
-			}
+	}
+	// Новые воркеры (--worker) дописываются в workers; уже описанные не трогаются.
+	var add []newWorker
+	for _, w := range workers {
+		if !slices.ContainsFunc(cfg.Workers, func(c config.Worker) bool { return c.Name == w.Name }) {
+			add = append(add, w)
 		}
 	}
-	return nil
+	if len(add) == 0 {
+		return nil
+	}
+	next, err := appendWorkers(raw, add)
+	if err != nil {
+		for _, w := range add {
+			s.warn("сборка воркера %s поставлена, но в %s он не дописан (%v) — добавьте в workers:\n  - name: %s\n    release: true",
+				w.Name, l.ConfigFile, err, w.Name)
+		}
+		return nil
+	}
+	if err := writeFileAtomic(s.p(l.ConfigFile)+".bak", raw, 0o644); err != nil {
+		return err
+	}
+	for _, w := range add {
+		s.say("воркер %s дописан в %s (прежний файл — %s.bak)", w.Name, l.ConfigFile, l.ConfigFile)
+	}
+	return writeFileAtomic(s.p(l.ConfigFile), next, 0o644)
+}
+
+// appendWorkers — agent.yaml raw с воркерами add в конце workers (нет списка — он создаётся);
+// комментарии и порядок ключей сохраняются.
+func appendWorkers(raw []byte, add []newWorker) ([]byte, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	if len(doc.Content) == 0 {
+		doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode}}}
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil, errors.New("в файле не словарь настроек")
+	}
+	var list *yaml.Node
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == "workers" {
+			list = root.Content[i+1]
+		}
+	}
+	if list == nil || list.Kind == yaml.ScalarNode && list.Tag == "!!null" {
+		if list == nil {
+			list = &yaml.Node{}
+			root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: "workers"}, list)
+		}
+		*list = yaml.Node{Kind: yaml.SequenceNode}
+	}
+	if list.Kind != yaml.SequenceNode {
+		return nil, errors.New("workers — не список")
+	}
+	for _, w := range add {
+		var n yaml.Node
+		if err := n.Encode(w); err != nil {
+			return nil, err
+		}
+		list.Content = append(list.Content, &n)
+	}
+	var b bytes.Buffer
+	enc := yaml.NewEncoder(&b)
+	enc.SetIndent(2)
+	if err := enc.Encode(&doc); err != nil {
+		return nil, err
+	}
+	_ = enc.Close()
+	return b.Bytes(), nil
 }
 
 // savedServer — адрес сервера установленного агента: AGENT_SERVER_URL из

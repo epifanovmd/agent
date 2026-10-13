@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/epifanovmd/agent/internal/fsutil"
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // CheckFile — итог последней проверки новой версии в каталоге данных агента.
@@ -23,7 +23,7 @@ type Check struct {
 
 // Newer — последняя версия новее version (агент без версии — dev — не сравнивается).
 func (c Check) Newer(version string) bool {
-	return c.Latest != "" && version != "dev" && message.CompareVersions(c.Latest, version) > 0
+	return c.Latest != "" && version != "dev" && protocol.CompareVersions(c.Latest, version) > 0
 }
 
 // Fresh — проверка моложе every.
@@ -32,11 +32,11 @@ func (c Check) Fresh(every time.Duration, now time.Time) bool {
 }
 
 // Info — для hello и status: nil, если новее version нет.
-func (c Check) Info(version string) *message.AgentUpdateInfo {
+func (c Check) Info(version string) *protocol.AgentUpdateInfo {
 	if !c.Newer(version) {
 		return nil
 	}
-	return &message.AgentUpdateInfo{Latest: c.Latest, CheckedAt: c.CheckedAt}
+	return &protocol.AgentUpdateInfo{Latest: c.Latest, CheckedAt: c.CheckedAt}
 }
 
 // Latest — последняя версия агента в каталоге сборок base ("" — релизы на GitHub).

@@ -11,31 +11,31 @@ import (
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/fsutil"
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
-// Update — worker.update (§11): fetch кладёт проверенную сборку в dst
+// Update — worker.update (§10): fetch кладёт проверенную сборку в dst
 // (файл или каталог распакованного архива); воркер заменяется (сначала
 // уходит прежний процесс), текущая сборка откладывается как previous, новая
-// становится current. Новая не ответила ok: true на GET /health за startTimeout —
-// previous возвращается, воркер перезапускается с ней, итог —
-// UPDATE_FAILED. Без force замена ждёт, пока воркер занят (§13). Ошибки —
-// *message.ErrorInfo.
-func (s *Supervisor) Update(ctx context.Context, name, version string, force bool, fetch func(dst string) error) (message.UpdateResult, error) {
-	var res message.UpdateResult
+// становится current. Новая не зарегистрировалась с пульсом ok: true за
+// startTimeout — previous возвращается, воркер перезапускается с ней, итог —
+// UPDATE_FAILED. Без force замена ждёт, пока воркер занят (§16). Ошибки —
+// *protocol.ErrorInfo.
+func (s *Supervisor) Update(ctx context.Context, name, version string, force bool, fetch func(dst string) error) (protocol.UpdateResult, error) {
+	var res protocol.UpdateResult
 	w := s.get(name)
 	if w == nil {
-		return res, message.NewError(message.CodeWorkerUnknown, fmt.Sprintf("воркера %q нет в настройках агента", name))
+		return res, protocol.NewError(protocol.CodeWorkerUnknown, fmt.Sprintf("воркера %q нет в настройках агента", name))
 	}
 	w.mu.Lock()
 	spec := w.spec
 	switch {
 	case !spec.Release:
 		w.mu.Unlock()
-		return res, message.NewError(message.CodeWorkerNotReleased, fmt.Sprintf("у воркера %q нет сборки с сервера (release: true не задан)", name))
+		return res, protocol.NewError(protocol.CodeWorkerNotReleased, fmt.Sprintf("у воркера %q нет сборки с сервера (release: true не задан)", name))
 	case w.updating:
 		w.mu.Unlock()
-		return res, message.NewError(message.CodeBusy, fmt.Sprintf("воркер %q уже обновляется", name))
+		return res, protocol.NewError(protocol.CodeBusy, fmt.Sprintf("воркер %q уже обновляется", name))
 	}
 	w.updating = true
 	w.mu.Unlock()
@@ -45,7 +45,7 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, force boo
 		w.mu.Unlock()
 	}()
 	failed := func(format string, args ...any) error {
-		return message.NewError(message.CodeUpdateFailed, fmt.Sprintf(format, args...))
+		return protocol.NewError(protocol.CodeUpdateFailed, fmt.Sprintf(format, args...))
 	}
 
 	dir := spec.ReleaseDir
@@ -57,7 +57,7 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, force boo
 	_ = os.RemoveAll(next)
 	if err := fetch(next); err != nil {
 		_ = os.RemoveAll(next)
-		var ei *message.ErrorInfo
+		var ei *protocol.ErrorInfo
 		if errors.As(err, &ei) {
 			return res, err
 		}
@@ -107,14 +107,14 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, force boo
 	startErr := w.replace(ctx, func() error {
 		installErr = install()
 		return installErr
-	}, message.PendingUpdate, force)
+	}, protocol.PendingUpdate, force)
 	if installErr != nil {
 		_ = os.RemoveAll(next)
 		return res, failed("замена сборки: %v", installErr)
 	}
 	cause := startErr
 	if cause == nil {
-		cause = s.waitHealthy(ctx, name, startTimeout, probeTimeout)
+		cause = s.waitHealthy(ctx, name, startTimeout)
 	}
 	if cause == nil {
 		log.Info("воркер работает на новой сборке", "version", version)
@@ -126,7 +126,7 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, force boo
 	if err := w.replace(context.WithoutCancel(ctx), func() error {
 		rbErr = rollback()
 		return rbErr
-	}, message.PendingUpdate, true); err != nil && rbErr == nil {
+	}, protocol.PendingUpdate, true); err != nil && rbErr == nil {
 		log.Error("воркер: прежняя сборка не запустилась", "err", err)
 	}
 	switch {

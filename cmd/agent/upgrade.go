@@ -18,9 +18,9 @@ import (
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/install"
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/releases"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 var releasesClient = &http.Client{Timeout: 10 * time.Minute, Transport: &http.Transport{Proxy: http.ProxyFromEnvironment}}
@@ -93,7 +93,7 @@ func upgradeCmd(args []string) error {
 		_ = releases.WriteCheck(cfg.DataDir, c)
 		target = c.Latest
 	}
-	newer := version == "dev" || message.CompareVersions(target, version) > 0
+	newer := version == "dev" || protocol.CompareVersions(target, version) > 0
 	if *check {
 		if newer {
 			fmt.Printf("Доступна версия %s (у вас %s): agent upgrade\n", target, version)

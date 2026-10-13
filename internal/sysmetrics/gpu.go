@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // nvidiaSMI — программа опроса видеокарт NVIDIA.
@@ -19,7 +19,7 @@ const nvidiaSMI = "nvidia-smi"
 const gpuTimeout = 5 * time.Second
 
 // gpuSource — опрос видеокарт, если nvidia-smi есть в PATH; иначе nil.
-func gpuSource() func(context.Context) []message.GPUMetrics {
+func gpuSource() func(context.Context) []protocol.GPUMetrics {
 	if _, err := exec.LookPath(nvidiaSMI); err != nil {
 		return nil
 	}
@@ -34,7 +34,7 @@ func queryGPU(ctx context.Context, fields string) ([]byte, error) {
 }
 
 // gpus — загрузка, память и температура видеокарт; ошибка nvidia-smi — nil.
-func gpus(ctx context.Context) []message.GPUMetrics {
+func gpus(ctx context.Context) []protocol.GPUMetrics {
 	out, err := queryGPU(ctx, "index,name,utilization.gpu,memory.used,memory.total,temperature.gpu")
 	if err != nil {
 		return nil
@@ -43,8 +43,8 @@ func gpus(ctx context.Context) []message.GPUMetrics {
 }
 
 // ParseNvidiaSMI — строки CSV nvidia-smi в метрики (память — МиБ → байты).
-func ParseNvidiaSMI(out []byte) []message.GPUMetrics {
-	var gpus []message.GPUMetrics
+func ParseNvidiaSMI(out []byte) []protocol.GPUMetrics {
+	var gpus []protocol.GPUMetrics
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
 		fields := strings.Split(scanner.Text(), ",")
@@ -58,7 +58,7 @@ func ParseNvidiaSMI(out []byte) []message.GPUMetrics {
 		if err != nil {
 			continue
 		}
-		g := message.GPUMetrics{Index: index, Name: fields[1]}
+		g := protocol.GPUMetrics{Index: index, Name: fields[1]}
 		if v, err := strconv.ParseFloat(fields[2], 64); err == nil {
 			g.UtilPercent = &v
 		}

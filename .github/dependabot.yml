@@ -7,15 +7,6 @@ updates:
     schedule:
       interval: weekly
 
-  # SDK, стенд, Prettier репозитория.
-  - package-ecosystem: npm
-    directories:
-      - /
-      - /sdk/node
-      - /examples/server
-    schedule:
-      interval: weekly
-
   # Действия CI и публикации версий.
   - package-ecosystem: github-actions
     directory: /

@@ -20,7 +20,7 @@ import (
 	"github.com/shirou/gopsutil/v4/process"
 	"github.com/shirou/gopsutil/v4/sensors"
 
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // sources — откуда берутся показатели узла (в тестах подменяются).
@@ -45,7 +45,7 @@ type sources struct {
 	// readFile — файлы /proc (Linux).
 	readFile func(name string) ([]byte, error)
 	// gpus — видеокарты (nil — nvidia-smi нет).
-	gpus func(ctx context.Context) []message.GPUMetrics
+	gpus func(ctx context.Context) []protocol.GPUMetrics
 }
 
 func systemSources() sources {
@@ -115,11 +115,11 @@ type collector struct {
 func newCollector() *collector { return &collector{src: systemSources()} }
 
 // host — блок host по группам; недоступные значения пропускаются.
-func (c *collector) host(ctx context.Context, groups, disks, exclude []string) *message.HostMetrics {
+func (c *collector) host(ctx context.Context, groups, disks, exclude []string) *protocol.HostMetrics {
 	has := func(g string) bool { return slices.Contains(groups, g) }
 	src := c.src
-	h := &message.HostMetrics{}
-	if has(message.MetricsCPU) {
+	h := &protocol.HostMetrics{}
+	if has(protocol.MetricsCPU) {
 		if pct, err := src.cpu(ctx, false); err == nil && len(pct) > 0 {
 			h.CPUPercent = &pct[0]
 		}
@@ -130,62 +130,62 @@ func (c *collector) host(ctx context.Context, groups, disks, exclude []string) *
 			}
 		}
 	}
-	if has(message.MetricsLoad) {
+	if has(protocol.MetricsLoad) {
 		if avg, err := src.load(ctx); err == nil {
 			h.Load1, h.Load5, h.Load15 = &avg.Load1, &avg.Load5, &avg.Load15
 		}
 	}
-	if has(message.MetricsMemory) {
+	if has(protocol.MetricsMemory) {
 		if vm, err := src.memory(ctx); err == nil {
 			h.MemUsedBytes, h.MemTotalBytes, h.MemAvailableBytes = &vm.Used, &vm.Total, &vm.Available
 		}
 	}
-	if has(message.MetricsSwap) {
+	if has(protocol.MetricsSwap) {
 		if sw, err := src.swap(ctx); err == nil {
 			h.SwapUsedBytes, h.SwapTotalBytes = &sw.Used, &sw.Total
 		}
 	}
-	if has(message.MetricsDisk) {
+	if has(protocol.MetricsDisk) {
 		c.diskUsage(ctx, h, disks)
 	}
-	if has(message.MetricsDiskIO) {
+	if has(protocol.MetricsDiskIO) {
 		c.diskIO(ctx, h)
 	} else {
 		c.prevDisk, c.prevDiskAt = nil, time.Time{}
 	}
-	if has(message.MetricsNetwork) || has(message.MetricsInterfaces) {
-		c.network(ctx, h, exclude, has(message.MetricsNetwork), has(message.MetricsInterfaces))
+	if has(protocol.MetricsNetwork) || has(protocol.MetricsInterfaces) {
+		c.network(ctx, h, exclude, has(protocol.MetricsNetwork), has(protocol.MetricsInterfaces))
 	} else {
 		c.prevNet, c.prevNetAt = nil, time.Time{}
 	}
-	if has(message.MetricsConntrack) {
+	if has(protocol.MetricsConntrack) {
 		h.Conntrack = c.procUint(procConntrackCount)
 		h.ConntrackMax = c.procUint(procConntrackMax)
 	}
-	if has(message.MetricsSockets) {
+	if has(protocol.MetricsSockets) {
 		h.TCP = c.tcp(ctx)
 	}
-	if has(message.MetricsProcesses) {
+	if has(protocol.MetricsProcesses) {
 		if pids, err := src.pids(ctx); err == nil && len(pids) > 0 {
 			n := uint64(len(pids))
 			h.Processes = &n
 		}
 		h.Threads = c.threads()
 	}
-	if has(message.MetricsFDs) {
+	if has(protocol.MetricsFDs) {
 		h.FDsOpen, h.FDsMax = c.fds()
 	}
-	if has(message.MetricsUptime) {
+	if has(protocol.MetricsUptime) {
 		if up, err := src.uptime(ctx); err == nil {
 			h.UptimeSec = &up
 		}
 	}
-	if has(message.MetricsTemperatures) {
+	if has(protocol.MetricsTemperatures) {
 		// Часть датчиков может не читаться: ошибка вместе с данными — берём данные.
 		stats, _ := src.temperatures(ctx)
 		h.Temperatures = Temperatures(stats)
 	}
-	if has(message.MetricsGPU) && src.gpus != nil {
+	if has(protocol.MetricsGPU) && src.gpus != nil {
 		h.GPUs = src.gpus(ctx)
 	}
 	return h
@@ -223,7 +223,7 @@ func RealMounts(parts []disk.PartitionStat) []string {
 }
 
 // diskUsage — корень (diskUsedBytes, diskTotalBytes) и disks по mounts.
-func (c *collector) diskUsage(ctx context.Context, h *message.HostMetrics, mounts []string) {
+func (c *collector) diskUsage(ctx context.Context, h *protocol.HostMetrics, mounts []string) {
 	if u, err := c.src.usage(ctx, "/"); err == nil {
 		h.DiskUsedBytes, h.DiskTotalBytes = &u.Used, &u.Total
 	}
@@ -239,7 +239,7 @@ func (c *collector) diskUsage(ctx context.Context, h *message.HostMetrics, mount
 		if err != nil || u.Total == 0 {
 			continue
 		}
-		h.Disks = append(h.Disks, message.DiskMetrics{
+		h.Disks = append(h.Disks, protocol.DiskMetrics{
 			Mount: mount, UsedBytes: u.Used, TotalBytes: u.Total, InodesUsed: u.InodesUsed, InodesTotal: u.InodesTotal,
 		})
 	}
@@ -267,7 +267,7 @@ func PhysicalDisk(name string, block map[string]bool) bool {
 }
 
 // diskIO — скорость чтения и записи по физическим дискам (по разнице счётчиков).
-func (c *collector) diskIO(ctx context.Context, h *message.HostMetrics) {
+func (c *collector) diskIO(ctx context.Context, h *protocol.HostMetrics) {
 	stats, err := c.src.diskIO(ctx)
 	if err != nil || len(stats) == 0 {
 		return
@@ -323,7 +323,7 @@ type netCounter struct{ rx, tx, errors, drops uint64 }
 
 // network — сеть по интерфейсам и суммарно (по разнице счётчиков с прошлого
 // сбора); интерфейсы из exclude не считаются.
-func (c *collector) network(ctx context.Context, h *message.HostMetrics, exclude []string, total, ifaces bool) {
+func (c *collector) network(ctx context.Context, h *protocol.HostMetrics, exclude []string, total, ifaces bool) {
 	stats, err := c.src.netIO(ctx)
 	if err != nil || len(stats) == 0 {
 		return
@@ -355,18 +355,18 @@ func (c *collector) network(ctx context.Context, h *message.HostMetrics, exclude
 // Rates — сеть по интерфейсам (байт/с; ошибки и отброшенные — за интервал,
 // по имени) и сумма; интерфейс без прошлых счётчиков или со сброшенными
 // (перезапуск) пропускается.
-func Rates(prev, cur map[string]netCounter, secs float64) ([]message.InterfaceMetrics, message.InterfaceMetrics) {
-	var sum message.InterfaceMetrics
+func Rates(prev, cur map[string]netCounter, secs float64) ([]protocol.InterfaceMetrics, protocol.InterfaceMetrics) {
+	var sum protocol.InterfaceMetrics
 	if secs <= 0 {
 		return nil, sum
 	}
-	var out []message.InterfaceMetrics
+	var out []protocol.InterfaceMetrics
 	for name, c := range cur {
 		p, ok := prev[name]
 		if !ok || c.rx < p.rx || c.tx < p.tx || c.errors < p.errors || c.drops < p.drops {
 			continue
 		}
-		m := message.InterfaceMetrics{
+		m := protocol.InterfaceMetrics{
 			Name: name, RxBps: uint64(float64(c.rx-p.rx) / secs), TxBps: uint64(float64(c.tx-p.tx) / secs),
 			Errors: c.errors - p.errors, Drops: c.drops - p.drops,
 		}
@@ -391,8 +391,8 @@ func Shown(name string, exclude []string) bool {
 
 // tcp — TCP-соединения по состояниям: Linux — /proc/net/tcp и tcp6 (дёшево),
 // иначе — список соединений системы.
-func (c *collector) tcp(ctx context.Context) *message.TCPMetrics {
-	t := &message.TCPMetrics{}
+func (c *collector) tcp(ctx context.Context) *protocol.TCPMetrics {
+	t := &protocol.TCPMetrics{}
 	found := false
 	for _, name := range []string{procTCP, procTCP6} {
 		if raw, err := c.src.readFile(name); err == nil {
@@ -427,7 +427,7 @@ func (c *collector) tcp(ctx context.Context) *message.TCPMetrics {
 
 // ParseProcTCP — добавляет к t соединения из /proc/net/tcp(6): состояние —
 // четвёртое поле, шестнадцатеричный код.
-func ParseProcTCP(raw []byte, t *message.TCPMetrics) {
+func ParseProcTCP(raw []byte, t *protocol.TCPMetrics) {
 	lines := bytes.Split(raw, []byte("\n"))
 	for i, line := range lines {
 		fields := strings.Fields(string(line))
@@ -517,21 +517,21 @@ func sensorName(key string) string {
 }
 
 // Temperatures — датчики (°C, по имени) и самая высокая; нет показаний — nil.
-func Temperatures(stats []sensors.TemperatureStat) *message.TemperatureMetrics {
-	var out []message.TemperatureSensor
+func Temperatures(stats []sensors.TemperatureStat) *protocol.TemperatureMetrics {
+	var out []protocol.TemperatureSensor
 	for _, s := range stats {
 		name := sensorName(s.SensorKey)
 		// Нули и заведомо неверные значения — датчик не подключён.
 		if name == "" || s.Temperature <= 0 || s.Temperature > 200 {
 			continue
 		}
-		out = append(out, message.TemperatureSensor{Name: name, C: round1(s.Temperature)})
+		out = append(out, protocol.TemperatureSensor{Name: name, C: round1(s.Temperature)})
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	t := &message.TemperatureMetrics{Sensors: out}
+	t := &protocol.TemperatureMetrics{Sensors: out}
 	for _, s := range out {
 		t.MaxC = max(t.MaxC, s.C)
 	}

@@ -58,41 +58,18 @@ func TestValidate(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("ожидались ошибки")
 	}
-	builtin := Defaults()
-	builtin.Server.URL = "https://api.example.com"
-	builtin.Workers = []Worker{{Name: SysmetricsWorker, Command: []string{"x"}}}
-	if err := builtin.Validate(); err == nil || !strings.Contains(err.Error(), "занято встроенным") {
-		t.Fatalf("имя встроенного воркера: %v", err)
-	}
 	ok := Defaults()
 	ok.Server.URL = "http://10.0.0.1:8181"
-	if err := ok.Validate(); err != nil || !ok.Insecure() {
-		t.Fatalf("валидный http на чужой адрес — небезопасен: %v", err)
+	if err := ok.Validate(); err == nil || !strings.Contains(err.Error(), "allowInsecure") {
+		t.Fatalf("http без allowInsecure: %v", err)
 	}
-	ok.Server.URL = "http://localhost:8181"
-	if ok.Insecure() {
-		t.Fatal("localhost — не предупреждаем")
+	ok.Server.AllowInsecure = true
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("http с allowInsecure: %v", err)
 	}
-}
-
-func TestInsecure(t *testing.T) {
-	for url, want := range map[string]bool{
-		"http://10.0.0.1:8181":         true,
-		"http://api.example.com":       true,
-		"HTTP://api.example.com":       true,
-		"http://host.docker.internal":  true,
-		"http://localhost:8080":        false,
-		"http://app.localhost":         false,
-		"http://127.0.0.1:8080":        false,
-		"http://127.10.20.30":          false,
-		"http://[::1]:8080":            false,
-		"https://api.example.com":      false,
-		"https://10.0.0.1":             false,
-		"http://[::ffff:127.0.0.1]:80": false,
-	} {
-		if got := Insecure(url); got != want {
-			t.Errorf("Insecure(%s) = %v, ждали %v", url, got, want)
-		}
+	ok.Server.URL = ""
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("без бэкенда: %v", err)
 	}
 }
 
@@ -246,7 +223,6 @@ workers:
 	for name, w := range map[string]Worker{
 		"имя с путём": {Name: "../x", Release: true},
 		"заглавные":   {Name: "Report", Command: []string{"/bin/x"}},
-		"встроенный":  {Name: SysmetricsWorker, Command: []string{"/bin/x"}},
 		"без command": {Name: "x"},
 	} {
 		c := Defaults()
@@ -290,7 +266,7 @@ func TestCompareRelease(t *testing.T) {
 	}
 }
 
-// server.url — один адрес http(s). log.forward — warn по умолчанию,
+// server.url — один адрес https (http — с allowInsecure). log.forward — warn по умолчанию,
 // AGENT_LOG_FORWARD, проверка значения.
 func TestServerURLAndLogForward(t *testing.T) {
 	dir := t.TempDir()
@@ -303,8 +279,9 @@ func TestServerURLAndLogForward(t *testing.T) {
 		t.Fatalf("адрес %q, forward %q", cfg.Server.URL, cfg.Log.Forward)
 	}
 	t.Setenv("AGENT_SERVER_URL", "http://10.0.0.1")
+	t.Setenv("AGENT_SERVER_ALLOW_INSECURE", "true")
 	t.Setenv("AGENT_LOG_FORWARD", "debug")
-	if cfg, err = Load(path); err != nil || cfg.Server.URL != "http://10.0.0.1" || cfg.Log.Forward != "debug" || !cfg.Insecure() {
+	if cfg, err = Load(path); err != nil || cfg.Server.URL != "http://10.0.0.1" || cfg.Log.Forward != "debug" || !cfg.Server.AllowInsecure {
 		t.Fatalf("из окружения: %+v %v", cfg.Server, err)
 	}
 	t.Setenv("AGENT_SERVER_URL", "ftp://x")

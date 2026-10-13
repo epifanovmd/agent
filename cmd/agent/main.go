@@ -1,27 +1,27 @@
-// Агент: держит связь с сервером, запускает воркеры и следит за ними,
-// передаёт им настройки и запросы, собирает метрики узла, обновляется сам.
+// Агент: запускает воркеры и следит за ними, держит связь с бэкендом, передаёт воркерам
+// желаемое и команды, собирает метрики узла, обновляется сам; без бэкенда работает по файлам.
 //
 //	agent [run] [-config ФАЙЛ | --env ИМЯ]   работа (по умолчанию); SIGHUP — перечитать настройки,
 //	                                   SIGUSR1 — перезапуск, SIGTERM/SIGINT — остановка
-//	agent restart                      перезапустить работающего агента (воркеры работают дальше)
-//	agent stop-workers                 остановить воркеры, оставшиеся работать после остановки агента
+//	agent restart [--worker ИМЯ]       перезапустить агента (воркеры работают дальше) или воркер
+//	agent command ВОРКЕР ТИП [JSON]    команда воркеру через локальный API, вывод — итог
+//	agent stop-workers [--cleanup]     остановить воркеры, оставшиеся работать после остановки агента;
+//	                                   --cleanup — затем ./cleanup воркеров (его вызывает uninstall)
 //	agent install --server URL --token ТОКЕН [флаги]   поставить службой systemd (Linux, root);
 //	                                   --rootless — агент пользователя без root
 //	agent uninstall [--purge]          удалить службу (с --purge — настройки и данные)
 //	                                   --instance ИМЯ у install, uninstall, status, logs, restart,
-//	                                   stop-workers, cleanup, config check — экземпляр агента на узле;
-//	                                   --env ИМЯ у run, status, restart, stop-workers, cleanup,
+//	                                   stop-workers, command, config check — экземпляр агента на узле;
+//	                                   --env ИМЯ у run, status, restart, stop-workers, command,
 //	                                   config check — файл agent.ИМЯ.yaml папки агента
 //	agent config check                 проверить настройки и показать итоговые значения
 //	agent status [--json]              работает ли агент, связь, воркеры (код выхода 0 — работает)
-//	agent logs [-f] [-n N]             лог службы (journalctl)
-//	agent cleanup                      уборка воркеров перед удалением агента (без сервера; её вызывает uninstall)
+//	agent logs [-f] [-n N] [--worker ИМЯ]   лог службы (journalctl) или журнал воркера
 //	agent upgrade [--check] [--version X]   поставить новую версию агента из каталога сборок
 //	agent pack [--env ИМЯ] [--platform linux/amd64,…]   архив папки агента для узла
 //	agent manifest DIR VERSION [--worker NAME=VERSION[,…]]…   manifest.json сборок в DIR
 //	agent version                      версия
 //	agent boot-guard BINARY            откат версии, не дошедшей до связи (ExecStartPre)
-//	agent sysmetrics                   встроенный воркер метрик узла (агент запускает его сам)
 //
 // Файл настроек — -config, иначе --env ИМЯ (agent.ИМЯ.yaml папки агента), иначе
 // --instance ИМЯ (/etc/agent-ИМЯ/agent.yaml; у пользователя без root — его
@@ -38,9 +38,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -52,9 +56,9 @@ import (
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/install"
-	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/sysmetrics"
 	"github.com/epifanovmd/agent/internal/update"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // version — задаётся при сборке: -ldflags "-X main.version=1.2.3".
@@ -67,7 +71,7 @@ var updateKey = ""
 // errQuiet — команда уже всё сказала сама: только код выхода 1.
 var errQuiet = errors.New("")
 
-const usage = `agent — агент для узлов: связь с сервером, воркеры, их настройки, метрики, обновление.
+const usage = `agent — агент для узлов: воркеры, связь с бэкендом, желаемое и команды, метрики, обновление.
 
 Команды:
   agent run [-config ФАЙЛ | --env ИМЯ]
@@ -79,10 +83,14 @@ const usage = `agent — агент для узлов: связь с серве�
   agent config check [-config ФАЙЛ | --env ИМЯ]
                                  проверить настройки и показать итоговые значения
   agent status [--json]          работает ли агент, связь, воркеры, последняя ошибка
-  agent logs [-f] [-n N]         лог службы
-  agent restart                  перезапустить агента; воркеры работают дальше
-  agent stop-workers             остановить воркеры, оставшиеся после остановки агента (агент не работает)
-  agent cleanup                  воркеры убирают за собой (перед удалением агента)
+  agent logs [-f] [-n N] [--worker ИМЯ]
+                                 лог службы; --worker — последние записи журнала воркера
+  agent restart [--worker ИМЯ] [--force]
+                                 перезапустить агента (воркеры работают дальше) или воркер
+  agent command ВОРКЕР ТИП [JSON] [--timeout 30s]
+                                 команда воркеру; вывод — итог
+  agent stop-workers [--cleanup] остановить воркеры, оставшиеся после остановки агента (агент не работает);
+                                 --cleanup — затем ./cleanup воркеров (убрать созданное ими на узле)
   agent pack [--env ИМЯ | -config ФАЙЛ] [--platform linux/amd64,linux/arm64] [--out КАТАЛОГ] [--with-env]
                                  архив папки агента для узла: программа под его платформу, настройки,
                                  воркеры и их сборки; на узле — tar xzf …, sudo ./agent install
@@ -122,8 +130,8 @@ func main() {
 		err = status(args)
 	case "logs":
 		err = logs(args)
-	case "cleanup":
-		err = cleanup(args)
+	case "command":
+		err = commandCmd(args)
 	case "restart":
 		err = restartCmd(args)
 	case "stop-workers":
@@ -140,9 +148,8 @@ func main() {
 		err = bootGuard(args)
 	case "help":
 		fmt.Printf(usage, config.DefaultPath())
-	case sysmetrics.Command, sysmetrics.SensorsCommand:
-		// Служебные: встроенный воркер метрик узла и показания датчиков (macOS) —
-		// агент запускает их сам дочерними процессами.
+	case sysmetrics.SensorsCommand:
+		// Служебная: показания датчиков (macOS) — агент запускает её сам дочерним процессом.
 		_, err = sysmetrics.Dispatch(os.Args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, usage, config.DefaultPath())
@@ -224,7 +231,7 @@ func (t target) path() (string, error) {
 
 // envConfig — файл настроек окружения env в одном из каталогов dirs.
 func envConfig(env string, dirs []string) (string, error) {
-	if !message.ValidName(env) {
+	if !protocol.ValidName(env) {
 		return "", fmt.Errorf("--env: имя окружения — строчная латиница, цифры и «-», первая — буква, а не %q", env)
 	}
 	name := config.EnvConfigName(env)
@@ -312,7 +319,7 @@ func run(args []string) error {
 	cfg, err := config.Load(path)
 	if err != nil {
 		if path == "" {
-			return fmt.Errorf("%w\nфайла настроек нет (ни agent.yaml рядом с программой или в текущем каталоге, ни %s): создайте его (server.url, enroll.token) или задайте AGENT_SERVER_URL и AGENT_ENROLL_TOKEN", err, config.DefaultPath())
+			return fmt.Errorf("%w\nфайла настроек нет (ни agent.yaml рядом с программой или в текущем каталоге, ни %s): создайте его (server.url, enroll.token, workers) или задайте AGENT_SERVER_URL и AGENT_ENROLL_TOKEN", err, config.DefaultPath())
 		}
 		return err
 	}
@@ -335,7 +342,7 @@ func run(args []string) error {
 	return err
 }
 
-// loadForTool — настройки для служебных команд (cleanup, status): файл,
+// loadForTool — настройки для служебных команд (status, restart, command): файл,
 // agent.env рядом с ним (как у службы), окружение.
 func loadForTool(t target) (config.Config, string, error) {
 	path, err := t.path()
@@ -345,44 +352,6 @@ func loadForTool(t target) (config.Config, string, error) {
 	_, _ = config.ApplyEnvFile(config.EnvFile(path))
 	cfg, err := config.Load(path)
 	return cfg, path, err
-}
-
-// cleanup — перед удалением агента с узла: каждый воркер из настроек
-// убирает за собой (POST /cleanup). Связи с сервером нет. Хоть один не
-// убрал — ошибка (код выхода 1).
-func cleanup(args []string) error {
-	fs := flag.NewFlagSet("cleanup", flag.ContinueOnError)
-	flagPath := configFlag(fs)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	cfg, _, err := loadForTool(flagPath)
-	if err != nil {
-		return err
-	}
-	if len(cfg.Workers) == 0 {
-		fmt.Println("воркеров нет — убирать нечего")
-		return nil
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-	results, err := app.Cleanup(ctx, cfg, version)
-	if err != nil {
-		return err
-	}
-	failed := 0
-	for _, r := range results {
-		if r.Err != nil {
-			failed++
-			fmt.Printf("%s: не убрано — %v\n", r.Worker, r.Err)
-		} else {
-			fmt.Printf("%s: убрано\n", r.Worker)
-		}
-	}
-	if failed > 0 {
-		return fmt.Errorf("уборка не завершена: воркеров с ошибкой — %d из %d", failed, len(cfg.Workers))
-	}
-	return nil
 }
 
 // bootGuard — вызывает прежняя версия перед запуском новой (systemd
@@ -398,18 +367,35 @@ func bootGuard(args []string) error {
 	return err
 }
 
-// restartCmd — `agent restart`: SIGUSR1 работающему агенту (pid — из
-// отметки agent.status): он выходит, менеджер службы запускает его снова,
-// воркеры работают дальше.
+// restartCmd — `agent restart`: SIGUSR1 работающему агенту (pid — из локального API): он
+// выходит, менеджер службы запускает его снова, воркеры работают дальше. --worker — перезапуск
+// воркера через локальный API (итог — после его регистрации).
 func restartCmd(args []string) error {
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	flagPath := configFlag(fs)
+	name := fs.String("worker", "", "перезапустить воркер, а не агента")
+	force := fs.Bool("force", false, "не ждать, пока воркер занят")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	cfg, _, err := loadForTool(flagPath)
 	if err != nil {
 		return err
+	}
+	if *name != "" {
+		c, err := app.NewAdmin(cfg.DataDir)
+		if err != nil {
+			return fmt.Errorf("агент не работает: %w", err)
+		}
+		path := "/workers/" + url.PathEscape(*name) + "/restart"
+		if *force {
+			path += "?force=true"
+		}
+		if err := c.Do(context.Background(), http.MethodPost, path, nil, nil); err != nil {
+			return err
+		}
+		fmt.Printf("воркер %s перезапущен\n", *name)
+		return nil
 	}
 	st, err := app.Status(cfg.DataDir)
 	if err != nil || st.PID <= 0 {
@@ -422,11 +408,68 @@ func restartCmd(args []string) error {
 	return nil
 }
 
+// commandCmd — `agent command ВОРКЕР ТИП [JSON]`: команда воркеру через локальный API;
+// вывод — итог (JSON), ошибка — код выхода 1.
+func commandCmd(args []string) error {
+	fs := flag.NewFlagSet("command", flag.ContinueOnError)
+	flagPath := configFlag(fs)
+	timeout := fs.Duration("timeout", protocol.DefaultRequestTimeout, "сколько ждать итога")
+	var pos []string
+	for len(args) > 0 {
+		if err := fs.Parse(args); err != nil {
+			return err
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		pos, args = append(pos, fs.Arg(0)), fs.Args()[1:]
+	}
+	if len(pos) < 2 || len(pos) > 3 {
+		return errors.New("agent command ВОРКЕР ТИП [JSON]")
+	}
+	req := app.CommandRequest{Type: pos[1], TimeoutMs: timeout.Milliseconds()}
+	if len(pos) == 3 {
+		if !json.Valid([]byte(pos[2])) {
+			return fmt.Errorf("args: %q — не JSON", pos[2])
+		}
+		req.Args = json.RawMessage(pos[2])
+	}
+	cfg, _, err := loadForTool(flagPath)
+	if err != nil {
+		return err
+	}
+	c, err := app.NewAdmin(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("агент не работает: %w", err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	var res protocol.Result
+	if err := c.Do(ctx, http.MethodPost, "/workers/"+url.PathEscape(pos[0])+"/command", req, &res); err != nil {
+		return err
+	}
+	if !res.OK {
+		return res.Error
+	}
+	if len(res.Result) > 0 {
+		// Итог — с отступами и без \uXXXX: как прислал воркер, но читаемо.
+		var v any
+		if json.Unmarshal(res.Result, &v) == nil {
+			if pretty, err := json.MarshalIndent(v, "", "  "); err == nil {
+				res.Result = pretty
+			}
+		}
+		fmt.Println(string(res.Result))
+	}
+	return nil
+}
+
 // stopWorkersCmd — `agent stop-workers`: остановить воркеры, оставшиеся
 // работать после остановки агента.
 func stopWorkersCmd(args []string) error {
 	fs := flag.NewFlagSet("stop-workers", flag.ContinueOnError)
 	flagPath := configFlag(fs)
+	cleanup := fs.Bool("cleanup", false, "затем ./cleanup воркеров — убрать созданное ими на узле (перед удалением агента)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -434,18 +477,34 @@ func stopWorkersCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	names, err := app.StopWorkers(cfg)
+	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	names, cleaned, err := app.StopWorkers(context.Background(), cfg, *cleanup, log)
 	if errors.Is(err, app.ErrLocked) {
 		l, _ := flagPath.layout()
 		return fmt.Errorf("агент работает — сначала остановите его (%s stop %s)", l.Systemctl(), l.Unit)
+	}
+	if len(names) > 0 && err != nil {
+		fmt.Println("остановлены:", strings.Join(names, ", "))
 	}
 	if err != nil {
 		return err
 	}
 	if len(names) == 0 {
 		fmt.Println("работающих воркеров нет")
-		return nil
+	} else {
+		fmt.Println("остановлены:", strings.Join(names, ", "))
 	}
-	fmt.Println("остановлены:", strings.Join(names, ", "))
+	failed := 0
+	for _, c := range cleaned {
+		if c.Err != nil {
+			failed++
+			fmt.Printf("уборка %s: %v\n", c.Worker, c.Err)
+		} else {
+			fmt.Printf("уборка %s: готово\n", c.Worker)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("уборка не завершена у воркеров: %d", failed)
+	}
 	return nil
 }

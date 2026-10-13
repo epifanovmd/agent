@@ -18,7 +18,7 @@ const sensorsTimeout = 5 * time.Second
 
 // temperatures — показания датчиков из дочернего процесса (`agent sensors`).
 // Чтение датчиков через IOKit (gopsutil без cgo) повреждает память процесса,
-// поэтому в процессе воркера оно не выполняется.
+// поэтому в процессе агента оно не выполняется.
 func temperatures(ctx context.Context) ([]sensors.TemperatureStat, error) {
 	exe, err := os.Executable()
 	if err != nil {

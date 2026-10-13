@@ -12,7 +12,7 @@ import (
 var releasesClient = &http.Client{Timeout: 10 * time.Minute, Transport: &http.Transport{Proxy: http.ProxyFromEnvironment}}
 
 // checkLoop — раз в update.checkInterval проверить последнюю версию в каталоге
-// сборок агента (§11): новее своей — в hello.agent.update, status.update и в
+// сборок агента (§10): новее своей — в состоянии (update) и в
 // журнал. Сам агент её не ставит. Итог хранится в dataDir: перезапуск не
 // повторяет свежую проверку, а команды на узле видят её без сети.
 func (a *App) checkLoop(ctx context.Context) {

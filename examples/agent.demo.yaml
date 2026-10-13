@@ -1,41 +1,31 @@
-# Агент стенда: сервер examples/server и четыре воркера-примера без SDK. ${…} подставляет
+# Агент стенда: сервер examples/server/server.py и два воркера-примера. ${…} подставляет
 # scripts/demo.sh. Второй агент — DEMO_AGENT=2: свой каталог данных и своё имя.
 server:
   url: ${AGENT_SERVER_URL}
+  # Сервер стенда — http:// на этой машине; на узлах — только https://.
+  allowInsecure: true
 dataDir: ${DEMO_ROOT}/.dev/demo-agent-${DEMO_AGENT}
 name: demo-${DEMO_AGENT}
 labels:
   env: demo
 enroll:
   token: ${AGENT_ENROLL_TOKEN}
-# Агент стенда себя не обновляет: обновление до новой версии проверяют сквозные тесты (scripts/e2e.sh).
+# Агент стенда себя не обновляет.
 update:
   mode: disabled
-# На сервер — записи журнала с warn; пока открыт поток /api/agents/{id}/watch, сервер просит подробнее.
+# Бэкенду — записи журнала с info; watch в желаемом может сделать подробнее.
 log:
-  forward: warn
-# Метрики узла собирает встроенный воркер sysmetrics (в workers его не описывают).
+  forward: info
 workers:
-  # Python, только стандартная библиотека: POST /echo, GET /stream, GET /bytes, задачи POST /jobs
-  # (долгая работа: события, busy в health, ход — на диске), POST /hang, настройка settings,
-  # метрики, health, cleanup.
+  # Python, стандартная библиотека: настройка settings, команды echo.say, echo.long (ход, отмена,
+  # busy), echo.hang; событие echo.said; запрос к бэкенду echo.lookup.
   - name: echo
     command: ["python3", "examples/workers/echo/main.py"]
     dir: ${DEMO_ROOT}
-    env:
-      PYTHONUNBUFFERED: "1"
-      ECHO_JOBS_DIR: ${DEMO_ROOT}/.dev/demo-agent-${DEMO_AGENT}/echo-jobs
-    # Перезапуск и остановка агента его не прерывают, замена ждёт окончания работы. После
-    # SIGTERM агент ждёт выхода stopTimeout (по умолчанию 30s), потом SIGKILL.
+    # После SIGTERM агент ждёт выхода stopTimeout (по умолчанию 30s), потом SIGKILL.
     lifecycle:
       stopTimeout: 10s
-  # Node.js, только node:http: то же, что echo.
-  - name: node-echo
-    command: ["node", "examples/workers/node-echo/main.mjs"]
-    dir: ${DEMO_ROOT}
-    lifecycle:
-      stopTimeout: 10s
-  # Go: GET /info, настройка banner, метрики процесса, событие sys.started. Вышел сам с кодом
-  # 0 — не перезапускается.
+  # Go, клиент github.com/epifanovmd/agent/worker: настройка banner, команда sys.info, событие
+  # sys.started, метрики процесса в пульсе.
   - name: sysinfo
     command: ["${SYSINFO_BIN}"]

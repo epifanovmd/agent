@@ -14,8 +14,8 @@ import (
 	"github.com/epifanovmd/agent/internal/worker"
 )
 
-// ReloadOnSignal — по SIGHUP перечитать настройки из path (и окружения) до
-// отмены ctx. Подписка на сигнал действует уже при возврате.
+// ReloadOnSignal — по SIGHUP перечитать настройки из path (и окружения) до отмены ctx. Подписка
+// на сигнал действует уже при возврате.
 func (a *App) ReloadOnSignal(ctx context.Context, path string) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
@@ -33,8 +33,8 @@ func (a *App) ReloadOnSignal(ctx context.Context, path string) {
 	}()
 }
 
-// ReloadFile — перечитать настройки из path и окружения и применить.
-// Ошибка в файле — в лог, агент работает со старыми настройками.
+// ReloadFile — перечитать настройки из path и окружения и применить; без бэкенда — и желаемое
+// из файлов. Ошибка в файле — в журнал, агент работает со старыми настройками.
 func (a *App) ReloadFile(path string) error {
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -43,15 +43,18 @@ func (a *App) ReloadFile(path string) error {
 	}
 	a.warnUnknown(path)
 	a.Reload(cfg)
+	if a.backend == nil {
+		a.setDesired(a.readLocalDesired())
+	}
 	return nil
 }
 
-// manualInstall — способ запуска в журнале установки у агента без службы: такой
-// агент запущен в фоне, перезапускать его некому.
+// manualInstall — способ запуска в журнале установки у агента без службы: такой агент запущен
+// в фоне, перезапускать его некому.
 const manualInstall = "manual"
 
 // warnUnknown — неизвестные поля файлов настроек (опечатка, поле другой версии) —
-// предупреждением в журнал агента (уходит и серверу): агент их не читает.
+// предупреждением в журнал агента: агент их не читает.
 func (a *App) warnUnknown(path string) {
 	for _, p := range config.Unknown(path) {
 		file := p.File
@@ -62,9 +65,9 @@ func (a *App) warnUnknown(path string) {
 	}
 }
 
-// Reload — применить новые настройки без перезапуска агента: лог — сразу,
-// воркеры — заменой изменённых, имя и метки — новым
-// hello. Ключи, которые на ходу не меняются, остаются прежними до перезапуска.
+// Reload — применить новые настройки без перезапуска агента: журнал — сразу, воркеры — заменой
+// изменённых, имя и метки — новым hello. Ключи, которые на ходу не меняются, остаются прежними
+// до перезапуска.
 func (a *App) Reload(next config.Config) {
 	a.reloadMu.Lock()
 	defer a.reloadMu.Unlock()
@@ -87,20 +90,17 @@ func (a *App) Reload(next config.Config) {
 		a.forward.SetLevel(next.Log.Forward)
 	}
 	if diff.Workers {
-		a.workers.Apply(workerSpecs(next, a.sysmetricsCmd))
+		a.workers.Apply(next.Workers)
 	}
-	a.log.Info("настройки перечитаны и применены", "log", diff.Log,
-		"workers", diff.Workers, "hello", diff.Hello || diff.Workers)
-	if diff.Hello || diff.Workers {
-		// hello несёт имя, метки и список воркеров: серверу нужен новый.
-		a.link.Reconnect()
+	a.log.Info("настройки перечитаны и применены", "log", diff.Log, "workers", diff.Workers, "hello", diff.Hello || diff.Workers)
+	if (diff.Hello || diff.Workers) && a.backend != nil {
+		a.backend.Rehello()
 	}
 }
 
-// Serve — работать как служба до сигнала (§13): SIGTERM и SIGINT —
-// остановка (воркеры работают дальше), SIGUSR1 (`agent restart`) — выход
-// для перезапуска менеджером службы (ErrRestart; воркеры работают дальше),
-// SIGHUP — перечитать настройки из path.
+// Serve — работать как служба до сигнала: SIGTERM и SIGINT — остановка (воркеры работают
+// дальше), SIGUSR1 (`agent restart`) — выход для перезапуска менеджером службы (ErrRestart;
+// воркеры работают дальше), SIGHUP — перечитать настройки из path.
 func (a *App) Serve(path string) error {
 	a.configPath = path
 	if path != "" {

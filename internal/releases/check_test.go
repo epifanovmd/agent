@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 // releasesServer — каталог сборок в устройстве релизов GitHub: последняя
@@ -26,7 +26,7 @@ func releasesServer(t *testing.T, latest string) *httptest.Server {
 			http.NotFound(w, r)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(message.Manifest{Version: version, Artifacts: []message.Artifact{
+		_ = json.NewEncoder(w).Encode(protocol.Manifest{Version: version, Artifacts: []protocol.Artifact{
 			{OS: "linux", Arch: "amd64", File: "agent-linux-amd64", SHA256: "ab", Signature: "sig"},
 		}})
 	}))

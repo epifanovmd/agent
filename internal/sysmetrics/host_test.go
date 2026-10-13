@@ -14,7 +14,7 @@ import (
 	"github.com/shirou/gopsutil/v4/net"
 	"github.com/shirou/gopsutil/v4/sensors"
 
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
 var errNone = errors.New("нет")
@@ -96,8 +96,8 @@ func (f *fakeHost) sources() sources {
 			}
 			return nil, os.ErrNotExist
 		},
-		gpus: func(context.Context) []message.GPUMetrics {
-			return []message.GPUMetrics{{Index: 0, Name: "Example GPU"}}
+		gpus: func(context.Context) []protocol.GPUMetrics {
+			return []protocol.GPUMetrics{{Index: 0, Name: "Example GPU"}}
 		},
 	}
 }
@@ -114,11 +114,11 @@ type testCollector struct {
 
 func (c *testCollector) Configure(opts Options) { c.opts = opts }
 
-func (c *testCollector) Collect(ctx context.Context) message.Metrics {
+func (c *testCollector) Collect(ctx context.Context) protocol.Metrics {
 	if len(c.opts.Metrics) == 0 {
-		return message.Metrics{}
+		return protocol.Metrics{}
 	}
-	return message.Metrics{Host: c.host(ctx, c.opts.Metrics, c.opts.Disks, c.opts.Exclude)}
+	return protocol.Metrics{Host: c.host(ctx, c.opts.Metrics, c.opts.Disks, c.opts.Exclude)}
 }
 
 func (f *fakeHost) collector(opts Options) *testCollector {
@@ -126,7 +126,7 @@ func (f *fakeHost) collector(opts Options) *testCollector {
 }
 
 // collect — два сбора с разницей 10 с: скорости считаются по второму.
-func (f *fakeHost) collect(c *testCollector) *message.HostMetrics {
+func (f *fakeHost) collect(c *testCollector) *protocol.HostMetrics {
 	f.step++
 	c.Collect(context.Background())
 	f.step++
@@ -154,7 +154,7 @@ func newFake() *fakeHost {
 // Все группы: каждое поле из своего источника.
 func TestHostAllGroups(t *testing.T) {
 	f := newFake()
-	c := f.collector(Options{Metrics: message.MetricGroups, Disks: []string{"/", "/data", "/missing"}, Exclude: []string{"lo"}})
+	c := f.collector(Options{Metrics: protocol.MetricGroups, Disks: []string{"/", "/data", "/missing"}, Exclude: []string{"lo"}})
 	h := f.collect(c)
 	switch {
 	case h == nil:
@@ -168,7 +168,7 @@ func TestHostAllGroups(t *testing.T) {
 	case *h.SwapUsedBytes != 2 || *h.SwapTotalBytes != 8:
 		t.Fatal("swap")
 	case *h.DiskUsedBytes != 300 || *h.DiskTotalBytes != 1000 || len(h.Disks) != 2 ||
-		h.Disks[0] != (message.DiskMetrics{Mount: "/", UsedBytes: 300, TotalBytes: 1000, InodesUsed: 5, InodesTotal: 50}) ||
+		h.Disks[0] != (protocol.DiskMetrics{Mount: "/", UsedBytes: 300, TotalBytes: 1000, InodesUsed: 5, InodesTotal: 50}) ||
 		h.Disks[1].Mount != "/data" || h.Disks[1].TotalBytes != 4000:
 		t.Fatalf("disk: %+v", h.Disks)
 	// Только sda: раздел sda1, loop0 и dm-0 не считаются; за 10 с — +1000 байт и +10 операций чтения.
@@ -176,11 +176,11 @@ func TestHostAllGroups(t *testing.T) {
 		t.Fatalf("diskio: %d %d %d %d", *h.DiskReadBps, *h.DiskWriteBps, *h.DiskReadIops, *h.DiskWriteIops)
 	case *h.NetRxBps != 10 || *h.NetTxBps != 5 || *h.NetErrors != 2 || *h.NetDrops != 3:
 		t.Fatalf("network: %d %d %d %d", *h.NetRxBps, *h.NetTxBps, *h.NetErrors, *h.NetDrops)
-	case len(h.Interfaces) != 1 || h.Interfaces[0] != (message.InterfaceMetrics{Name: "eth0", RxBps: 10, TxBps: 5, Errors: 2, Drops: 3}):
+	case len(h.Interfaces) != 1 || h.Interfaces[0] != (protocol.InterfaceMetrics{Name: "eth0", RxBps: 10, TxBps: 5, Errors: 2, Drops: 3}):
 		t.Fatalf("interfaces: %+v", h.Interfaces)
 	case *h.Conntrack != 1234 || *h.ConntrackMax != 262144:
 		t.Fatal("conntrack")
-	case *h.TCP != (message.TCPMetrics{Established: 2, TimeWait: 1, CloseWait: 1, Listen: 2}):
+	case *h.TCP != (protocol.TCPMetrics{Established: 2, TimeWait: 1, CloseWait: 1, Listen: 2}):
 		t.Fatalf("sockets: %+v", *h.TCP)
 	case *h.Processes != 3 || *h.Threads != 640:
 		t.Fatal("processes")
@@ -189,7 +189,7 @@ func TestHostAllGroups(t *testing.T) {
 	case *h.UptimeSec != 3600:
 		t.Fatal("uptime")
 	case h.Temperatures == nil || h.Temperatures.MaxC != 64 || len(h.Temperatures.Sensors) != 2 ||
-		h.Temperatures.Sensors[0] != (message.TemperatureSensor{Name: "coretemp_package_id_0", C: 64}) ||
+		h.Temperatures.Sensors[0] != (protocol.TemperatureSensor{Name: "coretemp_package_id_0", C: 64}) ||
 		h.Temperatures.Sensors[1].C != 41.5:
 		t.Fatalf("temperatures: %+v", h.Temperatures)
 	case len(h.GPUs) != 1 || h.GPUs[0].Name != "Example GPU":
@@ -225,7 +225,7 @@ func TestHostGroupsSelect(t *testing.T) {
 func TestHostUnavailable(t *testing.T) {
 	f := newFake()
 	f.files = nil
-	c := f.collector(Options{Metrics: message.MetricGroups})
+	c := f.collector(Options{Metrics: protocol.MetricGroups})
 	c.src.temperatures = func(context.Context) ([]sensors.TemperatureStat, error) { return nil, errNone }
 	c.src.blockDevices = func() (map[string]bool, error) { return nil, errNone }
 	h := f.collect(c)
@@ -244,7 +244,7 @@ func TestHostUnavailable(t *testing.T) {
 	c.src.connections = func(context.Context) ([]net.ConnectionStat, error) {
 		return []net.ConnectionStat{{Status: "ESTABLISHED"}, {Status: "LISTEN"}, {Status: "TIME_WAIT"}, {Status: "SYN_SENT"}}, nil
 	}
-	if h = c.Collect(context.Background()).Host; h.TCP == nil || *h.TCP != (message.TCPMetrics{Established: 1, TimeWait: 1, Listen: 1}) {
+	if h = c.Collect(context.Background()).Host; h.TCP == nil || *h.TCP != (protocol.TCPMetrics{Established: 1, TimeWait: 1, Listen: 1}) {
 		t.Fatalf("sockets из списка соединений: %+v", h.TCP)
 	}
 }
@@ -265,7 +265,7 @@ func TestDisksAll(t *testing.T) {
 
 // Настоящие источники: все группы собираются без паники (недоступное — без полей).
 func TestHostSystemAllGroups(t *testing.T) {
-	c := &testCollector{collector: newCollector(), opts: Options{Metrics: message.MetricGroups, Disks: []string{"all"}}}
+	c := &testCollector{collector: newCollector(), opts: Options{Metrics: protocol.MetricGroups, Disks: []string{"all"}}}
 	c.Collect(context.Background())
 	h := c.Collect(context.Background()).Host
 	if h == nil || h.Load5 == nil || h.MemAvailableBytes == nil || h.Processes == nil {

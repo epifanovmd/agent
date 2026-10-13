@@ -109,7 +109,7 @@ func TestInstallRootless(t *testing.T) {
 	if err := Uninstall(ctx, s, "", false, ""); err != nil {
 		t.Fatal(err)
 	}
-	f.ran(t, "systemctl --user disable --now agent.service", filepath.Join(f.root, l.Binary)+" cleanup -config /home/u/.agent/agent.yaml",
+	f.ran(t, "systemctl --user disable --now agent.service", filepath.Join(f.root, l.Binary)+" stop-workers --cleanup -config /home/u/.agent/agent.yaml",
 		"systemctl --user daemon-reload")
 	if f.exists(l.UnitFile) || f.exists(l.OptDir) || f.exists(l.Link) || !f.exists(l.ConfigFile) {
 		t.Fatal("без --purge: служба и программа удалены, настройки остались")

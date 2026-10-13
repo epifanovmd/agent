@@ -4,8 +4,6 @@ package worker
 
 import (
 	"context"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,33 +14,20 @@ import (
 	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
-	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/protocol"
 )
 
-// call — запрос к запущенному воркеру: тело ответа.
-func (h *harness) call(t *testing.T, name, method, path string) string {
+// say — вывод тестового воркера через его файл TEST_CMD (строки «out …» и «err …»).
+func say(t *testing.T, w config.Worker, lines ...string) {
 	t.Helper()
-	client, err := h.sup.Client(name)
-	if err != nil {
+	path := w.Env["TEST_CMD"]
+	eventually(t, "воркер прочитал прежние строки", func() bool { _, err := os.Stat(path); return os.IsNotExist(err) })
+	if err := os.WriteFile(path+".tmp", []byte(strings.Join(lines, "\n")), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	req, _ := http.NewRequest(method, "http://worker"+path, nil)
-	resp, err := client.Do(req)
-	if err != nil {
+	if err := os.Rename(path+".tmp", path); err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	return string(raw)
-}
-
-func (h *harness) pid(t *testing.T, name string) int {
-	t.Helper()
-	pid, err := strconv.Atoi(h.call(t, name, http.MethodGet, "/pid"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return pid
 }
 
 // journalHas — в журнале воркера есть строка text.
@@ -55,21 +40,23 @@ func (h *harness) journalHas(name, text string) bool {
 	return false
 }
 
-// Вывод воркера — в файлах <dataDir>/logs (stdout и stderr отдельно), агент
-// читает их в журнал с уровнями; большой файл переносится в .1 и очищается.
+// Вывод воркера — в файлах <dataDir>/logs (stdout и stderr отдельно), агент читает их в журнал
+// с уровнями; большой файл переносится в .1 и очищается.
 func TestOutputFiles(t *testing.T) {
 	// Прежнее значение — после остановки воркера (очистки идут в обратном порядке).
 	prev := logMaxSize
 	t.Cleanup(func() { logMaxSize = prev })
 	logMaxSize = 2048
-	h := start(t, spec("echo", "ok", ""))
+	w := spec("echo", "ok", "")
+	w.Env["TEST_CMD"] = filepath.Join(t.TempDir(), "cmd")
+	h := start(t, w)
 	<-h.started
 	files := LogFiles(filepath.Join(h.dir, LogsDir), "echo")
 	eventually(t, "строка запуска в файле и журнале", func() bool {
 		raw, _ := os.ReadFile(files[0])
-		return strings.Contains(string(raw), "воркер слушает сокет") && h.journalHas("echo", "воркер слушает сокет")
+		return strings.Contains(string(raw), "воркер запущен") && h.journalHas("echo", "воркер запущен")
 	})
-	h.call(t, "echo", http.MethodPost, "/print?stderr=1&text=ошибка")
+	say(t, w, "err ошибка")
 	eventually(t, "stderr — warn", func() bool {
 		raw, _ := os.ReadFile(files[1])
 		for _, e := range h.journal.Tail("echo", 100) {
@@ -79,9 +66,11 @@ func TestOutputFiles(t *testing.T) {
 		}
 		return false
 	})
+	var lines []string
 	for i := range 40 {
-		h.call(t, "echo", http.MethodPost, "/print?text="+strings.Repeat("x", 100)+strconv.Itoa(i))
+		lines = append(lines, "out "+strings.Repeat("x", 100)+strconv.Itoa(i))
 	}
+	say(t, w, lines...)
 	eventually(t, "файл перенесён в .1 и очищен", func() bool {
 		st, err := os.Stat(files[0])
 		_, err1 := os.Stat(files[0] + ".1")
@@ -90,14 +79,14 @@ func TestOutputFiles(t *testing.T) {
 	eventually(t, "все строки в журнале", func() bool { return h.journalHas("echo", strings.Repeat("x", 100)+"39") })
 }
 
-// Агент перезапускается (ExitRestart): воркер
-// работает дальше; следующий агент подхватывает тот же процесс с тем же
-// токеном, читает его вывод (и написанное, пока агента не было), следит за
-// ним; остановка агента без SetExit останавливает воркер.
+// Агент перезапускается (ExitRestart): воркер работает дальше; следующий агент подхватывает тот
+// же процесс с тем же токеном, читает его вывод (и написанное, пока агента не было), ждёт
+// повторной регистрации; остановка агента без SetExit останавливает воркер.
 func TestAdoptAfterAgentRestart(t *testing.T) {
 	dir := tempDir(t)
 	events := filepath.Join(dir, "events")
 	w := spec("echo", "ok", events)
+	w.Env["TEST_CMD"] = filepath.Join(dir, "cmd")
 	h1 := startIn(t, dir, w)
 	<-h1.started
 	pid, token := h1.pid(t, "echo"), h1.sup.Token("echo")
@@ -111,29 +100,22 @@ func TestAdoptAfterAgentRestart(t *testing.T) {
 		t.Fatalf("файл процесса: %+v", st)
 	}
 	// Пока агента нет, воркер пишет в свой файл.
-	client := unixClient(st.Socket)
-	resp, err := client.Post("http://worker/print?text=без+агента", "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
+	say(t, w, "out без агента")
 
 	h2 := startIn(t, dir, w)
-	if name := <-h2.adopted; name != "echo" {
+	if name := <-h2.started; name != "echo" {
 		t.Fatal(name)
 	}
 	if got := h2.pid(t, "echo"); got != pid || h2.sup.Token("echo") != token {
 		t.Fatalf("подхвачен другой процесс: %d %q", got, h2.sup.Token("echo"))
 	}
 	eventually(t, "вывод без агента — в журнале нового агента", func() bool { return h2.journalHas("echo", "без агента") })
-	eventually(t, "health подхваченного", func() bool {
+	eventually(t, "пульс подхваченного", func() bool {
 		st := h2.status("echo")
-		return st.State == message.WorkerRunning && st.Health != nil && st.Health.OK
+		return st.State == protocol.WorkerRunning && st.Health != nil && st.Health.OK
 	})
-	select {
-	case name := <-h2.started:
-		t.Fatalf("подхваченный воркер запущен заново: %s", name)
-	default:
+	if ev := readEvents(events); len(ev) != 1 {
+		t.Fatalf("подхваченный воркер запущен заново: %v", ev)
 	}
 	h2.stop()
 	eventually(t, "остановка агента — воркер остановлен", func() bool { return !alive(pid) || zombie(pid) })
@@ -142,8 +124,8 @@ func TestAdoptAfterAgentRestart(t *testing.T) {
 	}
 }
 
-// Перезапуск и остановка агента (ExitRestart, ExitStop) — воркер работает
-// дальше; без SetExit — останавливается вместе с агентом.
+// Перезапуск и остановка агента (ExitRestart, ExitStop) — воркер работает дальше; без SetExit —
+// останавливается вместе с агентом.
 func TestExitPolicies(t *testing.T) {
 	for _, c := range []struct {
 		name  string
@@ -169,9 +151,9 @@ func TestExitPolicies(t *testing.T) {
 	}
 }
 
-// Файл процесса с pid, выданным другому процессу (время запуска другое), —
-// не подхват: воркер запускается заново, чужой процесс не трогается.
-// Процесс воркера, которого нет в настройках, останавливается.
+// Файл процесса с pid, выданным другому процессу (время запуска другое), — не подхват: воркер
+// запускается заново, чужой процесс не трогается. Процесс воркера, которого нет в настройках,
+// останавливается.
 func TestAdoptRejectsReusedPID(t *testing.T) {
 	dir := tempDir(t)
 	stranger := exec.Command("sleep", "30")
@@ -184,7 +166,7 @@ func TestAdoptRejectsReusedPID(t *testing.T) {
 		go func() { _ = c.Wait() }()
 	}
 	states := filepath.Join(dir, ProcessesDir)
-	_ = writeState(states, "echo", procState{PID: stranger.Process.Pid, Start: "не то", Socket: filepath.Join(dir, "x.sock"), Token: "t"})
+	_ = writeState(states, "echo", procState{PID: stranger.Process.Pid, Start: "не то", Token: "t"})
 	start, _ := procStart(orphan.Process.Pid)
 	_ = writeState(states, "gone", procState{PID: orphan.Process.Pid, Start: start, StopTimeout: config.Duration(time.Second)})
 
@@ -197,17 +179,16 @@ func TestAdoptRejectsReusedPID(t *testing.T) {
 	if !alive(stranger.Process.Pid) {
 		t.Fatal("чужой процесс завершён")
 	}
-	if _, ok := readState(states, "gone"); ok {
-		t.Fatal("файл удалённого воркера остался")
-	}
+	eventually(t, "файл удалённого воркера удалён", func() bool { _, ok := readState(states, "gone"); return !ok })
 }
 
-// restartAsync — worker.restart в фоне; итог — в канале, отсрочка (pending) — в deferred.
+// restartAsync — worker.restart в фоне; итог — в канале.
 func restartAsync(h *harness, name string, force bool) chan error {
 	done, _ := restartDeferred(h, name, force)
 	return done
 }
 
+// restartDeferred — worker.restart в фоне; итог и отсрочка (pending) — в каналах.
 func restartDeferred(h *harness, name string, force bool) (chan error, chan string) {
 	done, deferred := make(chan error, 1), make(chan string, 2)
 	go func() {
@@ -218,8 +199,8 @@ func restartDeferred(h *harness, name string, force bool) (chan error, chan stri
 	return done, deferred
 }
 
-// busy: замена ждёт, пока воркер занят (status pending: restart), и идёт,
-// когда он освободился; force — сразу; busyTimeout — предел ожидания.
+// busy (§16): замена ждёт, пока воркер занят (pending: restart), и идёт, когда он освободился;
+// force — сразу; busyTimeout — предел ожидания.
 func TestBusyDefersReplace(t *testing.T) {
 	dir := t.TempDir()
 	busy := filepath.Join(dir, "busy")
@@ -228,16 +209,14 @@ func TestBusyDefersReplace(t *testing.T) {
 	w.Env["TEST_BUSY"] = busy
 	h := start(t, w)
 	<-h.started
+	eventually(t, "занят", func() bool { st := h.status("echo"); return st.Health != nil && st.Health.Busy })
 	pid := h.pid(t, "echo")
 
 	done, deferred := restartDeferred(h, "echo", false)
-	eventually(t, "замена ждёт", func() bool {
-		st := h.status("echo")
-		return st.Pending == message.PendingRestart && st.Health != nil && st.Health.Busy
-	})
+	eventually(t, "замена ждёт", func() bool { return h.status("echo").Pending == protocol.PendingRestart })
 	select {
 	case p := <-deferred:
-		if p != message.PendingRestart {
+		if p != protocol.PendingRestart {
 			t.Fatalf("отсрочка: %q", p)
 		}
 	case <-time.After(5 * time.Second):
@@ -278,8 +257,7 @@ func TestBusyDefersReplace(t *testing.T) {
 	}
 }
 
-// Занятый воркер завис (нет ответа на GET /health) — ожидание кончается,
-// замена идёт; новый процесс — один.
+// Занятый воркер завис (нет пульса) — ожидание кончается, замена идёт; новый процесс — один.
 func TestBusyHangRestarts(t *testing.T) {
 	dir := t.TempDir()
 	busy, hang := filepath.Join(dir, "busy"), filepath.Join(dir, "hang")
@@ -288,13 +266,14 @@ func TestBusyHangRestarts(t *testing.T) {
 	w.Env["TEST_BUSY"], w.Env["TEST_HANG"] = busy, hang
 	h := start(t, w)
 	<-h.started
+	eventually(t, "занят", func() bool { st := h.status("echo"); return st.Health != nil && st.Health.Busy })
 	done := restartAsync(h, "echo", false)
-	eventually(t, "замена ждёт", func() bool { return h.status("echo").Pending == message.PendingRestart })
+	eventually(t, "замена ждёт", func() bool { return h.status("echo").Pending == protocol.PendingRestart })
 	_ = os.WriteFile(hang, []byte(strconv.Itoa(h.pid(t, "echo"))), 0o600)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(time.Second)
 	starts := 0
 	for _, e := range readEvents(filepath.Join(dir, "events")) {
 		if strings.HasPrefix(e, "start ") {
@@ -306,8 +285,7 @@ func TestBusyHangRestarts(t *testing.T) {
 	}
 }
 
-// Выход с кодом 0 — без перезапуска (до worker.restart); падение —
-// перезапуск.
+// Выход с кодом 0 — без перезапуска (до worker.restart); падение — перезапуск.
 func TestRestartAfterExit(t *testing.T) {
 	for _, c := range []struct {
 		mode      string
@@ -315,20 +293,17 @@ func TestRestartAfterExit(t *testing.T) {
 	}{{"exit0", false}, {"crash", true}} {
 		t.Run(c.mode, func(t *testing.T) {
 			h := start(t, spec("w", c.mode, ""))
-			if c.mode == "exit0" {
-				<-h.started
-			}
 			if c.restarted {
 				eventually(t, "перезапуск", func() bool { return h.status("w").Restarts >= 1 })
 				return
 			}
 			eventually(t, "остановлен", func() bool {
 				st := h.status("w")
-				return st.State == message.WorkerStopped && st.Restarts == 0 &&
-					h.journalHas(message.LogSourceAgent, "воркер завершился сам (exit 0) — не перезапускается до worker.restart или изменения настроек")
+				return st.State == protocol.WorkerStopped && st.Restarts == 0 &&
+					h.journalHas(protocol.LogSourceAgent, "воркер завершился сам (exit 0) — не перезапускается до worker.restart или изменения настроек")
 			})
 			time.Sleep(200 * time.Millisecond)
-			if st := h.status("w"); st.State != message.WorkerStopped || st.Restarts != 0 {
+			if st := h.status("w"); st.State != protocol.WorkerStopped || st.Restarts != 0 {
 				t.Fatalf("без перезапуска: %+v", st)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -340,8 +315,8 @@ func TestRestartAfterExit(t *testing.T) {
 	}
 }
 
-// StopProcesses (agent stop-workers): процессы, оставшиеся после остановки
-// агента, останавливаются.
+// StopProcesses (agent stop-workers): процессы, оставшиеся после остановки агента,
+// останавливаются.
 func TestStopProcesses(t *testing.T) {
 	dir := tempDir(t)
 	h := startIn(t, dir, spec("echo", "ok", ""))
@@ -349,14 +324,13 @@ func TestStopProcesses(t *testing.T) {
 	pid := h.pid(t, "echo")
 	h.sup.SetExit(ExitStop)
 	h.stop()
-	if names := StopProcesses(dir); len(names) != 1 || names[0] != "echo" {
+	if names, failed := StopProcesses(dir); len(names) != 1 || names[0] != "echo" || len(failed) != 0 {
 		t.Fatalf("остановлены: %v", names)
 	}
 	eventually(t, "процесс завершён", func() bool { return !alive(pid) || zombie(pid) })
 }
 
-// Занятый воркер, который перестал отвечать, перезапускается как зависший:
-// busy не защищает от перезапуска.
+// Занятый воркер без пульса перезапускается как зависший: busy не защищает от перезапуска.
 func TestBusyHangKilled(t *testing.T) {
 	dir := t.TempDir()
 	busy, hang := filepath.Join(dir, "busy"), filepath.Join(dir, "hang")

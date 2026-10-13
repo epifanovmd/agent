@@ -19,6 +19,7 @@ type envVar struct {
 // envVars — переменные окружения, которые читает агент, поверх файла настроек.
 var envVars = []envVar{
 	envString("AGENT_SERVER_URL", func(c *Config) *string { return &c.Server.URL }),
+	envBool("AGENT_SERVER_ALLOW_INSECURE", func(c *Config) *bool { return &c.Server.AllowInsecure }),
 	envString("AGENT_SERVER_CA_FILE", func(c *Config) *string { return &c.Server.CAFile }),
 	envString("AGENT_DATA_DIR", func(c *Config) *string { return &c.DataDir }),
 	envString("AGENT_NAME", func(c *Config) *string { return &c.Name }),
@@ -66,6 +67,17 @@ func envList(name string, field func(*Config) *[]string) envVar {
 			}
 		}
 		*field(c) = list
+		return nil
+	}}
+}
+
+func envBool(name string, field func(*Config) *bool) envVar {
+	return envVar{Name: name, apply: func(c *Config, v string) error {
+		b, err := strconv.ParseBool(strings.TrimSpace(v))
+		if err != nil {
+			return errors.New("нужно true или false")
+		}
+		*field(c) = b
 		return nil
 	}}
 }

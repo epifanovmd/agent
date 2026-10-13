@@ -59,8 +59,8 @@ workers:
 	if len(res.Errors) != 1 || res.Errors[0].Line == 0 || !strings.Contains(res.Errors[0].Text, "YAML") {
 		t.Fatalf("разметка: %+v", res.Errors)
 	}
-	// Без файла — только окружение: нет адреса — ошибка без строки.
-	t.Setenv("AGENT_SERVER_URL", "")
+	// Без файла — только окружение: адрес без шифрования — ошибка без строки.
+	t.Setenv("AGENT_SERVER_URL", "http://api.example.com")
 	res = Check("")
 	if len(res.Errors) != 1 || res.Errors[0].Line != 0 || !strings.Contains(res.Errors[0].Text, "server.url") {
 		t.Fatalf("без файла: %+v", res.Errors)
