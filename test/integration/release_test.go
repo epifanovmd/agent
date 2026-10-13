@@ -106,7 +106,7 @@ func TestWorkerUpdate(t *testing.T) {
 	t.Parallel()
 	kit := newReleaseKit(t)
 	kit.write()
-	s := newStand(t, func(c *testserver.Config) { c.ReleasesDir, c.PublicKey = kit.dir, kit.pub })
+	s := newStand(t, func(c *testserver.Config) { c.ReleasesDir = kit.dir })
 	rel := s.worker("rel")
 	rel.Command, rel.Release = nil, true
 	cfg := s.config(rel, s.worker("w"))
@@ -236,7 +236,7 @@ func TestAgentUpdate(t *testing.T) {
 	kit := newReleaseKit(t)
 	kit.write()
 	s := newStand(t, func(c *testserver.Config) {
-		c.ReleasesDir, c.PublicKey = kit.dir, kit.pub
+		c.ReleasesDir = kit.dir
 		c.Options = map[string]any{"offlineGraceMs": 0}
 	})
 	dir := t.TempDir()

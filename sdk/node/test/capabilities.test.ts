@@ -1,6 +1,6 @@
-// Строгие возможности воркера на сервере: capabilities из манифеста, подписки на события
-// (subscribeEvents, waitEvent), проверка data событий (validateEvents), тела fetch и запросов
-// воркера (validateRequests), запросы воркера к серверу (onWorkerRequest).
+// Строгие возможности воркера на сервере: capabilities из манифеста, ожидание события
+// (waitEvent), проверка data событий (validate.events), тела fetch и запросов воркера
+// (validate.requests), запросы воркера к серверу (onWorkerRequest).
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 
@@ -91,64 +91,24 @@ describe("возможности воркера", () => {
     });
   });
 
-  it("subscribeEvents: только объявленный тип, после onEvent; отписка", async () => {
+  it("waitEvent: событие — после onEvent; неверный воркер — MESSAGE_INVALID", async () => {
     const order: string[] = [];
     const { s, c, fa } = await stand({
       onEvent: e => void order.push(`onEvent ${e.type}`),
     });
-    const got: AgentEvent[] = [];
 
     await assert.rejects(
-      s.agents.subscribeEvents(
-        { agentId: c.agentId, worker: "report", type: "report.lost" },
-        () => {},
-      ),
-      { code: "EVENT_UNDECLARED", status: 409 },
-    );
-    await assert.rejects(
-      s.agents.subscribeEvents({ worker: "Report", type: "x" }, () => {}),
+      s.agents.waitEvent(c.agentId, "Report", "report.sent"),
       { code: "MESSAGE_INVALID" },
     );
-    const off = await s.agents.subscribeEvents(
-      { agentId: c.agentId, worker: "report", type: "report.sent" },
-      e => {
-        order.push(`подписка ${e.type}`);
-        got.push(e);
-        throw new Error("подписчик упал");
-      },
-    );
+    const p = s.agents
+      .waitEvent(c.agentId, "report", "report.sent")
+      .then(e => (order.push(`waitEvent ${e.type}`), e));
 
+    await sleep(10);
     await event(fa, "e1", "report.sent", { target: "x" });
-    await until(() => got.length === 1);
-    assert.deepEqual(order, ["onEvent report.sent", "подписка report.sent"]);
-    assert.deepEqual(got[0].data, { target: "x" });
-    off();
-    await event(fa, "e2", "report.sent", { target: "y" });
-    await sleep(20);
-    assert.equal(got.length, 1);
-  });
-
-  it("subscribeEvents без агента: тип сверяется по первому событию — предупреждение", async () => {
-    const { s, fa, logged } = await stand();
-    const got: AgentEvent[] = [];
-
-    await s.agents.subscribeEvents(
-      { worker: "report", type: "report.lost" },
-      e => void got.push(e),
-    );
-    await s.agents.subscribeEvents(
-      { worker: "report", type: "report.sent" },
-      e => void got.push(e),
-    );
-    await event(fa, "e1", "report.sent", { target: "x" });
-    await event(fa, "e2", "report.sent", { target: "x" });
-    await until(() => got.length === 2);
-    assert.equal(
-      logged.filter(
-        m => m === "подписка на событие, которого нет в манифесте воркера",
-      ).length,
-      1,
-    );
+    assert.deepEqual((await p).data, { target: "x" });
+    assert.deepEqual(order, ["onEvent report.sent", "waitEvent report.sent"]);
   });
 
   it("waitEvent: первое подходящее событие, TIMEOUT, CANCELLED", async () => {
@@ -180,11 +140,11 @@ describe("возможности воркера", () => {
   });
 
   for (const mode of ["log", "reject"] as const) {
-    it(`validateEvents: ${mode}`, async () => {
+    it(`validate.events: ${mode}`, async () => {
       const seen: AgentEvent[] = [];
       const invalid: InvalidEvent[] = [];
       const { s, fa } = await stand({
-        validateEvents: mode,
+        validate: { events: mode },
         onEvent: e => void seen.push(e),
       });
 
@@ -200,8 +160,13 @@ describe("возможности воркера", () => {
         "items: ожидается целое число",
       ]);
       assert.deepEqual(
-        seen.map(e => e.id),
-        mode === "reject" ? ["ok"] : ["ok", "bad"],
+        seen.map(e => [e.id, e.problems]),
+        mode === "reject"
+          ? [["ok", undefined]]
+          : [
+              ["ok", undefined],
+              ["bad", invalid[0].problems],
+            ],
       );
       // Событие задачи схемой не проверяется.
       await event(fa, "job", "job.done", { jobId: "j1" });
@@ -209,8 +174,8 @@ describe("возможности воркера", () => {
     });
   }
 
-  it("validateRequests: тело fetch по routes[].request", async () => {
-    const { s, c, fa } = await stand({ validateRequests: true });
+  it("validate.requests: тело fetch по routes[].request", async () => {
+    const { s, c, fa } = await stand({ validate: { requests: true } });
 
     await assert.rejects(
       s.agents.fetch(c.agentId, "report", "/reports/7/send", {
@@ -263,7 +228,7 @@ describe("запросы воркера к серверу", () => {
   it("onWorkerRequest: data, ошибки обработчика, предел ответа, проверка data", async () => {
     const seen: WorkerRequest[] = [];
     const { c, fa } = await stand({
-      validateRequests: true,
+      validate: { requests: true },
       onWorkerRequest: async req => {
         seen.push(req);
         const report = (req.data as { report?: string } | undefined)?.report;

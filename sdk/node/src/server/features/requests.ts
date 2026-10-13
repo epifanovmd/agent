@@ -4,7 +4,6 @@
 import type { Context } from "../core/context";
 import { AgentsError } from "../core/errors";
 import type { Session } from "../core/session";
-import { jsonSchemaProblems } from "../lib/json-schema";
 import { bounded } from "../lib/util";
 import { workerManifest } from "../model/manifest";
 import { publicAgent } from "../model/public-agent";
@@ -133,31 +132,23 @@ export class Requests {
     }
   }
 
-  /** data не по requests[].schema (validateRequests); схема не применяется — без проверки. */
+  /** data не по requests[].schema (validate.requests); схема не применяется — без проверки. */
   private problems(
     agent: Agent,
     worker: string,
     type: string,
     data: unknown,
   ): string[] {
-    if (!this.ctx.settings.validateRequests) return [];
+    if (!this.ctx.settings.validate.requests) return [];
     const schema = workerManifest(agent, worker)?.requests?.find(
       r => r.type === type,
     )?.schema;
 
-    if (!schema) return [];
-    try {
-      return jsonSchemaProblems(schema, data ?? null);
-    } catch (e) {
-      this.ctx.log("схема запроса из манифеста воркера не применяется", {
-        agentId: agent.id,
-        worker,
-        type,
-        err: String(e),
-      });
-
-      return [];
-    }
+    return this.ctx.schemaProblems(schema, data ?? null, "запроса", {
+      agentId: agent.id,
+      worker,
+      type,
+    });
   }
 
   /** Ответ обработчика: undefined — без data; больше предела — BODY_TOO_LARGE. */

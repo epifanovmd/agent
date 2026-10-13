@@ -3,9 +3,9 @@
 # agentReleases находят его через API GitHub сами. Образы в GHCR: agent:<версия> (минимальный),
 # agent:<версия>-python (с python3 для воркеров), agent-dist:<версия>. Всё ставится с GitHub —
 # без npm. Тег с «-» (v1.2.0-rc.1) — предварительная версия.
-# Нужны в настройках репозитория (agent-release keygen выдаёт пару):
+# Нужны в настройках репозитория (agent keygen выдаёт пару):
 #   секрет AGENT_SIGNING_KEY — закрытый ключ подписи (base64 seed Ed25519);
-#   переменная AGENT_UPDATE_PUBLIC_KEY — открытый ключ: вшивается в сборки агента,
+#   переменная AGENT_UPDATE_PUBLIC_KEY — открытый ключ (AGENT_UPDATE_PUBLIC_KEYS в выводе): вшивается в сборки агента,
 #   чтобы они проверяли обновления без настройки update.publicKey.
 name: Release
 

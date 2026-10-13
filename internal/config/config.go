@@ -330,7 +330,6 @@ const (
 const (
 	Keep           = "keep"
 	StopWorker     = "stop"
-	RestartWorker  = "restart"
 	RestartAlways  = "always"
 	RestartFailure = "on-failure"
 	RestartNever   = "never"
@@ -340,12 +339,10 @@ const (
 // умолчанию (у них 0 и false — тоже значение); остальные: 0 — по умолчанию.
 // Validate (FillDefaults) заполняет всё.
 type Lifecycle struct {
-	// OnAgentRestart — перезапуск агента (обновление, agent restart): keep —
-	// воркер работает дальше, новый агент его подхватывает; restart —
-	// остановить, новый агент запустит заново.
-	OnAgentRestart string `yaml:"onAgentRestart"`
-	// OnAgentStop — остановка агента (SIGTERM, SIGINT): keep | stop.
-	OnAgentStop string `yaml:"onAgentStop"`
+	// OnAgentExit — агент перезапускается или останавливается (обновление,
+	// agent restart, SIGTERM, SIGINT): keep — воркер работает дальше, новый
+	// агент его подхватывает; stop — остановить вместе с агентом.
+	OnAgentExit string `yaml:"onAgentExit"`
 	// Restart — после выхода процесса: always | on-failure | never.
 	Restart string `yaml:"restart"`
 	// Backoff — пауза перед перезапуском после падения.
@@ -362,30 +359,16 @@ type Lifecycle struct {
 	// KeepChildren — дочерние процессы воркера переживают его остановку:
 	// сигналы получает только сам воркер, а не вся группа процессов.
 	KeepChildren bool `yaml:"keepChildren"`
-	// Busy — плановая замена занятого воркера (GET /health → busy: true).
-	Busy Busy `yaml:"busy"`
+	// BusyTimeout — плановая замена занятого воркера (GET /health → busy:
+	// true) ждёт окончания работы не дольше; 0 — не ждать.
+	BusyTimeout *Duration `yaml:"busyTimeout"`
 	// Health — проверка GET /health.
 	Health Health `yaml:"health"`
-	// ProbeTimeout — срок GET /manifest, GET /metrics и GET /health при регистрации.
-	ProbeTimeout Duration `yaml:"probeTimeout"`
-	// ConfigRetry — повтор неприменённых настроек.
-	ConfigRetry Duration `yaml:"configRetry"`
-	// UpdateHealthyTimeout — сколько новая сборка (worker.update) может не
-	// отвечать ok: true; потом — возврат прежней.
-	UpdateHealthyTimeout Duration `yaml:"updateHealthyTimeout"`
-}
-
-// Busy — ждать ли окончания работы перед плановой заменой и сколько.
-type Busy struct {
-	// Wait — ждать (по умолчанию true).
-	Wait *bool `yaml:"wait"`
-	// Timeout — дольше не ждать: замена идёт.
-	Timeout Duration `yaml:"timeout"`
 }
 
 // Health — проверка GET /health: раз в Interval (0 — не проверять), срок
-// ответа Timeout; Failures пропусков подряд — перезапуск (0 — не
-// перезапускать).
+// ответа Timeout (и у GET /manifest, GET /metrics при регистрации);
+// Failures пропусков подряд — перезапуск (0 — не перезапускать).
 type Health struct {
 	Interval *Duration `yaml:"interval"`
 	Timeout  Duration  `yaml:"timeout"`
@@ -428,17 +411,15 @@ func (l *Lifecycle) fill() {
 			*s = v
 		}
 	}
-	str(&l.OnAgentRestart, Keep)
-	str(&l.OnAgentStop, Keep)
+	str(&l.OnAgentExit, Keep)
 	str(&l.Restart, RestartFailure)
 	def(&l.Backoff.Min, time.Second)
 	def(&l.Backoff.Max, 30*time.Second)
 	def(&l.StartTimeout, message.WorkerStartTimeout)
 	def(&l.StopTimeout, DefaultStopTimeout)
-	if l.Busy.Wait == nil {
-		l.Busy.Wait = ptr(true)
+	if l.BusyTimeout == nil {
+		l.BusyTimeout = ptr(Duration(DefaultBusyTimeout))
 	}
-	def(&l.Busy.Timeout, DefaultBusyTimeout)
 	if l.Health.Interval == nil {
 		l.Health.Interval = ptr(Duration(message.HealthInterval))
 	}
@@ -446,9 +427,6 @@ func (l *Lifecycle) fill() {
 	if l.Health.Failures == nil {
 		l.Health.Failures = ptr(message.HealthMisses)
 	}
-	def(&l.ProbeTimeout, message.ProbeTimeout)
-	def(&l.ConfigRetry, message.ConfigRetry)
-	def(&l.UpdateHealthyTimeout, message.UpdateHealthTimeout)
 }
 
 // HealthInterval — частота GET /health (0 — не проверять).
@@ -467,8 +445,13 @@ func (l Lifecycle) HealthFailures() int {
 	return *l.Health.Failures
 }
 
-// BusyWait — ждать окончания работы перед плановой заменой.
-func (l Lifecycle) BusyWait() bool { return l.Busy.Wait == nil || *l.Busy.Wait }
+// BusyWait — сколько плановая замена ждёт окончания работы (0 — не ждёт).
+func (l Lifecycle) BusyWait() time.Duration {
+	if l.BusyTimeout == nil {
+		return DefaultBusyTimeout
+	}
+	return l.BusyTimeout.Std()
+}
 
 // DefaultLogs — файлы вывода воркера по умолчанию.
 func DefaultLogs() Logs {
@@ -511,11 +494,8 @@ func (w *Worker) check(i int) []error {
 	if w.Routes != "" && w.Routes != RoutesStrict && w.Routes != RoutesOpen {
 		bad("routes", "strict | open, а не %q", w.Routes)
 	}
-	if l.OnAgentRestart != Keep && l.OnAgentRestart != RestartWorker {
-		bad("lifecycle.onAgentRestart", "keep | restart, а не %q", l.OnAgentRestart)
-	}
-	if l.OnAgentStop != Keep && l.OnAgentStop != StopWorker {
-		bad("lifecycle.onAgentStop", "keep | stop, а не %q", l.OnAgentStop)
+	if l.OnAgentExit != Keep && l.OnAgentExit != StopWorker {
+		bad("lifecycle.onAgentExit", "keep | stop, а не %q", l.OnAgentExit)
 	}
 	if !slices.Contains([]string{RestartAlways, RestartFailure, RestartNever}, l.Restart) {
 		bad("lifecycle.restart", "always | on-failure | never, а не %q", l.Restart)
@@ -592,85 +572,6 @@ func problemsError(problems []Problem) error {
 		errs[i] = errors.New("config: " + p.String())
 	}
 	return errors.Join(errs...)
-}
-
-// applyEnv — переменные AGENT_* поверх файла; lookup — окружение процесса,
-// затем файлы переменных.
-func applyEnv(cfg *Config, lookup func(string) (string, bool)) {
-	set := func(target *string, name string) {
-		if v, ok := lookup(name); ok && v != "" {
-			*target = v
-		}
-	}
-	set(&cfg.Server.URL, "AGENT_SERVER_URL")
-	set(&cfg.DataDir, "AGENT_DATA_DIR")
-	set(&cfg.Name, "AGENT_NAME")
-	set(&cfg.Enroll.Token, "AGENT_ENROLL_TOKEN")
-	set(&cfg.Log.Level, "AGENT_LOG_LEVEL")
-	set(&cfg.Log.Format, "AGENT_LOG_FORMAT")
-	set(&cfg.Log.Forward, "AGENT_LOG_FORWARD")
-	set(&cfg.Server.CAFile, "AGENT_SERVER_CA_FILE")
-	set(&cfg.Server.CertFile, "AGENT_SERVER_CERT_FILE")
-	set(&cfg.Server.KeyFile, "AGENT_SERVER_KEY_FILE")
-	set(&cfg.Update.Mode, "AGENT_UPDATE_MODE")
-	set(&cfg.Update.PublicKey, "AGENT_UPDATE_PUBLIC_KEY")
-	set(&cfg.Update.Releases, "AGENT_UPDATE_RELEASES")
-	if labels, ok := lookup("AGENT_LABELS"); ok {
-		if cfg.Labels == nil {
-			cfg.Labels = map[string]string{}
-		}
-		for _, pair := range strings.Split(labels, ",") {
-			if k, v, found := strings.Cut(strings.TrimSpace(pair), "="); found && k != "" {
-				cfg.Labels[k] = v
-			}
-		}
-	}
-	// Списки через запятую; пустая переменная — пустой список.
-	list := func(target *[]string, name string) {
-		if v, ok := lookup(name); ok {
-			*target = []string{}
-			for _, item := range strings.Split(v, ",") {
-				if item = strings.TrimSpace(item); item != "" {
-					*target = append(*target, item)
-				}
-			}
-		}
-	}
-	list(&cfg.Server.URLs, "AGENT_SERVER_URLS")
-	list(&cfg.Update.PublicKeys, "AGENT_UPDATE_PUBLIC_KEYS")
-	list(&cfg.Telemetry.ExcludeInterfaces, "AGENT_TELEMETRY_EXCLUDE_INTERFACES")
-	list(&cfg.Telemetry.Metrics, "AGENT_TELEMETRY_METRICS")
-	list(&cfg.Telemetry.Disks, "AGENT_TELEMETRY_DISKS")
-	number := func(target *int, name string) {
-		if v, ok := lookup(name); ok && v != "" {
-			n, err := strconv.Atoi(strings.TrimSpace(v))
-			if err != nil {
-				cfg.envErrs = append(cfg.envErrs, fmt.Sprintf("%s: %q — нужно целое число", name, v))
-				return
-			}
-			*target = n
-		}
-	}
-	duration := func(target *Duration, name string) {
-		if v, ok := lookup(name); ok && v != "" {
-			d, err := time.ParseDuration(strings.TrimSpace(v))
-			if err != nil {
-				cfg.envErrs = append(cfg.envErrs, fmt.Sprintf("%s: %q — нужна длительность (например, 30s)", name, v))
-				return
-			}
-			*target = Duration(d)
-		}
-	}
-	if v, ok := lookup("AGENT_UPDATE_CHECK_INTERVAL"); ok && v != "" {
-		var d Duration
-		duration(&d, "AGENT_UPDATE_CHECK_INTERVAL")
-		cfg.Update.CheckInterval = &d
-	}
-	duration(&cfg.Server.Reconnect.Min, "AGENT_SERVER_RECONNECT_MIN")
-	duration(&cfg.Server.Reconnect.Max, "AGENT_SERVER_RECONNECT_MAX")
-	number(&cfg.Server.StreamBuffer, "AGENT_SERVER_STREAM_BUFFER")
-	number(&cfg.Outbox.MaxMessages, "AGENT_OUTBOX_MAX_MESSAGES")
-	number(&cfg.Log.Buffer, "AGENT_LOG_BUFFER")
 }
 
 // Validate — обязательные поля и допустимые значения; заполняет умолчания воркеров.

@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -99,7 +98,7 @@ func TestInstallRootless(t *testing.T) {
 	if !strings.Contains(f.out.String(), "/home/u/.agent/bin/agent status") {
 		t.Fatalf("подсказки:\n%s", f.out.String())
 	}
-	// Служба стоит, а systemd --user сейчас недоступен — ошибка, а не агент без службы.
+	// Служба стоит, а systemd --user сейчас недоступен — ошибка, узел не меняется.
 	delete(f.outputs, "systemctl --user show-environment")
 	if err := Install(ctx, s, Options{Binary: binary(t, "v3")}); err == nil || f.read(t, l.Binary) != "v2" {
 		t.Fatalf("без systemd --user при стоящей службе: %v", err)
@@ -123,90 +122,16 @@ func TestInstallRootless(t *testing.T) {
 	}
 }
 
-// Без systemd --user: агент запускается в фоне, автозапуск — @reboot в
-// crontab; повторная установка перезапускает работающего, удаление
-// останавливает его и убирает строку из crontab.
-func TestInstallRootlessManual(t *testing.T) {
-	ctx := context.Background()
-	f, s := newFake(t, "crontab")
+// Без systemd --user агент пользователя не ставится: ошибка с подсказкой, узел не изменён.
+func TestInstallRootlessNoUserSystemd(t *testing.T) {
+	f, s := newFake(t, "systemctl")
 	asUser(f, s)
-	f.outputs["crontab -l"] = "0 3 * * * /home/u/backup.sh\n"
-	if err := Install(ctx, s, Options{Binary: binary(t, "v1"), Server: "https://api.example.com", Token: "tok", Rootless: true}); err != nil {
-		t.Fatal(err)
+	err := Install(context.Background(), s, Options{Binary: binary(t, "v1"), Server: "https://api.example.com", Token: "tok", Rootless: true})
+	if err == nil || !strings.Contains(err.Error(), "agent run") {
+		t.Fatalf("ошибка: %v", err)
 	}
-	l := HomeLayout("/home/u", "")
-	line := "@reboot /home/u/.agent/bin/agent run -config /home/u/.agent/agent.yaml >>/home/u/.agent/agent.log 2>&1"
-	if f.exists(l.UnitFile) || !f.exists(l.Binary) || !strings.Contains(f.read(t, l.JournalFile), "\nmode manual\n") {
-		t.Fatalf("без службы: %v", f.cmds)
-	}
-	if got := f.stdin["crontab -"]; got != "0 3 * * * /home/u/backup.sh\n"+line+"\n" {
-		t.Fatalf("crontab: %q", got)
-	}
-	if len(f.spawned) != 1 || f.spawned[0] != "/home/u/.agent/bin/agent run -config /home/u/.agent/agent.yaml >>/home/u/.agent/agent.log" {
-		t.Fatalf("запуск в фоне: %v", f.spawned)
-	}
-	if out := f.out.String(); !strings.Contains(out, "запущен в фоне") || strings.Contains(out, "после перезагрузки запустите") {
-		t.Fatalf("подсказка:\n%s", out)
-	}
-	if s.modeOf(l) != ModeManual {
-		t.Fatal("способ запуска — из журнала")
-	}
-
-	// Повторно: строка в crontab не дублируется, работающий агент перезапускается (SIGUSR1).
-	f.cmds, f.spawned = nil, nil
-	f.running[l.DataDir] = 42
-	if err := Install(ctx, s, Options{Binary: binary(t, "v2")}); err != nil {
-		t.Fatal(err)
-	}
-	if slices.Contains(f.cmds, "crontab -") || len(f.spawned) != 0 || !slices.Contains(f.signals, "42 user defined signal 1") {
-		t.Fatalf("повторно: %v %v %v", f.cmds, f.spawned, f.signals)
-	}
-
-	// Удаление: агент остановлен, строка убрана, остальное в crontab — как было.
-	if err := Uninstall(ctx, s, "", false, ""); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Contains(f.signals, "42 terminated") || f.running[l.DataDir] != 0 {
-		t.Fatalf("остановка: %v", f.signals)
-	}
-	if got := f.outputs["crontab -l"]; got != "0 3 * * * /home/u/backup.sh\n" {
-		t.Fatalf("crontab после удаления: %q", got)
-	}
-}
-
-// Службы пользователя появились — агент без службы останавливается, ставится служба.
-func TestInstallManualToUser(t *testing.T) {
-	ctx := context.Background()
-	f, s := newFake(t, "crontab", "systemctl")
-	asUser(f, s)
-	o := Options{Binary: binary(t, "v1"), Server: "https://api.example.com", Token: "tok", Rootless: true}
-	if err := Install(ctx, s, o); err != nil {
-		t.Fatal(err)
-	}
-	l := HomeLayout("/home/u", "")
-	f.running[l.DataDir] = 7
-	f.outputs["systemctl --user show-environment"] = "HOME=/home/u\n"
-	if err := Install(ctx, s, Options{Binary: binary(t, "v2")}); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Contains(f.signals, "7 terminated") || f.outputs["crontab -l"] != "" || !f.exists(l.UnitFile) {
-		t.Fatalf("переход на службу: %v %q", f.signals, f.outputs["crontab -l"])
-	}
-	j := f.read(t, l.JournalFile)
-	if !strings.Contains(j, "\nmode user\n") || strings.Contains(j, "crontab") {
-		t.Fatalf("журнал:\n%s", j)
-	}
-}
-
-// Без crontab: агент запущен, подсказка — запускать после перезагрузки самому.
-func TestInstallRootlessManualNoCron(t *testing.T) {
-	f, s := newFake(t)
-	asUser(f, s)
-	if err := Install(context.Background(), s, Options{Binary: binary(t, "v1"), Server: "https://api.example.com", Token: "tok", Rootless: true}); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.spawned) != 1 || !strings.Contains(f.out.String(), "после перезагрузки запустите снова") {
-		t.Fatalf("%v\n%s", f.spawned, f.out.String())
+	if len(f.cmds) != 0 || f.exists("/home/u/.agent") {
+		t.Fatalf("узел изменён: %v", f.cmds)
 	}
 }
 
@@ -233,5 +158,32 @@ func TestInstallModeRefuses(t *testing.T) {
 		if len(f.cmds) != 0 || f.exists(Binary) || f.exists("/home/u/.agent") {
 			t.Errorf("%s: узел изменён: %v", name, f.cmds)
 		}
+	}
+}
+
+// Агент, поставленный без службы (в журнале — mode manual): установка службой
+// отказывает с подсказкой, как его остановить, и ничего не меняет; удаление —
+// предупреждает.
+func TestInstallOverManual(t *testing.T) {
+	f, s := newFake(t, "systemctl")
+	asUser(f, s)
+	f.outputs["systemctl --user show-environment"] = "HOME=/home/u\n"
+	l := HomeLayout("/home/u", "")
+	journal := filepath.Join(f.root, l.JournalFile)
+	if err := os.MkdirAll(filepath.Dir(journal), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(journal, []byte("mode manual\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := Install(context.Background(), s, Options{Binary: binary(t, "v1"), Server: "https://api.example.com", Token: "tok", Rootless: true})
+	if err == nil || !strings.Contains(err.Error(), "crontab") || len(f.cmds) != 0 || f.exists(l.UnitFile) {
+		t.Fatalf("установка поверх агента без службы: %v %v", err, f.cmds)
+	}
+	if err := Uninstall(context.Background(), s, "", false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.out.String(), "без службы") {
+		t.Fatalf("удаление: нет предупреждения:\n%s", f.out.String())
 	}
 }

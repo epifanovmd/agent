@@ -24,7 +24,7 @@ func TestReleaseManifestWorkers(t *testing.T) {
 	} {
 		_ = os.WriteFile(filepath.Join(dir, f), []byte(f), 0o755)
 	}
-	err := manifest([]string{dir, "1.0.0", "--worker", "sysinfo=1.3.0,stopTimeout=45s", "--worker=report=2.0.0,command=bin/report"})
+	err := manifestCmd([]string{dir, "1.0.0", "--worker", "sysinfo=1.3.0,stopTimeout=45s", "--worker=report=2.0.0,command=bin/report"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestReleaseManifestWorkers(t *testing.T) {
 		{dir, "1.0.0", "--worker", "report=2.0.0,command=../evil"},
 		{dir},
 	} {
-		if err := manifest(bad); err == nil {
+		if err := manifestCmd(bad); err == nil {
 			t.Errorf("%v: ожидалась ошибка", bad)
 		}
 	}
@@ -75,23 +75,14 @@ func TestReleaseManifestWorkersOnly(t *testing.T) {
 	t.Setenv("AGENT_SIGNING_KEY", "")
 	dir := t.TempDir()
 	_ = os.WriteFile(filepath.Join(dir, "report-1.0.0-linux-amd64"), []byte("r"), 0o755)
-	if err := manifest([]string{dir, "2.0.0"}); err == nil {
+	if err := manifestCmd([]string{dir, "2.0.0"}); err == nil {
 		t.Fatal("без сборок агента и --worker — ошибка")
 	}
-	if err := manifest([]string{dir, "2.0.0", "--worker", "report=1.0.0"}); err != nil {
+	if err := manifestCmd([]string{dir, "2.0.0", "--worker", "report=1.0.0"}); err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if !strings.Contains(string(raw), `"artifacts": []`) || strings.Contains(string(raw), "publicKey") {
 		t.Fatalf("манифест: %s", raw)
-	}
-}
-
-// Без команды и с неизвестной командой — понятная ошибка, а не паника.
-func TestRunUnknownCommand(t *testing.T) {
-	for _, args := range [][]string{nil, {"oops"}} {
-		if err := run(args); err == nil || !strings.Contains(err.Error(), "keygen | manifest") {
-			t.Fatalf("run(%q): %v", args, err)
-		}
 	}
 }

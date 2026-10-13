@@ -12,14 +12,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -40,13 +38,9 @@ type fake struct {
 	envs      map[string][]string
 	// outputs — вывод программ по командной строке (сверх известных ниже).
 	outputs map[string]string
-	// stdin — что передано программе на вход; spawned — запущенные в фоне;
-	// running — pid агента по каталогу данных; signals — посланные сигналы.
-	stdin   map[string]string
-	spawned []string
-	running map[string]int
-	signals []string
-	out     bytes.Buffer
+	// stdin — что передано программе на вход.
+	stdin map[string]string
+	out   bytes.Buffer
 }
 
 func newFake(t *testing.T, programs ...string) (*fake, *System) {
@@ -54,7 +48,7 @@ func newFake(t *testing.T, programs ...string) (*fake, *System) {
 	f := &fake{
 		root: t.TempDir(), users: map[string]bool{"root": true}, installed: map[string]bool{},
 		programs: programs, sysctl: map[string]string{}, owners: map[string]string{}, envs: map[string][]string{},
-		outputs: map[string]string{}, stdin: map[string]string{}, running: map[string]int{},
+		outputs: map[string]string{}, stdin: map[string]string{},
 	}
 	for _, d := range []string{"run/systemd/system", "usr/local/bin", "usr/sbin"} {
 		if err := os.MkdirAll(filepath.Join(f.root, d), 0o755); err != nil {
@@ -72,9 +66,6 @@ func newFake(t *testing.T, programs ...string) (*fake, *System) {
 			f.cmds = append(f.cmds, line)
 			f.envs[line] = c.Env
 			f.stdin[line] = c.Stdin
-			if line == "crontab -" {
-				f.outputs["crontab -l"] = c.Stdin
-			}
 			switch c.Args[0] {
 			case "useradd":
 				f.users[c.Args[len(c.Args)-1]] = true
@@ -107,22 +98,6 @@ func newFake(t *testing.T, programs ...string) (*fake, *System) {
 				return "/usr/bin/" + name, nil
 			}
 			return "", errors.New("not found")
-		},
-		Spawn: func(c Cmd, log string) error {
-			f.spawned = append(f.spawned, strings.Join(c.Args, " ")+" >>"+strings.TrimPrefix(log, f.root))
-			return nil
-		},
-		Running: func(dataDir string) int { return f.running[strings.TrimPrefix(dataDir, f.root)] },
-		Kill: func(pid int, sig syscall.Signal) error {
-			f.signals = append(f.signals, fmt.Sprintf("%d %s", pid, sig))
-			if sig == syscall.SIGTERM {
-				for d, p := range f.running {
-					if p == pid {
-						delete(f.running, d)
-					}
-				}
-			}
-			return nil
 		},
 		Euid: func() int { return 0 },
 		Chown: func(path, user string) error {
@@ -625,9 +600,8 @@ func TestParseFlags(t *testing.T) {
 	}
 }
 
-// Флаги из installCommand серверного SDK (sdk/node/test/install.test.ts) —
-// install.sh передаёт их agent install как есть: все известны.
-func TestParseFlagsInstallCommand(t *testing.T) {
+// Флаги, которые install.sh передаёт agent install как есть: все известны.
+func TestParseFlagsFromScript(t *testing.T) {
 	o, err := ParseFlags([]string{
 		"--instance", "web-2", "--token", "tok'en", "--name", "node 01", "--user", "root", "--config", "/etc/agent/node.yaml", "--privileged",
 		"--kill-mode", "process", "--packages", "jq curl", "--packages-apk", "bind-tools",

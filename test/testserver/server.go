@@ -34,9 +34,8 @@ type Config struct {
 	// StatusInterval, MetricsInterval — интервалы, которые сервер задаёт агентам.
 	StatusInterval  time.Duration
 	MetricsInterval time.Duration
-	// ReleasesDir, PublicKey — раздача сборок (manifest.json, файлы сборок) и install.sh.
+	// ReleasesDir — раздача сборок (manifest.json, файлы сборок).
 	ReleasesDir string
-	PublicKey   string
 	// Options — другие опции Agents (offlineGraceMs, actionTimeoutMs…).
 	Options map[string]any
 }
@@ -74,9 +73,6 @@ func Start(t testing.TB, cfg Config) *Server {
 	}
 	if cfg.ReleasesDir != "" {
 		opts["releasesDir"] = cfg.ReleasesDir
-	}
-	if cfg.PublicKey != "" {
-		opts["publicKey"] = cfg.PublicKey
 	}
 	raw, _ := json.Marshal(opts)
 
@@ -168,7 +164,7 @@ func need(t testing.TB) string {
 func (s *Server) Log() string { return s.log() }
 
 // Proxy — HTTP-обработчик для агента: всё — серверу (WebSocket тоже), с X-Forwarded-Host
-// и X-Forwarded-Proto (install.sh — с адресом прокси).
+// и X-Forwarded-Proto (адрес сервера для агента — адрес прокси).
 func (s *Server) Proxy() http.Handler {
 	dialer := &net.Dialer{}
 	return &httputil.ReverseProxy{

@@ -1,8 +1,8 @@
 # Сборки, установка, обновление, удаление
 
 Сборки — подписанные файлы агента и воркеров с `manifest.json`. Бэкенд берёт агента из
-релизов GitHub (GitHub Releases) или своего каталога, раздаёт сборки, ставит агента на узел одной командой и
-обновляет агентов и воркеры; узел проверяет подпись и
+релизов GitHub (GitHub Releases) или своего каталога, раздаёт сборки и обновляет агентов и
+воркеры; ставит агента на узел установщик из релиза агента; узел проверяет подпись и
 возвращает прежнюю сборку, если новая не заработала. Формат —
 [sdk/spec §10–§11](../spec/README.md#11-сборки-и-обновление), образцы —
 [actions.json](../spec/examples/actions.json). Флаги установщика и настройки агента —
@@ -13,6 +13,7 @@
 - [Собрать сборки](#собрать-сборки)
 - [Раздать сборки](#раздать-сборки)
 - [Установка одной командой](#установка-одной-командой)
+- [Установка из архива проекта](#установка-из-архива-проекта)
 - [Обновление агента](#обновление-агента)
 - [Агент сам замечает новые версии](#агент-сам-замечает-новые-версии)
 - [Обновление воркеров с сервера](#обновление-воркеров-с-сервера)
@@ -31,32 +32,30 @@ const agents = new Agents({
   // Агент и его стандартные воркеры (netprobe) — из релизов GitHub (GitHub Releases).
   agentReleases: {
     github: "epifanovmd/agent",
-    range: "^1", // необязательно; по умолчанию — та же мажорная версия, что у SDK
+    range: "^2", // необязательно; по умолчанию — та же мажорная версия, что у SDK
     checkIntervalMs: 3_600_000, // необязательно; по умолчанию 1 ч, первая проверка — при старте
     token: process.env.GITHUB_TOKEN, // необязательно: лимиты API GitHub
     proxy: false, // true — сборки узлам через бэкенд потоком (узлы без доступа к GitHub)
   },
-  // Воркеры проекта: manifest.json от agent-release и их сборки.
+  // Воркеры проекта: manifest.json от agent manifest и их сборки.
   releasesDir: "/srv/agent-release",
-  updatePublicKeys: [process.env.PROJECT_UPDATE_PUBLIC_KEY!], // ключ проекта — в install.sh
-  baseUrl: "https://api.example.com",
 });
 agents.on("release", ({ version, previous }) => {}); // в источнике появилась новая версия
-await agents.checkRelease(); // проверить сейчас, не дожидаясь checkIntervalMs
+await agents.release({ refresh: true }); // проверить сейчас, не дожидаясь checkIntervalMs
 ```
 
 **Удалённый источник** (`agentReleases`):
 
 - `{ github: "owner/repo" }` — SDK запрашивает API GitHub (`GET /repos/{owner}/{repo}/releases`),
   берёт релизы без `prerelease` и не `draft`, выбирает старшую версию в диапазоне `range` (semver;
-  по умолчанию `^<мажорная версия SDK>`, например `^1` — новая мажорная версия агента сама не
-  подхватывается) и скачивает её `manifest.json` и `install.sh`. Нужен публичный репозиторий;
+  по умолчанию `^<мажорная версия SDK>`, например `^2` — новая мажорная версия агента сама не
+  подхватывается) и скачивает её `manifest.json`. Нужен публичный репозиторий;
   `token` — только для лимитов запросов к API.
 - `{ url: "https://…/releases/download/v1.1.0" }` — адрес, откуда берутся сборки: `<url>/manifest.json`,
-  `<url>/<file>`, `<url>/install.sh`. Так закрепляют одну версию, берут сборки со своего
+  `<url>/<file>`. Так закрепляют одну версию, берут сборки со своего
   зеркала или из каталога `agent-dist` на своём сервере.
 
-Проверка — при старте и раз в `checkIntervalMs` (`checkRelease()` — сейчас). Полученный манифест сборок
+Проверка — при старте и раз в `checkIntervalMs` (`release({ refresh: true })` — сейчас). Полученный манифест сборок
 хранится в памяти процесса; ошибка сети или источника — предупреждение в журнал, остаётся прежний
 манифест. Новая версия — событие `release` (`{ version, previous?, from }`). Подписи сборок SDK не
 проверяет — это делает агент своими ключами.
@@ -70,8 +69,7 @@ await agents.checkRelease(); // проверить сейчас, не дожид
 
 `release()` возвращает итоговый набор сборок: у каждой сборки — `source` (`remote` или `local`) и `url`
 (ссылка источника или путь от корня бэкенда), у набора — `remote` (`{ version, from, checkedAt,
-publicKey? }`). `updateCandidates()`, `workerUpdateCandidates()`, `updateAgent()`,
-`updateWorker()` работают по нему. Узлам `…/releases/manifest.json` отдаёт тот же набор сборок без
+publicKey? }`). `updateCandidates()`, `updateAgent()` и `updateWorker()` работают по нему. Узлам `…/releases/manifest.json` отдаёт тот же набор сборок без
 источников: `file` — имя файла.
 
 **Сборки из удалённого источника.** `GET …/releases/<file>` отвечает перенаправлением `302` на
@@ -81,11 +79,11 @@ publicKey? }`). `updateCandidates()`, `workerUpdateCandidates()`, `updateAgent()
 ключом, а при перенаправлении на другой хост ключ не передаёт.
 
 **Воркеры проекта в `releasesDir`.** Сборки — файлы или архивы
-`<name>-<version>-<os>-<arch>[.tar.gz]`, `manifest.json` — от `agent-release`, без сборок агента
+`<name>-<version>-<os>-<arch>[.tar.gz]`, `manifest.json` — от `agent manifest`, без сборок агента
 (подпись — ключом проекта):
 
 ```bash
-AGENT_SIGNING_KEY=<ключ проекта> agent-release manifest /srv/agent-release 2.0.0 --worker report=2.0.0
+AGENT_SIGNING_KEY=<ключ проекта> agent manifest /srv/agent-release 2.0.0 --worker report=2.0.0
 ```
 
 **Ключи.** У агента может быть несколько ключей проверки; подпись принимается, если сходится с
@@ -93,20 +91,16 @@ AGENT_SIGNING_KEY=<ключ проекта> agent-release manifest /srv/agent-re
 
 - **ключ автора агента** — им подписаны агент и netprobe в релизах GitHub; он вшит в эти сборки, а
   `manifest.json` сборок называет его в поле `publicKey`;
-- **ключ проекта** — им проект подписывает свои воркеры; узлу его передаёт установщик
-  (`--update-key`), в настройках агента — `update.publicKeys`.
-
-`install.sh` из удалённого источника SDK отдаёт с подставленными адресом бэкенда и ключами:
-`publicKey`, `updatePublicKeys` и ключ автора агента (`agentReleases.publicKey` или `publicKey`
-из `manifest.json` источника). Нет `install.sh` в источнике — берётся из `releasesDir`.
+- **ключ проекта** — им проект подписывает свои воркеры; узлу его передаёт команда установки
+  (`--update-key`) или архив `agent pack`, в настройках агента — `update.publicKeys`.
 
 ## Ключи подписи
 
 ```bash
-agent keygen   # пара ключей проекта; для публикации самого агента — go run ./cmd/agent-release keygen
+agent keygen   # пара ключей подписи сборок
 # AGENT_SIGNING_KEY=…         закрытый: только там, где подписывают сборки (agent pack, секреты CI), не на бэкенде
 # AGENT_UPDATE_PUBLIC_KEYS=…  открытый: agent pack кладёт его в архив, установка из архива — к ключам узла;
-#                             бэкенду — опция updatePublicKeys (install.sh передаёт его узлу)
+#                             в команде установки — флагом --update-key
 ```
 
 Сборки воркеров проекта удобнее всего делать `agent pack` в папке агента: каталог `release/` в
@@ -126,8 +120,8 @@ AGENT_SIGNING_KEY=… AGENT_UPDATE_PUBLIC_KEY=… make release   # → dist/<VER
 
 `scripts/release.sh` собирает агента под linux и darwin × amd64 и arm64 (`agent-<os>-<arch>`) и
 стандартный воркер netprobe (`netprobe-<версия>-<os>-<arch>`), пишет подписанный
-`manifest.json` утилитой `agent-release manifest` (с `--worker netprobe=<версия>` и `publicKey` —
-открытым ключом подписи) и кладёт `install.sh`. Так же собираются сборки для релиза на GitHub (CI по тегу). Сборки
+`manifest.json` командой `agent manifest` (с `--worker netprobe=<версия>` и `publicKey` —
+открытым ключом подписи) и кладёт установщик `install.sh`. Так же собираются сборки для релиза на GitHub (CI по тегу). Сборки
 своих воркеров (файл или архив `<имя>-<версия>-<os>-<arch>.tar.gz`) кладут в тот же каталог заранее и
 вносят в манифест флагом `--worker`:
 `scripts/go.sh release --worker report=1.5.0,command=bin/report,stopTimeout=30s`
@@ -159,9 +153,7 @@ AGENT_SIGNING_KEY=… AGENT_UPDATE_PUBLIC_KEY=… make release   # → dist/<VER
 ```ts
 const agents = new Agents({
   enrollToken,
-  releasesDir: "/srv/agent-release", // manifest.json, сборки, install.sh
-  publicKey: process.env.AGENT_UPDATE_PUBLIC_KEY, // вписывается в install.sh
-  baseUrl: "https://api.example.com", // публичный адрес (иначе — из запроса)
+  releasesDir: "/srv/agent-release", // manifest.json и сборки
 });
 const manifest = await agents.release(); // ReleaseView | null — итоговый набор сборок
 ```
@@ -172,66 +164,57 @@ const manifest = await agents.release(); // ReleaseView | null — итогов�
 | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | `GET /api/v1/agent-link/releases/manifest.json` | манифест сборок                                                                                           |
 | `GET /api/v1/agent-link/releases/<file>`        | сборки агента и воркеров — только файлы из манифеста; из удалённого источника — `302` или поток (`proxy`) |
-| `GET /api/v1/agent-link/install.sh`             | установщик, в который уже вписаны адрес сервера и ключи проверки (`DEFAULT_UPDATE_KEYS`)                  |
 
 ## Установка одной командой
 
-Бэкенд собирает строку для узла — по флагу `agent install` на каждую заданную опцию. Выполнить
-её на машине (SSH, cloud-init, Ansible) — дело бэкенда.
+Ставит агента установщик `install.sh` из релиза агента — SDK его не раздаёт и команду не
+собирает. Адрес сервера, токен и ключи проверки подписи сборок проекта передаются флагами;
+строку для узла собирает бэкенд, выполнить её на машине (SSH, cloud-init, Ansible) — тоже его
+дело:
 
-```ts
-const cmd = agents.installCommand({
-  instance: "example", // необязательно: ещё один агент на узле (--instance), см. ниже
-  token: await issueEnrollToken(), // или tokenFile: "/run/secrets/agent-token" — ровно одно из двух
-  name: "node-01",
-  user: "agent",
-  config: "/etc/agent/node.yaml",
-  privileged: false,
-  killMode: "process", // process (по умолчанию: воркеры переживают перезапуск агента) | mixed
-  packages: ["jq", "curl"],
-  packagesByManager: { apk: ["bind-tools"] },
-  sysctl: { "vm.max_map_count": "262144" },
-  rwPaths: ["/srv/data"],
-  caFile: "/etc/ssl/example-ca.pem",
-  workers: ["report"], // воркеры с сервера (--worker)
-  stopTimeout: "15min",
-  releases: "https://cdn.example.com/agent", // необязательно: другой источник сборок
-  baseUrl: "https://api.example.com", // иначе — опция baseUrl
-});
-// curl -fsSL 'https://api.example.com/api/v1/agent-link/install.sh' | sudo sh -s -- --token '…' --name 'node-01' …
+```bash
+I=https://github.com/epifanovmd/agent/releases/latest/download/install.sh
+curl -fsSL "$I" | sudo sh -s -- --server https://api.example.com --token <токен> \
+  --update-key <ключ проекта> --name node-01 --worker report
 ```
 
-Значения взяты в одинарные кавычки; адрес, имена пакетов и менеджеров (`apt`, `dnf`, `yum`,
-`apk`, `zypper`), ключи `sysctl`, `killMode` и имена воркеров проверяются. Ошибка
-`MESSAGE_INVALID` — неверное значение, перевод строки в значении, не ровно одно из `token` и
-`tokenFile` или нет адреса (ни `baseUrl` в вызове, ни опции `baseUrl`). `privileged: true` нужен, только если воркер настраивает
-сам узел: сеть, firewall, системные файлы.
-
-Способ установки — опции `rootless` и `run` (по умолчанию — служба systemd от root):
-
 ```ts
-agents.installCommand({ token, rootless: true });
-// curl -fsSL '…/install.sh' | sh -s -- --rootless --token '…'   — без sudo, агент в ~/.agent
-agents.installCommand({ token, run: true });
-// curl -fsSL '…/install.sh' | sh -s -- --run --token '…'        — без установки, на переднем плане
+const sh = (v: string) => `'${v.replaceAll("'", `'\\''`)}'`;
+const flags = ["--server", "https://api.example.com", "--token", await issueEnrollToken(), "--name", "node-01"];
+const cmd = `curl -fsSL ${sh(installUrl)} | sudo sh -s -- ${flags.map(sh).join(" ")}`;
 ```
 
-`rootless` — агент пользователя без root: команда без `sudo`, служба пользователя systemd (её нет —
-агент в фоне с автозапуском из `crontab`); с ним нельзя `user`, `sysctl`, `privileged`, `rwPaths` и
-пакеты. `run` — без установки: агент запускается здесь же на переднем плане (контейнер, свой
-менеджер процессов), себя не обновляет; с ним — только `token` или `tokenFile`, `name`, `caFile` и
-`releases`. Несовместимые опции — ошибка `MESSAGE_INVALID`. Что ставится в каждом случае —
+`installUrl` (`$I` выше) — `https://github.com/epifanovmd/agent/releases/latest/download/install.sh`, адрес
+той же версии (`…/releases/download/v<версия>/install.sh`) или свой: установщик лежит и в каталоге
+сборок `make release` (`dist/<версия>/install.sh`), бэкенд может раздавать его сам — любым
+статическим хостингом. Остальные флаги уходят `agent install` как есть: `--worker` (воркеры с
+сервера), `--packages`, `--sysctl`, `--privileged`, `--user`, `--rw-path`, `--ca-file`,
+`--kill-mode`, `--stop-timeout`, `--token-file` вместо `--token`. `--privileged` нужен, только если
+воркер настраивает сам узел: сеть, firewall, системные файлы. Флаги —
 [ARCHITECTURE.md](../../docs/ARCHITECTURE.md#установка).
 
-`install.sh` скачивает с бэкенда сборку агента под машину, сверяет контрольную сумму и
-запускает `agent install` с этими флагами (с `run` — `agent run`). Агент ставится службой systemd
-(или так, как задано опциями `rootless` и `run`), при первом запуске
-регистрируется по токену ([connection.md](connection.md#регистрация-по-токену)) и появляется в
-`agents.listAgents()`. Воркер со сборкой с сервера (`--worker report`) ставится в
+Способ установки — флаги `--rootless` и `--run` (по умолчанию — служба systemd от root):
+
+```bash
+curl -fsSL "$I" | sh -s -- --rootless --server … --token …   # без sudo, агент в ~/.agent
+curl -fsSL "$I" | sh -s -- --run --server … --token …        # без установки, на переднем плане
+```
+
+`--rootless` — агент пользователя без root: команда без `sudo`, служба пользователя systemd (её
+нет — ошибка: запускайте агента сами, `--run`); с ним нельзя `--user`, `--sysctl`,
+`--privileged`, `--rw-path` и пакеты. `--run` — без установки: агент запускается здесь же на
+переднем плане (контейнер, свой менеджер процессов), себя не обновляет; с ним — только `--token`
+или `--token-file`, `--name`, `--update-key`, `--ca-file` и `--releases`.
+
+`install.sh` скачивает с бэкенда (`GET /api/v1/agent-link/releases/…`) сборку агента под машину,
+сверяет контрольную сумму и запускает `agent install` с этими флагами (с `--run` — `agent run`).
+Агент при первом запуске регистрируется по токену
+([connection.md](connection.md#регистрация-по-токену)) и появляется в `agents.listAgents()`.
+Воркер со сборкой с сервера (`--worker report`) ставится в
 `/var/lib/agent/workers/report/current` и прописывается в `agent.yaml` с `release: true`.
 
 **Если на узле уже есть агент другого бэкенда**, ставьте своего отдельным экземпляром:
-`instance: "example"` (флаг `--instance`; имя — по правилу имён). У экземпляра свои служба
+`--instance example` (имя — по правилу имён). У экземпляра свои служба
 (`agent-example`), пользователь, настройки (`/etc/agent-example`), данные
 (`/var/lib/agent-example`) и программа — агенты разных бэкендов не мешают друг другу и
 обновляются по отдельности. Пути и команды экземпляра —
@@ -239,38 +222,42 @@ agents.installCommand({ token, run: true });
 
 ## Установка из архива проекта
 
-Бэкенд, у которого настройки и воркеры агента — своя папка агента (`agent pack`), раздаёт её архивы:
-опция `bundlesDir` — каталог архивов `agent-<окружение>-<версия>-linux-<arch>.tar.gz`. SDK отдаёт
-установщик `GET /api/v1/agent-link/bundle/install.sh` (адрес сервера подставлен) и новейший архив под
-платформу узла `GET /api/v1/agent-link/bundle/linux-<arch>.tar.gz` (`darwin-<arch>` — для разработки); команда — `bundleInstallCommand`:
+Бэкенд, у которого настройки и воркеры агента — своя папка агента, собирает её архивы
+`agent pack` (`agent-<окружение>-<версия>-linux-<arch>.tar.gz`) и раздаёт их сам — любым
+статическим хостингом. Ставит тот же `install.sh` с флагом `--bundle URL`; `{arch}` в ссылке
+заменяется на `amd64` или `arm64` машины:
 
-```ts
-const agents = new Agents({ bundlesDir: "/app/agent/bundle", baseUrl: "https://api.example.com", … });
-agents.bundleInstallCommand({ token, name: "node-01" });
-// curl -fsSL '…/api/v1/agent-link/bundle/install.sh' | sudo sh -s -- --token '…' --name 'node-01'
-agents.bundleInstallCommand({ token, rootless: true }); // без root: | sh -s -- --rootless …
-agents.bundleInstallCommand({ token, run: true });      // без установки (контейнер): | sh -s -- --run …
+```bash
+B='https://files.example.com/agent-prod-linux-{arch}.tar.gz'
+curl -fsSL "$I" | sudo sh -s -- --bundle "$B" --token <токен> --name node-01
+curl -fsSL "$I" | sh -s -- --bundle "$B" --rootless --token <токен>   # без root
+curl -fsSL "$I" | sh -s -- --bundle "$B" --run --token <токен>        # без установки (контейнер)
+curl -fsSL "$I" | sudo sh -s -- --bundle "$B" --uninstall [--purge]   # удалить
 ```
 
-Адрес установщика — `bundleInstallUrl(baseUrl)` (например, чтобы скачать его по SSH и запустить
-с `--token-file` или `--uninstall`). Экземпляр, воркеры, пакеты и права — в настройках архива
-(`instance`, `install:`); в команде — только
-токен (`token` или `tokenFile`), имя и способ (`rootless` или `run`). Установщик скачивает архив под
-машину и запускает из него `agent install --server <адрес>` (служба или `--rootless`) или `agent run`
-(`--run`: данные — `AGENT_DATA_DIR`, по умолчанию `/var/lib/agent`); удалить — тем же установщиком:
-`… | sudo sh -s -- --uninstall [--purge]`.
+Программа агента, экземпляр, воркеры, пакеты, права и ключ проекта — из архива (`instance`,
+`install:` в настройках, ключ — в `bundle.json`); в команде — токен (`--token` или
+`--token-file`), имя и способ (`--rootless` или `--run`). `--server` нужен, только если адреса
+сервера нет в настройках архива. Установщик скачивает архив под машину и запускает из него
+`agent install` (служба или `--rootless`) или `agent run` с настройками архива (`--run`: данные —
+`AGENT_DATA_DIR`, по умолчанию `/var/lib/agent`; ключ проекта из `bundle.json` здесь не читается —
+передайте его `--update-key`).
 
 ## Обновление агента
 
 ```ts
-const candidates = await agents.updateCandidates(); // [{ agentId, name, online, current, target, os, arch }]
-for (const c of candidates) await agents.updateAgent(c.agentId); // → { version, previous }
+const { agents: list } = await agents.updateCandidates();
+// [{ agentId, agentName, online, current, target, os, arch, source: "server" | "agent" }]
+for (const c of list) await agents.updateAgent(c.agentId, c.source === "agent" ? { version: c.target } : {}); // → { version, previous }
 ```
 
-Кандидаты — агенты, чья версия отличается от версии в манифесте сборок и для чьих ОС и процессора есть сборка.
+Кандидаты — агенты, чья версия отличается от версии в манифесте сборок и для чьих ОС и процессора
+есть сборка (`source: "server"` — `updateAgent` без `version`), или те, кто нашёл в своём каталоге
+сборок версию новее своей (`source: "agent"` — `updateAgent` с `version: target`,
+[ниже](#агент-сам-замечает-новые-версии)). Из двух версий берётся новейшая.
 Агенты, которые себя не обновляют (`hello.agent.updateMode` — `external` у агента в контейнере или
 `disabled`), в кандидаты не входят: `agent.update` им ответил бы `UPDATE_NOT_SUPPORTED`. Как агент
-поставлен на узел — `hello.agent.install` (`systemd`, `user`, `manual`; нет — запущен иначе,
+поставлен на узел — `hello.agent.install` (`systemd`, `user`; нет — запущен иначе,
 например в контейнере).
 Нет манифеста или сборки — `UPDATE_NOT_AVAILABLE`. Аудит — `agent.update`.
 
@@ -284,7 +271,7 @@ previous}}`. Итог приходит уже в новом соединении
 программу как `.prev`, заменяет её и перезапускается. Новая версия за три запуска не получила
 `welcome` — возвращается `.prev`, итог — `UPDATE_FAILED`. Агент в контейнере себя не обновляет —
 `UPDATE_NOT_SUPPORTED` (`update.mode: external`, обновляют образ; так же при `update.mode: disabled`). Воркеры обновление агента не замечают: они работают
-дальше, новая версия их подхватывает (`lifecycle.onAgentRestart: keep`), — долгая работа не
+дальше, новая версия их подхватывает (`lifecycle.onAgentExit: keep`), — долгая работа не
 прерывается и ждать её окончания не нужно.
 
 ## Агент сам замечает новые версии
@@ -302,14 +289,15 @@ for (const a of outdated) await agents.updateAgent(a.id, { version: a.update!.la
 `updateAgent(id, { version })` отправляет `agent.update` только с версией: агент сам скачивает
 сборку под свою платформу из своего каталога сборок и сверяет подпись из его `manifest.json`;
 бэкенду не нужны ни `releasesDir`, ни `agentReleases`. Неверная версия — `MESSAGE_INVALID`. Без
-`version` — как раньше: сборка из набора бэкенда. На узле то же делает `agent upgrade`.
+`version` — сборка из набора бэкенда. Такие агенты входят и в `updateCandidates()` с
+`source: "agent"`. На узле то же делает `agent upgrade`.
 
 ## Обновление воркеров с сервера
 
 ```ts
-const list = await agents.workerUpdateCandidates();
+const { workers } = await agents.updateCandidates();
 // [{ agentId, agentName, online, worker, current, target, os, arch }]
-for (const c of list) await agents.updateWorker(c.agentId, c.worker);
+for (const c of workers) await agents.updateWorker(c.agentId, c.worker);
 // → { version, previous, deferred: false } — обновлён;
 //   { deferred: true, pending: "update", actionId } — воркер занят, итог — событие action
 await agents.updateWorker(agentId, "report", { force: true }); // не ждать окончания работы воркера
@@ -322,9 +310,9 @@ await agents.updateWorker(agentId, "report", { wait: true }); // ждать ит
 
 **Агент** скачивает и проверяет сборку; если воркер занят (`GET /health` → `busy: true`), сразу
 отвечает, что замена отложена, и ждёт окончания его работы (в `status` — `pending: "update"`, не
-дольше `lifecycle.busy.timeout`; `force: true` — не ждёт; итог — событие `action` с
+дольше `lifecycle.busyTimeout`; `force: true` — не ждёт; итог — событие `action` с
 `deferred: true`), останавливает прежний процесс, запускает новый и ждёт `ok: true` на
-`GET /health` до минуты (`lifecycle.updateHealthyTimeout`). Не дождался — возвращает прежнюю сборку, итог —
+`GET /health` до минуты (`lifecycle.startTimeout`). Не дождался — возвращает прежнюю сборку, итог —
 `UPDATE_FAILED`. Уже обновляется — `BUSY`. Добавить или удалить воркер бэкенд не может — это
 решает `agent.yaml`.
 
@@ -335,8 +323,8 @@ await agents.updateWorker(agentId, "report", { wait: true }); // ждать ит
 ```bash
 sudo agent uninstall [--purge]
 # или тем же установщиком:
-curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --uninstall [--purge]
-# экземпляр (instance в installCommand) — с --instance ИМЯ; другие экземпляры не затрагиваются
+curl -fsSL https://github.com/epifanovmd/agent/releases/latest/download/install.sh | sudo sh -s -- --uninstall [--purge]
+# экземпляр — с --instance ИМЯ (другие экземпляры не затрагиваются); агент из архива — с --bundle URL
 ```
 
 и отозвать агента, чтобы его ключ больше не принимался: `agents.revoke(agentId)`.

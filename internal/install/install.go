@@ -9,6 +9,7 @@ package install
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"io"
@@ -20,10 +21,10 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"syscall"
-	"time"
+	"text/template"
 
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/update"
 )
@@ -80,13 +81,6 @@ type System struct {
 	Home string
 	// Chown — отдать файл или каталог (со всем содержимым) пользователю.
 	Chown func(path, user string) error
-	// Spawn — запустить программу в фоне, в своём сеансе (переживает выход
-	// из системы), вывод — в конец файла log.
-	Spawn func(c Cmd, log string) error
-	// Running — pid работающего агента с каталогом данных dataDir (0 — не работает).
-	Running func(dataDir string) int
-	// Kill — сигнал процессу.
-	Kill func(pid int, sig syscall.Signal) error
 	// HTTP — клиент для загрузки воркеров (nil — по CA сервера).
 	HTTP *http.Client
 	// Arch — архитектура узла (GOARCH).
@@ -154,7 +148,7 @@ type Options struct {
 	// Vars — ещё переменные в agent.env (значения ${ИМЯ} из файла настроек).
 	Vars map[string]string
 	// Rootless — агент пользователя без root (--rootless): в его домашнем
-	// каталоге, служба — systemd --user, без неё — без службы.
+	// каталоге, служба — systemd --user.
 	Rootless bool
 	// Home — домашний каталог агента пользователя (ставит Plan); "" — системный агент.
 	Home string
@@ -258,7 +252,7 @@ func (s *System) own(path, user string) error {
 }
 
 // Install — поставить или обновить агента: службой systemd (root) или агентом
-// пользователя без root (--rootless: служба systemd --user или без службы).
+// пользователя без root (--rootless: служба systemd --user).
 func Install(ctx context.Context, s *System, o Options) error {
 	if err := Plan(s, &o); err != nil {
 		return err
@@ -274,12 +268,12 @@ func Install(ctx context.Context, s *System, o Options) error {
 	if err := s.preflight(mode == ModeSystemd, l); err != nil {
 		return err
 	}
-	prevMode := s.modeOf(l)
+	if s.modeOf(l) == modeManual {
+		return errors.New(manualHint(l) + ", затем повторите установку")
+	}
 	if mode == ModeUser && !s.userSystemd(ctx) {
-		if isFile(s.p(l.UnitFile)) {
-			return fmt.Errorf("служба пользователя %s уже стоит, но systemd --user сейчас недоступен — войдите в систему этим пользователем (ssh, не su) и повторите", l.Unit)
-		}
-		mode = ModeManual
+		return errors.New("служб пользователя (systemd --user) здесь нет: войдите этим пользователем по ssh (не через su) и повторите; " +
+			"без службы запускайте агента сами — agent run (install.sh --run), автозапуск — средствами узла")
 	}
 	if o.TokenFile != "" {
 		raw, err := os.ReadFile(o.TokenFile)
@@ -291,7 +285,7 @@ func Install(ctx context.Context, s *System, o Options) error {
 		}
 	}
 	o.Server = strings.TrimRight(o.Server, "/")
-	configExists := isFile(s.p(l.ConfigFile))
+	configExists := fsutil.IsFile(s.p(l.ConfigFile))
 	if o.Server == "" && !configExists && o.Config == "" {
 		return errors.New("--server: адрес сервера (например, --server https://api.example.com)")
 	}
@@ -304,7 +298,7 @@ func Install(ctx context.Context, s *System, o Options) error {
 	if releasesFrom.Server == "" && len(o.Workers) > 0 && o.Releases == "" {
 		return errors.New("--worker: сборки воркеров берутся с сервера — нужен --server или --releases")
 	}
-	if o.Config != "" && !isFile(o.Config) {
+	if o.Config != "" && !fsutil.IsFile(o.Config) {
 		return fmt.Errorf("--config: нет файла %s", o.Config)
 	}
 	for _, x := range o.Ignored {
@@ -397,39 +391,22 @@ func Install(ctx context.Context, s *System, o Options) error {
 		}
 	}
 	stopTimeout := cmpOr(o.StopTimeout, "15min")
-	switch mode {
-	case ModeSystemd, ModeUser:
-		// Был агентом без службы: он останавливается, служба запускает его заново.
-		if prevMode == ModeManual {
-			if err := s.stopManual(ctx, l, time.Minute); err != nil {
-				return err
-			}
-			j.drop(func(k, _ string) bool { return k == "crontab" })
-			if err := j.save(); err != nil {
-				return err
-			}
+	unit := Unit(UnitOptions{Paths: l, User: user, KillMode: killMode, StopTimeout: stopTimeout, Privileged: o.Privileged, RWPaths: o.RWPaths})
+	if err := os.MkdirAll(filepath.Dir(s.p(l.UnitFile)), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(s.p(l.UnitFile), []byte(unit), 0o644); err != nil {
+		return err
+	}
+	systemctl := strings.Fields(l.Systemctl())
+	for _, args := range [][]string{{"daemon-reload"}, {"enable", l.Service}, {"restart", l.Service}} {
+		args = append(slices.Clone(systemctl), args...)
+		if err := s.Run(ctx, Cmd{Args: args, Quiet: true}); err != nil {
+			return fmt.Errorf("%s: %w", strings.Join(args, " "), err)
 		}
-		unit := Unit(UnitOptions{Paths: l, User: user, KillMode: killMode, StopTimeout: stopTimeout, Privileged: o.Privileged, RWPaths: o.RWPaths})
-		if err := os.MkdirAll(filepath.Dir(s.p(l.UnitFile)), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(s.p(l.UnitFile), []byte(unit), 0o644); err != nil {
-			return err
-		}
-		systemctl := strings.Fields(l.Systemctl())
-		for _, args := range [][]string{{"daemon-reload"}, {"enable", l.Service}, {"restart", l.Service}} {
-			args = append(slices.Clone(systemctl), args...)
-			if err := s.Run(ctx, Cmd{Args: args, Quiet: true}); err != nil {
-				return fmt.Errorf("%s: %w", strings.Join(args, " "), err)
-			}
-		}
-		if mode == ModeUser {
-			s.linger(ctx)
-		}
-	case ModeManual:
-		if err := s.startManual(ctx, l, j); err != nil {
-			return err
-		}
+	}
+	if mode == ModeUser {
+		s.linger(ctx)
 	}
 	s.hints(l, mode, o.Version, user)
 	return nil
@@ -463,12 +440,6 @@ func (s *System) hints(l Paths, mode, version, user string) {
 	case ModeUser:
 		s.say("Агент %s установлен для пользователя %s и запущен (служба пользователя %s).", version, s.User, l.Unit)
 		logs = "journalctl --user -u " + l.Unit + " -f"
-	case ModeManual:
-		s.say("Агент %s установлен для пользователя %s и запущен в фоне: служб пользователя (systemd --user) здесь нет.", version, s.User)
-		if !s.manualAutostart(l) {
-			s.say("  после перезагрузки запустите снова: %s run   (crontab на узле нет — автозапуска нет)", l.Binary)
-		}
-		logs = "tail -f " + ManualLog(l)
 	}
 	s.say("  состояние:  %s%s status", sudo, cmd)
 	s.say("  лог:        %s%s logs -f   (%s)", sudo, cmd, logs)
@@ -500,7 +471,7 @@ func installBinary(s *System, l Paths, src, user string) error {
 		return err
 	}
 	dst := s.p(l.Binary)
-	if !sameFile(src, dst) {
+	if !fsutil.SameFile(src, dst) {
 		raw, err := os.ReadFile(src)
 		if err != nil {
 			return fmt.Errorf("программа агента: %w", err)
@@ -654,52 +625,27 @@ type UnitOptions struct {
 
 // Unit — файл службы. SIGHUP (systemctl reload) — агент перечитывает
 // agent.yaml на ходу; SIGTERM — только агенту (KillMode=process): воркеры
-// работают дальше по lifecycle.onAgentStop, новый запуск их подхватывает;
+// работают дальше по lifecycle.onAgentExit, новый запуск их подхватывает;
 // KillMode=mixed — systemd завершает и воркеры (они не переживают
 // перезапуск агента). Откат обновления делает прежняя версия до запуска
 // новой (ExecStartPre); перезапуск — всегда. Служба агента пользователя
 // (Paths.Home, systemd --user) — от него самого, без ограничений файловой
 // системы (в службах пользователя они работают не везде).
 func Unit(o UnitOptions) string {
-	l := o.Paths
-	if l.Binary == "" {
-		l = Layout("")
+	if o.Paths.Binary == "" {
+		o.Paths = Layout("")
 	}
-	hardening := "# --privileged: агент и воркеры настраивают узел — без ограничений файловой системы."
-	if !o.Privileged {
-		hardening = "NoNewPrivileges=true\nProtectSystem=full\nProtectHome=read-only\nPrivateTmp=true\n" +
-			"ReadWritePaths=" + strings.Join(append([]string{l.DataDir, l.OptDir}, o.RWPaths...), " ")
+	var b strings.Builder
+	if err := unitTemplate.Execute(&b, o); err != nil {
+		panic("agent.service.tmpl: " + err.Error())
 	}
-	desc := "Agent"
-	if l.Instance != "" {
-		desc += " " + l.Instance
-	}
-	unit, user, target := "Wants=network-online.target\nAfter=network-online.target\n", "User="+o.User+"\n", "multi-user.target"
-	if l.Home {
-		unit, user, target = "", "", "default.target"
-		hardening = "NoNewPrivileges=true"
-	}
-	return `[Unit]
-Description=` + desc + `
-` + unit + `
-[Service]
-Type=simple
-` + user + `EnvironmentFile=-` + l.EnvFile + `
-Environment=AGENT_BOOT_GUARD=external
-ExecStartPre=-/bin/sh -c '[ ! -x ` + l.Binary + `.prev ] || ` + l.Binary + `.prev boot-guard ` + l.Binary + `'
-ExecStart=` + l.Binary + ` run -config ` + l.ConfigFile + `
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=always
-RestartSec=2
-StartLimitIntervalSec=0
-KillMode=` + o.KillMode + `
-TimeoutStopSec=` + o.StopTimeout + `
-` + hardening + `
-
-[Install]
-WantedBy=` + target + `
-`
+	return b.String()
 }
+
+//go:embed agent.service.tmpl
+var unitText string
+
+var unitTemplate = template.Must(template.New("agent.service").Parse(unitText))
 
 // ensureUser — пользователь службы: нет — создаётся (системный, без входа) и
 // записывается в журнал: --purge удалит только его.
@@ -715,7 +661,7 @@ func ensureUser(ctx context.Context, s *System, l Paths, j *journal, user string
 	}
 	shell := "/bin/false"
 	for _, f := range []string{"/usr/sbin/nologin", "/sbin/nologin", "/usr/bin/nologin"} {
-		if isFile(s.p(f)) {
+		if fsutil.IsFile(s.p(f)) {
 			shell = f
 			break
 		}

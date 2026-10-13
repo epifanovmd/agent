@@ -35,7 +35,6 @@ const (
 	DefaultRequestTimeout = 30 * time.Second
 	MaxRequestTimeout     = 5 * time.Minute
 	WorkerStartTimeout    = 60 * time.Second
-	UpdateHealthTimeout   = time.Minute
 	HealthInterval        = 5 * time.Second
 	HealthMisses          = 3
 	MinWatchInterval      = time.Second

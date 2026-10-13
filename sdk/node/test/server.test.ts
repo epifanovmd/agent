@@ -9,17 +9,20 @@ import { after, afterEach, before, describe, it } from "node:test";
 
 import WebSocket from "ws";
 
+import { agentsDefaults } from "../src/server/core/options";
 import {
   type ActionRecord,
   type Agent,
-  agentsDefaults,
+  Agents,
+  AgentsError,
+  type AgentsOptions,
   type AlertEvent,
   type ConfigStatus,
   MAX_CONFIG_BYTES,
   MAX_FETCH_BODY,
   type MetricsEvent,
-  transportDefaults,
 } from "../src/server/index";
+import { transportDefaults } from "../src/server/transport/transport";
 import {
   enroll,
   FakeAgent,
@@ -722,7 +725,7 @@ describe("настройки", () => {
 });
 
 describe("наблюдение", () => {
-  it("watch: сводка зрителей, уход зрителя, истечение", async () => {
+  it("watch: сводка зрителей, продление, close", async () => {
     const s = await server();
     const c = await enroll(s.url);
     const fa = await FakeAgent.connect(s.ws, c);
@@ -750,22 +753,31 @@ describe("наблюдение", () => {
       metricsIntervalMs: 1000,
       logLevel: "debug",
     });
-    // Второй истёк — сводка снова по первому.
-    w = await fa.next("watch", () => true, 3000);
+    // Второй продлевается сам, пока открыт: срок прошёл — он ещё действует.
+    const firstUntil = w2.until;
+
+    await sleep(1200);
+    assert.ok(w2.until > firstUntil);
+    assert.equal((await s.agents.getAgent(c.agentId))?.online, true);
+    await w2.close();
+    w = await fa.next("watch", d => d.data.logLevel === "info", 3000);
     assert.deepEqual(w.data, {
       untilMs: w1.until,
       metricsIntervalMs: 5000,
       logLevel: "info",
     });
-    assert.ok(Date.now() >= w2.until);
-    await s.agents.unwatch(c.agentId, w1.id);
-    assert.deepEqual((await fa.next("watch")).data, {});
+    await w1.close();
+    assert.deepEqual((await fa.next("watch", d => !d.data.logLevel)).data, {});
     // Наблюдатель есть до подключения — watch сразу после welcome.
     await fa.close();
-    await s.agents.watch(c.agentId, { id: "ui", metricsIntervalMs: 2000 });
+    const ui = await s.agents.watch(c.agentId, {
+      id: "ui",
+      metricsIntervalMs: 2000,
+    });
     const fb = await FakeAgent.connect(s.ws, c);
 
     assert.equal((await fb.next("watch")).data.metricsIntervalMs, 2000);
+    await ui.close();
   });
 
   it("watch: ttlMs не число — срок по умолчанию", async () => {
@@ -1023,7 +1035,7 @@ describe("смена ключа", () => {
 });
 
 describe("сборки", () => {
-  it("manifest.json, сборки из манифеста, install.sh с адресом и ключом", async () => {
+  it("manifest.json и сборки из манифеста", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-release-"));
     const manifest = {
       version: "1.1.0",
@@ -1068,11 +1080,7 @@ describe("сборки", () => {
     writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest));
     writeFileSync(join(dir, "agent-linux-amd64"), "BIN");
     writeFileSync(join(dir, "secret.txt"), "нельзя");
-    writeFileSync(
-      join(dir, "install.sh"),
-      '#!/bin/sh\nDEFAULT_SERVER=""\nDEFAULT_PUBLIC_KEY=""\n',
-    );
-    const s = await server({ releasesDir: dir, publicKey: "a2V5" });
+    const s = await server({ releasesDir: dir });
     const base = `${s.url}/api/v1/agent-link`;
 
     assert.deepEqual(
@@ -1084,10 +1092,6 @@ describe("сборки", () => {
       "BIN",
     );
     assert.equal((await fetch(`${base}/releases/secret.txt`)).status, 404);
-    const sh = await (await fetch(`${base}/install.sh`)).text();
-
-    assert.match(sh, new RegExp(`DEFAULT_SERVER="${s.url}"`));
-    assert.match(sh, /DEFAULT_PUBLIC_KEY="a2V5"/);
 
     const c = await enroll(s.url);
     const fa = await FakeAgent.connect(s.ws, c);
@@ -1099,8 +1103,12 @@ describe("сборки", () => {
     });
     await fa.ackSeq(1);
     assert.deepEqual(
-      (await s.agents.updateCandidates()).map(x => [x.current, x.target]),
-      [["1.0.0", "1.1.0"]],
+      (await s.agents.updateCandidates()).agents.map(x => [
+        x.current,
+        x.target,
+        x.source,
+      ]),
+      [["1.0.0", "1.1.0", "server"]],
     );
     // Агент, который себя не обновляет (в контейнере), — не кандидат; hello хранит, как он поставлен.
     const c2 = await enroll(s.url);
@@ -1116,7 +1124,7 @@ describe("сборки", () => {
     });
 
     assert.deepEqual(
-      (await s.agents.updateCandidates()).map(x => x.agentId),
+      (await s.agents.updateCandidates()).agents.map(x => x.agentId),
       [c.agentId],
     );
     assert.equal(
@@ -1125,7 +1133,7 @@ describe("сборки", () => {
     );
     await fa2.close();
     assert.deepEqual(
-      (await s.agents.workerUpdateCandidates()).map(x => [
+      (await s.agents.updateCandidates()).workers.map(x => [
         x.worker,
         x.current,
         x.target,
@@ -1170,7 +1178,11 @@ describe("сборки", () => {
     const c = await enroll(s.url);
 
     await FakeAgent.connect(s.ws, c);
-    assert.deepEqual(await s.agents.updateCandidates(), []);
+    // Сборка сервера без file — не цель; в hello образца агент сам нашёл 1.1.0.
+    assert.deepEqual(
+      (await s.agents.updateCandidates()).agents.map(x => [x.target, x.source]),
+      [["1.1.0", "agent"]],
+    );
     await assert.rejects(s.agents.updateAgent(c.agentId), {
       code: "UPDATE_NOT_AVAILABLE",
     });
@@ -1189,6 +1201,28 @@ describe("сборки", () => {
       (await fetch(`${s.url}/api/v1/agent-link/releases/manifest.json`)).status,
       404,
     );
+  });
+});
+
+describe("опции", () => {
+  it("незнакомая опция — ошибка при создании Agents, а не молчание", () => {
+    for (const [opts, name] of [
+      [{ validateConfigs: true }, "validateConfigs"],
+      [{ validate: { config: true } }, "validate.config"],
+      [
+        { agentReleases: { url: "https://example.com/r", publicKey: "k" } },
+        "agentReleases.publicKey",
+      ],
+    ] as const) {
+      assert.throws(
+        () => new Agents(opts as unknown as AgentsOptions),
+        (e: AgentsError) =>
+          e.code === "MESSAGE_INVALID" && e.message.includes(name),
+      );
+    }
+    const ok = new Agents({ validate: { configs: true }, log: () => {} });
+
+    void ok.close();
   });
 });
 

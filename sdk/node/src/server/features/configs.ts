@@ -3,7 +3,6 @@
 import type { AlertChanges, Context } from "../core/context";
 import { codeError, invalid, revoked, valid } from "../core/errors";
 import type { Session } from "../core/session";
-import { jsonSchemaProblems } from "../lib/json-schema";
 import { recheckAlerts } from "../model/alerts";
 import {
   configStatus,
@@ -41,7 +40,7 @@ export class Configs {
     const a = await this.ctx.agent(agentId);
 
     if (a.revoked) throw revoked();
-    if (this.ctx.settings.validateConfigs) this.validate(a, worker, key, data);
+    if (this.ctx.settings.validate.configs) this.validate(a, worker, key, data);
     const reported = a.configs[worker]?.[key];
     // Версия — больше, чем уже у агента (Store мог быть сброшен).
     const rec = await this.ctx.store.setConfig(agentId, worker, key, data, {
@@ -181,22 +180,12 @@ export class Configs {
     const schema = workerManifest(publicAgent(a), worker)?.configs?.find(
       c => c.key === key,
     )?.schema;
+    const problems = this.ctx.schemaProblems(schema, data, "ключа", {
+      agentId: a.id,
+      worker,
+      key,
+    });
 
-    if (!schema) return;
-    let problems: string[];
-
-    try {
-      problems = jsonSchemaProblems(schema, data);
-    } catch (e) {
-      this.ctx.log("схема ключа из манифеста воркера не применяется", {
-        agentId: a.id,
-        worker,
-        key,
-        err: String(e),
-      });
-
-      return;
-    }
     if (problems.length)
       throw codeError(
         "CONFIG_INVALID",

@@ -5,13 +5,13 @@ package app
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/message"
+	"github.com/epifanovmd/agent/internal/worker"
 )
 
 // Частоты до первого welcome и задержка внеочередного status; переменные —
@@ -167,7 +167,7 @@ func (a *App) metricsLoop(ctx context.Context) {
 }
 
 // collect — GET /metrics всех запущенных воркеров сразу (срок —
-// lifecycle.probeTimeout воркера); ответ
+// lifecycle.health.timeout воркера); ответ
 // sysmetrics — host, остальных — workers как есть (§9).
 func (a *App) collect(ctx context.Context) (message.Metrics, bool) {
 	m := message.Metrics{CollectedAt: time.Now().UnixMilli()}
@@ -180,7 +180,7 @@ func (a *App) collect(ctx context.Context) (message.Metrics, bool) {
 		}
 		timeout := message.ProbeTimeout
 		if spec, ok := a.workers.Spec(name); ok {
-			timeout = spec.Lifecycle.ProbeTimeout.Std()
+			timeout = spec.Lifecycle.Health.Timeout.Std()
 		}
 		wg.Add(1)
 		go func() {
@@ -210,16 +210,8 @@ func (a *App) collect(ctx context.Context) (message.Metrics, bool) {
 
 // probeMetrics — GET /metrics: 2xx и JSON до 1 МБ; иначе воркера в точке нет.
 func probeMetrics(ctx context.Context, client *http.Client, timeout time.Duration) (json.RawMessage, bool) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://worker"+message.MetricsPath, nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, false
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, message.MaxMetricsBytes+1))
-	if err != nil || resp.StatusCode/100 != 2 || len(raw) > message.MaxMetricsBytes || !json.Valid(raw) {
+	status, raw, err := worker.Get(ctx, client, message.MetricsPath, timeout, message.MaxMetricsBytes)
+	if err != nil || status/100 != 2 || !json.Valid(raw) {
 		return nil, false
 	}
 	return raw, true

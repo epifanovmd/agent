@@ -25,6 +25,7 @@ import (
 	"github.com/epifanovmd/agent/internal/app"
 	"github.com/epifanovmd/agent/internal/bundle"
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/install"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/releases"
@@ -248,14 +249,9 @@ func initFile(path string, o config.TemplateOptions, force bool) error {
 	if o.Token != "" {
 		perm = 0o600
 	}
-	tmp := path + ".new"
-	if err := os.WriteFile(tmp, config.Template(o), perm); err != nil {
+	if err := fsutil.WriteFile(path, config.Template(o), perm); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	_ = os.Chmod(path, perm)
 	flagHint := ""
 	if path != config.DefaultPath() {
 		flagHint = " -config " + path
@@ -458,11 +454,8 @@ func printStatus(w io.Writer, rep statusReport, now time.Time) {
 		if e := rep.LastExit; e != nil {
 			fmt.Fprintf(w, "Последний раз завершился с ошибкой %s:\n  %s\n", when(e.At), short(e.Error))
 		}
-		switch u := rep.unit; install.ModeOf(u) {
-		case install.ModeSystemd, install.ModeUser:
+		if u := rep.unit; install.ModeOf(u) != "" {
 			fmt.Fprintf(w, "Служба: %s status %s; лог: agent logs%s\n", u.Systemctl(), u.Unit, u.Flag())
-		case install.ModeManual:
-			fmt.Fprintf(w, "Без службы: запустить — %s run; лог — agent logs%s (%s)\n", u.Binary, u.Flag(), install.ManualLog(u))
 		}
 		return
 	}
@@ -551,13 +544,8 @@ func ago(d time.Duration) string {
 	return fmt.Sprintf("%d дн назад", int(d.Hours()/24))
 }
 
-func isFile(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && !st.IsDir()
-}
-
 // logs — лог службы: journalctl -u agent[-ИМЯ] (у агента пользователя —
-// journalctl --user), без службы — файл лога (agent install запускает агента в фоне).
+// journalctl --user).
 func logs(args []string) error {
 	set := flag.NewFlagSet("logs", flag.ContinueOnError)
 	follow := set.Bool("f", false, "следить за новыми записями")
@@ -571,22 +559,14 @@ func logs(args []string) error {
 		return err
 	}
 	var argv []string
-	switch install.ModeOf(l) {
-	case install.ModeSystemd, install.ModeUser:
+	if install.ModeOf(l) != "" {
 		argv = []string{"journalctl", "-u", l.Unit, "-n", strconv.Itoa(*lines), "--no-pager"}
 		if l.Home {
 			argv = slices.Insert(argv, 1, "--user")
 		}
-	case install.ModeManual:
-		// Агент без службы пишет лог в файл (agent install запускает его в фоне).
-		argv = []string{"tail", "-n", strconv.Itoa(*lines)}
 		if *follow {
-			argv = append(argv, "-F")
+			argv = append(argv, "-f")
 		}
-		argv = append(argv, install.ManualLog(l))
-	}
-	if *follow && argv != nil && argv[0] != "tail" {
-		argv = append(argv, "-f")
 	}
 	prog := ""
 	if argv != nil {

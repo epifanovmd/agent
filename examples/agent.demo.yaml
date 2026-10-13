@@ -33,7 +33,7 @@ workers:
     # замена ждёт окончания работы до 24 ч). Здесь — короче для стенда.
     lifecycle:
       stopTimeout: 10s
-      busy: { wait: true, timeout: 10m }
+      busyTimeout: 10m
       health: { interval: 5s, timeout: 2s, failures: 3 }
     logs: { maxSize: 1MB, maxFiles: 2 }
   # Node.js, только node:http: то же, что echo.
@@ -42,13 +42,12 @@ workers:
     dir: ${DEMO_ROOT}
     lifecycle:
       stopTimeout: 10s
-  # Go: GET /info, настройка banner, метрики процесса, событие sys.started. Перезапуск агента
-  # (agent restart, обновление) его не трогает, остановка агента останавливает и его; вышел
-  # сам с кодом 0 — не перезапускается.
+  # Go: GET /info, настройка banner, метрики процесса, событие sys.started. Перезапуск и
+  # остановка агента останавливают и его; вышел сам с кодом 0 — не перезапускается.
   - name: sysinfo
     command: ["${SYSINFO_BIN}"]
     lifecycle:
-      onAgentStop: stop
+      onAgentExit: stop
       restart: on-failure
   # Go: проверка сети до целей из настройки targets, итоги — в GET /metrics.
   - name: netprobe

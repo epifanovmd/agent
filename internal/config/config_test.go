@@ -274,6 +274,25 @@ func TestCompare(t *testing.T) {
 	}
 }
 
+// Всё, что KeepRestartOnly оставляет прежним, Compare называет ключом
+// перезапуска: изменение не пропадает молча.
+func TestCompareUpdateKeys(t *testing.T) {
+	base := Defaults()
+	base.Server.URL = "https://a.example.com"
+	if err := base.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	next := base
+	next.Update.Releases = "https://releases.example.com/agent"
+	every := Duration(time.Hour)
+	next.Update.CheckInterval = &every
+	next.Server.StreamBuffer = base.Server.StreamBuffer + 1
+	d := Compare(base, next)
+	if strings.Join(d.Restart, ",") != "server.streamBuffer,update.releases,update.checkInterval" {
+		t.Fatalf("перезапуск: %v", d.Restart)
+	}
+}
+
 // release: true — каталог сборки <dataDir>/workers/<name>; имена воркеров — по
 // правилу §1; ошибки настроек воркера.
 func TestWorkerRelease(t *testing.T) {
@@ -465,16 +484,12 @@ workers:
   - name: tuned
     command: [x]
     lifecycle:
-      onAgentRestart: restart
-      onAgentStop: stop
+      onAgentExit: stop
       restart: never
       backoff: {min: 2s, max: 1m}
       startTimeout: 5s
-      busy: {wait: false, timeout: 1h}
+      busyTimeout: 0s
       health: {interval: 0s, failures: 0}
-      probeTimeout: 1s
-      configRetry: 5s
-      updateHealthyTimeout: 2m
     logs: {maxSize: 1MB, maxFiles: 0}
     routes: open
 `), 0o600)
@@ -487,16 +502,15 @@ workers:
 	if !reflect.DeepEqual(plain.Lifecycle, def) || !reflect.DeepEqual(plain.Logs, DefaultLogs()) {
 		t.Fatalf("умолчания: %+v %+v", plain.Lifecycle, plain.Logs)
 	}
-	if def.OnAgentRestart != Keep || def.OnAgentStop != Keep || def.Restart != RestartFailure || !def.BusyWait() ||
-		def.Busy.Timeout.Std() != 24*time.Hour || def.HealthInterval() != 5*time.Second || def.HealthFailures() != 3 ||
+	if def.OnAgentExit != Keep || def.Restart != RestartFailure ||
+		def.BusyWait() != 24*time.Hour || def.HealthInterval() != 5*time.Second || def.HealthFailures() != 3 ||
 		def.StartTimeout.Std() != time.Minute || def.Backoff.Max.Std() != 30*time.Second || DefaultLogs().MaxSize != 10<<20 {
 		t.Fatalf("значения по умолчанию: %+v", def)
 	}
 	l := tuned.Lifecycle
-	if l.OnAgentRestart != RestartWorker || l.OnAgentStop != StopWorker || l.Restart != RestartNever || l.BusyWait() ||
-		l.Busy.Timeout.Std() != time.Hour || l.HealthInterval() != 0 || l.HealthFailures() != 0 ||
+	if l.OnAgentExit != StopWorker || l.Restart != RestartNever || l.BusyWait() != 0 ||
+		l.HealthInterval() != 0 || l.HealthFailures() != 0 ||
 		l.Health.Timeout.Std() != 2*time.Second || l.Backoff.Min.Std() != 2*time.Second || l.StartTimeout.Std() != 5*time.Second ||
-		l.ProbeTimeout.Std() != time.Second || l.ConfigRetry.Std() != 5*time.Second || l.UpdateHealthyTimeout.Std() != 2*time.Minute ||
 		l.StopTimeout.Std() != DefaultStopTimeout || tuned.Logs.MaxSize != 1<<20 || tuned.Logs.Files() != 0 {
 		t.Fatalf("заданные: %+v %+v", l, tuned.Logs)
 	}
@@ -509,8 +523,7 @@ workers:
 		t.Fatalf("воркер из кода: %+v", coded.Lifecycle)
 	}
 	for field, src := range map[string]string{
-		"lifecycle.onAgentRestart": "lifecycle: {onAgentRestart: stop}",
-		"lifecycle.onAgentStop":    "lifecycle: {onAgentStop: restart}",
+		"lifecycle.onAgentExit":    "lifecycle: {onAgentExit: restart}",
 		"lifecycle.restart":        "lifecycle: {restart: sometimes}",
 		"lifecycle.backoff":        "lifecycle: {backoff: {min: 1m, max: 1s}}",
 		"lifecycle.health.timeout": "lifecycle: {health: {interval: 1s, timeout: 5s}}",

@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/epifanovmd/agent/internal/app"
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/install"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/releases"
@@ -148,7 +148,7 @@ func replaceBinary(ctx context.Context, exe string, keys update.Keys, rel update
 	if err := update.Download(ctx, releasesClient, "", rel.URL, next, rel.SHA256); err != nil {
 		return err
 	}
-	if err := copyBinary(exe, exe+".prev"); err != nil {
+	if _, err := fsutil.CopyFile(exe, exe+".prev", 0o755); err != nil {
 		os.Remove(next)
 		return fmt.Errorf("копия текущей версии: %w", err)
 	}
@@ -156,8 +156,7 @@ func replaceBinary(ctx context.Context, exe string, keys update.Keys, rel update
 }
 
 // upgradeService — новая версия установленной программы: как agent.update
-// (отметка для отката, если новая не выйдет на связь), затем перезапуск —
-// службы или самого агента без службы.
+// (отметка для отката, если новая не выйдет на связь), затем перезапуск службы.
 func upgradeService(ctx context.Context, exe string, l install.Paths, keys update.Keys, rel update.Release) error {
 	if runtime.GOOS != "linux" || (!l.Home && os.Geteuid() != 0) {
 		return errors.New("программа службы обновляется от root: sudo agent upgrade")
@@ -165,42 +164,13 @@ func upgradeService(ctx context.Context, exe string, l install.Paths, keys updat
 	if l.Home && os.Geteuid() == 0 {
 		return errors.New("агент пользователя обновляется без sudo — от этого пользователя: agent upgrade")
 	}
-	mode := install.ModeOf(l)
 	if err := update.Install(ctx, releasesClient, "", update.NewPaths(exe), keys, rel); err != nil {
 		return err
 	}
-	var argv []string
-	switch mode {
-	case install.ModeManual:
-		// Без службы: работающий агент перезапускается сам (SIGUSR1) уже новой версией.
-		st, err := app.Status(l.DataDir)
-		if err != nil || st.PID <= 0 {
-			fmt.Printf("Агент обновлён: %s → %s; запустите его: %s run\n", version, rel.Version, l.Binary)
-			return nil
-		}
-		if err := syscall.Kill(st.PID, syscall.SIGUSR1); err != nil {
-			return fmt.Errorf("сигнал агенту (pid %d): %w", st.PID, err)
-		}
-		fmt.Printf("Агент обновлён: %s → %s и перезапускается; не выйдет на связь — вернётся прежняя версия.\n", version, rel.Version)
-		return nil
-	default:
-		argv = append(strings.Fields(l.Systemctl()), "restart", l.Service)
-	}
+	argv := append(strings.Fields(l.Systemctl()), "restart", l.Service)
 	if out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput(); err != nil {
 		return fmt.Errorf("%s: %v: %s", strings.Join(argv, " "), err, strings.TrimSpace(string(out)))
 	}
 	fmt.Printf("Агент обновлён: %s → %s и перезапущен (служба %s); не выйдет на связь — вернётся прежняя версия.\n", version, rel.Version, l.Unit)
 	return nil
-}
-
-func copyBinary(src, dst string) error {
-	raw, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	tmp := dst + ".new"
-	if err := os.WriteFile(tmp, raw, 0o755); err != nil {
-		return err
-	}
-	return os.Rename(tmp, dst)
 }

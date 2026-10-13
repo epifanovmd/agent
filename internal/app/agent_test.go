@@ -677,3 +677,29 @@ func TestAgentUpdateRefusedWithoutConfig(t *testing.T) {
 		t.Fatalf("обновление не начиналось — отметки быть не должно: %v", err)
 	}
 }
+
+// Неизвестное поле файла настроек — предупреждение в журнале агента (уходит и
+// серверу) при перечитывании: агент его не читает.
+func TestReloadWarnsUnknownFields(t *testing.T) {
+	path := t.TempDir() + "/agent.yaml"
+	if err := os.WriteFile(path, []byte("server:\n  url: http://127.0.0.1:1\nworkers:\n  - name: w\n    command: [x]\n    lifecycle: {onAgentStp: stop}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Server.URL = "http://127.0.0.1:1"
+	cfg.DataDir = t.TempDir()
+	a, err := New(cfg, "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if err := a.ReloadFile(path); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range a.journal.Tail(message.LogSourceAgent, 50) {
+		if e.Level == message.LogWarn && strings.Contains(e.Msg, "«onAgentStp»") {
+			return
+		}
+	}
+	t.Fatalf("нет предупреждения: %+v", a.journal.Tail(message.LogSourceAgent, 50))
+}

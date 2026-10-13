@@ -1,16 +1,16 @@
 // Манифест воркера (§12): приём в hello и status, supports, проверка настроек по JSON Schema
-// ключа (validateConfigs).
+// ключа (validate.configs).
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 
 import {
   type Agent,
   AgentsError,
-  matchRoute,
   supports,
   type WorkerManifest,
 } from "../src/server/index";
 import { jsonSchemaProblems } from "../src/server/lib/json-schema";
+import { matchRoute } from "../src/server/model/manifest";
 import {
   enroll,
   FakeAgent,
@@ -281,7 +281,7 @@ describe("validateConfigs", () => {
   };
 
   it("неверное значение отклонено до отправки агенту; верное — отправлено", async () => {
-    const s = await server({ validateConfigs: true });
+    const s = await server({ validate: { configs: true } });
     const { c, fa } = await connect(s, manifest);
 
     await reject(
@@ -311,7 +311,7 @@ describe("validateConfigs", () => {
   it("схему нельзя применить — без проверки, запись в журнал", async () => {
     const logs: string[] = [];
     const s = await server({
-      validateConfigs: true,
+      validate: { configs: true },
       log: msg => logs.push(msg),
     });
     const { c } = await connect(s, {

@@ -59,7 +59,7 @@ export const sendJSON = (
 };
 
 /**
- * Адрес сервера, по которому клиент до него дошёл (install.sh): Host и TLS сокета;
+ * Адрес сервера, по которому клиент до него дошёл : Host и TLS сокета;
  * trustProxy (за доверенным прокси) — X-Forwarded-Host и X-Forwarded-Proto, если они есть.
  */
 export const baseUrl = (req: IncomingMessage, trustProxy = false): string => {

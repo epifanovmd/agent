@@ -2,13 +2,13 @@
 // небольшой HTTP API над ним (examples/API.md).
 //
 //   PORT=8080 ENROLL_TOKEN=demo-token npm start   (node --import tsx src/main.ts)
-//   RELEASES_DIR=dist/<VERSION> — каталог сборок (обновления, install.sh); с AGENT_RELEASES_* —
-//     воркеры проекта;
+//   RELEASES_DIR=dist/<VERSION> — каталог сборок (обновления; его install.sh — GET /install.sh);
+//     с AGENT_RELEASES_* — воркеры проекта;
 //   AGENT_RELEASES_GITHUB=owner/repo — агент и его воркеры из релизов GitHub (AGENT_RELEASES_RANGE —
 //     диапазон версий, AGENT_RELEASES_TOKEN — токен API) или AGENT_RELEASES_URL — адрес каталога сборок;
 //     AGENT_RELEASES_PROXY=1 — сборки узлам через сервер потоком;
-//   PUBLIC_KEY — ключ проверки подписи сборок (base64), вписывается в install.sh; UPDATE_PUBLIC_KEYS — ещё
-//     ключи через запятую;
+//   PUBLIC_KEY — ключ проверки подписи сборок (base64) и UPDATE_PUBLIC_KEYS — ещё ключи через
+//     запятую: флагами --update-key в команде установки;
 //   PUBLIC_URL — адрес сервера для команды установки (по умолчанию — из запроса);
 //   VALIDATE_CONFIGS=1 — проверять настройки по схеме из манифеста воркера до отправки агенту;
 //   VALIDATE_REQUESTS=1 — проверять тело запросов к воркерам и data запросов воркеров по схемам;
@@ -66,18 +66,14 @@ const agents = new Agents({
   metricsIntervalMs: interval(env.METRICS_INTERVAL_MS),
   releasesDir: env.RELEASES_DIR ? resolve(env.RELEASES_DIR) : undefined,
   agentReleases: agentReleases(),
-  publicKey: env.PUBLIC_KEY || undefined,
-  updatePublicKeys: (env.UPDATE_PUBLIC_KEYS ?? "")
-    .split(",")
-    .map(k => k.trim())
-    .filter(Boolean),
-  baseUrl: env.PUBLIC_URL || undefined,
-  validateConfigs: env.VALIDATE_CONFIGS === "1",
-  validateRequests: env.VALIDATE_REQUESTS === "1",
-  validateEvents:
-    env.VALIDATE_EVENTS === "log" || env.VALIDATE_EVENTS === "reject"
-      ? env.VALIDATE_EVENTS
-      : "off",
+  validate: {
+    configs: env.VALIDATE_CONFIGS === "1",
+    requests: env.VALIDATE_REQUESTS === "1",
+    events:
+      env.VALIDATE_EVENTS === "log" || env.VALIDATE_EVENTS === "reject"
+        ? env.VALIDATE_EVENTS
+        : "off",
+  },
   log,
 });
 
@@ -86,6 +82,13 @@ const server = createApp(agents, {
   history,
   enrollToken,
   publicUrl: env.PUBLIC_URL || undefined,
+  releasesDir: env.RELEASES_DIR ? resolve(env.RELEASES_DIR) : undefined,
+  updateKeys: [
+    env.PUBLIC_KEY ?? "",
+    ...(env.UPDATE_PUBLIC_KEYS ?? "").split(","),
+  ]
+    .map(k => k.trim())
+    .filter(Boolean),
 });
 
 server.listen(port, () =>

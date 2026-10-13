@@ -209,9 +209,9 @@ func main() {
 
 - узнать, что умеет воркер, — `agents.capabilities(agentId, worker)` и помощник `supports`
   ([sdk/README.md](../README.md#манифест-воркера));
-- проверить значение по схеме до отправки — опции `validateConfigs`
-  ([configs.md](configs.md#проверка-по-схеме)), `validateJobs`, `validateRequests`
-  ([fetch.md](fetch.md#проверка-тела-по-схеме)) и `validateEvents`
+- проверить значение по схеме до отправки — опция `validate`: `configs`
+  ([configs.md](configs.md#проверка-по-схеме)), `jobs`, `requests`
+  ([fetch.md](fetch.md#проверка-тела-по-схеме)) и `events`
   ([observe.md](observe.md#проверка-data-по-схеме)).
 
 ```json
@@ -295,8 +295,8 @@ func main() {
     `CONFIG_KEY_UNKNOWN` ([configs.md](configs.md#статус-применения)); агент проверит ключ снова,
     когда воркер зарегистрируется в следующий раз (например, после обновления);
   - запрос к бэкенду, типа которого нет в `requests`, — `400 REQUEST_UNDECLARED`.
-- **Что агент не проверяет.** Значения по схемам — это делает бэкенд (опции `validateConfigs`,
-  `validateJobs`, `validateRequests`, `validateEvents`), агент сверяет только имена, типы и пути.
+- **Что агент не проверяет.** Значения по схемам — это делает бэкенд (опция `validate`:
+  `configs`, `jobs`, `requests`, `events`), агент сверяет только имена, типы и пути.
 - **Проверку маршрутов можно выключить** для одного воркера — `routes: open` в его настройках в
   `agent.yaml` ([ARCHITECTURE.md](../../docs/ARCHITECTURE.md#настройки)): агент пропускает любой
   путь, кроме служебных, и не сверяет тип задачи. Это для воркера, который ещё не описал свои
@@ -439,7 +439,7 @@ const agents = new Agents({
 Запрос приходит в процесс бэкенда, с которым агент на связи, и обрабатывается там (с несколькими
 процессами — без пересылки). Ошибка обработчика уходит воркеру: у `AgentsError` — её код и текст,
 у другой — `REQUEST_FAILED`; ответ больше 4 МБ — `BODY_TOO_LARGE`. `req.signal` прерывается, когда
-истёк срок или оборвалась связь. С опцией `validateRequests` бэкенд сам отклоняет `data` не по
+истёк срок или оборвалась связь. С опцией `validate.requests` бэкенд сам отклоняет `data` не по
 `requests[].schema` — `REQUEST_INVALID`, обработчик не вызывается.
 
 ## Python
@@ -765,19 +765,16 @@ workers:
     env: { LOG_LEVEL: info }
     user: example # по умолчанию — пользователь агента; другой — только у агента от root
     lifecycle: # всё — необязательно; здесь — значения по умолчанию
-      onAgentRestart: keep # перезапуск агента воркер не трогает
-      onAgentStop: keep # остановка агента — тоже (stop — остановить вместе с ним)
+      onAgentExit: keep # перезапуск и остановка агента воркер не трогают (stop — остановить вместе с ним)
       restart: on-failure # always | on-failure | never — после выхода процесса
       backoff: { min: 1s, max: 30s } # пауза перед перезапуском после падения
       maxRestarts: 0 # падений подряд не больше (0 — без предела)
-      startTimeout: 60s # сокет должен начать отвечать
+      startTimeout: 60s # сокет должен начать отвечать; новая сборка — ответить ok: true
       stopTimeout: 30s
       keepChildren: false # true — дочерние процессы переживают остановку воркера
-      busy: { wait: true, timeout: 24h }
-      health: { interval: 5s, timeout: 2s, failures: 3 } # зависание — перезапуск через 15–20 с
-      probeTimeout: 2s # срок GET /manifest, GET /metrics и регистрации
-      configRetry: 25s # повтор неприменённых настроек
-      updateHealthyTimeout: 1m # новая сборка должна ответить ok: true
+      busyTimeout: 24h # замена ждёт, пока GET /health отвечает busy: true; 0s — не ждать
+      # зависание — перезапуск через 15–20 с; timeout — ещё срок GET /manifest, GET /metrics и регистрации
+      health: { interval: 5s, timeout: 2s, failures: 3 }
     logs: { maxSize: 10MB, maxFiles: 1 } # файлы вывода в <dataDir>/logs
   - name: report
     release: true # сборка — с сервера (releases.md)
@@ -865,11 +862,15 @@ const job = await agents.runJob(agentId, "report", {
 // задача идёт: её итог придёт событием job.done / job.failed (onEvent), состояние —
 await agents.jobStatus(agentId, "report", job.id!); // { id, state, progress?, result?, error? }
 await agents.cancelJob(agentId, "report", job.id!);
+
+// Не ждать итога: долгая задача (202) — сразу { jobId, id, state: "running" }.
+const started = await agents.runJob(agentId, "report", { type: "example.report", data, wait: false });
 ```
 
 - `runJob` проверяет тип по `manifest.jobs` воркера (нет — `JOB_UNKNOWN`), с опцией
-  `validateJobs` — и `data` по схеме типа (`JOB_INVALID`); отказ воркера — `JOB_REJECTED` с его
-  статусом и текстом.
+  `validate.jobs` — и `data` по схеме типа (`JOB_INVALID`); отказ воркера — `JOB_REJECTED` с его
+  статусом и текстом. Повторить ли вызов — `AgentsError.retryable`: `JOB_REJECTED` со статусом
+  5xx, 408, 409 или 429 — да (с тем же `jobId` повтор не начнёт вторую задачу).
 - Итог долгой задачи `runJob` ждёт по событиям `job.*` в копии бэкенда, где агент на связи (из
   другой копии вызов пересылается туда — опция `relay`). События всё равно проходят через
   `onEvent` и событие `event`: обработчик бэкенда видит каждое и сохраняет итог, даже если
@@ -901,7 +902,7 @@ netprobe ([examples/workers](../../examples/workers)).
 ### Замена занятого воркера
 
 `worker.restart`, `worker.update` и изменение настроек воркера в `agent.yaml` ждут окончания
-работы (не дольше `lifecycle.busy.timeout`, по умолчанию 24 ч), в `status` — `pending: "restart"`
+работы (не дольше `lifecycle.busyTimeout`, по умолчанию 24 ч), в `status` — `pending: "restart"`
 или `"update"`. Бэкенд не ждёт вместе с агентом:
 
 ```ts

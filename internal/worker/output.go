@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/logx"
 )
 
@@ -153,7 +154,7 @@ func (f *tailFile) rotate(keep int) {
 		for i := keep - 1; i >= 1; i-- {
 			_ = os.Rename(fmt.Sprintf("%s.%d", f.path, i), fmt.Sprintf("%s.%d", f.path, i+1))
 		}
-		size, err := copyFile(f.path, f.path+".1")
+		size, err := fsutil.CopyFile(f.path, f.path+".1", 0o600)
 		_ = os.Truncate(f.path, 0)
 		if err == nil {
 			// Дописанное между чтением и копированием — из копии.
@@ -163,28 +164,6 @@ func (f *tailFile) rotate(keep int) {
 		_ = os.Truncate(f.path, 0)
 	}
 	f.offset = 0
-}
-
-// copyFile — копия src в dst; итог — сколько байт скопировано.
-func copyFile(src, dst string) (int64, error) {
-	in, err := os.Open(src)
-	if err != nil {
-		return 0, err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return 0, err
-	}
-	n, err := io.Copy(out, in)
-	if err != nil {
-		out.Close()
-		return 0, err
-	}
-	if err := out.Close(); err != nil {
-		return 0, err
-	}
-	return n, os.Rename(dst+".tmp", dst)
 }
 
 // close — дочитать файлы и перестать читать; итог — места, с которых

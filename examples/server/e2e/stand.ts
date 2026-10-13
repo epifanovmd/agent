@@ -35,7 +35,10 @@ import { createApp } from "../src/app";
 import { History } from "../src/history";
 import { onWorkerRequest } from "../src/requests";
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+export const ROOT = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../..",
+);
 
 export const BIN = resolve(process.env.E2E_BIN ?? join(ROOT, ".dev/e2e"));
 const PLATFORM = `${platform()}-${arch() === "x64" ? "amd64" : arch()}`;
@@ -207,6 +210,11 @@ export class Stand {
     this.server = createApp(this.agents, {
       history: this.history,
       enrollToken: TOKEN,
+      releasesDir: this.opts.releasesDir,
+      updateKeys: [
+        ...(this.opts.updateKey ? [this.opts.updateKey] : []),
+        ...(this.opts.updateKeys ?? []),
+      ],
     });
     await new Promise<void>((ok, fail) => {
       this.server.once("error", fail);
@@ -438,7 +446,7 @@ export class Stand {
   };
 
   /**
-   * Перезапустить процесс агента: SIGTERM (воркеры работают дальше — lifecycle.onAgentStop:
+   * Перезапустить процесс агента: SIGTERM (воркеры работают дальше — lifecycle.onAgentExit:
    * keep), затем запуск — новый агент подхватывает воркеры.
    */
   restartAgent = async (): Promise<void> => {

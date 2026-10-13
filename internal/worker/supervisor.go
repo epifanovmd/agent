@@ -55,10 +55,10 @@ type Exit int32
 const (
 	// ExitShutdown — остановить все воркеры (по умолчанию).
 	ExitShutdown Exit = iota
-	// ExitRestart — агент перезапускается: воркеры с
-	// lifecycle.onAgentRestart: keep работают дальше.
+	// ExitRestart — агент перезапускается: воркеры с lifecycle.onAgentExit:
+	// keep работают дальше.
 	ExitRestart
-	// ExitStop — агент останавливается: воркеры с lifecycle.onAgentStop:
+	// ExitStop — агент останавливается: воркеры с lifecycle.onAgentExit:
 	// keep работают дальше.
 	ExitStop
 )
@@ -515,7 +515,7 @@ func (w *Worker) replace(ctx context.Context, swap func() error, kind string, fo
 }
 
 // waitIdle — плановая замена ждёт, пока воркер отвечает busy: true на
-// GET /health (не дольше busy.timeout). true — ждать не нужно и заменять
+// GET /health (не дольше lifecycle.busyTimeout). true — ждать не нужно и заменять
 // тоже: это перезапуск, а воркер за время ожидания уже запущен заново.
 func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 	w.mu.Lock()
@@ -538,7 +538,7 @@ func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 	}()
 	for {
 		life := w.life()
-		if !life.BusyWait() {
+		if life.BusyWait() <= 0 {
 			return restarted()
 		}
 		client, err := w.sup.Client(w.name)
@@ -554,15 +554,15 @@ func (w *Worker) waitIdle(ctx context.Context, kind string) bool {
 		}
 		w.setHealth(h)
 		if deadline.IsZero() {
-			deadline = time.Now().Add(life.Busy.Timeout.Std())
+			deadline = time.Now().Add(life.BusyWait())
 			w.mu.Lock()
 			w.waiting[kind]++
 			w.mu.Unlock()
 			w.opts().OnChange()
-			log.Info("воркер занят — замена отложена до окончания работы", "busyTimeout", life.Busy.Timeout.Std(), "message", h.Message)
+			log.Info("воркер занят — замена отложена до окончания работы", "busyTimeout", life.BusyWait(), "message", h.Message)
 			notifyDeferred(ctx, kind)
 		} else if time.Now().After(deadline) {
-			log.Warn("воркер занят дольше busy.timeout — замена", "busyTimeout", life.Busy.Timeout.Std())
+			log.Warn("воркер занят дольше busyTimeout — замена", "busyTimeout", life.BusyWait())
 			return false
 		}
 		select {
@@ -612,7 +612,7 @@ func (w *Worker) settle() {
 }
 
 // keepOnExit — агент уходит, а воркер работает дальше (SetExit,
-// lifecycle.onAgentRestart / onAgentStop); встроенный и удалённый из
+// lifecycle.onAgentExit); встроенный и удалённый из
 // настроек — никогда.
 func (w *Worker) keepOnExit() bool {
 	w.mu.Lock()
@@ -621,10 +621,8 @@ func (w *Worker) keepOnExit() bool {
 		return false
 	}
 	switch Exit(w.sup.exit.Load()) {
-	case ExitRestart:
-		return w.spec.Lifecycle.OnAgentRestart == config.Keep
-	case ExitStop:
-		return w.spec.Lifecycle.OnAgentStop == config.Keep
+	case ExitRestart, ExitStop:
+		return w.spec.Lifecycle.OnAgentExit == config.Keep
 	}
 	return false
 }
@@ -919,7 +917,7 @@ func (w *Worker) setHealth(h *message.Health) {
 // корректны — state: running, иначе — invalid с причиной. Манифест
 // обновляется при каждой проверке. true — зарегистрирован.
 func (w *Worker) register(ctx context.Context, p *process) bool {
-	m, reason := probeRegistration(ctx, p.client, w.life().ProbeTimeout.Std())
+	m, reason := probeRegistration(ctx, p.client, w.life().Health.Timeout.Std())
 	if ctx.Err() != nil {
 		return false
 	}
@@ -983,7 +981,7 @@ func (w *Worker) registered(adopted bool) {
 // зарегистрирован).
 func probeRegistration(ctx context.Context, client *http.Client, timeout time.Duration) (*message.WorkerManifest, string) {
 	var problems []string
-	status, raw, err := probe(ctx, client, message.HealthPath, timeout, message.MaxHealthBytes)
+	status, raw, err := Get(ctx, client, message.HealthPath, timeout, message.MaxHealthBytes)
 	switch {
 	case err != nil:
 		problems = append(problems, err.Error())
@@ -998,7 +996,7 @@ func probeRegistration(ctx context.Context, client *http.Client, timeout time.Du
 		}
 	}
 	var m *message.WorkerManifest
-	status, raw, err = probe(ctx, client, message.WorkerManifestPath, timeout, message.MaxManifestBytes)
+	status, raw, err = Get(ctx, client, message.WorkerManifestPath, timeout, message.MaxManifestBytes)
 	switch {
 	case err != nil:
 		problems = append(problems, err.Error())
@@ -1012,50 +1010,43 @@ func probeRegistration(ctx context.Context, client *http.Client, timeout time.Du
 	return m, strings.Join(problems, "; ")
 }
 
-// probe — GET path у воркера: код ответа и тело (не больше limit); нет
-// ответа или тело больше limit — ошибка.
-func probe(ctx context.Context, client *http.Client, path string, timeout time.Duration, limit int) (int, []byte, error) {
+// Get — GET path у воркера: код ответа и тело (не больше limit); нет ответа
+// — ошибка errNoResponse, тело больше limit — errTooLarge.
+func Get(ctx context.Context, client *http.Client, path string, timeout time.Duration, limit int) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://worker"+path, nil)
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("GET %s: нет ответа за %s: %w", path, timeout, err)
+		return 0, nil, fmt.Errorf("GET %s: %w за %s: %v", path, errNoResponse, timeout, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
-		return 0, nil, fmt.Errorf("GET %s: %w", path, err)
+		return 0, nil, fmt.Errorf("GET %s: %w: %v", path, errNoResponse, err)
 	}
 	if len(raw) > limit {
-		return 0, nil, fmt.Errorf("GET %s: ответ больше %d байт", path, limit)
+		return resp.StatusCode, nil, fmt.Errorf("GET %s: %w %d байт", path, errTooLarge, limit)
 	}
 	return resp.StatusCode, raw, nil
 }
 
+// errTooLarge — ответ воркера больше предела.
+var errTooLarge = errors.New("ответ больше")
+
 // probeHealth — GET /health (§9): nil, nil — не поддерживается (404);
 // не-2xx или неверное тело — ok: false; нет ответа — errNoResponse.
 func probeHealth(ctx context.Context, client *http.Client, timeout time.Duration) (*message.Health, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://worker"+message.HealthPath, nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errNoResponse, err)
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, message.MaxHealthBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errNoResponse, err)
-	}
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	if resp.StatusCode/100 != 2 {
-		return &message.Health{OK: false, Message: fmt.Sprintf("GET /health: HTTP %d", resp.StatusCode)}, nil
-	}
+	status, raw, err := Get(ctx, client, message.HealthPath, timeout, message.MaxHealthBytes)
 	var h message.Health
-	if len(raw) > message.MaxHealthBytes || json.Unmarshal(raw, &h) != nil {
+	switch {
+	case errors.Is(err, errNoResponse):
+		return nil, err
+	case status == http.StatusNotFound:
+		return nil, nil
+	case status/100 != 2:
+		return &message.Health{OK: false, Message: fmt.Sprintf("GET /health: HTTP %d", status)}, nil
+	case err != nil || json.Unmarshal(raw, &h) != nil:
 		return &message.Health{OK: false, Message: "GET /health: неверное тело ответа"}, nil
 	}
 	return &h, nil

@@ -34,7 +34,7 @@ import { Agents } from "agent-sdk/server";
 const agents = new Agents({ enrollToken: process.env.AGENT_ENROLL_TOKEN });
 
 const server = createServer(async (req, res) => {
-  if (await agents.handle(req, res)) return; // регистрация, сборки, install.sh
+  if (await agents.handle(req, res)) return; // регистрация, сборки
   res.writeHead(404).end();
 });
 agents.attach(server); // WebSocket агентов

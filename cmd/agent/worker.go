@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/scaffold"
 )
 
@@ -79,7 +80,7 @@ func workerNew(args []string) error {
 	}
 	// Воркер дописывается в общий agent.yaml (а не в файл окружения), если он есть.
 	target := filepath.Join(root, config.FileName)
-	if !isFile(target) {
+	if !fsutil.IsFile(target) {
 		target = cfgPath
 	}
 	created, added, err := scaffold.NewWorker(scaffold.WorkerOptions{Root: root, Config: target, Name: name, Lang: *lang, Force: *force})

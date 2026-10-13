@@ -88,7 +88,7 @@ func TestOutputFiles(t *testing.T) {
 	eventually(t, "все строки в журнале", func() bool { return h.journalHas("echo", strings.Repeat("x", 100)+"39") })
 }
 
-// Агент перезапускается (ExitRestart, onAgentRestart: keep): воркер
+// Агент перезапускается (ExitRestart, onAgentExit: keep): воркер
 // работает дальше; следующий агент подхватывает тот же процесс с тем же
 // токеном, читает его вывод (и написанное, пока агента не было), следит за
 // ним; остановка агента без SetExit останавливает воркер.
@@ -140,8 +140,8 @@ func TestAdoptAfterAgentRestart(t *testing.T) {
 	}
 }
 
-// onAgentRestart: restart и onAgentStop: stop — воркер останавливается
-// вместе с агентом; onAgentStop: keep — работает дальше.
+// onAgentExit: stop — воркер останавливается вместе с агентом (перезапуск
+// и остановка); keep — работает дальше.
 func TestExitPolicies(t *testing.T) {
 	for _, c := range []struct {
 		name  string
@@ -150,9 +150,9 @@ func TestExitPolicies(t *testing.T) {
 		alive bool
 	}{
 		{"restart-keep", ExitRestart, func(*config.Lifecycle) {}, true},
-		{"restart-restart", ExitRestart, func(l *config.Lifecycle) { l.OnAgentRestart = config.RestartWorker }, false},
+		{"restart-stop", ExitRestart, func(l *config.Lifecycle) { l.OnAgentExit = config.StopWorker }, false},
 		{"stop-keep", ExitStop, func(*config.Lifecycle) {}, true},
-		{"stop-stop", ExitStop, func(l *config.Lifecycle) { l.OnAgentStop = config.StopWorker }, false},
+		{"stop-stop", ExitStop, func(l *config.Lifecycle) { l.OnAgentExit = config.StopWorker }, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w := spec("echo", "ok", "")
@@ -221,7 +221,7 @@ func restartDeferred(h *harness, name string, force bool) (chan error, chan stri
 }
 
 // busy: замена ждёт, пока воркер занят (status pending: restart), и идёт,
-// когда он освободился; force — сразу; busy.timeout — предел ожидания.
+// когда он освободился; force — сразу; busyTimeout — предел ожидания.
 func TestBusyDefersReplace(t *testing.T) {
 	dir := t.TempDir()
 	busy := filepath.Join(dir, "busy")
@@ -269,16 +269,17 @@ func TestBusyDefersReplace(t *testing.T) {
 		t.Fatal("force не откладывается; об отсрочке сообщается один раз")
 	}
 
-	// busy.timeout — дольше не ждать.
+	// busyTimeout — дольше не ждать.
 	next := w
 	next.Lifecycle = life()
-	next.Lifecycle.Busy.Timeout = config.Duration(300 * time.Millisecond)
+	busyFor := config.Duration(300 * time.Millisecond)
+	next.Lifecycle.BusyTimeout = &busyFor
 	h.sup.Apply([]config.Worker{next}) // меняется только lifecycle — без замены
 	eventually(t, "занят", func() bool { st := h.status("echo"); return st.Health != nil && st.Health.Busy })
 	pid = h.pid(t, "echo")
 	began := time.Now()
 	if err := <-restartAsync(h, "echo", false); err != nil || h.pid(t, "echo") == pid || time.Since(began) < 300*time.Millisecond {
-		t.Fatalf("busy.timeout: %v %v", err, time.Since(began))
+		t.Fatalf("busyTimeout: %v %v", err, time.Since(began))
 	}
 }
 

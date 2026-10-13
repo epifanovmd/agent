@@ -20,6 +20,8 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+
+	"github.com/epifanovmd/agent/internal/fsutil"
 )
 
 // MaxBootAttempts — запусков новой версии без связи до отката.
@@ -158,7 +160,7 @@ func Install(ctx context.Context, client *http.Client, auth string, p Paths, key
 	if err := Download(ctx, client, auth, rel.URL, next, rel.SHA256); err != nil {
 		return err
 	}
-	if err := copyFile(p.Binary, p.Binary+".prev"); err != nil {
+	if _, err := fsutil.CopyFile(p.Binary, p.Binary+".prev", 0o755); err != nil {
 		os.Remove(next)
 		return fmt.Errorf("update: копия текущей версии: %w", err)
 	}
@@ -252,7 +254,7 @@ func Guard(p Paths) (bool, error) {
 		_ = os.Remove(p.Marker)
 		return false, nil
 	}
-	if err := copyFile(prev, p.Binary+".rollback"); err != nil {
+	if _, err := fsutil.CopyFile(prev, p.Binary+".rollback", 0o755); err != nil {
 		return false, fmt.Errorf("update: откат: %w", err)
 	}
 	if err := os.Rename(p.Binary+".rollback", p.Binary); err != nil {
@@ -297,21 +299,4 @@ func readMarker(path string) (*marker, error) {
 func writeMarker(path string, m marker) error {
 	raw, _ := json.Marshal(m)
 	return os.WriteFile(path, raw, 0o600)
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
 }

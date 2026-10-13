@@ -1,13 +1,12 @@
 // Запросы к воркерам через агента (§7): fetch → fetch.head, fetch.chunk, fetch.end; отмена и
-// срок — fetch.cancel; тело — по схеме маршрута из манифеста (validateRequests).
+// срок — fetch.cancel; тело — по схеме маршрута из манифеста (validate.requests).
 import { z } from "zod";
 
 import type { Context } from "../core/context";
 import { AgentsError, codeError, valid } from "../core/errors";
 import { agentsDefaults } from "../core/options";
 import type { PendingFetch, Session } from "../core/session";
-import { jsonSchemaProblems } from "../lib/json-schema";
-import { bounded } from "../lib/util";
+import { bounded, NULL_BODY } from "../lib/util";
 import { findRoute, workerManifest } from "../model/manifest";
 import { publicAgent } from "../model/public-agent";
 import { parse, parseFetchReply } from "../protocol/checks";
@@ -41,8 +40,15 @@ const targetSchema = z.object({
 
 /** Служебные пути воркера: их вызывает только агент. */
 const FORBIDDEN = /^\/(config(\/.*)?|metrics|health|cleanup)$/;
-/** Статусы без тела. */
-const NULL_BODY = new Set([101, 103, 204, 205, 304]);
+
+/** Запрос к воркеру от имени actor (в этом процессе или с пересылкой). */
+export type Fetcher = (
+  actor: string,
+  agentId: string,
+  worker: string,
+  path: string,
+  init: FetchInit,
+) => Promise<Response>;
 
 export class Tunnel {
   private readonly ctx: Context;
@@ -63,7 +69,7 @@ export class Tunnel {
     if (init.signal?.aborted) throw codeError("CANCELLED", "запрос отменён");
     const ss = await this.ctx.localSession(agentId);
 
-    if (this.ctx.settings.validateRequests)
+    if (this.ctx.settings.validate.requests)
       await this.validate(
         agentId,
         worker,
@@ -104,20 +110,12 @@ export class Tunnel {
     } catch {
       throw codeError("REQUEST_INVALID", `${what}: тело — не JSON`);
     }
-    let problems: string[];
+    const problems = this.ctx.schemaProblems(schema, value, "тела маршрута", {
+      agentId,
+      worker,
+      path,
+    });
 
-    try {
-      problems = jsonSchemaProblems(schema, value);
-    } catch (e) {
-      this.ctx.log("схема тела маршрута из манифеста воркера не применяется", {
-        agentId,
-        worker,
-        path,
-        err: String(e),
-      });
-
-      return;
-    }
     if (problems.length)
       throw codeError("REQUEST_INVALID", `${what}: ${problems.join("; ")}`);
   }

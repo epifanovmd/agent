@@ -29,7 +29,6 @@ const Usage = `agent install — поставить агента на Linux: с�
 
   sudo agent install --server https://api.example.com --token <токен> [флаги]   служба systemd
   agent install --rootless --server … --token …     без root: ~/.agent, служба systemd --user
-                                                     (её нет — в фоне, автозапуск из crontab)
 
 Из папки агента или распакованного архива agent pack — по её настройкам:
 

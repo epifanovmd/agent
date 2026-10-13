@@ -16,8 +16,6 @@ export interface RemoteRelease {
   /** Источник: `github:owner/repo` или база сборок. */
   from: string;
   manifest: ReleaseManifest;
-  /** install.sh из источника; нет в источнике — undefined. */
-  installScript?: string;
   /** Когда проверен источник, мс. */
   checkedAt: number;
 }
@@ -129,10 +127,6 @@ export class AgentReleases {
 
       if (!parsed.ok) throw new Error(parsed.error);
       const manifest = absolute(parsed.value, where);
-      const script = where.fileUrl("install.sh");
-      const installScript = script
-        ? await this.text(script).catch(() => undefined)
-        : undefined;
       const prev = this.current;
 
       if (this.closed) return prev;
@@ -140,7 +134,6 @@ export class AgentReleases {
         version: manifest.version,
         from: this.from,
         manifest,
-        installScript: installScript ?? prev?.installScript,
         checkedAt: Date.now(),
       };
       if (prev?.version !== manifest.version)
@@ -236,10 +229,6 @@ export class AgentReleases {
 
   private async json(url: string, api: boolean): Promise<unknown> {
     return (await this.get(url, api)).json();
-  }
-
-  private async text(url: string): Promise<string> {
-    return (await this.get(url, false)).text();
   }
 
   /** Скачать сборку (раздача через бэкенд потоком, agentReleases.proxy). */

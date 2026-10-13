@@ -7,10 +7,6 @@ export const ENROLL_PATH = "/api/v1/agent-link/enroll";
 export const WS_CHANNEL = "agent.v2";
 /** Раздача сборок (§11): manifest.json и сборки. */
 export const RELEASES_PATH = "/api/v1/agent-link/releases";
-/** Установщик агента: адрес сервера и ключ проверки подставлены. */
-export const INSTALL_PATH = "/api/v1/agent-link/install.sh";
-/** Архивы папки агента проекта (agent pack): install.sh и linux-<arch>.tar.gz. */
-export const BUNDLE_PATH = "/api/v1/agent-link/bundle";
 
 const KB = 1024;
 const MB = 1024 * KB;

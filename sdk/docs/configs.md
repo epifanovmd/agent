@@ -33,13 +33,13 @@ await agents.by("admin@example.com").setConfig(agentId, "report", "main", { inte
 до записи в Store и отправки агенту:
 
 ```ts
-const agents = new Agents({ enrollToken, validateConfigs: true });
+const agents = new Agents({ enrollToken, validate: { configs: true } });
 
 await agents.setConfig(agentId, "echo", "settings", { prefix: 5, extra: 1 });
 // AgentsError CONFIG_INVALID (400): "echo/settings: prefix: ожидается строка; extra: лишнее поле"
 ```
 
-- Опция `validateConfigs` по умолчанию выключена: значение проверяет только воркер (отказ
+- Опция `validate.configs` по умолчанию выключена: значение проверяет только воркер (отказ
   придёт как `CONFIG_REJECTED`, см. ниже). Агент значение по схеме не проверяет — он смотрит
   только, есть ли ключ в манифесте ([ниже](#как-доходит-до-воркера)).
 - Схема берётся из манифеста воркера в последнем `status` агента (или в `hello`). Нет манифеста или у ключа нет

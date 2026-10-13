@@ -6,6 +6,7 @@ import type { Duplex } from "node:stream";
 import { type WebSocket, WebSocketServer } from "ws";
 
 import { AgentsError } from "../core/errors";
+import type { Settings } from "../core/options";
 import { Session } from "../core/session";
 import type { AgentRecord } from "../model/types";
 import {
@@ -18,7 +19,6 @@ import {
   WS_CHANNEL,
 } from "../protocol/messages";
 import { envelopeSchema } from "../protocol/schemas";
-import { type BundleSource, serveBundle } from "./bundle";
 import { baseUrl, clientAddress, readJSON, sendJSON } from "./http";
 import { type ReleaseSource, serveRelease } from "./releases";
 
@@ -31,8 +31,8 @@ export const transportDefaults = {
 const MISSED_PONGS = 2;
 
 /** Что транспорт передаёт дальше. */
-export interface TransportHost extends ReleaseSource, BundleSource {
-  readonly settings: ReleaseSource["settings"] & BundleSource["settings"];
+export interface TransportHost extends ReleaseSource {
+  readonly settings: Pick<Settings, "trustProxy" | "log">;
   /** Частота ping агенту, мс (опция pingIntervalMs). */
   readonly pingIntervalMs: number;
   /** Регистрация: функция чтения тела и адрес клиента → ключ агента. */
@@ -55,16 +55,31 @@ export class Transport {
   async handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     const path = pathOf(req);
 
-    if (req.method === "POST" && path === ENROLL_PATH) {
-      await this.enroll(req, res);
+    try {
+      if (req.method === "POST" && path === ENROLL_PATH) {
+        await this.enroll(req, res);
+
+        return true;
+      }
+
+      return await serveRelease(this.host, req, res, path);
+    } catch (err) {
+      // Ошибка ответа — клиенту { code, message }, не вызывающему.
+      const e =
+        err instanceof AgentsError
+          ? err
+          : new AgentsError("INTERNAL", "маршрут агентов не обработан", 500);
+
+      if (e.status >= 500)
+        this.host.settings.log("маршрут агентов не обработан", {
+          path,
+          err: String(err),
+        });
+      if (res.headersSent) res.destroy();
+      else sendJSON(res, e.status, { code: e.code, message: e.message });
 
       return true;
     }
-
-    return (
-      (await serveBundle(this.host, req, res, path)) ||
-      serveRelease(this.host, req, res, path)
-    );
   }
 
   close(): void {

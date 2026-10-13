@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 )
 
@@ -48,7 +49,7 @@ func Open(dir string) (*Outbox, error) {
 		return nil, fmt.Errorf("outbox: %w", err)
 	}
 	// Недописанные временные файлы прошлого запуска — мусор.
-	tmp, _ := filepath.Glob(filepath.Join(dir, "*.tmp"))
+	tmp, _ := filepath.Glob(filepath.Join(dir, "*"+fsutil.TmpSuffix))
 	for _, f := range tmp {
 		_ = os.Remove(f)
 	}
@@ -108,10 +109,9 @@ func (o *Outbox) Append(env message.Envelope) error {
 	if env.Type == message.TypeEvent && len(o.items) >= o.limit {
 		return ErrFull
 	}
-	if err := writeAtomic(filepath.Join(o.dir, name), raw); err != nil {
-		return err
+	if err := fsutil.WriteFileSync(filepath.Join(o.dir, name), raw, 0o600); err != nil {
+		return fmt.Errorf("outbox: %w", err)
 	}
-	syncDir(o.dir)
 	o.items = append(o.items, newItem(name, env))
 	select {
 	case o.notify <- struct{}{}:
@@ -190,33 +190,4 @@ func (o *Outbox) Remove(ids ...string) {
 		_ = os.Remove(filepath.Join(o.dir, it.name))
 		return true
 	})
-}
-
-// writeAtomic — запись во временный файл, fsync и переименование.
-func writeAtomic(path string, data []byte) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("outbox: %w", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return fmt.Errorf("outbox: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("outbox: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("outbox: %w", err)
-	}
-	return os.Rename(tmp, path)
-}
-
-// syncDir — fsync каталога: переименование файла переживает сбой питания.
-func syncDir(dir string) {
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
 }

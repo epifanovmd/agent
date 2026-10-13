@@ -1,10 +1,3 @@
-// Утилита подписи сборок агента: ключи подписи и манифест сборок. На узлы не ставится —
-// нужна там, где готовят публикацию (scripts/release.sh, CI).
-//
-//	agent-release keygen                ключи подписи сборок (Ed25519)
-//	agent-release manifest DIR VERSION [--worker NAME=VERSION[,stopTimeout=…][,command=…]]…
-//	                                    manifest.json сборок агента и воркеров в DIR (подпись — AGENT_SIGNING_KEY);
-//	                                    без сборок агента — только сборки воркеров (воркеры проекта)
 package main
 
 import (
@@ -22,46 +15,14 @@ import (
 	"github.com/epifanovmd/agent/internal/update"
 )
 
-func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "agent-release:", err)
-		os.Exit(1)
-	}
-}
-
-// run — команда утилиты по аргументам (без имени программы).
-func run(args []string) error {
-	cmd := ""
-	if len(args) > 0 {
-		cmd = args[0]
-	}
-	switch cmd {
-	case "keygen":
-		return keygen()
-	case "manifest":
-		return manifest(args[1:])
-	default:
-		return fmt.Errorf("неизвестная команда %q (keygen | manifest)", cmd)
-	}
-}
-
-func keygen() error {
-	priv, pub, err := releases.NewKeyPair()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("AGENT_SIGNING_KEY=%s\nAGENT_UPDATE_PUBLIC_KEY=%s\n", priv, pub)
-	return nil
-}
-
-// manifest — manifest.json для сборок agent-<os>-<arch> в каталоге и
+// manifestCmd — agent manifest: manifest.json для сборок agent-<os>-<arch> в каталоге и
 // сборок воркеров: `--worker NAME=VERSION[,stopTimeout=…]`
 // (повторяемый) берёт файлы DIR/<name>-<version>-<os>-<arch> или архивы
 // DIR/<name>-<version>-<os>-<arch>.tar.gz. Подпись — AGENT_SIGNING_KEY над
 // строкой сборки (§11: имя, версия, os, arch, sha256), publicKey — её
 // открытый ключ. Сборок агента нет, но есть --worker — только сборки воркеров.
-func manifest(args []string) error {
-	usage := errors.New("manifest DIR VERSION [--worker NAME=VERSION[,stopTimeout=30s][,command=bin/report]]…")
+func manifestCmd(args []string) error {
+	usage := errors.New("agent manifest DIR VERSION [--worker NAME=VERSION[,stopTimeout=30s][,command=bin/report]]…")
 	var positional []string
 	var workers []message.WorkerArtifact
 	for i := 0; i < len(args); i++ {
@@ -155,7 +116,7 @@ func manifest(args []string) error {
 		return err
 	}
 	if priv == nil {
-		fmt.Fprintln(os.Stderr, "agent-release: AGENT_SIGNING_KEY не задан — релиз без подписи, самообновление на него не встанет")
+		fmt.Fprintln(os.Stderr, "agent manifest: AGENT_SIGNING_KEY не задан — релиз без подписи, самообновление на него не встанет")
 	}
 	fmt.Println(filepath.Join(dir, "manifest.json"))
 	return nil

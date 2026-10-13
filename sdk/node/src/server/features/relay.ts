@@ -2,7 +2,6 @@
 // действия, logs, watch, runJob), из процесса без неё уходит в процесс с сессией (опция relay),
 // там его выполняет handleRelay. Обычные вызовы — JSON { result } или { error }; ответ fetch —
 // поток кадров: заголовок ответа воркера, куски тела, конец (с ошибкой, если она была).
-import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { z } from "zod";
@@ -11,15 +10,16 @@ import type { Context } from "../core/context";
 import { AgentsError, codeError } from "../core/errors";
 import {
   agentsDefaults,
+  RELAY_METHODS,
   type RelayCall,
   type RelayMethod,
 } from "../core/options";
-import { bounded } from "../lib/util";
+import { bounded, NULL_BODY, safeEqual } from "../lib/util";
 import { parse } from "../protocol/checks";
 import { MAX_MESSAGE_BYTES } from "../protocol/messages";
 import { messageIdSchema } from "../protocol/schemas";
 import { readJSON, sendJSON } from "../transport/http";
-import type { FetchInit } from "./tunnel";
+import type { Fetcher, FetchInit } from "./tunnel";
 
 /** Заголовок с общим секретом пересылки (relaySecret). */
 export const RELAY_SECRET_HEADER = "x-agents-relay-secret";
@@ -32,17 +32,7 @@ const Frame = { Head: 1, Data: 2, End: 3 } as const;
 
 /** Вызов в теле запроса пересылки. */
 const relayCallSchema = z.object({
-  method: z.enum([
-    "fetch",
-    "restartWorker",
-    "updateWorker",
-    "updateAgent",
-    "rotateKey",
-    "logs",
-    "watch",
-    "unwatch",
-    "runJob",
-  ]),
+  method: z.enum(RELAY_METHODS),
   agentId: messageIdSchema,
   actor: z.string().optional(),
   args: z.array(z.unknown()),
@@ -56,15 +46,6 @@ interface RelayFetchInit {
   bodyBase64?: string;
   timeoutMs?: number;
 }
-
-/** fetch к воркеру в этом процессе. */
-export type Fetcher = (
-  actor: string,
-  agentId: string,
-  worker: string,
-  path: string,
-  init: FetchInit,
-) => Promise<Response>;
 
 /** Вызов в этом процессе: от имени actor, аргументы — как в RelayCall. */
 export type LocalCall = (
@@ -256,7 +237,9 @@ export class Relay {
   async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const secret = this.ctx.settings.relaySecret;
 
-    if (secret && !sameSecret(req.headers[RELAY_SECRET_HEADER], secret))
+    const got = req.headers[RELAY_SECRET_HEADER];
+
+    if (secret && (typeof got !== "string" || !safeEqual(got, secret)))
       return sendError(
         res,
         codeError("UNAUTHORIZED", "неверный секрет пересылки", 401),
@@ -414,19 +397,6 @@ const decodeInit = (init: RelayFetchInit): FetchInit => {
   if (init.timeoutMs !== undefined) out.timeoutMs = init.timeoutMs;
 
   return out;
-};
-
-/** Статусы без тела. */
-const NULL_BODY = new Set([101, 103, 204, 205, 304]);
-
-/** Секрет из заголовка совпадает (сравнение постоянного времени по хешам). */
-const sameSecret = (
-  got: string | string[] | undefined,
-  want: string,
-): boolean => {
-  const digest = (v: string) => createHash("sha256").update(v).digest();
-
-  return typeof got === "string" && timingSafeEqual(digest(got), digest(want));
 };
 
 const asAgentsError = (e: unknown): AgentsError =>

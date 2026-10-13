@@ -224,7 +224,8 @@ pgListener.on("notification", (n) => void agents.refresh(n.payload));
 ## Подключение к HTTP-серверу и фреймворкам
 
 `Agents` нужны две вещи: обработчик HTTP-маршрутов `/api/v1/agent-link/…` (`handle`) и
-WebSocket на том же сервере (`attach`). `handle` возвращает `true`, если запрос был его.
+WebSocket на том же сервере (`attach`). `handle` возвращает `true`, если запрос был его, и не
+бросает: ошибку SDK он отвечает сам (`{ code, message }` с её HTTP-статусом).
 
 **node:http**
 

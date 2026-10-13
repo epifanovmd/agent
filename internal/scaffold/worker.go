@@ -12,6 +12,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 )
 
@@ -123,12 +124,12 @@ func NewWorker(o WorkerOptions) ([]string, bool, error) {
 			}
 			raw = b.Bytes()
 		}
-		if err := writeFile(filepath.Join(dir, f.to), raw, f.perm); err != nil {
+		if err := fsutil.WriteFile(filepath.Join(dir, f.to), raw, f.perm); err != nil {
 			return nil, false, err
 		}
 		created = append(created, filepath.Join("workers", o.Name, f.to))
 	}
-	if err := writeFile(filepath.Join(dir, "VERSION"), []byte("0.1.0\n"), 0o644); err != nil {
+	if err := fsutil.WriteFile(filepath.Join(dir, "VERSION"), []byte("0.1.0\n"), 0o644); err != nil {
 		return nil, false, err
 	}
 	created = append(created, filepath.Join("workers", o.Name, "VERSION"))
@@ -181,7 +182,7 @@ func addWorker(file, path string) (bool, error) {
 	default:
 		text = strings.TrimRight(text, "\n") + "\n\nworkers:\n" + item + "\n"
 	}
-	return true, writeFile(file, []byte(text), 0o644)
+	return true, fsutil.WriteFile(file, []byte(text), 0o644)
 }
 
 // BaseVersion — версия базы воркера языка lang в этой программе (из её файла).
@@ -230,7 +231,7 @@ func SyncBases(root string) ([]Synced, error) {
 			if have == 0 || have > next || bytes.Equal(raw, want) {
 				continue
 			}
-			if err := writeFile(path, want, 0o644); err != nil {
+			if err := fsutil.WriteFile(path, want, 0o644); err != nil {
 				return out, err
 			}
 			out = append(out, Synced{File: filepath.Join("workers", d.Name(), lang.Base), From: have, To: next})

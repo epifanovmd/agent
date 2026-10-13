@@ -12,8 +12,7 @@ import type {
   AgentRecord,
   ReleaseLocation,
   ReleaseView,
-  UpdateCandidate,
-  WorkerUpdateCandidate,
+  UpdateCandidates,
 } from "../model/types";
 import { parseManifest } from "../protocol/checks";
 import {
@@ -39,12 +38,6 @@ export interface UpdateArgs extends Record<string, unknown> {
 
 /** Где взять файл сборок: в releasesDir или по ссылке удалённого источника. */
 export type ReleaseFile = { path: string } | { url: string; proxy: boolean };
-
-/** install.sh для раздачи и ключи проверки, которые в него подставить. */
-export interface InstallScript {
-  script: string;
-  keys: string[];
-}
 
 export class Release {
   private readonly ctx: Context;
@@ -197,30 +190,6 @@ export class Release {
       : Promise.reject(new Error("нет удалённого источника"));
   }
 
-  /**
-   * install.sh: из удалённого источника (если сборки получены и в нём есть install.sh), иначе — из
-   * releasesDir. Ключи: publicKey, updatePublicKeys (проект) и ключ автора агента
-   * (agentReleases.publicKey или publicKey удалённого manifest.json).
-   */
-  async installScript(): Promise<InstallScript | null> {
-    const { releasesDir, publicKey, updatePublicKeys, agentReleases } =
-      this.ctx.settings;
-    const remote = await this.remote?.release();
-    let script = remote?.installScript;
-
-    if (script === undefined && releasesDir)
-      script = await readFile(join(releasesDir, "install.sh"), "utf8").catch(
-        () => undefined,
-      );
-    if (script === undefined) return null;
-    const author = agentReleases?.publicKey ?? remote?.manifest.publicKey;
-    const keys = [publicKey, ...updatePublicKeys, author].filter(
-      (k, i, all): k is string => Boolean(k) && all.indexOf(k) === i,
-    );
-
-    return { script, keys };
-  }
-
   /** Аргументы agent.update для агента; сборки нет — UPDATE_NOT_AVAILABLE. */
   async agentUpdate(agent: AgentRecord): Promise<UpdateArgs> {
     const m = await this.required();
@@ -266,62 +235,64 @@ export class Release {
   }
 
   /**
-   * Агенты, чья версия не как на сервере и для чьих os/arch есть сборка. Агенты,
-   * которые себя не обновляют (`hello.agent.updateMode` — не self), не входят.
+   * Кого можно обновить. Агенты: до версии сборок сервера (source: server — сборка под их
+   * os/arch есть, версия другая) или до новой версии, которую агент нашёл в своём каталоге сборок
+   * сам (source: agent, hello/status → update.latest); из двух целей — новейшая. Агенты, которые
+   * себя не обновляют (updateMode не self), не входят. Воркеры со сборкой с сервера — до версии
+   * новейшей сборки в manifest.json.
    */
-  async updateCandidates(): Promise<UpdateCandidate[]> {
+  async updateCandidates(): Promise<UpdateCandidates> {
     const m = await this.manifest();
-
-    if (!m) return [];
-    const out: UpdateCandidate[] = [];
+    const out: UpdateCandidates = { agents: [], workers: [] };
 
     for (const a of await this.ctx.store.listAgents()) {
       const h = a.hello;
 
-      if (a.revoked || !h || sameVersion(h.agent.version, m.version)) continue;
-      if (!selfUpdating(h)) continue;
-      if (!agentArtifact(m, h.host.os, h.host.arch)) continue;
+      if (a.revoked || !h) continue;
       const { os, arch } = h.host;
-
-      out.push({
+      const base = {
         agentId: a.id,
-        name: a.name,
+        agentName: a.name,
         online: a.online,
-        current: h.agent.version,
-        target: m.version,
         os,
         arch,
-      });
-    }
+      };
+      const current = h.agent.version;
+      const fromServer =
+        m && !sameVersion(current, m.version) && agentArtifact(m, os, arch)
+          ? m.version
+          : undefined;
+      const fromAgent = publicAgent(a).update?.latest;
 
-    return out;
-  }
-
-  /** Воркеры со сборкой с сервера, чья версия не как у новейшей сборки в manifest.json. */
-  async workerUpdateCandidates(): Promise<WorkerUpdateCandidate[]> {
-    const m = await this.manifest();
-
-    if (!m?.workers?.length) return [];
-    const out: WorkerUpdateCandidate[] = [];
-
-    for (const a of await this.ctx.store.listAgents()) {
-      if (a.revoked || !a.hello) continue;
-      const { os, arch } = a.hello.host;
-
-      for (const w of publicAgent(a).workers) {
-        if (!w.release) continue;
-        const art = workerArtifact(m, w.name, os, arch);
+      if (selfUpdating(h)) {
+        if (
+          fromAgent &&
+          newerVersion(fromAgent, current) &&
+          (!fromServer || newerVersion(fromAgent, fromServer))
+        )
+          out.agents.push({
+            ...base,
+            current,
+            target: fromAgent,
+            source: "agent",
+          });
+        else if (fromServer)
+          out.agents.push({
+            ...base,
+            current,
+            target: fromServer,
+            source: "server",
+          });
+      }
+      for (const w of m?.workers?.length ? publicAgent(a).workers : []) {
+        const art = w.release && workerArtifact(m!, w.name, os, arch);
 
         if (!art || sameVersion(w.version ?? "", art.version)) continue;
-        out.push({
-          agentId: a.id,
-          agentName: a.name,
-          online: a.online,
+        out.workers.push({
+          ...base,
           worker: w.name,
           current: w.version ?? "",
           target: art.version,
-          os,
-          arch,
         });
       }
     }

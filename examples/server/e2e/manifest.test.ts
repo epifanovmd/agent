@@ -1,5 +1,5 @@
 // Манифест воркеров (§12): echo, node-echo, sysinfo и netprobe описывают себя, агент передаёт
-// манифест в status; supports по манифесту; validateConfigs — неверная настройка отклонена
+// манифест в status; supports по манифесту; validate.configs — неверная настройка отклонена
 // сервером до отправки агенту.
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
@@ -21,7 +21,7 @@ describe("манифест воркеров", () => {
   before(async () => {
     s = await Stand.start({
       name: "e2e-manifest",
-      server: { validateConfigs: true },
+      server: { validate: { configs: true } },
     });
   });
   after(() => s?.close());
@@ -102,7 +102,7 @@ describe("манифест воркеров", () => {
     assert.equal(await supported("sysmetrics", "config=settings"), false);
   });
 
-  it("validateConfigs: неверная настройка отклонена до отправки агенту", async () => {
+  it("validate.configs: неверная настройка отклонена до отправки агенту", async () => {
     const path = `/api/agents/${s.agentId}/configs/echo/settings`;
     const err = await s.api("PUT", path, { prefix: 5, extra: 1 }).then(
       () => assert.fail("ждали CONFIG_INVALID"),

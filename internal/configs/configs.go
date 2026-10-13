@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/worker"
 )
@@ -35,12 +36,6 @@ var (
 type Workers interface {
 	Has(name string) bool
 	Client(name string) (*http.Client, error)
-}
-
-// retrier — свой срок повтора неприменённых настроек у воркера
-// (lifecycle.configRetry); 0 — общий.
-type retrier interface {
-	ConfigRetry(name string) time.Duration
 }
 
 // declarer — манифест зарегистрированного воркера (§12): по нему агент не
@@ -286,16 +281,6 @@ func (s *Store) Adopted(name string) {
 	s.kick(name)
 }
 
-// retry — через сколько повторить неприменённые настройки воркера name.
-func (s *Store) retry(name string) time.Duration {
-	if r, ok := s.workers.(retrier); ok {
-		if d := r.ConfigRetry(name); d > 0 {
-			return d
-		}
-	}
-	return s.retryEvery
-}
-
 // kick — разбудить передачу настроек воркеру name (запускает её при первом вызове).
 func (s *Store) kick(name string) {
 	s.mu.Lock()
@@ -452,7 +437,7 @@ func (s *Store) done(name, key string, f file, res result) {
 	e.status = &res
 	// Необъявленный ключ проверяется заново при следующей регистрации воркера.
 	if !res.OK && res.Code != message.CodeConfigKeyUnknown {
-		e.retryAt = time.Now().Add(s.retry(name))
+		e.retryAt = time.Now().Add(s.retryEvery)
 	}
 	send := e.Reported == nil || e.Reported.OK != res.OK || e.Reported.Code != res.Code
 	if send {
@@ -492,10 +477,5 @@ func (s *Store) save(name, key string, f file) error {
 	if err != nil {
 		return err
 	}
-	path := s.path(name, key)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsutil.WriteFile(s.path(name, key), raw, 0o600)
 }

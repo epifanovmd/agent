@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { type AgentRecord, publicAgent } from "../src/server";
+import type { AgentRecord } from "../src/server";
+import { publicAgent } from "../src/server/model/public-agent";
 
 const record = (patch: Partial<AgentRecord>): AgentRecord => ({
   id: "a1",

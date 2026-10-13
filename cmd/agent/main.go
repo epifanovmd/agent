@@ -3,7 +3,7 @@
 //
 //	agent [run] [-config ФАЙЛ | --env ИМЯ]   работа (по умолчанию); SIGHUP — перечитать настройки,
 //	                                   SIGUSR1 — перезапуск, SIGTERM/SIGINT — остановка
-//	agent restart                      перезапустить работающего агента (воркеры — по lifecycle.onAgentRestart)
+//	agent restart                      перезапустить работающего агента (воркеры — по lifecycle.onAgentExit)
 //	agent stop-workers                 остановить воркеры, оставшиеся работать после остановки агента
 //	agent install --server URL --token ТОКЕН [флаги]   поставить службой systemd (Linux, root);
 //	                                   --rootless — агент пользователя без root
@@ -16,11 +16,12 @@
 //	                                   (-config ФАЙЛ — один файл настроек с пояснениями)
 //	agent config check                 проверить настройки и показать итоговые значения
 //	agent status [--json]              работает ли агент, связь, воркеры (код выхода 0 — работает)
-//	agent logs [-f] [-n N]             лог службы (journalctl) или агента без службы (его файл)
+//	agent logs [-f] [-n N]             лог службы (journalctl)
 //	agent cleanup                      уборка воркеров перед удалением агента (без сервера; её вызывает uninstall)
 //	agent upgrade [--check] [--version X]   поставить новую версию агента из каталога сборок
 //	agent pack [--env ИМЯ] [--platform linux/amd64,…]   архив папки агента для узла
-//	agent keygen                       ключи подписи сборок воркеров проекта
+//	agent keygen                       ключи подписи сборок (AGENT_SIGNING_KEY)
+//	agent manifest DIR VERSION [--worker NAME=VERSION[,…]]…   manifest.json сборок в DIR
 //	agent worker new|sync|list         воркеры папки агента: заготовка, обновление базы, список
 //	agent version                      версия
 //	agent boot-guard BINARY            откат версии, не дошедшей до связи (ExecStartPre)
@@ -34,8 +35,6 @@
 // иначе ~/.agent/agent.yaml агента пользователя, иначе /etc/agent/agent.yaml
 // (на macOS ~/.agent/agent.yaml), если он есть. Файл может опираться на другой
 // (extends) и брать значения из файлов переменных (envFiles).
-//
-// Ключи подписи и манифест сборок — отдельная программа cmd/agent-release.
 //
 // Ключ проверки обновлений вшивается при сборке: -ldflags "-X main.updateKey=<base64>";
 // ключи из настроек (update.publicKey, update.publicKeys) действуют вместе с ним.
@@ -55,6 +54,7 @@ import (
 
 	"github.com/epifanovmd/agent/internal/app"
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/install"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/sysmetrics"
@@ -88,13 +88,15 @@ const usage = `agent — агент для узлов: связь с серве�
                                  проверить настройки и показать итоговые значения и откуда они
   agent status [--json]          работает ли агент, связь, воркеры, последняя ошибка
   agent logs [-f] [-n N]         лог службы
-  agent restart                  перезапустить агента; воркеры работают дальше (lifecycle.onAgentRestart)
+  agent restart                  перезапустить агента; воркеры работают дальше (lifecycle.onAgentExit)
   agent stop-workers             остановить воркеры, оставшиеся после остановки агента (агент не работает)
   agent cleanup                  воркеры убирают за собой (перед удалением агента)
   agent pack [--env ИМЯ | -config ФАЙЛ] [--platform linux/amd64,linux/arm64] [--out КАТАЛОГ] [--with-env]
                                  архив папки агента для узла: программа под его платформу, настройки,
                                  воркеры и их сборки; на узле — tar xzf …, sudo ./agent install
-  agent keygen                   ключи подписи сборок воркеров (AGENT_SIGNING_KEY для agent pack)
+  agent keygen                   ключи подписи сборок (AGENT_SIGNING_KEY — для agent pack и agent manifest)
+  agent manifest КАТАЛОГ ВЕРСИЯ [--worker ИМЯ=ВЕРСИЯ[,stopTimeout=…][,command=…]]…
+                                 manifest.json сборок агента и воркеров в каталоге (подпись — AGENT_SIGNING_KEY)
   agent worker new ИМЯ [--lang python|go]
                                  воркер из заготовки: база agent_worker.* и наследник (класс или тип),
                                  run, VERSION; строка в agent.yaml
@@ -148,6 +150,8 @@ func main() {
 		err = packCmd(args)
 	case "keygen":
 		err = keygenCmd(args)
+	case "manifest":
+		err = manifestCmd(args)
 	case "worker":
 		err = workerCmd(args)
 	case "version":
@@ -245,7 +249,7 @@ func envConfig(env string, dirs []string) (string, error) {
 	}
 	name := config.EnvConfigName(env)
 	for _, dir := range dirs {
-		if p := filepath.Join(dir, name); isFile(p) {
+		if p := filepath.Join(dir, name); fsutil.IsFile(p) {
 			return p, nil
 		}
 	}
@@ -279,14 +283,6 @@ func localDirs() []string {
 	return dirs
 }
 
-// warning — замечание к файлу настроек path: с именем файла, если в замечании его нет.
-func warning(path string, p config.Problem) string {
-	if p.File != "" {
-		return p.String()
-	}
-	return config.ShortPath(path) + ": " + p.String()
-}
-
 // selfLayout — установленный экземпляр, которому принадлежит запущенная
 // программа (ok=false — программа не установленного агента).
 func selfLayout() (install.Paths, bool) {
@@ -304,14 +300,6 @@ func selfLayout() (install.Paths, bool) {
 func userHome() string {
 	h, _ := os.UserHomeDir()
 	return h
-}
-
-// selfRestart — перезапускается ли агент сам (exec): установлен без службы
-// (агент пользователя без systemd --user) — перезапустить его некому.
-// Остальных перезапускает менеджер процесса: служба, контейнер, свой.
-func selfRestart() bool {
-	l, ok := selfLayout()
-	return ok && install.ModeOf(l) == install.ModeManual
 }
 
 func run(args []string) error {
@@ -336,9 +324,6 @@ func run(args []string) error {
 		return err
 	}
 	if path != "" {
-		for _, p := range config.Unknown(path) {
-			fmt.Fprintf(os.Stderr, "agent: предупреждение: %s\n", warning(path, p))
-		}
 		// agent.env рядом с настройками (токен, ключи) — как у службы; окружение важнее.
 		if _, err := config.ApplyEnvFile(config.EnvFile(path)); err != nil {
 			return err
@@ -362,10 +347,6 @@ func run(args []string) error {
 	}
 	// SIGTERM, SIGINT — остановка; SIGUSR1 — перезапуск; SIGHUP (systemctl reload) — перечитать настройки.
 	err = agent.Serve(path)
-	if errors.Is(err, app.ErrRestart) && exeErr == nil && selfRestart() {
-		// Агент без службы перезапускает себя сам — новой версией после обновления.
-		return syscall.Exec(exe, os.Args, os.Environ())
-	}
 	if errors.Is(err, app.ErrRestart) || errors.Is(err, context.Canceled) {
 		// Перезапуск — дело менеджера процесса (systemd Restart=always, Docker restart).
 		return nil
@@ -439,7 +420,7 @@ func bootGuard(args []string) error {
 
 // restartCmd — `agent restart`: SIGUSR1 работающему агенту (pid — из
 // отметки agent.status): он выходит, менеджер службы запускает его снова,
-// воркеры работают дальше (lifecycle.onAgentRestart: keep).
+// воркеры работают дальше (lifecycle.onAgentExit: keep).
 func restartCmd(args []string) error {
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	flagPath := configFlag(fs)

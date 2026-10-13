@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 	"github.com/epifanovmd/agent/internal/releases"
 	"github.com/epifanovmd/agent/internal/update"
@@ -337,27 +337,11 @@ func writeJSON(path string, v any) error {
 }
 
 func copyFile(src, dst string) error {
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
+	_, err := fsutil.CopyFile(src, dst, 0)
+	return err
 }
 
 // isExecutable — обычный файл с правом запуска.

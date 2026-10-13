@@ -187,14 +187,16 @@ export interface AgentEvent {
   /** Когда случилось на узле, мс. */
   at: number;
   receivedAt: number;
+  /** data не по events[].schema манифеста (validate.events: log): «поле: замечание». */
+  problems?: string[];
 }
 
-/** Событие, data которого не подходит под events[].schema манифеста (опция validateEvents). */
+/** Событие, data которого не подходит под events[].schema манифеста (опция validate.events). */
 export interface InvalidEvent {
   event: AgentEvent;
   /** Что не так: «поле: замечание», не больше трёх. */
   problems: string[];
-  /** reject — событие подтверждено агенту, но не передано onEvent и подпискам. */
+  /** reject — событие подтверждено агенту, но не передано onEvent и событию event. */
   rejected: boolean;
 }
 
@@ -287,12 +289,17 @@ export interface ReleaseView extends ReleaseManifest {
 /** Агент, которого можно обновить до версии с сервера. */
 export interface UpdateCandidate {
   agentId: string;
-  name: string;
+  agentName: string;
   online: boolean;
   current: string;
   target: string;
   os: string;
   arch: string;
+  /**
+   * server — сборка с сервера (updateAgent без version); agent — версия, которую агент нашёл в
+   * своём каталоге сборок (updateAgent с version: target).
+   */
+  source: "server" | "agent";
 }
 
 /** Воркер со сборкой с сервера, которого можно обновить. */
@@ -305,6 +312,12 @@ export interface WorkerUpdateCandidate {
   target: string;
   os: string;
   arch: string;
+}
+
+/** Итог updateCandidates: агенты и воркеры, которых можно обновить. */
+export interface UpdateCandidates {
+  agents: UpdateCandidate[];
+  workers: WorkerUpdateCandidate[];
 }
 
 export type AuditAction =

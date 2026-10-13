@@ -4,7 +4,6 @@ import { z } from "zod";
 
 import type { Context } from "../core/context";
 import { AgentsError, codeError, valid } from "../core/errors";
-import { jsonSchemaProblems } from "../lib/json-schema";
 import { bounded, DAY_MS } from "../lib/util";
 import { workerManifest } from "../model/manifest";
 import { publicAgent } from "../model/public-agent";
@@ -28,7 +27,7 @@ import {
   messageIdSchema,
   nameSchema,
 } from "../protocol/schemas";
-import type { FetchInit } from "./tunnel";
+import type { Fetcher } from "./tunnel";
 
 /** Файлы задачи по ссылкам: воркер сам скачивает входные и загружает выходные. */
 const jobFilesSchema = z.object({
@@ -49,6 +48,8 @@ const runOptionsSchema = z.object({
    * POST /jobs ждётся не меньше 30 с.
    */
   timeoutMs: z.number().optional().catch(undefined),
+  /** false — долгой задаче (202) не ждать итога: сразу state: running с id задачи. */
+  wait: z.boolean().optional(),
 });
 
 export type JobFiles = z.input<typeof jobFilesSchema>;
@@ -74,15 +75,6 @@ export interface JobResult {
   error?: ErrorInfo;
 }
 
-/** Запрос к воркеру (fetch этого процесса или с пересылкой). */
-type Fetcher = (
-  actor: string,
-  agentId: string,
-  worker: string,
-  path: string,
-  init: FetchInit,
-) => Promise<Response>;
-
 /** Ожидающий итога долгой задачи в этом процессе. */
 interface Waiter {
   progress?: number;
@@ -106,7 +98,7 @@ export class Jobs {
   /**
    * Задача воркеру в этом процессе (fetch — этого процесса): 200 — итог сразу, 202 — ждать
    * событий job.* не дольше timeoutMs. Тип нет в manifest.jobs — JOB_UNKNOWN, data не по
-   * схеме (validateJobs) — JOB_INVALID, отказ воркера (4xx) — JOB_REJECTED.
+   * схеме (validate.jobs) — JOB_INVALID, отказ воркера (4xx) — JOB_REJECTED.
    */
   async run(
     actor: string,
@@ -122,6 +114,7 @@ export class Jobs {
       data,
       files,
       timeoutMs,
+      wait = true,
     } = valid(parse(runOptionsSchema, opts, "runJob"));
 
     await this.check(agentId, worker, type, data);
@@ -154,6 +147,7 @@ export class Jobs {
         return { jobId, state: "done", ...pick(reply, "result") };
       if (!reply.id)
         throw codeError("JOB_REJECTED", "воркер ответил 202 без id задачи");
+      if (!wait) return { jobId, id: reply.id, state: "running" };
 
       return await this.wait(w, jobId, reply.id, deadline, signal, () =>
         fetch(actor, agentId, worker, `${JOBS_PATH}/${reply.id}/cancel`, {
@@ -220,7 +214,7 @@ export class Jobs {
     }
   }
 
-  /** Тип задачи в manifest.jobs воркера и data по схеме типа (validateJobs). */
+  /** Тип задачи в manifest.jobs воркера и data по схеме типа (validate.jobs). */
   private async check(
     agentId: string,
     worker: string,
@@ -238,21 +232,18 @@ export class Jobs {
         `задачи ${type} нет в манифесте воркера ${worker} (jobs)`,
         409,
       );
-    if (!this.ctx.settings.validateJobs || !job.schema) return;
-    let problems: string[];
-
-    try {
-      problems = jsonSchemaProblems(job.schema, data ?? null);
-    } catch (e) {
-      this.ctx.log("схема задачи из манифеста воркера не применяется", {
+    if (!this.ctx.settings.validate.jobs) return;
+    const problems = this.ctx.schemaProblems(
+      job.schema,
+      data ?? null,
+      "задачи",
+      {
         agentId,
         worker,
         type,
-        err: String(e),
-      });
+      },
+    );
 
-      return;
-    }
     if (problems.length)
       throw codeError(
         "JOB_INVALID",

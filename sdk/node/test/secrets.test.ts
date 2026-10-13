@@ -24,7 +24,7 @@ describe("секреты не попадают в журнал SDK", () => {
   before(async () => {
     s = await startServer({
       enrollToken: TOKEN,
-      validateEvents: "log",
+      validate: { events: "log" },
       onWorkerRequest: req => ({ echo: req.data }),
       log: (msg, extra) => logged.push([msg, extra]),
     });

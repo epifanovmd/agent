@@ -1,6 +1,6 @@
 // Удалённый источник сборок агента (agentReleases): фейковый API GitHub на node:http — выбор
 // версии по диапазону, пропуск prerelease и draft, ошибка сети, объединение с воркерами проекта
-// из releasesDir, install.sh с ключами, перенаправление и раздача сборок потоком, событие release.
+// из releasesDir, перенаправление и раздача сборок потоком, событие release.
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -9,12 +9,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 
-import type { AgentsOptions, ReleaseEvent } from "../src/server/index";
+import { defaultRange } from "../src/server/features/agent-releases";
+import {
+  type AgentsOptions,
+  type ReleaseEvent,
+  SDK_VERSION,
+} from "../src/server/index";
 import { enroll, FakeAgent, startServer, type TestServer } from "./helpers";
 
 const AUTHOR_KEY = "QVVUSE9SLUtFWS1FWEFNUExFLUFVVEhPUi1LRVktMDE=";
-const PROJECT_KEY = "UFJPSkVDVC1LRVktRVhBTVBMRS1QUk9KRUNULUtFWTA=";
-const EXTRA_KEY = "RVhUUkEtS0VZLUVYQU1QTEUtRVhUUkEtS0VZLUVYVFI=";
 
 /** Релиз в фейковом GitHub: тег, флаги и файлы (имя → содержимое). */
 interface FakeRelease {
@@ -24,7 +27,7 @@ interface FakeRelease {
   files: Record<string, string>;
 }
 
-/** Файлы релиза версии v: manifest.json (агент и netprobe), сборки, install.sh. */
+/** Файлы релиза версии v: manifest.json (агент и netprobe), сборки. */
 const releaseFiles = (v: string): Record<string, string> => ({
   "manifest.json": JSON.stringify({
     version: v,
@@ -52,7 +55,6 @@ const releaseFiles = (v: string): Record<string, string> => ({
   }),
   "agent-linux-amd64": `AGENT ${v}`,
   [`netprobe-${v}-linux-amd64`]: `NETPROBE ${v}`,
-  "install.sh": `#!/bin/sh\n# ${v}\nDEFAULT_SERVER=""\nDEFAULT_UPDATE_KEYS=""\n`,
 });
 
 /** Фейковый GitHub: API релизов и файлы по browser_download_url. */
@@ -151,10 +153,16 @@ const fromGithub = (
 ): AgentsOptions["agentReleases"] => ({
   github: "example/agent",
   apiUrl: g.url,
+  // Релизы тестов — 1.x; по умолчанию диапазон — мажорная версия SDK (ниже).
+  range: "^1",
   ...more,
 });
 
 describe("удалённый источник сборок агента", () => {
+  it("диапазон по умолчанию — мажорная версия SDK", () => {
+    assert.equal(defaultRange(), `^${SDK_VERSION.split(".")[0]}`);
+  });
+
   it("старшая версия в диапазоне: prerelease, draft и чужой мажор пропускаются", async () => {
     const g = await github();
 
@@ -215,7 +223,7 @@ describe("удалённый источник сборок агента", () => 
     s.agents.on("release", e => events.push(e));
     assert.equal((await s.agents.release())?.version, "1.1.0");
     g.add("v1.2.0");
-    assert.equal((await s.agents.checkRelease())?.version, "1.2.0");
+    assert.equal((await s.agents.release({ refresh: true }))?.version, "1.2.0");
     // Первая проверка идёт с запуска: её событие (без previous) могло прийти до подписки.
     assert.deepEqual(events.at(-1), {
       version: "1.2.0",
@@ -226,7 +234,7 @@ describe("удалённый источник сборок агента", () => 
 
     g.down = true;
     g.add("v1.3.0");
-    const view = await s.agents.checkRelease();
+    const view = await s.agents.release({ refresh: true });
 
     assert.equal(view?.version, "1.2.0");
     assert.ok(logged.some(m => m.includes("остаются прежние")));
@@ -234,7 +242,7 @@ describe("удалённый источник сборок агента", () => 
     // Та же версия — без события.
     g.down = false;
     g.releases.pop();
-    await s.agents.checkRelease();
+    await s.agents.release({ refresh: true });
     assert.equal(events.length, seen);
   });
 
@@ -260,7 +268,7 @@ describe("удалённый источник сборок агента", () => 
     assert.equal(before?.artifacts[0].source, "local");
     g.down = false;
     g.add("v1.1.0");
-    assert.equal((await s.agents.checkRelease())?.version, "1.1.0");
+    assert.equal((await s.agents.release({ refresh: true }))?.version, "1.1.0");
     assert.deepEqual(events, [
       { version: "1.1.0", from: "github:example/agent" },
     ]);
@@ -343,11 +351,17 @@ describe("удалённый источник сборок агента", () => 
     });
     await fa.ackSeq(1);
     assert.deepEqual(
-      (await s.agents.updateCandidates()).map(x => [x.current, x.target]),
+      (await s.agents.updateCandidates()).agents.map(x => [
+        x.current,
+        x.target,
+      ]),
       [["1.0.0", "1.2.0"]],
     );
     assert.deepEqual(
-      (await s.agents.workerUpdateCandidates()).map(x => [x.worker, x.target]),
+      (await s.agents.updateCandidates()).workers.map(x => [
+        x.worker,
+        x.target,
+      ]),
       [
         ["report", "3.0.0"],
         ["netprobe", "0.9.0"],
@@ -385,6 +399,11 @@ describe("удалённый источник сборок агента", () => 
       "fetch проходит перенаправление",
     );
     assert.equal((await fetch(`${base}/install.sh`)).status, 404);
+    assert.equal(
+      (await fetch(`${s.url}/api/v1/agent-link/install.sh`)).status,
+      404,
+      "установку SDK не раздаёт",
+    );
     assert.equal((await fetch(`${base}/other`)).status, 404);
 
     const p = await server({ agentReleases: fromGithub(g, { proxy: true }) });
@@ -403,40 +422,7 @@ describe("удалённый источник сборок агента", () => 
     assert.equal((await fetch(`${pbase}/agent-linux-amd64`)).status, 502);
   });
 
-  it("install.sh из удалённого источника: адрес сервера и ключи проекта и автора агента", async () => {
-    const g = await github();
-
-    g.add("v1.2.0");
-    const s = await server({
-      agentReleases: fromGithub(g),
-      publicKey: PROJECT_KEY,
-      updatePublicKeys: [EXTRA_KEY, PROJECT_KEY, "не ключ"],
-      baseUrl: "https://api.example.com",
-    });
-    const sh = await (
-      await fetch(`${s.url}/api/v1/agent-link/install.sh`)
-    ).text();
-
-    assert.match(sh, /# 1\.2\.0/);
-    assert.match(sh, /^DEFAULT_SERVER="https:\/\/api\.example\.com"$/m);
-    assert.match(
-      sh,
-      new RegExp(
-        `^DEFAULT_UPDATE_KEYS="${PROJECT_KEY} ${EXTRA_KEY} ${AUTHOR_KEY}"$`,
-        "m",
-      ),
-    );
-    const own = await server({
-      agentReleases: fromGithub(g, { publicKey: EXTRA_KEY }),
-    });
-    const sh2 = await (
-      await fetch(`${own.url}/api/v1/agent-link/install.sh`)
-    ).text();
-
-    assert.match(sh2, new RegExp(`^DEFAULT_UPDATE_KEYS="${EXTRA_KEY}"$`, "m"));
-  });
-
-  it("база сборок по ссылке (url): manifest.json, сборки и install.sh рядом", async () => {
+  it("база сборок по ссылке (url): manifest.json и сборки рядом", async () => {
     const g = await github();
 
     g.add("v1.2.0");
@@ -451,11 +437,6 @@ describe("удалённый источник сборок агента", () => 
       view?.workers?.[0].url,
       `${g.url}/download/v1.2.0/netprobe-1.2.0-linux-amd64`,
     );
-    const sh = await (
-      await fetch(`${s.url}/api/v1/agent-link/install.sh`)
-    ).text();
-
-    assert.match(sh, new RegExp(`DEFAULT_UPDATE_KEYS="${AUTHOR_KEY}"`));
   });
 
   it("неверные настройки источника — MESSAGE_INVALID", async () => {

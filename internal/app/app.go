@@ -202,12 +202,6 @@ func (c configWorkers) Has(name string) bool {
 	return ok && !spec.Builtin
 }
 
-// ConfigRetry — повтор неприменённых настроек воркера (lifecycle.configRetry).
-func (c configWorkers) ConfigRetry(name string) time.Duration {
-	spec, _ := c.s.Spec(name)
-	return spec.Lifecycle.ConfigRetry.Std()
-}
-
 // Manifest — манифест воркера (ключи, которые ему можно передавать).
 func (c configWorkers) Manifest(name string) *message.WorkerManifest { return c.s.Manifest(name) }
 
@@ -281,7 +275,7 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 // requestRestart — выйти для перезапуска (ErrRestart): воркеры — по
-// lifecycle.onAgentRestart.
+// lifecycle.onAgentExit.
 func (a *App) requestRestart() {
 	a.restart.Store(true)
 	a.setExit(worker.ExitRestart)

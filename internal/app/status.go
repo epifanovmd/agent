@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 )
 
@@ -94,10 +95,7 @@ func (h heartbeat) run(ctx context.Context) error {
 		st := h.snapshot()
 		st.PID, st.At = os.Getpid(), time.Now().UnixMilli()
 		raw, _ := json.Marshal(st)
-		tmp := h.path + ".tmp"
-		if err := os.WriteFile(tmp, raw, 0o600); err == nil {
-			_ = os.Rename(tmp, h.path)
-		}
+		_ = fsutil.WriteFile(h.path, raw, 0o600)
 		select {
 		case <-ctx.Done():
 			return nil

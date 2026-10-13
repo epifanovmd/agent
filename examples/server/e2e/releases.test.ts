@@ -18,21 +18,21 @@ import { BIN, bin, NEXT_VERSION, run, Stand, VERSION } from "./stand";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
-/** Пара ключей подписи сборок (agent-release keygen). */
+/** Пара ключей подписи сборок (agent keygen). */
 const keygen = async () => {
-  const { stdout } = await run(bin("agent-release"), ["keygen"]);
+  const { stdout } = await run(bin("agent"), ["keygen"]);
   const value = (name: string) =>
     stdout.match(new RegExp(`^${name}=(.+)$`, "m"))![1];
 
   return {
     signing: value("AGENT_SIGNING_KEY"),
-    public: value("AGENT_UPDATE_PUBLIC_KEY"),
+    public: value("AGENT_UPDATE_PUBLIC_KEYS"),
   };
 };
 
-/** manifest.json в dir, подпись ключом signing; args — ещё аргументы agent-release manifest. */
+/** manifest.json в dir, подпись ключом signing; args — ещё аргументы agent manifest. */
 const manifest = (dir: string, signing: string, ...args: string[]) =>
-  run(bin("agent-release"), ["manifest", dir, NEXT_VERSION, ...args], {
+  run(bin("agent"), ["manifest", dir, NEXT_VERSION, ...args], {
     env: { ...process.env, AGENT_SIGNING_KEY: signing },
   });
 
@@ -115,10 +115,7 @@ describe("сборки агента с другого сервера", () => {
       releasesDir: projectDir,
       updateKeys: [project.public, author.public],
       releaseNetprobe: true,
-      server: {
-        agentReleases: { url: remote.url },
-        updatePublicKeys: [project.public],
-      },
+      server: { agentReleases: { url: remote.url } },
     });
   });
   after(async () => {
@@ -131,7 +128,7 @@ describe("сборки агента с другого сервера", () => {
   it("итоговый список сборок: агент из источника, netprobe — из releasesDir", async () => {
     const r = await s.api<{
       release: ReleaseView;
-      candidates: UpdateCandidate[];
+      candidates: { agents: UpdateCandidate[] };
     }>("GET", "/api/releases");
 
     assert.equal(r.release.version, NEXT_VERSION);
@@ -146,23 +143,12 @@ describe("сборки агента с другого сервера", () => {
       [["netprobe", "local"]],
     );
     assert.equal(
-      r.candidates.find(c => c.agentId === s.agentId)?.target,
+      r.candidates.agents.find(c => c.agentId === s.agentId)?.target,
       NEXT_VERSION,
     );
   });
 
-  it("install.sh из источника с адресом сервера и ключами проекта и автора; сборка — 302", async () => {
-    const sh = await (
-      await fetch(`${s.url}/api/v1/agent-link/install.sh`)
-    ).text();
-
-    assert.match(sh, new RegExp(`^DEFAULT_SERVER="${s.url}"$`, "m"));
-    assert.ok(
-      sh.includes(
-        `\nDEFAULT_UPDATE_KEYS="${project.public} ${author.public}"\n`,
-      ),
-      "ключи проекта и автора",
-    );
+  it("сборка агента из источника — 302 на его ссылку", async () => {
     const res = await fetch(
       `${s.url}/api/v1/agent-link/releases/agent-${platform}`,
       { redirect: "manual" },

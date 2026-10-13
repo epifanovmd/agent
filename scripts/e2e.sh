@@ -5,7 +5,7 @@
 # собранный sdk/node (make node-sdk).
 #   scripts/e2e.sh          # собрать и прогнать
 #   scripts/e2e.sh build    # только собрать: агент (VERSION), агент и netprobe следующей версии
-#                           # (для проверки обновления), agent-release, sysinfo, netprobe → .dev/e2e
+#                           # (для проверки обновления), sysinfo, netprobe → .dev/e2e
 #   scripts/e2e.sh test     # только прогнать (сборки уже есть)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,7 +26,6 @@ w() { GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build -trimpath -buildvcs=false -ld
 b $VERSION $OUT/agent-$P ./cmd/agent
 b $NEXT $OUT/next/agent-$P ./cmd/agent
 b $NEXT $OUT/next/netprobe-$P ./examples/workers/netprobe
-b $VERSION $OUT/agent-release-$P ./cmd/agent-release
 w $OUT/sysinfo-$P ./examples/workers/sysinfo
 w $OUT/netprobe-$P ./examples/workers/netprobe"
   mkdir -p "$OUT/next"

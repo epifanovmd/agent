@@ -1,6 +1,6 @@
 // Регистрация и ключи агентов: регистрация с пределом неудач, вход по ключу, смена ключа,
 // отзыв и удаление.
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { LRUCache } from "lru-cache";
 import { z } from "zod";
@@ -8,6 +8,7 @@ import { z } from "zod";
 import type { Context } from "../core/context";
 import { AgentsError, notFound, valid } from "../core/errors";
 import type { EnrollInfo, EnrollVerdict } from "../core/options";
+import { safeEqual } from "../lib/util";
 import { publicAgent } from "../model/public-agent";
 import type { Agent, AgentRecord } from "../model/types";
 import { parse, parseEnroll } from "../protocol/checks";
@@ -259,11 +260,4 @@ class FailureLimiter {
 
 const sha256 = (s: string): string => {
   return createHash("sha256").update(s).digest("hex");
-};
-
-const safeEqual = (a: string, b: string): boolean => {
-  const x = Buffer.from(a);
-  const y = Buffer.from(b);
-
-  return x.length === y.length && timingSafeEqual(x, y);
 };

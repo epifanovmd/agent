@@ -104,7 +104,6 @@ type Link struct {
 	urls []string
 	cur  atomic.Int64
 
-	kick     chan struct{}
 	renew    chan struct{}
 	renewGen atomic.Int64
 
@@ -123,7 +122,7 @@ func New(opts Options, handler Handler) *Link {
 	if opts.Backoff == (backoff.Policy{}) {
 		opts.Backoff = backoff.Default
 	}
-	l := &Link{opts: opts, handler: handler, kick: make(chan struct{}, 1), renew: make(chan struct{}, 1),
+	l := &Link{opts: opts, handler: handler, renew: make(chan struct{}, 1),
 		welcomeTimeout: welcomeTimeout, pingInterval: pingInterval, pongTimeout: pongTimeout, retryImportant: retryImportant}
 	for _, u := range opts.ServerURLs {
 		if u != "" && !slices.Contains(l.urls, u) {
@@ -185,14 +184,7 @@ func (l *Link) Important(env message.Envelope) error {
 	if env.ID == "" {
 		env.ID = message.NewID()
 	}
-	if err := l.opts.Outbox.Append(env); err != nil {
-		return err
-	}
-	select {
-	case l.kick <- struct{}{}:
-	default:
-	}
-	return nil
+	return l.opts.Outbox.Append(env)
 }
 
 // Reconnect — закрыть соединение и сразу открыть новое со свежим hello.
@@ -504,7 +496,6 @@ func (l *Link) outboxLoop(s *Session) error {
 		case <-s.ctx.Done():
 			return s.ctx.Err()
 		case <-l.opts.Outbox.Notify():
-		case <-l.kick:
 		case <-t.C:
 		}
 		if err := l.sendImportant(s); err != nil {

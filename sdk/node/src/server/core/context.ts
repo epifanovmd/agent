@@ -2,6 +2,7 @@
 // запись агента. Части получают Context и не знают друг о друге.
 import type { EventEmitter } from "node:events";
 
+import { jsonSchemaProblems } from "../lib/json-schema";
 import { publicAgent } from "../model/public-agent";
 import type {
   ActionRecord,
@@ -86,6 +87,16 @@ export interface Context {
   /** Сессии этого процесса: id агента → сессия. */
   readonly sessions: Map<string, Session>;
   log(msg: string, extra?: Record<string, unknown>): void;
+  /**
+   * Замечания к data по схеме из манифеста воркера (пусто — подходит). Нет схемы или её нельзя
+   * применить — без проверки (второе — запись в журнал: «схема what … не применяется», fields).
+   */
+  schemaProblems(
+    schema: Record<string, unknown> | undefined,
+    data: unknown,
+    what: string,
+    fields: Record<string, unknown>,
+  ): string[];
   /** Событие; ошибка подписчика не мешает работе. */
   emit<K extends keyof AgentsEvents>(event: K, ...args: AgentsEvents[K]): void;
   listens(event: keyof AgentsEvents): boolean;
@@ -132,6 +143,20 @@ export const createContext = (
     instanceId,
     sessions,
     log,
+
+    schemaProblems(schema, data, what, fields) {
+      if (!schema) return [];
+      try {
+        return jsonSchemaProblems(schema, data);
+      } catch (e) {
+        log(`схема ${what} из манифеста воркера не применяется`, {
+          ...fields,
+          err: String(e),
+        });
+
+        return [];
+      }
+    },
 
     emit(event, ...args) {
       try {

@@ -37,8 +37,7 @@ func life() config.Lifecycle {
 	l.Backoff = config.Backoff{Min: config.Duration(20 * time.Millisecond), Max: config.Duration(50 * time.Millisecond)}
 	interval := config.Duration(50 * time.Millisecond)
 	l.Health.Interval, l.Health.Timeout = &interval, config.Duration(200*time.Millisecond)
-	l.ProbeTimeout = config.Duration(200 * time.Millisecond)
-	l.StartTimeout, l.StopTimeout, l.UpdateHealthyTimeout = config.Duration(5*time.Second), config.Duration(2*time.Second), config.Duration(2*time.Second)
+	l.StartTimeout, l.StopTimeout = config.Duration(5*time.Second), config.Duration(2*time.Second)
 	return l
 }
 

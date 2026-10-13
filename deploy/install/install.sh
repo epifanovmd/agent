@@ -1,22 +1,28 @@
 #!/bin/sh
-# Установка агента одной командой (Linux): скачивает сборку агента под эту машину и запускает
-# `agent install` — он и ставит службу systemd или агента пользователя без root (--rootless).
+# Установка агента одной командой (Linux): скачивает сборку агента под эту машину (или архив
+# папки агента проекта, --bundle) и запускает `agent install` — он и ставит службу systemd или
+# агента пользователя без root (--rootless).
 # Все флаги, кроме своих (ниже), передаются agent install как есть: --token, --name, --worker,
-# --packages, --sysctl, --privileged, --rootless и др.
+# --update-key, --packages, --sysctl, --privileged, --rootless и др.
 # (список — agent install -h и docs/ARCHITECTURE.md, раздел «Установка»).
 #
-# С сервера (он раздаёт этот скрипт со своим адресом и ключами проверки подписи сборок):
-#   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --token <токен> [флаги]
-#   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sh -s -- --rootless --token <токен>
-#   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sh -s -- --run --token <токен>
-#   curl -fsSL https://api.example.com/api/v1/agent-link/install.sh | sudo sh -s -- --uninstall [--purge]
+# Скрипт — в релизе агента (install.sh рядом со сборками):
+#   I=https://github.com/epifanovmd/agent/releases/latest/download/install.sh
+#   curl -fsSL $I | sudo sh -s -- --server https://api.example.com --token <токен> [флаги]
+#   curl -fsSL $I | sh -s -- --rootless --server https://api.example.com --token <токен>
+#   curl -fsSL $I | sh -s -- --run --server https://api.example.com --token <токен>
+#   curl -fsSL $I | sudo sh -s -- --bundle 'https://files.example.com/agent-prod-linux-{arch}.tar.gz' --token <токен>
+#   curl -fsSL $I | sudo sh -s -- --uninstall [--purge]
 #
 # Свои флаги:
-#   --server URL      адрес сервера (в скрипт с сервера уже вписан)
+#   --server URL      адрес сервера
 #   --releases URL    откуда скачать сборку (по умолчанию <server>/api/v1/agent-link/releases);
 #                     передаётся и agent install (оттуда же — сборки воркеров)
 #   --ca-file ПУТЬ    свой корневой сертификат сервера для загрузки; передаётся и agent install
 #   --binary ПУТЬ     не скачивать, а поставить сборку из файла
+#   --bundle URL      архив папки агента проекта (agent pack) по ссылке; {arch} в ссылке — amd64
+#                     или arm64 этой машины. Программа агента, настройки и воркеры — из архива;
+#                     --server — только если адреса нет в его настройках
 #   --instance ИМЯ    экземпляр агента (несколько агентов на одном узле — для разных бэкендов);
 #                     передаётся и agent install
 #   --uninstall [--purge]   удалить агента: /opt/agent/bin/agent uninstall [--purge]
@@ -24,24 +30,20 @@
 #                     без sudo — агента пользователя: ~/.agent[-ИМЯ]/bin/agent uninstall)
 #   --run             без установки: агент здесь же на переднем плане (контейнер, свой менеджер
 #                     процессов) — `agent run` с --token/--token-file и --name, данные —
-#                     AGENT_DATA_DIR (по умолчанию /var/lib/agent); себя не обновляет
+#                     AGENT_DATA_DIR (по умолчанию /var/lib/agent); себя не обновляет. С --bundle —
+#                     agent run с настройками архива; ключи проверки — --update-key
 # Без root — только с --rootless или --run (агент пользователя в ~/.agent или без установки).
 #
 # Без скрипта — то же самое вручную: скачать agent-linux-<arch> и выполнить
 #   sudo ./agent-linux-<arch> install --server URL --token <токен>
 set -eu
 
-# Сервер, раздающий скрипт, подставляет сюда свой адрес и ключи проверки подписи сборок (base64 через
-# пробел: автор агента и проект) — они уходят agent install флагами --update-key.
-DEFAULT_SERVER=""
-DEFAULT_UPDATE_KEYS=""
-
 die() {
   echo "install.sh: $*" >&2
   exit 1
 }
 
-SERVER="$DEFAULT_SERVER" RELEASES="" BINARY="" CA_FILE="" UNINSTALL="" PURGE="" INSTANCE="" ROOTLESS="" RUN=""
+SERVER="" RELEASES="" BINARY="" BUNDLE="" CA_FILE="" UNINSTALL="" PURGE="" INSTANCE="" ROOTLESS="" RUN=""
 # Свои флаги забираются, остальные остаются в "$@" по порядку (для agent install).
 n=$#
 while [ "$n" -gt 0 ]; do
@@ -56,13 +58,14 @@ while [ "$n" -gt 0 ]; do
       set -- "$@" "$a"
       ;;
     --run) RUN=1 ;;
-    --binary | --server | --releases | --ca-file | --instance)
+    --binary | --bundle | --server | --releases | --ca-file | --instance)
       [ "$n" -gt 0 ] || die "$a: нужно значение"
       v=$1
       shift
       n=$((n - 1))
       case "$a" in
         --binary) BINARY=$v ;;
+        --bundle) BUNDLE=$v ;;
         --server) SERVER=$v ;;
         --releases)
           RELEASES=$v
@@ -79,6 +82,7 @@ while [ "$n" -gt 0 ]; do
       esac
       ;;
     --binary=*) BINARY=${a#*=} ;;
+    --bundle=*) BUNDLE=${a#*=} ;;
     --server=*) SERVER=${a#*=} ;;
     --releases=*)
       RELEASES=${a#*=}
@@ -104,19 +108,34 @@ SERVER="${SERVER%/}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# fetch_agent — сборка агента в $TMP/agent: --binary или из manifest.json (sha256 сверяется).
+arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64) echo amd64 ;;
+    aarch64 | arm64) echo arm64 ;;
+    *) die "архитектура $(uname -m) не поддерживается" ;;
+  esac
+}
+
+# fetch_agent — программа агента в $AGENT: из архива --bundle (распакован в $TMP/agent/), --binary
+# или из manifest.json (sha256 сверяется).
+AGENT="$TMP/agent"
 fetch_agent() {
+  if [ -n "$BUNDLE" ]; then
+    command -v curl >/dev/null || die "нужен curl"
+    URL=$(printf '%s' "$BUNDLE" | sed "s/{arch}/$(arch)/g")
+    curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$URL" -o "$TMP/bundle.tar.gz" || die "архив не скачан: $URL"
+    tar xzf "$TMP/bundle.tar.gz" -C "$TMP" || die "архив не распакован: $URL"
+    AGENT="$TMP/agent/agent"
+    [ -x "$AGENT" ] && [ -f "$TMP/agent/bundle.json" ] || die "$URL: не архив agent pack (нет agent/agent и agent/bundle.json)"
+    return
+  fi
   if [ -n "$BINARY" ]; then
     [ -f "$BINARY" ] || die "--binary: нет файла $BINARY"
     cp "$BINARY" "$TMP/agent"
   else
     [ -n "$SERVER" ] || [ -n "$RELEASES" ] || die "--server: адрес сервера (или --binary ПУТЬ к сборке)"
     command -v curl >/dev/null || die "нужен curl"
-    case "$(uname -m)" in
-      x86_64 | amd64) ARCH=amd64 ;;
-      aarch64 | arm64) ARCH=arm64 ;;
-      *) die "архитектура $(uname -m) не поддерживается" ;;
-    esac
+    ARCH=$(arch)
     RELEASES="${RELEASES:-$SERVER/api/v1/agent-link/releases}"
     RELEASES="${RELEASES%/}"
     MANIFEST="$(curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$RELEASES/manifest.json")" || die "манифест сборок не получен: $RELEASES/manifest.json"
@@ -142,7 +161,7 @@ fetch_agent() {
     GOT="$(sha256sum "$TMP/agent" | cut -d' ' -f1)"
     [ "$GOT" = "$SUM" ] || die "sha256 сборки не сходится: $GOT"
   fi
-  chmod 0755 "$TMP/agent"
+  chmod 0755 "$AGENT"
 }
 
 case "$INSTANCE" in
@@ -163,8 +182,12 @@ else
 fi
 
 if [ -n "$UNINSTALL" ]; then
-  # Удаляет установленная программа; её уже нет (удалена без --purge) — скачанная.
-  if [ -x "$BIN" ]; then
+  # Удаляет установленная программа; её уже нет (удалена без --purge) — скачанная. Из архива —
+  # его программа: экземпляр она берёт из настроек архива.
+  if [ -n "$BUNDLE" ]; then
+    fetch_agent
+    "$AGENT" uninstall ${PURGE:+--purge}
+  elif [ -x "$BIN" ]; then
     "$BIN" uninstall ${INSTANCE:+--instance "$INSTANCE"} ${PURGE:+--purge}
   else
     fetch_agent
@@ -175,12 +198,14 @@ fi
 
 fetch_agent
 
-# Без установки: agent run здесь же (настройки — из окружения), только токен и имя.
+# Без установки: agent run здесь же (настройки — из окружения или архива), только токен, имя и
+# ключи проверки.
 if [ -n "$RUN" ]; then
-  [ -n "$SERVER" ] || die "--server: адрес сервера"
+  [ -n "$SERVER" ] || [ -n "$BUNDLE" ] || die "--server: адрес сервера"
+  KEYS=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --token | --token-file | --name | --releases | --ca-file | --instance) [ $# -ge 2 ] || die "$1: нужно значение" ;;
+      --token | --token-file | --name | --update-key | --releases | --ca-file | --instance) [ $# -ge 2 ] || die "$1: нужно значение" ;;
     esac
     case "$1" in
       --token) AGENT_ENROLL_TOKEN=$2; shift 2 ;;
@@ -189,30 +214,28 @@ if [ -n "$RUN" ]; then
       --token-file=*) AGENT_ENROLL_TOKEN=$(tr -d ' \t\r\n' <"${1#*=}"); shift ;;
       --name) AGENT_NAME=$2; shift 2 ;;
       --name=*) AGENT_NAME=${1#*=}; shift ;;
+      --update-key) KEYS="${KEYS:+$KEYS,}$2"; shift 2 ;;
+      --update-key=*) KEYS="${KEYS:+$KEYS,}${1#*=}"; shift ;;
       # Флаги скрипта, уже учтённые при загрузке.
       --releases | --ca-file | --instance) shift 2 ;;
       --releases=* | --ca-file=* | --instance=*) shift ;;
-      *) die "--run: $1 — здесь только --token, --token-file и --name" ;;
+      *) die "--run: $1 — здесь только --token, --token-file, --name и --update-key" ;;
     esac
   done
-  AGENT_SERVER_URL="$SERVER"
+  [ -z "$SERVER" ] || export AGENT_SERVER_URL="$SERVER"
   AGENT_DATA_DIR="${AGENT_DATA_DIR:-/var/lib/agent}"
   AGENT_UPDATE_MODE="${AGENT_UPDATE_MODE:-external}"
-  export AGENT_SERVER_URL AGENT_DATA_DIR AGENT_UPDATE_MODE
+  export AGENT_DATA_DIR AGENT_UPDATE_MODE
   [ -z "${AGENT_ENROLL_TOKEN:-}" ] || export AGENT_ENROLL_TOKEN
   [ -z "${AGENT_NAME:-}" ] || export AGENT_NAME
   [ -z "$CA_FILE" ] || export AGENT_SERVER_CA_FILE="$CA_FILE"
-  if [ -n "$DEFAULT_UPDATE_KEYS" ]; then
-    AGENT_UPDATE_PUBLIC_KEYS=$(echo "$DEFAULT_UPDATE_KEYS" | tr ' ' ',')
-    export AGENT_UPDATE_PUBLIC_KEYS
-  fi
+  [ -z "$KEYS" ] || export AGENT_UPDATE_PUBLIC_KEYS="$KEYS"
   mkdir -p "$AGENT_DATA_DIR"
-  exec "$TMP/agent" run
+  if [ -n "$BUNDLE" ]; then
+    CONFIG=$(sed -n 's/.*"config": *"\([^"]*\)".*/\1/p' "$TMP/agent/bundle.json")
+    exec "$AGENT" run -config "$TMP/agent/${CONFIG:-agent.yaml}"
+  fi
+  exec "$AGENT" run
 fi
 
-# Ключи сервера — флагами --update-key перед остальными (ключи — base64 без пробелов).
-for k in $DEFAULT_UPDATE_KEYS; do
-  set -- --update-key "$k" "$@"
-done
-# Адрес сервера — первым: такой же флаг в командной строке его заменяет.
-"$TMP/agent" install ${SERVER:+--server "$SERVER"} "$@"
+"$AGENT" install ${SERVER:+--server "$SERVER"} "$@"

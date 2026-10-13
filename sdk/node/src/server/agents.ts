@@ -5,7 +5,7 @@ import { EventEmitter } from "node:events";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
 import { type AgentsEvents, createContext } from "./core/context";
-import { codeError } from "./core/errors";
+import { AgentsError, codeError } from "./core/errors";
 import {
   agentsDefaults,
   type AgentsOptions,
@@ -26,25 +26,23 @@ import { Configs } from "./features/configs";
 import { Connections } from "./features/connections";
 import { Enrollment } from "./features/enrollment";
 import { Inbound } from "./features/inbound";
-import {
-  bundleInstallCommand,
-  type BundleInstallOptions,
-  installCommand,
-  type InstallOptions,
-} from "./features/install";
 import { type JobOptions, type JobResult, Jobs } from "./features/jobs";
 import {
-  type EventFilter,
-  type EventHandler,
   Observe,
   type WaitEventOptions,
+  type Watch,
   type WatchOptions,
   type WatchRef,
 } from "./features/observe";
-import { type Fetcher, Relay } from "./features/relay";
+import { Relay } from "./features/relay";
 import { Release } from "./features/release";
 import { Requests } from "./features/requests";
-import { type FetchInit, fetchReply, Tunnel } from "./features/tunnel";
+import {
+  type Fetcher,
+  type FetchInit,
+  fetchReply,
+  Tunnel,
+} from "./features/tunnel";
 import { capabilities } from "./model/manifest";
 import { publicAgent } from "./model/public-agent";
 import type {
@@ -54,9 +52,8 @@ import type {
   ConfigRecord,
   ConfigStatus,
   ReleaseView,
-  UpdateCandidate,
+  UpdateCandidates,
   WorkerCapabilities,
-  WorkerUpdateCandidate,
 } from "./model/types";
 import { type JobStatus, type LogEntry, newId } from "./protocol/messages";
 import { MemoryStore } from "./store/memory";
@@ -67,54 +64,46 @@ import { Transport } from "./transport/transport";
  * Вызовы от имени actor (общие для Agents и Actor). Вызовы, которым нужна сессия агента, при
  * опции relay уходят в процесс с сессией (features/relay.ts).
  */
-interface Operations {
-  enrollment: Enrollment;
-  configs: Configs;
-  fetch(
-    actor: string,
-    agentId: string,
-    worker: string,
-    path: string,
-    init: FetchInit,
-  ): Promise<Response>;
-  restartWorker(
-    actor: string,
-    agentId: string,
-    name: string,
-    opts: WorkerActionOptions,
-  ): Promise<RestartResult>;
-  updateWorker(
+const createOperations = (
+  enrollment: Enrollment,
+  configs: Configs,
+  relay: Relay,
+  jobs: Jobs,
+) => ({
+  enrollment,
+  configs,
+  fetch: relay.fetch,
+  restartWorker: (
     actor: string,
     agentId: string,
     name: string,
-    opts: WorkerActionOptions,
-  ): Promise<WorkerUpdateResult>;
-  updateAgent(
+    o: WorkerActionOptions,
+  ) => relay.run<RestartResult>("restartWorker", actor, agentId, [name, o]),
+  updateWorker: (
     actor: string,
     agentId: string,
-    opts: UpdateAgentOptions,
-  ): Promise<UpdateResult>;
-  rotateKey(actor: string, agentId: string, opts: ActionOptions): Promise<void>;
-  logs(actor: string, agentId: string, opts: LogsOptions): Promise<LogEntry[]>;
-  runJob(
-    actor: string,
-    agentId: string,
-    worker: string,
-    opts: JobOptions,
-  ): Promise<JobResult>;
-  jobStatus(
-    actor: string,
-    agentId: string,
-    worker: string,
-    id: string,
-  ): Promise<JobStatus>;
-  cancelJob(
+    name: string,
+    o: WorkerActionOptions,
+  ) => relay.run<WorkerUpdateResult>("updateWorker", actor, agentId, [name, o]),
+  updateAgent: (actor: string, agentId: string, o: UpdateAgentOptions) =>
+    relay.run<UpdateResult>("updateAgent", actor, agentId, [o]),
+  rotateKey: (actor: string, agentId: string, o: ActionOptions) =>
+    relay.run<void>("rotateKey", actor, agentId, [o]),
+  logs: (actor: string, agentId: string, o: LogsOptions) =>
+    relay.run<LogEntry[]>("logs", actor, agentId, [o]),
+  runJob: (
     actor: string,
     agentId: string,
     worker: string,
-    id: string,
-  ): Promise<JobStatus>;
-}
+    { signal, ...o }: JobOptions,
+  ) => relay.run<JobResult>("runJob", actor, agentId, [worker, o], signal),
+  jobStatus: (actor: string, agentId: string, worker: string, id: string) =>
+    jobs.status(actor, agentId, worker, id, relay.fetch),
+  cancelJob: (actor: string, agentId: string, worker: string, id: string) =>
+    jobs.cancel(actor, agentId, worker, id, relay.fetch),
+});
+
+type Operations = ReturnType<typeof createOperations>;
 
 const operations = new WeakMap<Agents, Operations>();
 
@@ -204,7 +193,6 @@ export class Agents extends EventEmitter<AgentsEvents> {
           localFetch,
         ),
     });
-    const fetch = relay.fetch;
 
     this.transport = new Transport({
       settings: this.settings,
@@ -213,33 +201,13 @@ export class Agents extends EventEmitter<AgentsEvents> {
       servedManifest: () => releases.served(),
       releaseFile: name => releases.file(name),
       downloadRelease: (url, signal) => releases.download(url, signal),
-      installScript: () => releases.installScript(),
       enroll: (body, remote) => enrollment.enroll(body, remote),
       authenticate: header => enrollment.authenticate(header),
       open: (ss, env) => links.open(ss, env),
       process: (ss, env) => inbound.process(ss, env),
       closed: ss => links.closed(ss),
     });
-    this.ops = {
-      enrollment,
-      configs,
-      fetch,
-      restartWorker: (actor, agentId, name, o) =>
-        relay.run("restartWorker", actor, agentId, [name, o]),
-      updateWorker: (actor, agentId, name, o) =>
-        relay.run("updateWorker", actor, agentId, [name, o]),
-      updateAgent: (actor, agentId, o) =>
-        relay.run("updateAgent", actor, agentId, [o]),
-      rotateKey: (actor, agentId, o) =>
-        relay.run("rotateKey", actor, agentId, [o]),
-      logs: (actor, agentId, o) => relay.run("logs", actor, agentId, [o]),
-      runJob: (actor, agentId, worker, { signal, ...o }) =>
-        relay.run("runJob", actor, agentId, [worker, o], signal),
-      jobStatus: (actor, agentId, worker, id) =>
-        jobs.status(actor, agentId, worker, id, fetch),
-      cancelJob: (actor, agentId, worker, id) =>
-        jobs.cancel(actor, agentId, worker, id, fetch),
-    };
+    this.ops = createOperations(enrollment, configs, relay, jobs);
     operations.set(this, this.ops);
     this.links = links;
     this.watchers = {
@@ -272,7 +240,10 @@ export class Agents extends EventEmitter<AgentsEvents> {
     this.transport.attach(server);
   }
 
-  /** HTTP-маршруты агентов (регистрация, сборки, install.sh); обработан — true. */
+  /**
+   * HTTP-маршруты агентов (регистрация, сборки); обработан — true, чужой путь — false.
+   * Ошибку SDK отвечает сам ({ code, message }), наружу не бросает.
+   */
   handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
     return this.transport.handle(req, res);
   }
@@ -370,7 +341,7 @@ export class Agents extends EventEmitter<AgentsEvents> {
   /**
    * Задача воркеру: POST /jobs. Быстрая (200) — итог сразу; долгая (202) — ждать события
    * job.done, job.failed или job.cancelled не дольше timeoutMs (по умолчанию 30 с), не дождались —
-   * state: running. Тип нет в manifest.jobs — JOB_UNKNOWN; data не по схеме (validateJobs) —
+   * state: running; wait: false — не ждать, сразу state: running. Тип нет в manifest.jobs — JOB_UNKNOWN; data не по схеме (validate.jobs) —
    * JOB_INVALID; отказ воркера — JOB_REJECTED. События задач доходят и до onEvent.
    */
   runJob(
@@ -434,31 +405,47 @@ export class Agents extends EventEmitter<AgentsEvents> {
   // ── наблюдение ──
 
   /**
-   * Наблюдатель: пока он есть, агент присылает метрики чаще и журнал подробнее (§9). Повтор с тем
-   * же id продлевает и заменяет параметры. Наблюдатели сводятся в один watch. Живут в памяти
-   * процесса с сессией агента (опция relay — туда и уходят) и действуют, пока агент на связи с
-   * ним.
+   * Наблюдатель: пока он есть, агент присылает метрики чаще и журнал подробнее (§9). Наблюдатель
+   * продлевается сам, пока его не закроют (close) или не закончится процесс: тогда он истекает
+   * через ttlMs. Повтор с тем же id заменяет параметры. Наблюдатели сводятся в один watch;
+   * живут в памяти процесса с сессией агента (опция relay — туда и уходят) и действуют, пока
+   * агент на связи с ним.
    */
-  watch(agentId: string, opts: WatchOptions = {}): Promise<WatchRef> {
-    return this.watchers.watch(agentId, opts);
+  async watch(agentId: string, opts: WatchOptions = {}): Promise<Watch> {
+    const ref = await this.watchers.watch(agentId, opts);
+    const renew = setInterval(
+      () =>
+        void this.watchers
+          .watch(agentId, { ...opts, id: ref.id })
+          .then(r => (w.until = r.until))
+          .catch(e => {
+            this.settings.log("наблюдатель не продлён", {
+              agentId,
+              id: ref.id,
+              err: String(e),
+            });
+            if (e instanceof AgentsError && e.code === "AGENT_NOT_FOUND")
+              clearInterval(renew);
+          }),
+      Math.max((ref.until - Date.now()) / 2, 500),
+    );
+
+    renew.unref();
+    const w: Watch = {
+      ...ref,
+      close: () => {
+        clearInterval(renew);
+
+        return this.watchers.unwatch(agentId, ref.id);
+      },
+    };
+
+    return w;
   }
 
-  /** Снять наблюдателя. */
+  /** Снять наблюдателя по id (например, созданного другим процессом). */
   unwatch(agentId: string, id: string): Promise<void> {
     return this.watchers.unwatch(agentId, id);
-  }
-
-  /**
-   * Подписка на события типа type воркера worker (агента agentId или любого): handler — после
-   * onEvent и подтверждения, его ошибка только пишется в журнал. Итог — отписка. Агент известен и
-   * манифест есть — тип сверяется сразу (нет в events — EVENT_UNDECLARED, 409), иначе — по
-   * первому событию воркера (предупреждение в журнал). Видны события, принятые этим процессом.
-   */
-  subscribeEvents(
-    filter: EventFilter,
-    handler: EventHandler,
-  ): Promise<() => void> {
-    return this.observe.subscribe(filter, handler);
   }
 
   /**
@@ -527,42 +514,16 @@ export class Agents extends EventEmitter<AgentsEvents> {
 
   /**
    * Итоговые сборки или null: агент и его воркеры — из удалённого источника (agentReleases), воркеры
-   * проекта — из releasesDir; у каждой сборки — источник (source) и ссылка (url).
+   * проекта — из releasesDir; у каждой сборки — источник (source) и ссылка (url). refresh —
+   * проверить удалённый источник сейчас, не дожидаясь checkIntervalMs.
    */
-  release(): Promise<ReleaseView | null> {
-    return this.releases.manifest();
+  release(opts: { refresh?: boolean } = {}): Promise<ReleaseView | null> {
+    return opts.refresh ? this.releases.check() : this.releases.manifest();
   }
 
-  /** Проверить удалённый источник сборок сейчас (не дожидаясь checkIntervalMs) и вернуть итоговые сборки. */
-  checkRelease(): Promise<ReleaseView | null> {
-    return this.releases.check();
-  }
-
-  /** Агенты, чья версия не как на сервере и для чьих os/arch есть сборка. */
-  updateCandidates(): Promise<UpdateCandidate[]> {
+  /** Агенты и воркеры, которых можно обновить (UpdateCandidate.source — откуда версия). */
+  updateCandidates(): Promise<UpdateCandidates> {
     return this.releases.updateCandidates();
-  }
-
-  /** Воркеры со сборкой с сервера, чья версия не как у новейшей сборки в manifest.json. */
-  workerUpdateCandidates(): Promise<WorkerUpdateCandidate[]> {
-    return this.releases.workerUpdateCandidates();
-  }
-
-  /**
-   * Команда установки агента одной строкой: `curl -fsSL '<адрес>/api/v1/agent-link/install.sh' |
-   * sudo sh -s -- --token '…' [флаги]`. Неверные значения — MESSAGE_INVALID.
-   */
-  installCommand(opts: InstallOptions): string {
-    return installCommand(opts, this.settings.baseUrl);
-  }
-
-  /**
-   * Команда установки из архива папки агента проекта (опция bundlesDir) одной строкой:
-   * `curl -fsSL '<адрес>/api/v1/agent-link/bundle/install.sh' | sudo sh -s -- --token '…'`;
-   * rootless — без root, run — без установки (контейнер). Неверные значения — MESSAGE_INVALID.
-   */
-  bundleInstallCommand(opts: BundleInstallOptions): string {
-    return bundleInstallCommand(opts, this.settings.baseUrl);
   }
 
   // ── несколько процессов ──

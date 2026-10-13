@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 )
 
 // Diff — что изменилось между применёнными настройками и прочитанными заново
@@ -36,19 +37,13 @@ func Compare(old, next Config) Diff {
 			d.Restart = append(d.Restart, key)
 		}
 	}
-	restart("server.url", old.Server.URL != next.Server.URL)
-	restart("server.urls", !slices.Equal(old.Server.URLs, next.Server.URLs))
-	restart("server.caFile", old.Server.CAFile != next.Server.CAFile)
-	restart("server.certFile", old.Server.CertFile != next.Server.CertFile)
-	restart("server.keyFile", old.Server.KeyFile != next.Server.KeyFile)
+	// Разделы, которые KeepRestartOnly оставляет прежними целиком: каждое их
+	// поле — ключ перезапуска.
+	restartFields("server", old.Server, next.Server, restart)
 	restart("dataDir", old.DataDir != next.DataDir)
-	restart("update.mode", old.Update.Mode != next.Update.Mode)
-	restart("update.publicKey", old.Update.PublicKey != next.Update.PublicKey)
-	restart("update.publicKeys", !slices.Equal(old.Update.PublicKeys, next.Update.PublicKeys))
-	restart("enroll.token", old.Enroll.Token != next.Enroll.Token)
-	restart("server.reconnect", old.Server.Reconnect != next.Server.Reconnect)
-	restart("server.streamBuffer", old.Server.StreamBuffer != next.Server.StreamBuffer)
-	restart("outbox.maxMessages", old.Outbox != next.Outbox)
+	restartFields("update", old.Update, next.Update, restart)
+	restartFields("enroll", old.Enroll, next.Enroll, restart)
+	restartFields("outbox", old.Outbox, next.Outbox, restart)
 	restart("log.buffer", old.Log.Buffer != next.Log.Buffer)
 
 	oldLog, nextLog := old.Log, next.Log
@@ -58,6 +53,15 @@ func Compare(old, next Config) Diff {
 	d.Hello = old.Name != next.Name || !maps.Equal(old.Labels, next.Labels)
 	d.Workers = !reflect.DeepEqual(old.Workers, next.Workers)
 	return d
+}
+
+// restartFields — сравнить поля раздела old и next; ключ — <prefix>.<имя в yaml>.
+func restartFields[T any](prefix string, old, next T, restart func(string, bool)) {
+	o, n := reflect.ValueOf(old), reflect.ValueOf(next)
+	for i := range o.NumField() {
+		name, _, _ := strings.Cut(o.Type().Field(i).Tag.Get("yaml"), ",")
+		restart(prefix+"."+name, !reflect.DeepEqual(o.Field(i).Interface(), n.Field(i).Interface()))
+	}
 }
 
 // KeepRestartOnly — next, в котором ключи, требующие перезапуска, остаются

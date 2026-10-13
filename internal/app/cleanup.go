@@ -36,7 +36,7 @@ func Cleanup(ctx context.Context, cfg config.Config, version string) ([]worker.C
 }
 
 // StopWorkers — `agent stop-workers`: остановить воркеры, оставшиеся
-// работать после остановки агента (lifecycle.onAgentStop: keep). Агент с
+// работать после остановки агента (lifecycle.onAgentExit: keep). Агент с
 // этим dataDir не должен работать. Итог — имена остановленных.
 func StopWorkers(cfg config.Config) ([]string, error) {
 	lock, err := LockDataDir(cfg.DataDir)

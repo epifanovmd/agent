@@ -5,7 +5,7 @@
 //
 // Настройки — опции Agents (enrollToken, statusIntervalMs, metricsIntervalMs, releasesDir…).
 // Сервер слушает 127.0.0.1 на свободном порту и пишет в stdout одну строку {"url": "..."}.
-// Он стоит за прокси теста: адрес для install.sh — из X-Forwarded-Host и X-Forwarded-Proto.
+// Он стоит за прокси теста: свой адрес — из X-Forwarded-Host и X-Forwarded-Proto.
 //
 // Управляющий API: POST /test/<метод>, тело — массив аргументов, ответ — {"result": ...}
 // или {"error": {"code", "message"}} с кодом 4xx/5xx. Методы — Agents (getAgent, setConfig,
@@ -97,8 +97,6 @@ const methods = new Set([
   "updateAgent",
   "rotateKey",
   "updateCandidates",
-  "workerUpdateCandidates",
-  "installCommand",
   "runJob",
   "jobStatus",
   "cancelJob",

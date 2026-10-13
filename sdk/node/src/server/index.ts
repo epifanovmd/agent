@@ -1,5 +1,5 @@
 // agent-sdk/server — серверная часть: Agents (связь с агентами), Store, типы сообщений.
-export { Actor, Agents } from "./agents";
+export { type Actor, Agents } from "./agents";
 export type {
   AgentsEvents,
   AlertEvent,
@@ -9,18 +9,17 @@ export type {
   ReleaseEvent,
 } from "./core/context";
 export { AgentsError } from "./core/errors";
-export {
-  type AgentReleasesOptions,
-  agentsDefaults,
-  type AgentsOptions,
-  type EnrollInfo,
-  type EnrollVerdict,
-  type RelayCall,
-  type RelayFunction,
-  type RelayMethod,
-  type RelayRequest,
+export type {
+  AgentReleasesOptions,
+  AgentsOptions,
+  EnrollInfo,
+  EnrollVerdict,
+  RelayCall,
+  RelayFunction,
+  RelayMethod,
+  RelayRequest,
+  ValidateOptions,
 } from "./core/options";
-export { Session } from "./core/session";
 export type {
   ActionOptions,
   Deferred,
@@ -31,46 +30,33 @@ export type {
   WorkerActionOptions,
   WorkerUpdateResult,
 } from "./features/actions";
-export {
-  bundleInstallCommand,
-  type BundleInstallOptions,
-  bundleInstallUrl,
-  installCommand,
-  type InstallOptions,
-  PACKAGE_MANAGERS,
-  type PackageManager,
-} from "./features/install";
 export type { JobFiles, JobOptions, JobResult } from "./features/jobs";
 export type {
-  EventFilter,
-  EventHandler,
   WaitEventOptions,
+  Watch,
   WatchOptions,
   WatchRef,
 } from "./features/observe";
-export { RELAY_SECRET_HEADER } from "./features/relay";
 export type { FetchInit } from "./features/tunnel";
-export { shellQuote } from "./lib/shell";
+export { SDK_VERSION } from "./lib/sdk-version";
 export {
   capabilities,
-  declaresEvent,
-  findRoute,
-  matchRoute,
   supports,
   type SupportsQuery,
   workerManifest,
 } from "./model/manifest";
-export { publicAgent } from "./model/public-agent";
-export * from "./model/types";
-export { validEventType, validName } from "./protocol/checks";
-export * from "./protocol/messages";
+export type * from "./model/types";
+export {
+  EVENT_TYPE_PATTERN,
+  JOB_EVENTS,
+  LINK_PATH,
+  MAX_CONFIG_BYTES,
+  MAX_FETCH_BODY,
+  NAME_PATTERN,
+  WS_CHANNEL,
+} from "./protocol/constants";
+export type * from "./protocol/messages";
+export { LOG_LEVELS } from "./protocol/messages";
 export { MemoryStore } from "./store/memory";
 export type { SetConfigOptions, Store } from "./store/store";
-export {
-  baseUrl,
-  clientAddress,
-  readBody,
-  readJSON,
-  sendJSON,
-} from "./transport/http";
-export { transportDefaults } from "./transport/transport";
+export { baseUrl, readBody, readJSON, sendJSON } from "./transport/http";

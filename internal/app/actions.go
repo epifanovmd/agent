@@ -233,26 +233,14 @@ func (a *App) source(raw string) (src, auth string, err error) {
 	if err != nil || u.Host == "" || u.User != nil {
 		return "", "", message.NewError(message.CodeUpdateFailed, fmt.Sprintf("адрес сборки %q: нужен путь от корня (/api/…) или ссылка https://", raw))
 	}
-	s, _ := url.Parse(server)
-	switch {
-	case strings.EqualFold(u.Scheme, "https"):
-	case strings.EqualFold(u.Scheme, "http") && s != nil && strings.EqualFold(s.Scheme, "http"):
-	default:
+	if !releases.SchemeAllowed(u, server) {
 		return "", "", message.NewError(message.CodeUpdateFailed, fmt.Sprintf("адрес сборки %q: нужна ссылка https:// (http:// — только если и сервер http://)", raw))
 	}
+	s, _ := url.Parse(server)
 	if s != nil && strings.EqualFold(u.Scheme, s.Scheme) && strings.EqualFold(u.Host, s.Host) {
 		return u.String(), a.auth.Session(), nil
 	}
 	return u.String(), "", nil
-}
-
-// isArchive — сборка воркера — архив .tar.gz (по имени файла в url).
-func isArchive(rawURL string) bool {
-	p := rawURL
-	if u, err := url.Parse(rawURL); err == nil {
-		p = u.Path
-	}
-	return strings.HasSuffix(p, ".tar.gz")
 }
 
 // workerUpdate — worker.update (§11): сборка скачивается со своим ключом,
@@ -273,7 +261,7 @@ func (a *App) workerUpdate(ctx context.Context, args message.WorkerUpdateArgs) (
 		if len(a.keys) == 0 {
 			return message.NewError(message.CodeUpdateNotVerified, update.ErrNotVerified.Error())
 		}
-		if isArchive(src) {
+		if releases.IsArchive(src) {
 			return update.FetchArchive(ctx, a.client, auth, a.keys, build, src, args.Signature, dst)
 		}
 		return update.Fetch(ctx, a.client, auth, a.keys, build, src, args.Signature, dst)

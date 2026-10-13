@@ -42,8 +42,25 @@ func (a *App) ReloadFile(path string) error {
 		a.log.Error("настройки не перечитаны — агент работает со старыми", "err", err)
 		return err
 	}
+	a.warnUnknown(path)
 	a.Reload(cfg)
 	return nil
+}
+
+// manualInstall — способ запуска в журнале установки у агента без службы: такой
+// агент запущен в фоне, перезапускать его некому.
+const manualInstall = "manual"
+
+// warnUnknown — неизвестные поля файлов настроек (опечатка, поле другой версии) —
+// предупреждением в журнал агента (уходит и серверу): агент их не читает.
+func (a *App) warnUnknown(path string) {
+	for _, p := range config.Unknown(path) {
+		file := p.File
+		if file == "" {
+			file = config.ShortPath(path)
+		}
+		a.log.Warn("настройки: "+p.Text, "file", file, "line", p.Line)
+	}
 }
 
 // Reload — применить новые настройки без перезапуска агента: лог — сразу,
@@ -92,11 +109,18 @@ func (a *App) Reload(next config.Config) {
 }
 
 // Serve — работать как служба до сигнала (§13): SIGTERM и SIGINT —
-// остановка (воркеры — по lifecycle.onAgentStop), SIGUSR1 (`agent restart`)
+// остановка (воркеры — по lifecycle.onAgentExit), SIGUSR1 (`agent restart`)
 // — выход для перезапуска менеджером службы (ErrRestart; воркеры — по
-// lifecycle.onAgentRestart), SIGHUP — перечитать настройки из path.
+// lifecycle.onAgentExit), SIGHUP — перечитать настройки из path.
 func (a *App) Serve(path string) error {
 	a.configPath = path
+	if path != "" {
+		a.warnUnknown(path)
+	}
+	if InstallMode == manualInstall {
+		a.log.Warn("агент поставлен без службы (запущен в фоне): перезапустить его после обновления или agent restart некому — " +
+			"поставьте его службой (agent install --rootless) или запускайте agent run своим менеджером процессов")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sig := make(chan os.Signal, 4)

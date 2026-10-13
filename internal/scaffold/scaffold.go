@@ -8,11 +8,12 @@ import (
 	"embed"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"text/template"
+
+	"github.com/epifanovmd/agent/internal/fsutil"
 )
 
 //go:embed files
@@ -81,7 +82,7 @@ func Init(o Options) (Result, error) {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return res, err
 		}
-		if err := writeFile(dst, body, f.perm); err != nil {
+		if err := fsutil.WriteFile(dst, body, f.perm); err != nil {
 			return res, err
 		}
 		res.Created = append(res.Created, f.name)
@@ -89,11 +90,11 @@ func Init(o Options) (Result, error) {
 	if o.Binary != "" {
 		dst := filepath.Join(o.Dir, "agent")
 		switch {
-		case sameFile(o.Binary, dst):
+		case fsutil.SameFile(o.Binary, dst):
 		case exists(dst) && !o.Force:
 			res.Skipped = append(res.Skipped, "agent")
 		default:
-			if err := copyFile(o.Binary, dst); err != nil {
+			if _, err := fsutil.CopyFile(o.Binary, dst, 0o755); err != nil {
 				return res, fmt.Errorf("программа агента: %w", err)
 			}
 			res.Created = append(res.Created, "agent")
@@ -121,48 +122,4 @@ func render(name string, o Options) ([]byte, error) {
 func exists(path string) bool {
 	_, err := os.Lstat(path)
 	return !errors.Is(err, fs.ErrNotExist)
-}
-
-func sameFile(a, b string) bool {
-	sa, err := os.Stat(a)
-	if err != nil {
-		return false
-	}
-	sb, err := os.Stat(b)
-	return err == nil && os.SameFile(sa, sb)
-}
-
-func writeFile(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".new"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp, perm); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	tmp := dst + ".new"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, dst)
 }

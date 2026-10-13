@@ -33,11 +33,12 @@ const (
 	TypeRequest = "request"
 )
 
-// Класс доставки сообщения агента (§3).
+// Класс доставки сообщения агента (§3): важное, поток или в текущем
+// соединении — последнее различается полями (управление, ответ с re, запрос с id).
 type Class int
 
 const (
-	// ClassControl — действует в текущем соединении.
+	// ClassControl — управление в текущем соединении.
 	ClassControl Class = iota
 	// ClassImportant — хранится в outbox до ack {ids}.
 	ClassImportant

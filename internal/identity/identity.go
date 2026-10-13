@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 )
 
@@ -82,11 +83,10 @@ func (s *Store) Save(c Credentials) error {
 		return fmt.Errorf("identity: %w", err)
 	}
 	raw, _ := json.Marshal(c)
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := fsutil.WriteFile(s.path, raw, 0o600); err != nil {
 		return fmt.Errorf("identity: %w", err)
 	}
-	return os.Rename(tmp, s.path)
+	return nil
 }
 
 // Forget — удалить (учётные данные отозваны).

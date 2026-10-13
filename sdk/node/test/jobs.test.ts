@@ -138,7 +138,7 @@ describe("задачи воркера", () => {
   });
 
   it("validateJobs: data не по схеме — JOB_INVALID до отправки; без опции — уходит воркеру", async () => {
-    const { s, c, fa } = await setup({ validateJobs: true });
+    const { s, c, fa } = await setup({ validate: { jobs: true } });
 
     await assert.rejects(
       s.agents.runJob(c.agentId, "report", {

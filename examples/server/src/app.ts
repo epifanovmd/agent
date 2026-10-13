@@ -3,12 +3,14 @@
 // API над ним (examples/API.md) и история в памяти (history.ts). Без авторизации — пример для
 // запуска у себя.
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import {
   createServer,
   type IncomingMessage,
   type Server,
   type ServerResponse,
 } from "node:http";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 import type { ReadableStream } from "node:stream/web";
 
@@ -38,10 +40,14 @@ export interface AppOptions {
   enrollToken?: string;
   /** Публичный адрес сервера для команды установки; по умолчанию — из запроса. */
   publicUrl?: string;
+  /** Каталог сборок: его install.sh стенд отдаёт по GET /install.sh. */
+  releasesDir?: string;
+  /** Ключи проверки подписи сборок — флагами --update-key в команде установки. */
+  updateKeys?: string[];
 }
 
-/** Сроки потока /watch (тесты не меняют: агент не присылает метрики чаще раза в секунду). */
-const WATCH = { metricsIntervalMs: 1000, ttlMs: 60_000, renewMs: 20_000 };
+/** Поток /watch: агент не присылает метрики чаще раза в секунду. */
+const WATCH = { metricsIntervalMs: 1000 };
 
 /** Заголовки ответа воркера, которые не передаются дальше как есть. */
 const HOP_HEADERS = new Set([
@@ -49,6 +55,23 @@ const HOP_HEADERS = new Set([
   "content-length",
   "transfer-encoding",
 ]);
+
+/** Строка в одинарных кавычках sh. */
+const shellQuote = (v: string): string => `'${v.replaceAll("'", `'\\''`)}'`;
+
+/** install.sh агента из каталога сборок (scripts/release.sh кладёт его рядом со сборками). */
+const installScript = async (
+  opts: AppOptions,
+  res: ServerResponse,
+): Promise<void> => {
+  const script =
+    opts.releasesDir &&
+    (await readFile(join(opts.releasesDir, "install.sh")).catch(() => null));
+
+  if (!script) return notFound(res);
+  res.writeHead(200, { "Content-Type": "text/x-shellscript; charset=utf-8" });
+  res.end(script);
+};
 
 /** Разобранный запрос к API. */
 interface Call {
@@ -114,8 +137,11 @@ const handle = async (
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> => {
-  if (await agents.handle(req, res)) return; // регистрация, сборки, install.sh
+  if (await agents.handle(req, res)) return; // регистрация, сборки
   const url = new URL(req.url ?? "/", "http://x");
+
+  if (req.method === "GET" && url.pathname === "/install.sh")
+    return installScript(opts, res);
 
   if (!url.pathname.startsWith("/api/")) return notFound(res);
   const call: Call = {
@@ -147,17 +173,21 @@ const handle = async (
       }),
     );
   if (method === "GET" && path === "releases") {
-    const [release, candidates, workerCandidates] = await Promise.all([
+    const [release, candidates] = await Promise.all([
       agents.release(),
       agents.updateCandidates(),
-      agents.workerUpdateCandidates(),
     ]);
-    const installCommand = agents.installCommand({
-      baseUrl: opts.publicUrl || baseUrl(req),
-      token: opts.enrollToken ?? "<ENROLL_TOKEN>",
-    });
+    const server = opts.publicUrl || baseUrl(req);
+    const flags = [
+      "--server",
+      server,
+      "--token",
+      opts.enrollToken ?? "<ENROLL_TOKEN>",
+      ...(opts.updateKeys ?? []).flatMap(k => ["--update-key", k]),
+    ];
+    const installCommand = `curl -fsSL ${shellQuote(`${server}/install.sh`)} | sudo sh -s -- ${flags.map(shellQuote).join(" ")}`;
 
-    return reply({ release, candidates, workerCandidates, installCommand });
+    return reply({ release, candidates, installCommand });
   }
   notFound(res);
 };
@@ -367,16 +397,12 @@ const watch = async (agents: Agents, call: Call, id: string): Promise<void> => {
   const level = isLogLevel(query.get("logLevel"))
     ? (query.get("logLevel") as LogLevel)
     : "info";
-  const watchId = `api-${randomUUID()}`;
-  const renew = () =>
-    agents.watch(id, {
-      id: watchId,
-      metricsIntervalMs: WATCH.metricsIntervalMs,
-      logLevel: level,
-      ttlMs: WATCH.ttlMs,
-    });
+  const watcher = await agents.watch(id, {
+    id: `api-${randomUUID()}`,
+    metricsIntervalMs: WATCH.metricsIntervalMs,
+    logLevel: level,
+  });
 
-  await renew();
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache",
@@ -396,16 +422,14 @@ const watch = async (agents: Agents, call: Call, id: string): Promise<void> => {
   const onEvent = (e: AgentEvent) => {
     if (e.agentId === id) send("event", e);
   };
-  const timer = setInterval(() => void renew().catch(() => {}), WATCH.renewMs);
 
   agents.on("metrics", onMetrics);
   agents.on("log", onLog);
   agents.on("event", onEvent);
   res.on("close", () => {
-    clearInterval(timer);
     agents.off("metrics", onMetrics);
     agents.off("log", onLog);
     agents.off("event", onEvent);
-    void agents.unwatch(id, watchId).catch(() => {});
+    void watcher.close().catch(() => {});
   });
 };

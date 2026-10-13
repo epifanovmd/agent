@@ -4,11 +4,8 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 
-import {
-  agentsDefaults,
-  type ChangeEvent,
-  MemoryStore,
-} from "../src/server/index";
+import { agentsDefaults } from "../src/server/core/options";
+import { type ChangeEvent, MemoryStore } from "../src/server/index";
 import {
   enroll,
   FakeAgent,

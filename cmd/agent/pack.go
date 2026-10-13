@@ -97,7 +97,7 @@ func packCmd(args []string) error {
 	return nil
 }
 
-// keygenCmd — agent keygen: пара ключей подписи сборок воркеров проекта.
+// keygenCmd — agent keygen: пара ключей подписи сборок (агента, воркеров проекта).
 func keygenCmd(args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("лишние аргументы: %s", strings.Join(args, " "))
@@ -107,7 +107,7 @@ func keygenCmd(args []string) error {
 		return err
 	}
 	fmt.Printf("%s=%s\nAGENT_UPDATE_PUBLIC_KEYS=%s\n", releases.SigningKeyEnv, priv, pub)
-	fmt.Fprintln(os.Stderr, "\nЗакрытый ключ (AGENT_SIGNING_KEY) — только там, где собирают архивы (agent pack): секрет CI или")
+	fmt.Fprintln(os.Stderr, "\nЗакрытый ключ (AGENT_SIGNING_KEY) — только там, где собирают архивы и релизы (agent pack, agent manifest): секрет CI или")
 	fmt.Fprintln(os.Stderr, "переменная окружения; в папку агента и в git его не кладут. Открытый (AGENT_UPDATE_PUBLIC_KEYS)")
 	fmt.Fprintln(os.Stderr, "agent pack кладёт в архив сам, установка добавит его к ключам проверки узла; в .env.prod —")
 	fmt.Fprintln(os.Stderr, "если узел ставится не из архива.")

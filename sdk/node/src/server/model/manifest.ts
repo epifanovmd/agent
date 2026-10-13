@@ -14,8 +14,10 @@ export interface SupportsQuery {
   route?: { method: string; path: string };
   /** Ключ настроек. */
   config?: string;
-  /** Тип события. */
+  /** Тип события, которое агент примет от воркера (события задач — если объявлены jobs). */
   event?: string;
+  /** Тип задачи из manifest.jobs. */
+  job?: string;
 }
 
 /** Манифест воркера из последнего status (или hello); нет — воркер себя не описывает. */
@@ -101,7 +103,7 @@ export const capabilities = (
 
 /**
  * Воркер worker агента описал в манифесте всё, что задано в query: маршрут, ключ настроек, тип
- * события. Нет манифеста — false.
+ * события, тип задачи. Нет манифеста — false.
  */
 export const supports = (
   agent: Pick<Agent, "workers">,
@@ -111,11 +113,12 @@ export const supports = (
   const m = workerManifest(agent, worker);
 
   if (!m) return false;
-  const { route, config, event } = query;
+  const { route, config, event, job } = query;
 
   return (
     (!route || findRoute(m, route.method, route.path) !== undefined) &&
     (config === undefined || (m.configs ?? []).some(c => c.key === config)) &&
-    (event === undefined || (m.events ?? []).some(e => e.type === event))
+    (event === undefined || declaresEvent(m, event)) &&
+    (job === undefined || (m.jobs ?? []).some(j => j.type === job))
   );
 };

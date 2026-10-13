@@ -5,7 +5,6 @@ package install
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -17,8 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-
-	"github.com/epifanovmd/agent/internal/app"
 )
 
 // Host — настоящая система: программы, файлы, пользователи этой машины.
@@ -62,32 +59,6 @@ func Host(out, errOut io.Writer) *System {
 			out, err := exec.CommandContext(ctx, args[0], args[1:]...).Output()
 			return string(out), err
 		},
-		Spawn: func(c Cmd, log string) error {
-			if err := os.MkdirAll(filepath.Dir(log), 0o755); err != nil {
-				return err
-			}
-			f, err := os.OpenFile(log, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			cmd := exec.Command(c.Args[0], c.Args[1:]...)
-			cmd.Env = append(os.Environ(), c.Env...)
-			cmd.Stdout, cmd.Stderr = f, f
-			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-			if err := cmd.Start(); err != nil {
-				return err
-			}
-			return cmd.Process.Release()
-		},
-		Running: func(dataDir string) int {
-			st, err := app.Status(dataDir)
-			if errors.Is(err, app.ErrNotRunning) || errors.Is(err, fs.ErrNotExist) {
-				return 0
-			}
-			return st.PID
-		},
-		Kill:     syscall.Kill,
 		LookPath: exec.LookPath,
 		Euid:     os.Geteuid,
 		Chown: func(path, name string) error {

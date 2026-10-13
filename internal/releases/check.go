@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 )
 
@@ -62,10 +63,5 @@ func WriteCheck(dataDir string, c Check) error {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return err
 	}
-	path := filepath.Join(dataDir, CheckFile)
-	tmp := path + ".new"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsutil.WriteFile(filepath.Join(dataDir, CheckFile), raw, 0o644)
 }

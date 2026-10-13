@@ -1,26 +1,20 @@
-// Раздача сборок (§11) по HTTP: manifest.json, сборки из манифеста (из releasesDir — файлом,
-// из удалённого источника — перенаправлением 302 или потоком), install.sh с адресом сервера и
-// ключами проверки. Публично: сборки подписаны.
+// Раздача сборок (§11) по HTTP: manifest.json и сборки из манифеста (из releasesDir — файлом,
+// из удалённого источника — перенаправлением 302 или потоком). Публично: сборки подписаны.
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 
 import type { Settings } from "../core/options";
-import { safeServer } from "../lib/shell";
-import {
-  INSTALL_PATH,
-  type ReleaseManifest,
-  RELEASES_PATH,
-} from "../protocol/messages";
-import { baseUrl, sendJSON } from "./http";
+import { type ReleaseManifest, RELEASES_PATH } from "../protocol/messages";
+import { sendJSON } from "./http";
 
 /** Файл сборок: в каталоге или по ссылке удалённого источника (proxy — отдавать потоком). */
 export type ReleaseFileRef = { path: string } | { url: string; proxy: boolean };
 
 /** Что нужно раздаче сборок. */
 export interface ReleaseSource {
-  readonly settings: Pick<Settings, "baseUrl" | "trustProxy" | "log">;
+  readonly settings: Pick<Settings, "log">;
   /** Раздача включена (releasesDir или agentReleases). */
   releaseEnabled(): boolean;
   /** manifest.json для узлов или null. */
@@ -29,13 +23,9 @@ export interface ReleaseSource {
   releaseFile(name: string): Promise<ReleaseFileRef | null>;
   /** Скачать сборку удалённого источника (раздача потоком). */
   downloadRelease(url: string, signal: AbortSignal): Promise<Response>;
-  /** install.sh и ключи проверки для подстановки; нет — null. */
-  installScript(): Promise<{ script: string; keys: string[] } | null>;
 }
 
-const SAFE_KEY = /^[A-Za-z0-9+/=]+$/;
-
-/** GET и HEAD install.sh и файлов сборок; не наш маршрут — false. */
+/** GET и HEAD файлов сборок; не наш маршрут — false. */
 export const serveRelease = async (
   src: ReleaseSource,
   req: IncomingMessage,
@@ -44,7 +34,6 @@ export const serveRelease = async (
 ): Promise<boolean> => {
   if ((req.method !== "GET" && req.method !== "HEAD") || !src.releaseEnabled())
     return false;
-  if (path === INSTALL_PATH) return install(src, req, res);
   if (!path.startsWith(RELEASES_PATH + "/")) return false;
   let name: string;
 
@@ -156,57 +145,6 @@ const proxyFile = async (
   Readable.fromWeb(upstream.body as import("node:stream/web").ReadableStream)
     .on("error", () => res.destroy())
     .pipe(res);
-
-  return true;
-};
-
-/**
- * install.sh: DEFAULT_SERVER — baseUrl или адрес из запроса (иначе 400); DEFAULT_UPDATE_KEYS —
- * ключи проверки через пробел; DEFAULT_PUBLIC_KEY (установщик с одним ключом) — первый ключ.
- */
-const install = async (
-  src: ReleaseSource,
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<boolean> => {
-  const { trustProxy, log } = src.settings;
-  const found = await src.installScript();
-
-  if (!found) return fileNotFound(res);
-  // Значения попадают в строку sh в двойных кавычках — только безопасные символы.
-  const server =
-    src.settings.baseUrl?.replace(/\/$/, "") ?? baseUrl(req, trustProxy);
-
-  if (!safeServer(server)) {
-    sendJSON(res, 400, {
-      code: "MESSAGE_INVALID",
-      message: "Некорректный адрес сервера",
-    });
-
-    return true;
-  }
-  const keys = found.keys.filter(k => {
-    if (SAFE_KEY.test(k)) return true;
-    log("ключ проверки не base64: в install.sh не подставлен");
-
-    return false;
-  });
-  const script = found.script
-    .replace(/^DEFAULT_SERVER=""$/m, `DEFAULT_SERVER="${server}"`)
-    .replace(
-      /^DEFAULT_UPDATE_KEYS=""$/m,
-      `DEFAULT_UPDATE_KEYS="${keys.join(" ")}"`,
-    )
-    .replace(
-      /^DEFAULT_PUBLIC_KEY=""$/m,
-      `DEFAULT_PUBLIC_KEY="${keys[0] ?? ""}"`,
-    );
-
-  res.writeHead(200, {
-    "Content-Type": "text/x-shellscript; charset=utf-8",
-    "Content-Length": Buffer.byteLength(script),
-  });
-  res.end(req.method === "HEAD" ? undefined : script);
 
   return true;
 };

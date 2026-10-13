@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 )
 
@@ -91,7 +92,7 @@ func Find(name, home string, euid int) Paths {
 
 func (s *System) find(name string) Paths {
 	if s.Euid() != 0 && s.Home != "" {
-		if l := HomeLayout(s.Home, name); isFile(s.p(l.JournalFile)) || isFile(s.p(l.ConfigFile)) {
+		if l := HomeLayout(s.Home, name); fsutil.IsFile(s.p(l.JournalFile)) || fsutil.IsFile(s.p(l.ConfigFile)) {
 			return l
 		}
 	}
@@ -173,7 +174,7 @@ func (l Paths) Flag() string {
 func (s *System) others(self Paths) []*journal {
 	var out []*journal
 	add := func(l Paths) {
-		if l.JournalFile == self.JournalFile || !isFile(s.p(l.JournalFile)) {
+		if l.JournalFile == self.JournalFile || !fsutil.IsFile(s.p(l.JournalFile)) {
 			return
 		}
 		if j, err := loadJournal(s.p(l.JournalFile)); err == nil {

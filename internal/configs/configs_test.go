@@ -409,18 +409,6 @@ func TestAdopted(t *testing.T) {
 	}
 }
 
-// configRetry воркера (lifecycle.configRetry) — свой срок повтора.
-type retryWorker struct{ *fakeWorker }
-
-func (retryWorker) ConfigRetry(string) time.Duration { return 30 * time.Millisecond }
-
-func TestWorkerConfigRetry(t *testing.T) {
-	w, r := newFakeWorker(t), &reports{}
-	s := open(t, t.TempDir(), retryWorker{w}, r)
-	s.Put(put("limits", 1, `{"reject":"нет"}`))
-	eventually(t, "повтор по сроку воркера", func() bool { return len(w.got()) >= 3 })
-}
-
 // declaredWorker — fakeWorker с манифестом: объявлен только ключ main;
 // invalid — воркер не зарегистрирован.
 type declaredWorker struct {

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/epifanovmd/agent/internal/fsutil"
 )
 
 // manager — менеджер пакетов узла (имя для --packages-<имя>, программа);
@@ -176,7 +178,7 @@ func sysctlApply(ctx context.Context, s *System, l Paths) {
 		s.warn("sysctl не найден — параметры ядра вступят в силу при загрузке")
 		return
 	}
-	if isFile(s.p(l.SysctlFile)) {
+	if fsutil.IsFile(s.p(l.SysctlFile)) {
 		if err := s.Run(ctx, Cmd{Args: []string{"sysctl", "-q", "-p", l.SysctlFile}, Quiet: true}); err != nil {
 			s.warn("параметры ядра не применены сейчас — применятся при загрузке")
 		}

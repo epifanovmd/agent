@@ -3,6 +3,7 @@ import { format } from "node:util";
 
 import type { AgentEvent, WorkerRequest } from "../model/types";
 import type { Store } from "../store/store";
+import { invalid } from "./errors";
 
 /** Сведения из запроса регистрации — для хука enroll. */
 export interface EnrollInfo {
@@ -26,16 +27,19 @@ export type EnrollVerdict =
   | { labels?: Record<string, string>; name?: string };
 
 /** Методы SDK, которые пересылаются в процесс с сессией агента. */
-export type RelayMethod =
-  | "fetch"
-  | "restartWorker"
-  | "updateWorker"
-  | "updateAgent"
-  | "rotateKey"
-  | "logs"
-  | "watch"
-  | "unwatch"
-  | "runJob";
+export const RELAY_METHODS = [
+  "fetch",
+  "restartWorker",
+  "updateWorker",
+  "updateAgent",
+  "rotateKey",
+  "logs",
+  "watch",
+  "unwatch",
+  "runJob",
+] as const;
+
+export type RelayMethod = (typeof RELAY_METHODS)[number];
 
 /** Пересылаемый вызов: метод SDK, агент, от чьего имени (by) и аргументы — всё JSON. */
 export interface RelayCall {
@@ -76,11 +80,6 @@ interface AgentReleasesCommon {
    * GitHub). По умолчанию false: `GET …/releases/<file>` отвечает 302 на ссылку источника.
    */
   proxy?: boolean;
-  /**
-   * Ключ автора агента (base64) для install.sh; по умолчанию — publicKey из manifest.json
-   * удалённого источника.
-   */
-  publicKey?: string;
   /** Своя функция fetch (тесты, прокси); по умолчанию — глобальная. */
   fetch?: typeof globalThis.fetch;
 }
@@ -102,10 +101,30 @@ export type AgentReleasesOptions = AgentReleasesCommon &
         apiUrl?: string;
       }
     | {
-        /** База сборок: `<url>/manifest.json`, `<url>/<file>`, `<url>/install.sh`. */
+        /** База сборок: `<url>/manifest.json`, `<url>/<file>`. */
         url: string;
       }
   );
+
+/** Что проверять по схемам манифеста воркера (опция validate). */
+export interface ValidateOptions {
+  /** Значение setConfig по configs[].schema: не подходит — CONFIG_INVALID (400). */
+  configs?: boolean;
+  /** data runJob по jobs[].schema: не подходит — JOB_INVALID (400). */
+  jobs?: boolean;
+  /**
+   * Тело fetch по routes[].request (не подходит или не JSON — REQUEST_INVALID, 400) и data
+   * запроса воркера по requests[].schema (не подходит — отказ воркеру REQUEST_INVALID).
+   */
+  requests?: boolean;
+  /**
+   * data события по events[].schema: off — нет; log — журнал, invalidEvent и problems в
+   * событии, событие обрабатывается как обычно; reject — журнал и invalidEvent, событие
+   * подтверждается агенту (повтор доставки ничего не исправит), но onEvent и событие event его
+   * не получают.
+   */
+  events?: "off" | "log" | "reject";
+}
 
 export interface AgentsOptions {
   /** Токен регистрации агентов (или своя проверка — enroll). */
@@ -165,29 +184,17 @@ export interface AgentsOptions {
   /** Срок ответа на worker.update и agent.update, мс (по умолчанию 300 000). */
   updateTimeoutMs?: number;
   /**
-   * Каталог сборок (manifest.json, сборки, install.sh). С agentReleases — воркеры проекта:
-   * manifest.json от `agent-release manifest` и их сборки; сборки агента из него не берутся, пока
+   * Каталог сборок (manifest.json и сборки). С agentReleases — воркеры проекта:
+   * manifest.json от `agent manifest` и их сборки; сборки агента из него не берутся, пока
    * получены удалённые сборки.
    */
   releasesDir?: string;
-  /**
-   * Каталог архивов папки агента проекта (`agent pack`: agent-<окружение>-<версия>-linux-<arch>.tar.gz).
-   * SDK раздаёт установщик `bundle/install.sh` и новейший архив под платформу узла; команда —
-   * bundleInstallCommand.
-   */
-  bundlesDir?: string;
   /**
    * Откуда брать агента и его воркеры (netprobe): релизы GitHub (GitHub Releases) или база сборок по ссылке. SDK
    * сам следит за новыми версиями; итоговые сборки — удалённые плюс воркеры проекта из
    * releasesDir.
    */
   agentReleases?: AgentReleasesOptions;
-  /** Ключ проверки сборок (base64): подставляется в install.sh. */
-  publicKey?: string;
-  /** Ещё ключи проверки (base64; ключи проекта): подставляются в install.sh вместе с publicKey. */
-  updatePublicKeys?: string[];
-  /** Публичный адрес сервера для install.sh и installCommand (по умолчанию — из запроса). */
-  baseUrl?: string;
   /** Неудачных регистраций с одного адреса за окно, после которых — 429 (по умолчанию 10; 0 — без предела). */
   enrollFailureLimit?: number;
   /** Окно подсчёта неудачных регистраций, мс (по умолчанию 60 000). */
@@ -198,29 +205,10 @@ export interface AgentsOptions {
    */
   trustProxy?: boolean;
   /**
-   * Проверять значение setConfig по JSON Schema ключа из манифеста воркера (§12) до отправки
-   * агенту: не подходит — AgentsError CONFIG_INVALID (400). Нет манифеста или схемы ключа —
-   * без проверки. По умолчанию false.
+   * Проверка значений по JSON Schema из манифеста воркера (§12); нет манифеста или схемы — без
+   * проверки. По умолчанию всё выключено.
    */
-  validateConfigs?: boolean;
-  /**
-   * Проверять data runJob по JSON Schema типа задачи из манифеста воркера: не подходит —
-   * AgentsError JOB_INVALID (400). Нет схемы — без проверки. По умолчанию false.
-   */
-  validateJobs?: boolean;
-  /**
-   * Проверять по JSON Schema из манифеста воркера тело fetch (routes[].request; не подходит или
-   * не JSON — AgentsError REQUEST_INVALID, 400) и data запроса воркера (requests[].schema; не
-   * подходит — отказ воркеру REQUEST_INVALID). Нет схемы — без проверки. По умолчанию false.
-   */
-  validateRequests?: boolean;
-  /**
-   * Проверять data события по events[].schema манифеста воркера: off (по умолчанию) — нет; log —
-   * журнал и событие invalidEvent, событие обрабатывается как обычно; reject — журнал и
-   * invalidEvent, событие подтверждается агенту (повтор доставки ничего не исправит), но onEvent,
-   * подписки и событие event его не получают.
-   */
-  validateEvents?: "off" | "log" | "reject";
+  validate?: ValidateOptions;
   log?: (msg: string, extra?: Record<string, unknown>) => void;
 }
 
@@ -237,10 +225,7 @@ type Optional =
   | "onEvent"
   | "onWorkerRequest"
   | "releasesDir"
-  | "bundlesDir"
   | "agentReleases"
-  | "publicKey"
-  | "baseUrl"
   | "relay"
   | "relaySecret";
 
@@ -253,11 +238,80 @@ const stdoutLog = (msg: string, extra?: Record<string, unknown>) => {
 
 /** Настройки со значениями по умолчанию (store и instanceId — отдельно, у Agents). */
 export type Settings = Required<
-  Omit<AgentsOptions, Optional | "store" | "instanceId">
+  Omit<AgentsOptions, Optional | "store" | "instanceId" | "validate">
 > &
-  Pick<AgentsOptions, Optional>;
+  Pick<AgentsOptions, Optional> & { validate: Required<ValidateOptions> };
+
+/** Ключи объекта со всеми ветками объединения. */
+type KeysOf<T> = T extends unknown ? keyof T : never;
+
+/** Имена опций — по типам: новая опция без записи здесь не соберётся. */
+const OPTION_KEYS = {
+  enrollToken: true,
+  enroll: true,
+  store: true,
+  instanceId: true,
+  statusIntervalMs: true,
+  metricsIntervalMs: true,
+  onEvent: true,
+  onWorkerRequest: true,
+  offlineGraceMs: true,
+  pingIntervalMs: true,
+  relay: true,
+  relaySecret: true,
+  offlineAfterMs: true,
+  actionTimeoutMs: true,
+  updateTimeoutMs: true,
+  releasesDir: true,
+  agentReleases: true,
+  enrollFailureLimit: true,
+  enrollFailureWindowMs: true,
+  trustProxy: true,
+  validate: true,
+  log: true,
+} satisfies Record<keyof AgentsOptions, true>;
+
+const VALIDATE_KEYS = {
+  configs: true,
+  jobs: true,
+  requests: true,
+  events: true,
+} satisfies Record<keyof ValidateOptions, true>;
+
+const RELEASES_KEYS = {
+  checkIntervalMs: true,
+  proxy: true,
+  fetch: true,
+  github: true,
+  range: true,
+  token: true,
+  apiUrl: true,
+  url: true,
+} satisfies Record<KeysOf<AgentReleasesOptions>, true>;
+
+/**
+ * Незнакомая опция — ошибка при создании Agents: опечатка или имя, которого у SDK нет, иначе
+ * молча не действовали бы.
+ */
+const checkKeys = (
+  what: string,
+  value: object | undefined,
+  known: Record<string, true>,
+): void => {
+  const unknown = Object.keys(value ?? {}).filter(
+    k => !Object.hasOwn(known, k),
+  );
+
+  if (unknown.length)
+    throw invalid(
+      `Agents: неизвестная опция ${unknown.map(k => what + k).join(", ")}`,
+    );
+};
 
 export const resolveOptions = (opts: AgentsOptions): Settings => {
+  checkKeys("", opts, OPTION_KEYS);
+  checkKeys("validate.", opts.validate, VALIDATE_KEYS);
+  checkKeys("agentReleases.", opts.agentReleases, RELEASES_KEYS);
   const statusIntervalMs = opts.statusIntervalMs ?? 30_000;
   const offlineGraceMs = opts.offlineGraceMs ?? 3000;
 
@@ -278,18 +332,16 @@ export const resolveOptions = (opts: AgentsOptions): Settings => {
     actionTimeoutMs: opts.actionTimeoutMs ?? 60_000,
     updateTimeoutMs: opts.updateTimeoutMs ?? 300_000,
     releasesDir: opts.releasesDir,
-    bundlesDir: opts.bundlesDir,
     agentReleases: opts.agentReleases,
-    publicKey: opts.publicKey,
-    updatePublicKeys: opts.updatePublicKeys ?? [],
-    baseUrl: opts.baseUrl,
     enrollFailureLimit: opts.enrollFailureLimit ?? 10,
     enrollFailureWindowMs: opts.enrollFailureWindowMs ?? 60_000,
     trustProxy: opts.trustProxy ?? false,
-    validateConfigs: opts.validateConfigs ?? false,
-    validateJobs: opts.validateJobs ?? false,
-    validateRequests: opts.validateRequests ?? false,
-    validateEvents: opts.validateEvents ?? "off",
+    validate: {
+      configs: opts.validate?.configs ?? false,
+      jobs: opts.validate?.jobs ?? false,
+      requests: opts.validate?.requests ?? false,
+      events: opts.validate?.events ?? "off",
+    },
     log: opts.log ?? stdoutLog,
   };
 };

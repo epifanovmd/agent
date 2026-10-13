@@ -38,7 +38,7 @@ import { Agents } from "agent-sdk/server";
 const agents = new Agents({ enrollToken: "demo-token" }); // хранилище — в памяти (MemoryStore)
 
 const server = createServer(async (req, res) => {
-  if (await agents.handle(req, res)) return; // регистрация, сборки, install.sh
+  if (await agents.handle(req, res)) return; // регистрация, сборки
   res.writeHead(404).end(); // здесь — ваше API
 });
 agents.attach(server); // WebSocket агентов на том же порту
@@ -178,11 +178,13 @@ agent/agent pack --env prod   # agent/agent-prod-<версия>-linux-amd64.tar.
 # на узле: tar xzf agent-prod-…-linux-amd64.tar.gz && cd agent && sudo ./agent install --token demo-token
 ```
 
-Или бэкенд собирает команду установки, её выполняют на узле (SSH, cloud-init, Ansible):
+Или установщиком из релиза агента — бэкенд собирает команду, её выполняют на узле (SSH,
+cloud-init, Ansible); архив по ссылке — флагом `--bundle`:
 
-```ts
-agents.installCommand({ token: "demo-token", name: "node-01", baseUrl: "https://api.example.com" });
-// curl -fsSL 'https://api.example.com/api/v1/agent-link/install.sh' | sudo sh -s -- --token 'demo-token' --name 'node-01'
+```bash
+I=https://github.com/epifanovmd/agent/releases/latest/download/install.sh
+curl -fsSL "$I" | sudo sh -s -- --server https://api.example.com --token demo-token --name node-01
+curl -fsSL "$I" | sudo sh -s -- --bundle 'https://files.example.com/agent-prod-linux-{arch}.tar.gz' --token demo-token
 ```
 
 Сборки, установка и обновления — [releases.md](releases.md).

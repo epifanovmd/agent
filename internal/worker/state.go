@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/fsutil"
 )
 
 // Каталоги воркеров в каталоге данных агента.
@@ -62,11 +63,7 @@ func writeState(dir, name string, st procState) error {
 	if err != nil {
 		return err
 	}
-	path := statePath(dir, name)
-	if err := os.WriteFile(path+".tmp", raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(path+".tmp", path)
+	return fsutil.WriteFile(statePath(dir, name), raw, 0o600)
 }
 
 func removeState(dir, name string) { _ = os.Remove(statePath(dir, name)) }

@@ -1,3 +1,5 @@
-// Версия SDK (одна на агента, SDK и примеры — scripts/version.sh).
+// Версия SDK — из package.json пакета (одна на агента, SDK и примеры — scripts/version.sh).
+import pkg from "../../../package.json" with { type: "json" };
+
 /** Версия SDK. */
-export const SDK_VERSION = "1.4.0";
+export const SDK_VERSION: string = pkg.version;

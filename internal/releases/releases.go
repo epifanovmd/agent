@@ -106,15 +106,25 @@ func BuildURL(dir, file string) (string, error) {
 	if err != nil || u.Host == "" || u.User != nil {
 		return "", fmt.Errorf("файл сборки %q: нужно имя файла или ссылка https://", file)
 	}
-	base, _ := url.Parse(dir)
-	if !strings.EqualFold(u.Scheme, "https") && (!strings.EqualFold(u.Scheme, "http") || base == nil || !strings.EqualFold(base.Scheme, "http")) {
+	if !SchemeAllowed(u, dir) {
 		return "", fmt.Errorf("файл сборки %q: нужна ссылка https:// (http:// — только если и каталог сборок http://)", file)
 	}
 	return u.String(), nil
 }
 
-// isArchive — сборка — архив .tar.gz (по пути ссылки).
-func isArchive(rawURL string) bool {
+// SchemeAllowed — ссылку u на сборку можно скачать, если основной адрес base
+// (сервер или каталог сборок) такой: https:// — всегда, http:// — только если
+// и base http:// (стенд, локальная сеть).
+func SchemeAllowed(u *url.URL, base string) bool {
+	if strings.EqualFold(u.Scheme, "https") {
+		return true
+	}
+	b, err := url.Parse(base)
+	return strings.EqualFold(u.Scheme, "http") && err == nil && strings.EqualFold(b.Scheme, "http")
+}
+
+// IsArchive — сборка — архив .tar.gz (по пути ссылки).
+func IsArchive(rawURL string) bool {
 	if u, err := url.Parse(rawURL); err == nil {
 		return strings.HasSuffix(u.Path, ".tar.gz")
 	}
@@ -178,7 +188,7 @@ func PlaceWorker(ctx context.Context, client *http.Client, dir string, m *messag
 	if err != nil {
 		return Placed{}, err
 	}
-	archive := isArchive(src)
+	archive := IsArchive(src)
 	if a.Command != "" && (!archive || !reCommand.MatchString(a.Command) || strings.HasPrefix(a.Command, "/") ||
 		slices.Contains(strings.Split(a.Command, "/"), "..")) {
 		return Placed{}, fmt.Errorf("command в manifest.json — не путь внутри архива: %q", a.Command)

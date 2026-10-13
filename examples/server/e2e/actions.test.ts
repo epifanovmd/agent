@@ -21,27 +21,28 @@ import {
   BIN,
   bin,
   NEXT_VERSION,
+  ROOT,
   run,
   Stand,
   VERSION,
   waitFor,
 } from "./stand";
 
-/** Пара ключей подписи сборок (agent-release keygen). */
+/** Пара ключей подписи сборок (agent keygen). */
 const keygen = async () => {
-  const { stdout } = await run(bin("agent-release"), ["keygen"]);
+  const { stdout } = await run(bin("agent"), ["keygen"]);
   const value = (name: string) =>
     stdout.match(new RegExp(`^${name}=(.+)$`, "m"))![1];
 
   return {
     signing: value("AGENT_SIGNING_KEY"),
-    public: value("AGENT_UPDATE_PUBLIC_KEY"),
+    public: value("AGENT_UPDATE_PUBLIC_KEYS"),
   };
 };
 
 /** manifest.json каталога сборок с подписью ключом signing. */
 const manifest = (dir: string, signing: string) =>
-  run(bin("agent-release"), ["manifest", dir, NEXT_VERSION], {
+  run(bin("agent"), ["manifest", dir, NEXT_VERSION], {
     env: { ...process.env, AGENT_SIGNING_KEY: signing },
   });
 
@@ -81,6 +82,10 @@ describe("действия и обновления", () => {
     releases = await mkdtemp(join(tmpdir(), "agent-e2e-release-"));
     keys = await keygen();
     await copyFile(bin("agent", join(BIN, "next")), bin("agent", releases));
+    await copyFile(
+      join(ROOT, "deploy/install/install.sh"),
+      join(releases, "install.sh"),
+    );
     // Сначала сборки подписаны чужим ключом.
     await manifest(releases, (await keygen()).signing);
     s = await Stand.start({
@@ -98,16 +103,24 @@ describe("действия и обновления", () => {
     it("кандидаты обновления и команда установки", async () => {
       const r = await s.api<{
         release: { version: string };
-        candidates: UpdateCandidate[];
+        candidates: { agents: UpdateCandidate[] };
         installCommand: string;
       }>("GET", "/api/releases");
 
       assert.equal(r.release.version, NEXT_VERSION);
-      const c = r.candidates.find(x => x.agentId === s.agentId);
+      const c = r.candidates.agents.find(x => x.agentId === s.agentId);
 
       assert.equal(c?.current, VERSION);
       assert.equal(c?.target, NEXT_VERSION);
-      assert.match(r.installCommand, /install\.sh' \| sudo sh -s -- --token/);
+      assert.match(
+        r.installCommand,
+        /^curl -fsSL '.+\/install\.sh' \| sudo sh -s -- '--server' '.+' '--token' /,
+      );
+      assert.ok(r.installCommand.includes(`'--update-key' '${keys.public}'`));
+      assert.match(
+        await (await fetch(`${s.url}/install.sh`)).text(),
+        /--bundle URL/,
+      );
     });
 
     it("чужая подпись: UPDATE_FAILED, агент работает прежней версией", async () => {
@@ -146,12 +159,11 @@ describe("действия и обновления", () => {
       const { stdout } = await run(s.agentBin, ["version"]);
 
       assert.equal(stdout.trim(), NEXT_VERSION);
-      const { candidates } = await s.api<{ candidates: UpdateCandidate[] }>(
-        "GET",
-        "/api/releases",
-      );
+      const { candidates } = await s.api<{
+        candidates: { agents: UpdateCandidate[] };
+      }>("GET", "/api/releases");
 
-      assert.deepEqual(candidates, []);
+      assert.deepEqual(candidates.agents, []);
       await s.waitWorkers();
       assert.equal(await echoPid(), pid, "echo пережил обновление агента");
       const finished = await waitFor(

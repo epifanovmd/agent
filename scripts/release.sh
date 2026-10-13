@@ -2,13 +2,13 @@
 # Сборки агента в каталог DIR: linux/darwin × amd64/arm64 (agent-<os>-<arch>), стандартный
 # воркер netprobe (examples/workers/netprobe → netprobe-<VERSION>-<os>-<arch>, в манифесте —
 # --worker netprobe=<VERSION>), manifest.json (подпись — AGENT_SIGNING_KEY, base64 seed Ed25519 из
-# agent-release keygen; без него — без подписей, самообновление на такую версию не встанет) и
+# agent keygen; без него — без подписей, самообновление на такую версию не встанет) и
 # install.sh.
 # Нужен Go: на машине без него — scripts/go.sh release (контейнер golang).
 #   scripts/release.sh DIR VERSION [--worker NAME=VERSION[,stopTimeout=…][,command=…]]…
 # --worker — ещё воркеры в manifest.json: их сборки кладутся в DIR заранее — файл
 # DIR/<name>-<version>-<os>-<arch> или архив DIR/<name>-<version>-<os>-<arch>.tar.gz.
-# AGENT_UPDATE_PUBLIC_KEY (base64 открытого ключа из agent-release keygen) вшивается в сборки агента:
+# AGENT_UPDATE_PUBLIC_KEY (base64 открытого ключа из agent keygen) вшивается в сборки агента:
 # они проверяют обновления без настройки update.publicKey.
 # Каталог сборок — dist/<VERSION>/ (make release, CI, образ agent-dist).
 set -eu
@@ -29,6 +29,6 @@ for os in linux darwin; do
       -ldflags "-s -w -X main.version=$VERSION" -o "$DIR/netprobe-$VERSION-$os-$arch" ./examples/workers/netprobe
   done
 done
-go run ./cmd/agent-release manifest "$DIR" "$VERSION" --worker "netprobe=$VERSION" "$@"
+go run ./cmd/agent manifest "$DIR" "$VERSION" --worker "netprobe=$VERSION" "$@"
 cp deploy/install/install.sh "$DIR/install.sh"
 echo "сборки $VERSION: $DIR"

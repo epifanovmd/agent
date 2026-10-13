@@ -24,7 +24,7 @@ describe("строгие возможности воркеров", () => {
   before(async () => {
     s = await Stand.start({
       name: NAME,
-      server: { validateRequests: true, validateEvents: "reject" },
+      server: { validate: { requests: true, events: "reject" } },
     });
     s.agents.on("invalidEvent", e => invalid.push(e));
   });

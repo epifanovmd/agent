@@ -10,13 +10,14 @@ import (
 	"path/filepath"
 
 	"github.com/epifanovmd/agent/internal/config"
+	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/message"
 )
 
 // Update — worker.update (§11): fetch кладёт проверенную сборку в dst
 // (файл или каталог распакованного архива); воркер заменяется (сначала
 // уходит прежний процесс), текущая сборка откладывается как previous, новая
-// становится current. Новая не ответила ok: true на GET /health за lifecycle.updateHealthyTimeout —
+// становится current. Новая не ответила ok: true на GET /health за lifecycle.startTimeout —
 // previous возвращается, воркер перезапускается с ней, итог —
 // UPDATE_FAILED. Без force замена ждёт, пока воркер занят (§13). Ошибки —
 // *message.ErrorInfo.
@@ -114,7 +115,7 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, force boo
 	cause := startErr
 	if cause == nil {
 		life := w.life()
-		cause = s.waitHealthy(ctx, name, life.UpdateHealthyTimeout.Std(), life.Health.Timeout.Std())
+		cause = s.waitHealthy(ctx, name, life.StartTimeout.Std(), life.Health.Timeout.Std())
 	}
 	if cause == nil {
 		log.Info("воркер работает на новой сборке", "version", version)
@@ -143,9 +144,5 @@ func (s *Supervisor) Update(ctx context.Context, name, version string, force boo
 }
 
 func writeFileAtomic(path, text string) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(text+"\n"), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsutil.WriteFile(path, []byte(text+"\n"), 0o644)
 }

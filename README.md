@@ -183,7 +183,7 @@ import { Agents } from "agent-sdk/server";
 
 const agents = new Agents({ enrollToken: process.env.AGENT_ENROLL_TOKEN });
 const server = createServer(async (req, res) => {
-  if (await agents.handle(req, res)) return; // регистрация агентов, сборки, install.sh
+  if (await agents.handle(req, res)) return; // регистрация агентов, сборки
   res.writeHead(404).end(); // ваше API
 });
 agents.attach(server); // WebSocket агентов на том же порту
@@ -209,17 +209,19 @@ ssh node-01 'tar xzf agent-prod-*-linux-amd64.tar.gz && cd agent && sudo ./agent
 Принцип один: на узле — программа агента, один файл настроек, воркеры в каталоге данных агента и
 то, что их запускает: служба systemd или служба пользователя без root (`--rootless`); в контейнере и
 под своим менеджером процессов — без установки (`install.sh --run`). Различается только то, откуда
-всё это приходит.
+всё это приходит. `…/install.sh` — установщик из релиза агента:
+`https://github.com/epifanovmd/agent/releases/latest/download/install.sh`.
 
-| Способ                    | Команда                                                                                                                   | Когда                                                       |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| Из папки агента           | `sudo ./agent install --env prod` в папке проекта                                                                         | агент ставится на ту же машину, где лежит папка             |
-| Из архива                 | `agent pack --env prod` → на узле `tar xzf … && cd agent && sudo ./agent install`                                         | перенос вручную; узлу не нужен доступ к бэкенду и GitHub    |
-| С бэкенда одной командой  | `curl -fsSL https://api.example.com/api/v1/agent-link/install.sh \| sudo sh -s -- --token <токен>`                        | бэкенд на `agent-sdk` раздаёт сборки и команду установки    |
-| Только программа          | `sudo ./agent install --server https://api.example.com --token <токен> [--worker …]`                                      | без папки агента: настройки создаются по шаблону            |
-| Без root                  | `./agent install --rootless --server https://api.example.com --token <токен>` (и с `--env`, из архива, с бэкенда)         | нет прав root: агент в `~/.agent`, служба пользователя      |
-| Без установки (контейнер) | `curl -fsSL https://api.example.com/api/v1/agent-link/bundle/install.sh \| sh -s -- --run --token <токен>`                | агент на переднем плане: контейнер, свой менеджер процессов |
-| Образ Docker              | `docker run -e AGENT_SERVER_URL=… -e AGENT_ENROLL_TOKEN=… -v agent-data:/var/lib/agent ghcr.io/epifanovmd/agent:<версия>` | узел — контейнер                                            |
+| Способ                    | Команда                                                                                                                        | Когда                                                              |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Из папки агента           | `sudo ./agent install --env prod` в папке проекта                                                                              | агент ставится на ту же машину, где лежит папка                    |
+| Из архива                 | `agent pack --env prod` → на узле `tar xzf … && cd agent && sudo ./agent install`                                              | перенос вручную; узлу не нужен доступ к бэкенду и GitHub           |
+| Одной командой            | `curl -fsSL …/install.sh \| sudo sh -s -- --server https://api.example.com --token <токен>`                                    | установщик из релиза агента; сборку берёт с бэкенда на `agent-sdk` |
+| Архив по ссылке           | `curl -fsSL …/install.sh \| sudo sh -s -- --bundle 'https://files.example.com/agent-prod-linux-{arch}.tar.gz' --token <токен>` | архив `agent pack` с любого хостинга, без ручного переноса         |
+| Только программа          | `sudo ./agent install --server https://api.example.com --token <токен> [--worker …]`                                           | без папки агента: настройки создаются по шаблону                   |
+| Без root                  | `./agent install --rootless --server https://api.example.com --token <токен>` (и с `--env`, из архива, `install.sh`)           | нет прав root: агент в `~/.agent`, служба пользователя             |
+| Без установки (контейнер) | `curl -fsSL …/install.sh \| sh -s -- --run --bundle '…-linux-{arch}.tar.gz' --token <токен>`                                   | агент на переднем плане: контейнер, свой менеджер процессов        |
+| Образ Docker              | `docker run -e AGENT_SERVER_URL=… -e AGENT_ENROLL_TOKEN=… -v agent-data:/var/lib/agent ghcr.io/epifanovmd/agent:<версия>`      | узел — контейнер                                                   |
 
 Повторная установка обновляет программу и службу (или контейнер) и сохраняет ключ агента. Несколько агентов на
 одном узле (для разных бэкендов) — `--instance ИМЯ` или `instance:` в настройках. Удаление —
@@ -378,7 +380,6 @@ make check                            # все проверки перед ко�
 
 ```
 cmd/agent/          программа агента
-cmd/agent-release/  подпись сборок для публикации (на узлы не ставится)
 internal/           устройство агента — docs/ARCHITECTURE.md
 sdk/                SDK бэкенда (node/), документация (docs/), формат сообщений (spec/)
 examples/           стенд: сервер на SDK, воркеры-примеры, сквозные тесты

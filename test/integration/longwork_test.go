@@ -47,7 +47,7 @@ func TestLongWorkSurvivesAgent(t *testing.T) {
 	kit := newReleaseKit(t)
 	kit.write()
 	s := newStand(t, func(c *testserver.Config) {
-		c.ReleasesDir, c.PublicKey = kit.dir, kit.pub
+		c.ReleasesDir = kit.dir
 		c.Options = map[string]any{"offlineGraceMs": 0}
 	})
 	dir := t.TempDir()

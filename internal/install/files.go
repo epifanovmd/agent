@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/epifanovmd/agent/internal/fsutil"
 )
 
 func isDir(path string) bool {
@@ -15,31 +17,12 @@ func isDir(path string) bool {
 	return err == nil && st.IsDir()
 }
 
-func isFile(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && !st.IsDir()
-}
-
-func sameFile(a, b string) bool {
-	sa, err1 := os.Stat(a)
-	sb, err2 := os.Stat(b)
-	return err1 == nil && err2 == nil && os.SameFile(sa, sb)
-}
-
-// writeFileAtomic — записать через временный файл рядом и переименовать.
+// writeFileAtomic — создать каталог и записать через временный файл рядом.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".new"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp, perm); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsutil.WriteFile(path, data, perm)
 }
 
 func yamlUnmarshal(raw []byte, v any) error {
