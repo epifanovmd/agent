@@ -126,7 +126,9 @@ fetch_agent() {
     curl -fsSL ${CA_FILE:+--cacert "$CA_FILE"} "$URL" -o "$TMP/bundle.tar.gz" || die "архив не скачан: $URL"
     tar xzf "$TMP/bundle.tar.gz" -C "$TMP" || die "архив не распакован: $URL"
     AGENT="$TMP/agent/agent"
-    [ -x "$AGENT" ] && [ -f "$TMP/agent/bundle.json" ] || die "$URL: не архив agent pack (нет agent/agent и agent/bundle.json)"
+    if [ ! -x "$AGENT" ] || [ ! -f "$TMP/agent/bundle.json" ]; then
+      die "$URL: не архив agent pack (нет agent/agent и agent/bundle.json)"
+    fi
     return
   fi
   if [ -n "$BINARY" ]; then
