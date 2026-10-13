@@ -1,6 +1,6 @@
 // Стенд сквозного теста: сервер стенда (createApp над Agents) в процессе теста на свободном
-// порту и настоящий агент с воркерами-примерами echo (Python), node-echo (Node.js), sysinfo и
-// netprobe (Go). У каждого стенда — свой временный каталог: настройки и данные агента, журналы
+// порту и настоящий агент с воркерами-примерами echo (Python), node-echo (Node.js) и sysinfo
+// (Go). У каждого стенда — свой временный каталог: настройки и данные агента, журналы
 // агента (agent.log) и сервера (server.log). E2E_KEEP=1 — не удалять его после теста.
 //
 // Сборки агента и Go-воркеров — в E2E_BIN (по умолчанию .dev/e2e; их собирает scripts/e2e.sh).
@@ -55,7 +55,7 @@ export const NEXT_VERSION = existsSync(join(BIN, "next/VERSION"))
 
 const TOKEN = "e2e-token";
 
-export const WORKERS = ["echo", "node-echo", "sysinfo", "netprobe"];
+export const WORKERS = ["echo", "node-echo", "sysinfo"];
 
 export const run = promisify(execFile);
 
@@ -134,8 +134,8 @@ export interface StandOptions {
   updateKey?: string;
   /** Ключи проверки подписи сборок для агента (update.publicKeys): подпись принимается, если сходится с любым. */
   updateKeys?: string[];
-  /** netprobe — воркер со сборкой с сервера (release: true): сборка в <dataDir>/workers/netprobe/current. */
-  releaseNetprobe?: boolean;
+  /** sysinfo — воркер со сборкой с сервера (release: true): сборка в <dataDir>/workers/sysinfo/current. */
+  releaseSysinfo?: boolean;
   /** Сервер стенда проверяет настройки и тела запросов к воркерам по схемам манифестов. */
   validate?: boolean;
   /** Свои настройки Agents сервера стенда. */
@@ -407,7 +407,7 @@ export class Stand {
     JSON.parse(await readFile(join(this.dataDir, "credentials.json"), "utf8"));
 
   writeConfig = async (): Promise<void> => {
-    const { name, updateKey, updateKeys, releaseNetprobe, agentReleases } =
+    const { name, updateKey, updateKeys, releaseSysinfo, agentReleases } =
       this.opts;
     const echoEnv = (worker: string) => ({
       ECHO_STATE_FILE: this.stateFile(worker),
@@ -449,21 +449,20 @@ export class Stand {
           env: echoEnv("node-echo"),
           lifecycle,
         },
-        { name: "sysinfo", command: [bin("sysinfo")], lifecycle },
-        releaseNetprobe
-          ? { name: "netprobe", release: true, lifecycle }
-          : { name: "netprobe", command: [bin("netprobe")], lifecycle },
+        releaseSysinfo
+          ? { name: "sysinfo", release: true, lifecycle }
+          : { name: "sysinfo", command: [bin("sysinfo")], lifecycle },
         ...(this.opts.workers ?? []),
       ],
     };
 
     await writeFile(this.configPath, JSON.stringify(config, null, 2));
-    if (releaseNetprobe) {
-      // Воркер со сборкой с сервера, как после agent install --worker netprobe.
-      const dir = join(this.dataDir, "workers", "netprobe");
+    if (releaseSysinfo) {
+      // Воркер со сборкой с сервера, как после agent install --worker sysinfo.
+      const dir = join(this.dataDir, "workers", "sysinfo");
 
       await mkdir(dir, { recursive: true });
-      await copyFile(bin("netprobe"), join(dir, "current"));
+      await copyFile(bin("sysinfo"), join(dir, "current"));
       await writeFile(join(dir, "version"), "1.0.0\n");
     }
   };

@@ -60,9 +60,9 @@ images: ## образы: агент (agent:dev), агент с python3 для в
 
 # --- Стенд (examples/)
 
-demo-build: ## стенд: агент, sysinfo и netprobe → .dev/bin, сборки агента → dist/<VERSION>, agent-sdk, сервер
+demo-build: ## стенд: агент и sysinfo → .dev/bin, сборки агента → dist/<VERSION>, agent-sdk, сервер
 	scripts/demo.sh build
 demo-server: ## стенд: сервер на Node.js, API — http://localhost:8080/api
 	scripts/demo.sh server
-demo-agent: ## стенд: агент с воркерами echo (Python), node-echo (Node.js), sysinfo и netprobe (Go)
+demo-agent: ## стенд: агент с воркерами echo (Python), node-echo (Node.js) и sysinfo (Go)
 	scripts/demo.sh agent

@@ -1,4 +1,4 @@
-// Манифест воркеров (§12): echo, node-echo, sysinfo и netprobe описывают себя, агент передаёт
+// Манифест воркеров (§12): echo, node-echo и sysinfo описывают себя, агент передаёт
 // манифест в status; неверная настройка отклонена сервером стенда по схеме из манифеста до
 // отправки агенту.
 import assert from "node:assert/strict";
@@ -30,7 +30,6 @@ describe("манифест воркеров", () => {
       echo: "settings",
       "node-echo": "settings",
       sysinfo: "banner",
-      netprobe: "targets",
     };
 
     for (const name of WORKERS) {
@@ -63,12 +62,6 @@ describe("манифест воркеров", () => {
       );
       assert.equal(typeof m.jobs?.[1].schema, "object", name);
     }
-    assert.deepEqual(
-      a.workers
-        .find(x => x.name === "netprobe")
-        ?.manifest?.jobs?.map(j => j.type),
-      ["netprobe.run"],
-    );
     // Встроенный sysmetrics тоже отвечает GET /manifest: версия — версия агента.
     assert.equal(
       a.workers.find(w => w.name === "sysmetrics")?.manifest?.version,
@@ -96,15 +89,15 @@ describe("манифест воркеров", () => {
     assert.deepEqual(configs, [], "на сервере не сохранено");
     assert.equal(await s.echo("echo", "a"), "A", "воркер работает по-прежнему");
 
-    // Схема netprobe из манифеста: id цели — непустая строка.
+    // Схема sysinfo из манифеста: text баннера — строка.
     await assert.rejects(
-      s.api("PUT", `/api/agents/${s.agentId}/configs/netprobe/targets`, {
-        targets: [{ id: "", host: "192.0.2.1" }],
+      s.api("PUT", `/api/agents/${s.agentId}/configs/sysinfo/banner`, {
+        text: 5,
       }),
       (e: unknown) =>
         e instanceof ApiError &&
         e.code === "CONFIG_INVALID" &&
-        /targets\[0\]\.id/.test(e.message),
+        /text: ожидается строка/.test(e.message),
     );
 
     // Верная настройка проходит проверку и применяется воркером.

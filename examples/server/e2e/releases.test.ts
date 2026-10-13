@@ -1,5 +1,5 @@
 // Каталог сборок агента на отдельном HTTP-сервере, устроенный как релизы GitHub
-// (update.releases; подпись ключом автора агента); воркер проекта — netprobe следующей версии —
+// (update.releases; подпись ключом автора агента); воркер проекта — sysinfo следующей версии —
 // в releasesDir сервера (подпись ключом проекта). Агент знает оба ключа (update.publicKeys):
 // воркер обновляется с сервера, агент — из своего каталога сборок.
 import assert from "node:assert/strict";
@@ -79,23 +79,23 @@ describe("каталог сборок агента на другом серве�
       join(remoteDir, "install.sh"),
     );
     await manifest(remoteDir, author.signing);
-    // Воркеры проекта: netprobe той же версии, подпись ключом проекта.
+    // Воркеры проекта: sysinfo той же версии, подпись ключом проекта.
     await copyFile(
-      bin("netprobe", next),
-      join(projectDir, `netprobe-${NEXT_VERSION}-${platform}`),
+      bin("sysinfo", next),
+      join(projectDir, `sysinfo-${NEXT_VERSION}-${platform}`),
     );
     await manifest(
       projectDir,
       project.signing,
       "--worker",
-      `netprobe=${NEXT_VERSION}`,
+      `sysinfo=${NEXT_VERSION}`,
     );
     remote = await serveDir(remoteDir);
     s = await Stand.start({
       name: "e2e-releases",
       releasesDir: projectDir,
       updateKeys: [project.public, author.public],
-      releaseNetprobe: true,
+      releaseSysinfo: true,
       agentReleases: remote.url,
     });
   });
@@ -114,8 +114,8 @@ describe("каталог сборок агента на другом серве�
       r.release.workers?.map(w => [w.name, w.url]),
       [
         [
-          "netprobe",
-          `/api/v1/agent-link/releases/netprobe-${NEXT_VERSION}-${platform}`,
+          "sysinfo",
+          `/api/v1/agent-link/releases/sysinfo-${NEXT_VERSION}-${platform}`,
         ],
       ],
     );
@@ -130,15 +130,15 @@ describe("каталог сборок агента на другом серве�
   it("воркер проекта обновляется с сервера (ключ проекта), агент — из своего каталога (ключ автора)", async () => {
     const w = await s.api<{ version: string; previous: string }>(
       "POST",
-      `/api/agents/${s.agentId}/workers/netprobe/update`,
+      `/api/agents/${s.agentId}/workers/sysinfo/update`,
     );
 
     assert.equal(w.version, NEXT_VERSION);
-    await s.waitAgent("netprobe новой версии работает", a =>
+    await s.waitAgent("sysinfo новой версии работает", a =>
       Boolean(
         a.status?.workers.some(
           x =>
-            x.name === "netprobe" &&
+            x.name === "sysinfo" &&
             x.state === "running" &&
             x.version === NEXT_VERSION &&
             x.health?.ok,

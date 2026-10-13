@@ -44,16 +44,8 @@ describe("строгие возможности воркеров", () => {
       status: 404,
       code: "ROUTE_UNDECLARED",
     });
-    // netprobe объявляет GET /results: до первого круга воркер сам отвечает 404.
-    const res = await s.fetchWorker("netprobe", "/results");
-
-    assert.ok([200, 404].includes(res.status));
-    if (res.status === 404)
-      assert.equal(
-        ((await res.json()) as { code?: string }).code,
-        undefined,
-        "404 — ответ воркера, а не агента",
-      );
+    // sysinfo объявляет GET /info — запрос доходит до воркера.
+    assert.equal((await s.fetchWorker("sysinfo", "/info")).status, 200);
   });
 
   it("тип задачи не из манифеста — JOB_UNKNOWN от агента", async () => {

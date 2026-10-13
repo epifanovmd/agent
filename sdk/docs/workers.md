@@ -863,8 +863,8 @@ await agents.fetch(agentId, "report", `/jobs/${body.id}/cancel`, { method: "POST
 - События задач хранятся на диске агента, пока бэкенд их не подтвердит: итог дойдёт и после обрыва
   связи, в ту копию бэкенда, с которой агент на связи.
 
-Примеры — задачи `echo.quick` и `echo.long` воркеров echo и node-echo, `netprobe.run` воркера
-netprobe ([examples/workers](../../examples/workers)).
+Примеры — задачи `echo.quick` и `echo.long` воркеров echo и node-echo
+([examples/workers](../../examples/workers)).
 
 ## Долгая работа
 

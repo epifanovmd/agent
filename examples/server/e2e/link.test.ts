@@ -1,11 +1,10 @@
 // Связь и наблюдение: регистрация, hello и status, запросы к воркерам, события, метрики,
-// журнал, проверка сети netprobe.
+// журнал.
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 
 import type {
   AgentsError,
-  ConfigStatus,
   LogEntry,
   MetricsEvent,
   MetricsPoint,
@@ -222,25 +221,10 @@ describe("связь и наблюдение", () => {
         ),
       );
     }
-    // Тип не из манифеста — JOB_UNKNOWN; netprobe.run — быстрая задача.
+    // Тип не из манифеста — JOB_UNKNOWN.
     await assert.rejects(s.job("echo", { type: "echo.none" }), {
       code: "JOB_UNKNOWN",
     });
-    const probe = await s.job("netprobe", {
-      type: "netprobe.run",
-      data: {
-        targets: [
-          { id: "self", host: "127.0.0.1", port: s.port, method: "tcp" },
-        ],
-        count: 1,
-      },
-    });
-
-    assert.equal(
-      (probe.result as { results: { id: string; received: number }[] })
-        .results[0].received,
-      1,
-    );
   });
 
   describe("метрики и журнал", () => {
@@ -259,7 +243,7 @@ describe("связь и наблюдение", () => {
 
         return (
           fields.every(f => f in host) &&
-          ["echo", "node-echo", "netprobe", "sysinfo"].every(
+          ["echo", "node-echo", "sysinfo"].every(
             w => a.metrics?.workers?.[w] !== undefined,
           )
         );
@@ -332,39 +316,5 @@ describe("связь и наблюдение", () => {
         echoLog.map(e => e.msg).join("\n"),
       );
     });
-  });
-
-  it("netprobe: цель TCP — итоги в его метриках", async () => {
-    await s.api("PUT", `/api/agents/${s.agentId}/configs/netprobe/targets`, {
-      targets: [
-        { id: "server", host: "127.0.0.1", port: s.port, method: "tcp" },
-      ],
-      intervalSec: 1,
-      count: 2,
-    });
-    await waitFor("настройка targets применена", async () => {
-      const { status } = await s.api<{ status: ConfigStatus[] }>(
-        "GET",
-        `/api/agents/${s.agentId}/configs`,
-      );
-
-      return status.find(c => c.worker === "netprobe")?.state === "applied";
-    });
-    interface Probe {
-      results?: { id: string; received: number; lossPct: number }[];
-    }
-    const a = await s.waitAgent("итог проверки в метриках", a =>
-      Boolean(
-        (a.metrics?.workers?.netprobe as Probe | undefined)?.results?.some(
-          r => r.id === "server",
-        ),
-      ),
-    );
-    const r = (a.metrics!.workers!.netprobe as Probe).results!.find(
-      x => x.id === "server",
-    )!;
-
-    assert.equal(r.received, 2);
-    assert.equal(r.lossPct, 0);
   });
 });

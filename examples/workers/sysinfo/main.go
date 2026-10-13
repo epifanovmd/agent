@@ -34,7 +34,8 @@ import (
 	"unicode/utf8"
 )
 
-const version = "1.0.0"
+// version — версия воркера; сборка может задать свою: -ldflags "-X main.version=…".
+var version = "1.0.0"
 
 // maxBanner — длина баннера, символов.
 const maxBanner = 200

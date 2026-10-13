@@ -39,6 +39,3 @@ workers:
   # 0 — не перезапускается.
   - name: sysinfo
     command: ["${SYSINFO_BIN}"]
-  # Go: проверка сети до целей из настройки targets, итоги — в GET /metrics.
-  - name: netprobe
-    command: ["${NETPROBE_BIN}"]

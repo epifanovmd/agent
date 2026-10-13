@@ -278,7 +278,7 @@ workers:
   `agents.updateAgent(id, { version })` с бэкенда; новая версия не вышла на связь — возвращается
   прежняя.
 - **Воркеры** со сборкой обновляет бэкенд (`agents.updateWorker`), с проверкой подписи и откатом.
-- **Подписи** — Ed25519. Агент и `netprobe` подписаны ключом автора агента, он вшит в программу.
+- **Подписи** — Ed25519. Сборки агента подписаны ключом автора агента, он вшит в программу.
   Свои воркеры проект подписывает своим ключом (пару создаёт OpenSSL —
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#обновление), «Ключи подписи»), закрытый ключ
   (`AGENT_SIGNING_KEY`) нужен только `agent pack`, открытый `pack` кладёт в архив, и установка
@@ -334,16 +334,16 @@ make demo-agent                       # в другом терминале: аг
 make check                            # все проверки перед коммитом
 ```
 
-| Цель                      | Что делает                                                                             |
-| ------------------------- | -------------------------------------------------------------------------------------- |
-| `make test`, `make race`  | тесты на Go (агент, образцы сообщений, `test/integration`), с поиском гонок            |
-| `make sdk-test`           | тесты SDK, ESLint и проверка типов                                                     |
-| `make e2e`                | сквозные тесты: сервер стенда, настоящий агент и воркеры-примеры                       |
-| `make fmt`, `make format` | отформатировать Go-код и всё остальное (Prettier)                                      |
-| `make build`              | агент под эту машину → `dist/<VERSION>/`                                               |
-| `make release`            | сборки агента и netprobe под linux/darwin × amd64/arm64, `manifest.json`, `install.sh` |
-| `make images`             | образы `agent:dev`, `agent:dev-python`, `agent-dist:dev`                               |
-| `make version V=1.2.0`    | записать версию во все места                                                           |
+| Цель                      | Что делает                                                                  |
+| ------------------------- | --------------------------------------------------------------------------- |
+| `make test`, `make race`  | тесты на Go (агент, образцы сообщений, `test/integration`), с поиском гонок |
+| `make sdk-test`           | тесты SDK, ESLint и проверка типов                                          |
+| `make e2e`                | сквозные тесты: сервер стенда, настоящий агент и воркеры-примеры            |
+| `make fmt`, `make format` | отформатировать Go-код и всё остальное (Prettier)                           |
+| `make build`              | агент под эту машину → `dist/<VERSION>/`                                    |
+| `make release`            | сборки агента под linux/darwin × amd64/arm64, `manifest.json`, `install.sh` |
+| `make images`             | образы `agent:dev`, `agent:dev-python`, `agent-dist:dev`                    |
+| `make version V=1.2.0`    | записать версию во все места                                                |
 
 ```
 cmd/agent/          программа агента
@@ -355,7 +355,7 @@ test/integration/   настоящий агент против сервера н
 ```
 
 **Публикация.** Версия одна на агента, SDK и примеры — файл `VERSION`. Тег `v<VERSION>` → CI
-выкладывает в GitHub Release подписанные сборки агента и `netprobe`, `manifest.json`,
+выкладывает в GitHub Release подписанные сборки агента, `manifest.json`,
 `install.sh`, архив SDK `agent-sdk-<версия>.tgz` и образы `ghcr.io/epifanovmd/agent:<версия>`,
 `:<версия>-python`, `ghcr.io/epifanovmd/agent-dist:<версия>`. Ключ подписи — секрет репозитория
 `AGENT_SIGNING_KEY`, открытый ключ — переменная `AGENT_UPDATE_PUBLIC_KEY` (CI вшивает его в

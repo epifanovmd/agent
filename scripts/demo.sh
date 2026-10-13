@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Стенд целиком на этой машине: сервер на Node.js (agent-sdk/server и HTTP API над ним), агент
-# с воркерами-примерами без SDK (echo — Python, node-echo — Node.js, sysinfo и netprobe — Go).
+# с воркерами-примерами без SDK (echo — Python, node-echo — Node.js, sysinfo — Go).
 # Go — в контейнере (scripts/go.sh), Node ≥ 24 и python3 — на машине. Сквозные тесты того же
 # стенда — scripts/e2e.sh.
-#   scripts/demo.sh build        # агент, sysinfo и netprobe под эту машину (.dev/bin); сборки агента
+#   scripts/demo.sh build        # агент и sysinfo под эту машину (.dev/bin); сборки агента
 #                                # (dist/<VERSION>: сборки, manifest.json, install.sh); agent-sdk
 #                                # (sdk/node), зависимости сервера
 #   scripts/demo.sh server       # сервер: http://localhost:8080 (PORT — другой порт)
@@ -24,7 +24,6 @@ case "${1:-}" in
     # Агент и Go-воркеры для запуска на этой машине — отдельно от каталога сборок.
     BUILD_DIR=.dev/bin "$ROOT/scripts/go.sh" build "$OS" "$ARCH" agent
     BUILD_DIR=.dev/bin "$ROOT/scripts/go.sh" build "$OS" "$ARCH" sysinfo ./examples/workers/sysinfo
-    BUILD_DIR=.dev/bin "$ROOT/scripts/go.sh" build "$OS" "$ARCH" netprobe ./examples/workers/netprobe
     # Сборки агента linux/darwin × amd64/arm64, manifest.json (подпись — AGENT_SIGNING_KEY), install.sh.
     "$ROOT/scripts/go.sh" release
     # agent-sdk собирается в dist: сервер подключает его как file:-зависимость.
@@ -38,7 +37,7 @@ case "${1:-}" in
     DEMO_ROOT="$ROOT" DEMO_AGENT="${2:-1}" exec "$BIN/agent-$OS-$ARCH" status -config "$ROOT/examples/agent.demo.yaml" ;;
   agent)
     mkdir -p "$ROOT/.dev"
-    export DEMO_ROOT="$ROOT" DEMO_AGENT="${2:-1}" SYSINFO_BIN="$BIN/sysinfo-$OS-$ARCH" NETPROBE_BIN="$BIN/netprobe-$OS-$ARCH"
+    export DEMO_ROOT="$ROOT" DEMO_AGENT="${2:-1}" SYSINFO_BIN="$BIN/sysinfo-$OS-$ARCH"
     export AGENT_SERVER_URL="${AGENT_SERVER_URL:-http://localhost:$PORT}" AGENT_ENROLL_TOKEN="$TOKEN"
     exec "$BIN/agent-$OS-$ARCH" run -config "$ROOT/examples/agent.demo.yaml" ;;
   *) echo "использование: $0 build | server | agent [N] | status [N]" >&2; exit 2 ;;

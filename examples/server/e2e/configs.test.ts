@@ -158,7 +158,7 @@ describe("настройки и доставка", () => {
       s.configPath,
     ]);
 
-    for (const w of ["echo", "node-echo", "sysinfo", "netprobe"])
+    for (const w of ["echo", "node-echo", "sysinfo"])
       assert.match(stdout, new RegExp(`^${w}: убрано$`, "m"));
     assert.equal(existsSync(s.stateFile("echo")), false);
     assert.equal(existsSync(s.stateFile("node-echo")), false);

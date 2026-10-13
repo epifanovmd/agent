@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Сквозные тесты стенда (examples/server/e2e): сервер стенда на agent-sdk/server в процессе
-# теста, настоящий агент с воркерами-примерами (echo — Python, node-echo — Node.js, sysinfo и
-# netprobe — Go). Go — на машине или в контейнере (scripts/go.sh); нужны Node ≥ 24, python3 и
+# теста, настоящий агент с воркерами-примерами (echo — Python, node-echo — Node.js, sysinfo —
+# Go). Go — на машине или в контейнере (scripts/go.sh); нужны Node ≥ 24, python3 и
 # собранный sdk/node (make node-sdk).
 #   scripts/e2e.sh          # собрать и прогнать
-#   scripts/e2e.sh build    # только собрать: агент (VERSION), агент и netprobe следующей версии
-#                           # (для проверки обновления), sysinfo, netprobe → .dev/e2e
+#   scripts/e2e.sh build    # только собрать: агент (VERSION), агент и sysinfo следующей версии
+#                           # (для проверки обновления), sysinfo → .dev/e2e
 #   scripts/e2e.sh test     # только прогнать (сборки уже есть)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -25,9 +25,8 @@ b() { GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build -trimpath -buildvcs=false -ld
 w() { GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags \"-s -w\" -o \"\$1\" \"\$2\"; }
 b $VERSION $OUT/agent-$P ./cmd/agent
 b $NEXT $OUT/next/agent-$P ./cmd/agent
-b $NEXT $OUT/next/netprobe-$P ./examples/workers/netprobe
-w $OUT/sysinfo-$P ./examples/workers/sysinfo
-w $OUT/netprobe-$P ./examples/workers/netprobe"
+b $NEXT $OUT/next/sysinfo-$P ./examples/workers/sysinfo
+w $OUT/sysinfo-$P ./examples/workers/sysinfo"
   mkdir -p "$OUT/next"
   if command -v go >/dev/null; then sh -c "$script"; else scripts/go.sh sh -c "$script"; fi
   echo "$NEXT" >"$OUT/next/VERSION"
