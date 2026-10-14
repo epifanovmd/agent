@@ -15,7 +15,7 @@
 #   curl -fsSL $I | sudo sh -s -- --uninstall [--purge]
 #
 # Свои флаги:
-#   --server URL      адрес сервера
+#   --server URL      адрес сервера; http:// — связь без шифрования разрешена явно
 #   --releases URL    откуда скачать сборку агента (по умолчанию — последний релиз агента на GitHub,
 #                     $GITHUB_RELEASES); передаётся и agent install (оттуда же — сборки воркеров)
 #   --ca-file ПУТЬ    свой корневой сертификат сервера для загрузки; передаётся и agent install
@@ -230,6 +230,8 @@ if [ -n "$RUN" ]; then
     esac
   done
   [ -z "$SERVER" ] || export AGENT_SERVER_URL="$SERVER"
+  # Адрес http:// задан явно — связь без шифрования разрешена (как у agent install --server).
+  case "$SERVER" in http://* | HTTP://*) export AGENT_SERVER_ALLOW_INSECURE=true ;; esac
   AGENT_DATA_DIR="${AGENT_DATA_DIR:-/var/lib/agent}"
   AGENT_UPDATE_MODE="${AGENT_UPDATE_MODE:-external}"
   export AGENT_DATA_DIR AGENT_UPDATE_MODE

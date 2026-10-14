@@ -327,20 +327,30 @@ func problemsError(problems []Problem) error {
 	return errors.Join(errs...)
 }
 
+// CheckServerURL — адрес бэкенда, если задан: https://, http:// — только с server.allowInsecure.
+func (c *Config) CheckServerURL() error {
+	addr := c.Server.URL
+	if addr == "" {
+		return nil
+	}
+	u, err := url.Parse(addr)
+	switch {
+	case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
+		return fmt.Errorf("server.url (AGENT_SERVER_URL): %q — нужен адрес https://", addr)
+	case u.Scheme == "http" && !c.Server.AllowInsecure:
+		return fmt.Errorf("server.url (AGENT_SERVER_URL): %q — без шифрования; нужен https:// или server.allowInsecure: true (AGENT_SERVER_ALLOW_INSECURE)", addr)
+	}
+	return nil
+}
+
 // Validate — обязательные поля и допустимые значения; заполняет умолчания воркеров.
 func (c *Config) Validate() error {
 	var errs []error
 	for _, e := range c.envErrs {
 		errs = append(errs, errors.New(e))
 	}
-	if addr := c.Server.URL; addr != "" {
-		u, err := url.Parse(addr)
-		switch {
-		case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
-			errs = append(errs, fmt.Errorf("server.url (AGENT_SERVER_URL): %q — нужен адрес https://", addr))
-		case u.Scheme == "http" && !c.Server.AllowInsecure:
-			errs = append(errs, fmt.Errorf("server.url (AGENT_SERVER_URL): %q — без шифрования; нужен https:// или server.allowInsecure: true (AGENT_SERVER_ALLOW_INSECURE)", addr))
-		}
+	if err := c.CheckServerURL(); err != nil {
+		errs = append(errs, err)
 	}
 	if !slices.Contains([]string{"off", protocol.LogError, protocol.LogWarn, protocol.LogInfo, protocol.LogDebug}, c.Log.Forward) {
 		errs = append(errs, fmt.Errorf("log.forward (AGENT_LOG_FORWARD): off | error | warn | info | debug, а не %q", c.Log.Forward))

@@ -488,6 +488,34 @@ func TestInstallRequiresToken(t *testing.T) {
 	f.ran(t, "systemctl restart agent.service")
 }
 
+// Адрес http://: --server — явное разрешение (в agent.env); из файла переменных без
+// разрешения — отказ до изменений на узле.
+func TestInstallInsecureServer(t *testing.T) {
+	ctx := context.Background()
+	local := filepath.Join(t.TempDir(), "agent.yaml")
+	_ = os.WriteFile(local, []byte("server:\n  url: ${AGENT_SERVER_URL}\n  allowInsecure: false\n"), 0o644)
+
+	f, s := newFake(t, "systemctl", "useradd")
+	err := Install(ctx, s, Options{Binary: binary(t, "v1"), Config: local, Token: "t",
+		Vars: map[string]string{"AGENT_SERVER_URL": "http://10.0.0.1:8080"}})
+	if err == nil || !strings.Contains(err.Error(), "без шифрования") || !strings.Contains(err.Error(), "ничего не изменено") {
+		t.Fatalf("http:// без разрешения: %v", err)
+	}
+	if f.exists(Binary) || f.exists(ConfigFile) || len(f.cmds) > 0 {
+		t.Fatalf("узел изменён: %v", f.cmds)
+	}
+
+	if err := Install(ctx, s, Options{Binary: binary(t, "v1"), Config: local, Token: "t",
+		Server: "http://10.0.0.1:8080"}); err != nil {
+		t.Fatalf("--server http://: %v", err)
+	}
+	env := f.read(t, EnvFile)
+	if !strings.Contains(env, "AGENT_SERVER_ALLOW_INSECURE=true") || !strings.Contains(env, "AGENT_SERVER_URL=http://10.0.0.1:8080") {
+		t.Fatalf("agent.env:\n%s", env)
+	}
+	f.ran(t, "systemctl restart agent.service")
+}
+
 // --worker: старшая версия под эту машину, подпись и sha256 сверяются,
 // архив распаковывается, записи — в создаваемый agent.yaml.
 func TestInstallWorkers(t *testing.T) {
@@ -571,18 +599,18 @@ func TestInstallWorkers(t *testing.T) {
 	if f.read(t, ConfigFile) != got {
 		t.Fatal("уже описанный воркер — файл не меняется")
 	}
-	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n  allowInsecure: true\n"), 0o644)
 	// Повторная установка без --server: адрес — из agent.yaml, затем из agent.env.
 	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKeys: []string{key}, Workers: []string{"collector"}}); err != nil {
 		t.Fatalf("адрес из agent.yaml: %v", err)
 	}
 	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: https://wrong.example.com\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(f.root, EnvFile), []byte("AGENT_SERVER_URL="+srv.URL+"/\nAGENT_ENROLL_TOKEN=t\n"), 0o600)
+	_ = os.WriteFile(filepath.Join(f.root, EnvFile), []byte("AGENT_SERVER_URL="+srv.URL+"/\nAGENT_SERVER_ALLOW_INSECURE=true\nAGENT_ENROLL_TOKEN=t\n"), 0o600)
 	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKeys: []string{key}, Workers: []string{"collector"}}); err != nil {
 		t.Fatalf("адрес из agent.env: %v", err)
 	}
 	_ = os.WriteFile(filepath.Join(f.root, EnvFile), []byte("AGENT_ENROLL_TOKEN=t\n"), 0o600)
-	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n  allowInsecure: true\n"), 0o644)
 	// Та же версия уже стоит — сборка не скачивается и не меняется.
 	if !strings.Contains(f.out.String(), "Воркер collector 1.2.0 уже стоит") {
 		t.Fatalf("повторная установка той же версии:\n%s", f.out.String())

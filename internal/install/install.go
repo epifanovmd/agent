@@ -119,6 +119,8 @@ type Options struct {
 	// BuiltinKey — ключ проверки подписи сборок, вшитый в сборку.
 	BuiltinKey string
 
+	// Server — адрес бэкенда (--server); http:// — связь без шифрования разрешена явно
+	// (agent.env AGENT_SERVER_ALLOW_INSECURE=true, как в создаваемом agent.yaml).
 	Server    string
 	Token     string
 	TokenFile string
@@ -263,6 +265,19 @@ func Install(ctx context.Context, s *System, o Options) error {
 	if mode == ModeUser && !s.userSystemd(ctx) {
 		return errors.New("служб пользователя (systemd --user) здесь нет: войдите этим пользователем по ssh (не через su) и повторите; " +
 			"без службы запускайте агента сами — agent run (install.sh --run), автозапуск — средствами узла")
+	}
+	if o.Server != "" && o.Config != "" {
+		// Свои настройки (--config, архив): адрес из --server — службе через agent.env, как его
+		// видит проверка; http:// — явное разрешение связи без шифрования (создаваемый
+		// agent.yaml пишет то же сам).
+		o.Vars = maps.Clone(o.Vars)
+		if o.Vars == nil {
+			o.Vars = map[string]string{}
+		}
+		o.Vars["AGENT_SERVER_URL"] = strings.TrimRight(o.Server, "/")
+		if strings.HasPrefix(strings.ToLower(o.Server), "http://") {
+			o.Vars["AGENT_SERVER_ALLOW_INSECURE"] = "true"
+		}
 	}
 	if o.TokenFile != "" {
 		raw, err := os.ReadFile(o.TokenFile)
@@ -668,11 +683,16 @@ func precheckServer(s *System, l Paths, o Options, configExists bool) error {
 			return err
 		}
 	default:
+		// Как в создаваемом agent.yaml: адрес http:// из --server — с разрешением.
 		cfg.Server.URL = vars["AGENT_SERVER_URL"]
+		cfg.Server.AllowInsecure = strings.HasPrefix(strings.ToLower(cfg.Server.URL), "http://")
 		cfg.Enroll.Token = vars["AGENT_ENROLL_TOKEN"]
 	}
 	_, enrolled, _ := identity.NewStore(s.p(l.DataDir)).Load()
 	if err := cfg.RequireServer(enrolled); err != nil {
+		return fmt.Errorf("%w — на узле ничего не изменено", err)
+	}
+	if err := cfg.CheckServerURL(); err != nil {
 		return fmt.Errorf("%w — на узле ничего не изменено", err)
 	}
 	return nil
@@ -691,6 +711,9 @@ func requireServer(s *System, l Paths) error {
 	}
 	_, enrolled, _ := identity.NewStore(s.p(l.DataDir)).Load()
 	if err := cfg.RequireServer(enrolled); err != nil {
+		return fmt.Errorf("%w — служба не запущена; повторите установку с этими значениями", err)
+	}
+	if err := cfg.CheckServerURL(); err != nil {
 		return fmt.Errorf("%w — служба не запущена; повторите установку с этими значениями", err)
 	}
 	return nil
