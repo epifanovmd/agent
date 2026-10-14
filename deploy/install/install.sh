@@ -11,7 +11,7 @@
 #   curl -fsSL $I | sudo sh -s -- --server https://api.example.com --token <токен> [флаги]
 #   curl -fsSL $I | sh -s -- --rootless --server https://api.example.com --token <токен>
 #   curl -fsSL $I | sh -s -- --run --server https://api.example.com --token <токен>
-#   curl -fsSL $I | sudo sh -s -- --bundle 'https://files.example.com/agent-prod-linux-{arch}.tar.gz' --token <токен>
+#   curl -fsSL $I | sudo sh -s -- --bundle 'https://files.example.com/agent-prod.tar.gz' --token <токен>
 #   curl -fsSL $I | sudo sh -s -- --uninstall [--purge]
 #
 # Свои флаги:
@@ -20,7 +20,7 @@
 #                     $GITHUB_RELEASES); передаётся и agent install (оттуда же — сборки воркеров)
 #   --ca-file ПУТЬ    свой корневой сертификат сервера для загрузки; передаётся и agent install
 #   --binary ПУТЬ     не скачивать, а поставить сборку из файла
-#   --bundle URL      архив папки агента проекта (agent pack) по ссылке; {arch} в ссылке — amd64
+#   --bundle URL      архив папки агента проекта (agent pack, все платформы) по ссылке; {arch} в ссылке — amd64
 #                     или arm64 этой машины. Программа агента, настройки и воркеры — из архива;
 #                     --server — только если адреса нет в его настройках
 #   --instance ИМЯ    экземпляр агента (несколько агентов на одном узле — для разных бэкендов);

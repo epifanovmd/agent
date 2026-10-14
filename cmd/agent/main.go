@@ -53,6 +53,7 @@ import (
 	"syscall"
 
 	"github.com/epifanovmd/agent/internal/app"
+	"github.com/epifanovmd/agent/internal/bundle"
 	"github.com/epifanovmd/agent/internal/config"
 	"github.com/epifanovmd/agent/internal/fsutil"
 	"github.com/epifanovmd/agent/internal/install"
@@ -262,7 +263,8 @@ func envConfig(env string, dirs []string) (string, error) {
 	return "", fmt.Errorf("--env %s: нет %s (искал в %s)", env, name, strings.Join(dirs, ", "))
 }
 
-// localDirs — папка агента: каталог программы, затем текущий. У
+// localDirs — папка агента: каталог программы (у программы из bin/ архива — каталог выше),
+// затем текущий. У
 // установленной программы (/opt/agent…/bin, ~/.agent…/bin) папки нет — её
 // настройки в /etc/agent… или ~/.agent….
 func localDirs() []string {
@@ -274,7 +276,7 @@ func localDirs() []string {
 		if _, ok := install.Self(exe, userHome()); ok {
 			return nil
 		}
-		dirs = append(dirs, filepath.Dir(exe))
+		dirs = append(dirs, bundle.HomeOf(exe))
 	}
 	if wd, err := os.Getwd(); err == nil && !slices.Contains(dirs, wd) {
 		dirs = append(dirs, wd)

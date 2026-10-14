@@ -75,7 +75,7 @@ func packCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("Архивы для узлов:")
+	fmt.Println("Архив для узлов:")
 	for _, a := range archives {
 		fmt.Println("  " + config.ShortPath(a))
 	}

@@ -1,6 +1,8 @@
-// Package bundle — архив папки агента для узла (agent pack) и установка из
-// него (agent install): программа под платформу узла, файлы настроек, воркеры
-// из папки и сборки воркеров в каталоге release/ (manifest.json, §10).
+// Package bundle — архив папки агента для узлов (agent pack) и установка из
+// него (agent install): программы агента под все платформы архива (bin/) и
+// скрипт agent, который запускает программу под платформу машины, файлы
+// настроек, воркеры из папки (собираемые — под каждую платформу) и сборки
+// воркеров в каталоге release/ (manifest.json, §10).
 package bundle
 
 import (
@@ -33,9 +35,26 @@ const (
 	InfoFile = "bundle.json"
 	// ReleaseDir — сборки воркеров архива с manifest.json.
 	ReleaseDir = "release"
-	// Binary — программа агента в папке.
+	// Binary — скрипт agent в папке: запускает программу под платформу машины из BinDir.
 	Binary = "agent"
+	// BinDir — программы агента под платформы архива: agent-<os>-<arch>.
+	BinDir = "bin"
 )
+
+// BinaryFor — программа агента под платформу p в распакованном архиве dir.
+func BinaryFor(dir string, p Platform) string {
+	return filepath.Join(dir, BinDir, "agent-"+p.OS+"-"+p.Arch)
+}
+
+// HomeOf — папка агента программы exe: для программы из bin/ распакованного
+// архива (её запускает скрипт agent) — папка архива, иначе — папка программы.
+func HomeOf(exe string) string {
+	dir := filepath.Dir(exe)
+	if filepath.Base(dir) == BinDir && fsutil.IsFile(filepath.Join(filepath.Dir(dir), InfoFile)) {
+		return filepath.Dir(dir)
+	}
+	return dir
+}
 
 // Info — bundle.json.
 type Info struct {
@@ -44,8 +63,8 @@ type Info struct {
 	// Config — главный файл настроек (путь в папке), Env — окружение (--env).
 	Config string `json:"config"`
 	Env    string `json:"env,omitempty"`
-	OS     string `json:"os"`
-	Arch   string `json:"arch"`
+	// Platforms — платформы архива: "linux/amd64", "linux/arm64".
+	Platforms []string `json:"platforms"`
 	// PublicKeys — открытые ключи, которыми подписаны сборки воркеров архива:
 	// установка добавляет их к ключам проверки агента.
 	PublicKeys []string `json:"publicKeys,omitempty"`
@@ -58,6 +77,9 @@ type Info struct {
 type Platform struct{ OS, Arch string }
 
 func (p Platform) String() string { return p.OS + "/" + p.Arch }
+
+// dir — имя каталога сборки под платформу: linux-amd64.
+func (p Platform) dir() string { return p.OS + "-" + p.Arch }
 
 // ParsePlatforms — "linux/amd64,linux/arm64".
 func ParsePlatforms(s string) ([]Platform, error) {
@@ -99,7 +121,7 @@ type Options struct {
 	share func(a protocol.WorkerArtifact, file string) error
 }
 
-// Pack — архивы папки агента, по одному на платформу. Вернёт их пути.
+// Pack — архив папки агента под все платформы o.Platforms. Вернёт его путь (один).
 func Pack(ctx context.Context, o Options) ([]string, error) {
 	src := config.ReadSource(o.Config)
 	if len(src.Errors) > 0 {
@@ -152,13 +174,11 @@ func Pack(ctx context.Context, o Options) ([]string, error) {
 			return copyFile(file, filepath.Join(o.ReleaseOut, a.File))
 		}
 	}
-	for _, p := range o.Platforms {
-		archive := filepath.Join(o.Out, fmt.Sprintf("agent-%s-%s-%s-%s.tar.gz", label, strings.TrimPrefix(o.Version, "v"), p.OS, p.Arch))
-		if err := packOne(ctx, o, cfg, root, rels, rels[len(src.Files)-1], p, archive); err != nil {
-			return out, fmt.Errorf("%s: %w", p, err)
-		}
-		out = append(out, archive)
+	archive := filepath.Join(o.Out, fmt.Sprintf("agent-%s-%s.tar.gz", label, strings.TrimPrefix(o.Version, "v")))
+	if err := packArchive(ctx, o, cfg, root, rels, rels[len(src.Files)-1], archive); err != nil {
+		return out, err
 	}
+	out = append(out, archive)
 	if o.ReleaseOut != "" {
 		m := protocol.Manifest{Version: strings.TrimPrefix(o.Version, "v"), Artifacts: []protocol.Artifact{}, Workers: shared}
 		if o.Signing != nil {
@@ -171,7 +191,10 @@ func Pack(ctx context.Context, o Options) ([]string, error) {
 	return out, nil
 }
 
-func packOne(ctx context.Context, o Options, cfg config.Config, root string, rels []string, main string, p Platform, archive string) error {
+// packArchive — архив: программы агента под платформы (bin/) и скрипт agent, настройки, воркеры
+// (собираемые — под каждую платформу, run и прочие исполняемые — скрипты выбора платформы),
+// release/ со сборками воркеров под все платформы, bundle.json и файлы pack.files.
+func packArchive(ctx context.Context, o Options, cfg config.Config, root string, rels []string, main string, archive string) error {
 	tmp, err := os.MkdirTemp("", "agent-pack-")
 	if err != nil {
 		return err
@@ -182,7 +205,15 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 	if err := os.MkdirAll(release, 0o755); err != nil {
 		return err
 	}
-	if err := binary(ctx, o, cfg, p, filepath.Join(stage, Binary)); err != nil {
+	m := protocol.Manifest{Version: strings.TrimPrefix(o.Version, "v"), Artifacts: []protocol.Artifact{}}
+	info := Info{Version: m.Version, Config: main, Env: o.Env, CreatedAt: time.Now().UnixMilli()}
+	for _, p := range o.Platforms {
+		if err := binary(ctx, o, cfg, p, BinaryFor(stage, p)); err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		info.Platforms = append(info.Platforms, p.String())
+	}
+	if err := os.WriteFile(filepath.Join(stage, Binary), []byte(launcher("программа агента", BinDir+"/agent-")), 0o755); err != nil {
 		return err
 	}
 	for _, rel := range rels {
@@ -190,8 +221,6 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 			return err
 		}
 	}
-	m := protocol.Manifest{Version: strings.TrimPrefix(o.Version, "v"), Artifacts: []protocol.Artifact{}}
-	info := Info{Version: m.Version, Config: main, Env: o.Env, OS: p.OS, Arch: p.Arch, CreatedAt: time.Now().UnixMilli()}
 	if o.Signing != nil {
 		m.PublicKey = releases.PublicKeyOf(o.Signing)
 		info.PublicKeys = []string{m.PublicKey}
@@ -199,39 +228,11 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 	for _, w := range cfg.Workers {
 		switch {
 		case w.Path != "":
-			rel, err := inside(root, w.Path)
-			if err != nil {
-				return fmt.Errorf("воркер %s: папка %s — вне папки агента", w.Name, w.Path)
-			}
-			version, err := readVersion(w.Path)
+			arts, err := packWorker(ctx, o, root, stage, release, tmp, w)
 			if err != nil {
 				return fmt.Errorf("воркер %s: %w", w.Name, err)
 			}
-			src, skip := w.Path, releases.ReadIgnore(w.Path)
-			if isExecutable(filepath.Join(w.Path, "build")) {
-				if src, err = buildWorker(ctx, w.Path, filepath.Join(tmp, "build-"+w.Name), version, p); err != nil {
-					return fmt.Errorf("воркер %s: %w", w.Name, err)
-				}
-				skip = nil
-			}
-			if err := copyDir(src, filepath.Join(stage, rel), skip); err != nil {
-				return err
-			}
-			file := fmt.Sprintf("%s-%s-%s-%s.tar.gz", w.Name, version, p.OS, p.Arch)
-			hash, err := releases.TarDirSkip(src, filepath.Join(release, file), "", skip)
-			if err != nil {
-				return fmt.Errorf("воркер %s: %w", w.Name, err)
-			}
-			a := protocol.WorkerArtifact{Name: w.Name, Version: version, OS: p.OS, Arch: p.Arch, File: file, SHA256: hash}
-			if o.Signing != nil {
-				a.Signature = update.Sign(o.Signing, update.Build{Name: w.Name, Version: version, OS: p.OS, Arch: p.Arch, SHA256: hash})
-			}
-			m.Workers = append(m.Workers, a)
-			if o.share != nil {
-				if err := o.share(a, filepath.Join(release, file)); err != nil {
-					return err
-				}
-			}
+			m.Workers = append(m.Workers, arts...)
 		case w.Release:
 			o.Warn(fmt.Sprintf("воркер %s со сборкой с сервера (release: true) — в архив не попадает: его ставит сервер", w.Name))
 			continue
@@ -255,6 +256,104 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 	}
 	_, err = releases.TarDir(stage, archive, Dir)
 	return err
+}
+
+// packWorker — воркер из папки в архив и его сборки под платформы в release/. Без build — папка
+// как есть (одна на все платформы); с build — сборка под каждую платформу в
+// workers/<имя>/<os>-<arch>/, а её исполняемые файлы (run, setup, cleanup) в папке воркера —
+// скрипты, которые запускают их под платформу машины.
+func packWorker(ctx context.Context, o Options, root, stage, release, tmp string, w config.Worker) ([]protocol.WorkerArtifact, error) {
+	rel, err := inside(root, w.Path)
+	if err != nil {
+		return nil, fmt.Errorf("папка %s — вне папки агента", w.Path)
+	}
+	version, err := readVersion(w.Path)
+	if err != nil {
+		return nil, err
+	}
+	dst := filepath.Join(stage, rel)
+	built := isExecutable(filepath.Join(w.Path, "build"))
+	skip := releases.ReadIgnore(w.Path)
+	if !built {
+		if err := copyDir(w.Path, dst, skip); err != nil {
+			return nil, err
+		}
+	}
+	execs := map[string]bool{}
+	var arts []protocol.WorkerArtifact
+	for _, p := range o.Platforms {
+		src, sk := w.Path, skip
+		if built {
+			if src, err = buildWorker(ctx, w.Path, filepath.Join(tmp, "build-"+w.Name+"-"+p.dir()), version, p); err != nil {
+				return nil, err
+			}
+			sk = nil
+			if err := copyDir(src, filepath.Join(dst, p.dir()), nil); err != nil {
+				return nil, err
+			}
+			entries, _ := os.ReadDir(src)
+			for _, e := range entries {
+				if !e.IsDir() && isExecutable(filepath.Join(src, e.Name())) {
+					execs[e.Name()] = true
+				}
+			}
+		}
+		file := fmt.Sprintf("%s-%s-%s-%s.tar.gz", w.Name, version, p.OS, p.Arch)
+		hash, err := releases.TarDirSkip(src, filepath.Join(release, file), "", sk)
+		if err != nil {
+			return nil, err
+		}
+		a := protocol.WorkerArtifact{Name: w.Name, Version: version, OS: p.OS, Arch: p.Arch, File: file, SHA256: hash}
+		if o.Signing != nil {
+			a.Signature = update.Sign(o.Signing, update.Build{Name: w.Name, Version: version, OS: p.OS, Arch: p.Arch, SHA256: hash})
+		}
+		arts = append(arts, a)
+		if o.share != nil {
+			if err := o.share(a, filepath.Join(release, file)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if built {
+		for name := range execs {
+			script := launcher("сборка воркера "+w.Name, "", name)
+			if err := os.WriteFile(filepath.Join(dst, name), []byte(script), 0o755); err != nil {
+				return nil, err
+			}
+		}
+		if err := os.WriteFile(filepath.Join(dst, "VERSION"), []byte(version+"\n"), 0o644); err != nil {
+			return nil, err
+		}
+	}
+	return arts, nil
+}
+
+// launcher — скрипт, который запускает what под платформу машины: <prefix><os>-<arch> рядом со
+// скриптом (программа агента — bin/agent-linux-amd64) или <os>-<arch>/<name> (сборка воркера —
+// из её каталога).
+func launcher(what, prefix string, name ...string) string {
+	target := `"$dir/` + prefix + `$os-$arch"`
+	run := `exec ` + target + ` "$@"`
+	if len(name) > 0 {
+		target = `"$dir/$os-$arch/` + name[0] + `"`
+		run = `cd "$dir/$os-$arch" && exec ./` + name[0] + ` "$@"`
+	}
+	return `#!/bin/sh
+# ` + what + ` под платформу этой машины (архив agent pack).
+case "$(uname -s)" in
+  Linux) os=linux ;;
+  Darwin) os=darwin ;;
+  *) echo "` + what + `: система $(uname -s) не поддерживается" >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+  x86_64 | amd64) arch=amd64 ;;
+  aarch64 | arm64) arch=arm64 ;;
+  *) echo "` + what + `: архитектура $(uname -m) не поддерживается" >&2; exit 1 ;;
+esac
+dir=$(cd "$(dirname "$0")" && pwd)
+[ -x ` + target + ` ] || { echo "` + what + `: в архиве нет сборки под $os/$arch" >&2; exit 1; }
+` + run + `
+`
 }
 
 // packFile — файл или папка проекта f (pack.files) в архив stage: по пути внутри папки агента
@@ -322,6 +421,9 @@ func binary(ctx context.Context, o Options, cfg config.Config, p Platform, dst s
 	if len(o.Keys) == 0 {
 		o.Warn("ключей проверки подписи нет — у программы агента под " + p.String() + " сверена только контрольная сумма")
 	} else if err := o.Keys.Verify(update.Build{Name: update.AgentName, Version: rel.Version, OS: p.OS, Arch: p.Arch, SHA256: rel.SHA256}, rel.Signature); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
 	return download(ctx, o, rel.URL, dst, rel.SHA256)

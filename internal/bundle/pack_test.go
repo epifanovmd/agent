@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -64,7 +65,7 @@ func TestPack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(out, "agent-prod-1.2.0-"+runtime.GOOS+"-"+runtime.GOARCH+".tar.gz")
+	want := filepath.Join(out, "agent-prod-1.2.0.tar.gz")
 	if len(archives) != 1 || archives[0] != want {
 		t.Fatalf("архивы: %v", archives)
 	}
@@ -73,7 +74,8 @@ func TestPack(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := filepath.Join(x, Dir)
-	for _, name := range []string{"agent", "agent.yaml", "agent.prod.yaml", "workers/echo/run", "workers/echo/VERSION", InfoFile, "release/manifest.json"} {
+	here := Platform{runtime.GOOS, runtime.GOARCH}
+	for _, name := range []string{"agent", "bin/agent-" + here.dir(), "agent.yaml", "agent.prod.yaml", "workers/echo/run", "workers/echo/VERSION", InfoFile, "release/manifest.json"} {
 		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
 			t.Errorf("нет %s", name)
 		}
@@ -89,7 +91,8 @@ func TestPack(t *testing.T) {
 	var info Info
 	raw, _ := os.ReadFile(filepath.Join(root, InfoFile))
 	_ = json.Unmarshal(raw, &info)
-	if info.Version != "1.2.0" || info.Config != "agent.prod.yaml" || info.Env != "prod" || !slices.Equal(info.Workers, []string{"echo"}) || len(info.PublicKeys) != 1 {
+	if info.Version != "1.2.0" || info.Config != "agent.prod.yaml" || info.Env != "prod" || !slices.Equal(info.Workers, []string{"echo"}) ||
+		len(info.PublicKeys) != 1 || !slices.Equal(info.Platforms, []string{here.String()}) {
 		t.Fatalf("bundle.json: %+v", info)
 	}
 	var m protocol.Manifest
@@ -174,8 +177,88 @@ func TestPackOtherPlatform(t *testing.T) {
 	if err := update.Extract(archives[0], x); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := os.ReadFile(filepath.Join(x, Dir, Binary)); string(got) != string(body) {
+	if got, _ := os.ReadFile(BinaryFor(filepath.Join(x, Dir), other)); string(got) != string(body) {
 		t.Fatalf("программа под %s: %q", other, got)
+	}
+}
+
+// Один архив под несколько платформ: программы в bin/, скрипт agent запускает программу под
+// платформу машины; собираемый воркер — под каждую платформу, его run — скрипт выбора.
+func TestPackPlatforms(t *testing.T) {
+	here := Platform{runtime.GOOS, runtime.GOARCH}
+	other := Platform{"linux", "amd64"}
+	if here == other {
+		other = Platform{"linux", "arm64"}
+	}
+	body := []byte("agent for " + other.String())
+	sum := sha256.Sum256(body)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/download/v1.2.0/manifest.json":
+			_ = json.NewEncoder(w).Encode(protocol.Manifest{Version: "1.2.0", Artifacts: []protocol.Artifact{
+				{OS: other.OS, Arch: other.Arch, File: "agent-" + other.dir(), SHA256: hex.EncodeToString(sum[:])},
+			}})
+		case "/download/v1.2.0/agent-" + other.dir():
+			_, _ = w.Write(body)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	files := map[string]string{
+		"agent.yaml":          "update: { releases: " + srv.URL + " }\nworkers:\n  - path: workers/gow\n",
+		"workers/gow/VERSION": "2.0.0\n",
+		"workers/gow/build":   "#!/bin/sh\nset -e\nprintf '#!/bin/sh\\necho %s/%s\\n' \"$GOOS\" \"$GOARCH\" > \"$OUT/run\"\nchmod +x \"$OUT/run\"\n",
+	}
+	for name, b := range files {
+		p := filepath.Join(dir, name)
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		mode := os.FileMode(0o644)
+		if filepath.Base(name) == "build" {
+			mode = 0o755
+		}
+		_ = os.WriteFile(p, []byte(b), mode)
+	}
+	self := filepath.Join(t.TempDir(), "agent-self")
+	_ = os.WriteFile(self, []byte("#!/bin/sh\necho this-machine \"$@\"\n"), 0o755)
+	archives, err := Pack(context.Background(), Options{Config: filepath.Join(dir, "agent.yaml"), Out: t.TempDir(),
+		Platforms: []Platform{here, other}, Version: "1.2.0", Self: self, Client: http.DefaultClient, Warn: func(string) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := filepath.Join(t.TempDir(), "x")
+	if err := update.Extract(archives[0], x); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(x, Dir)
+	if got, _ := os.ReadFile(BinaryFor(root, other)); string(got) != string(body) {
+		t.Fatalf("программа под %s: %q", other, got)
+	}
+	// Скрипт agent запускает программу этой машины с аргументами.
+	out, err := exec.Command(filepath.Join(root, Binary), "version").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "this-machine version" {
+		t.Fatalf("скрипт agent: %q %v", out, err)
+	}
+	// Воркер: сборки под обе платформы, run — скрипт выбора; VERSION — в папке воркера.
+	for _, p := range []Platform{here, other} {
+		run, _ := os.ReadFile(filepath.Join(root, "workers/gow", p.dir(), "run"))
+		if !strings.Contains(string(run), p.OS+"/"+p.Arch) {
+			t.Fatalf("сборка gow под %s: %q", p, run)
+		}
+	}
+	out, err = exec.Command(filepath.Join(root, "workers/gow/run")).CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != here.String() {
+		t.Fatalf("run воркера: %q %v", out, err)
+	}
+	if v, _ := os.ReadFile(filepath.Join(root, "workers/gow/VERSION")); strings.TrimSpace(string(v)) != "2.0.0" {
+		t.Fatalf("VERSION: %q", v)
+	}
+	var info Info
+	raw, _ := os.ReadFile(filepath.Join(root, InfoFile))
+	_ = json.Unmarshal(raw, &info)
+	if !slices.Equal(info.Platforms, []string{here.String(), other.String()}) {
+		t.Fatalf("платформы: %v", info.Platforms)
 	}
 }
 
@@ -216,11 +299,11 @@ func TestPackBuildAndIgnore(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := filepath.Join(x, Dir)
-	run, _ := os.ReadFile(filepath.Join(root, "workers/gow/run"))
+	run, _ := os.ReadFile(filepath.Join(root, "workers/gow", runtime.GOOS+"-"+runtime.GOARCH, "run"))
 	if !strings.Contains(string(run), runtime.GOOS+"/"+runtime.GOARCH) {
 		t.Fatalf("run — не итог build под платформу: %q", run)
 	}
-	for _, gone := range []string{"workers/gow/main.go", "workers/gow/build", "workers/py/tests", "workers/py/notes.tmp", "workers/py/.packignore"} {
+	for _, gone := range []string{"workers/gow/main.go", "workers/gow/build", "workers/gow/" + runtime.GOOS + "-" + runtime.GOARCH + "/main.go", "workers/py/tests", "workers/py/notes.tmp", "workers/py/.packignore"} {
 		if _, err := os.Stat(filepath.Join(root, gone)); err == nil {
 			t.Errorf("лишнее в архиве: %s", gone)
 		}
@@ -315,5 +398,25 @@ func TestPackFiles(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "agent.prod.yaml"), []byte("extends: agent.yaml\npack:\n  files: [../outside]\n"), 0o644)
 	if _, err := pack(); err == nil || !strings.Contains(err.Error(), "вне папки агента") {
 		t.Fatalf("вне папки: %v", err)
+	}
+}
+
+func TestHomeOf(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, BinDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(dir, BinDir, "agent-linux-amd64")
+	if got := HomeOf(exe); got != filepath.Join(dir, BinDir) {
+		t.Fatalf("bin/ без bundle.json: %s", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, InfoFile), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := HomeOf(exe); got != dir {
+		t.Fatalf("программа из bin/ архива: %s, а нужно %s", got, dir)
+	}
+	if got := HomeOf(filepath.Join(dir, "agent")); got != dir {
+		t.Fatalf("программа в папке агента: %s", got)
 	}
 }

@@ -61,7 +61,7 @@ func installCmd(args []string) error {
 
 	// Папка агента: распакованный архив agent pack рядом с программой или
 	// --env в папке агента (тогда — тот же архив, собранный здесь же).
-	dir := filepath.Dir(exe)
+	dir := bundle.HomeOf(exe)
 	if _, packed, err := bundle.ReadInfo(dir); err != nil {
 		return err
 	} else if !packed && o.Env != "" {
@@ -152,7 +152,7 @@ func uninstallCmd(args []string) error {
 	}
 	if *instance == "" && self != "" {
 		// Из распакованного архива agent pack — экземпляр из его настроек.
-		name, err := bundle.Instance(filepath.Dir(self))
+		name, err := bundle.Instance(bundle.HomeOf(self))
 		if err != nil {
 			return err
 		}

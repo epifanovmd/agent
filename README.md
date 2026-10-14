@@ -131,10 +131,10 @@ curl --unix-socket "$AGENT_SOCKET" -H "Authorization: Worker $AGENT_WORKER_TOKEN
 | Из папки агента           | `sudo ./agent install --env prod` в папке проекта                                                                              | агент ставится на ту же машину, где лежит папка          |
 | Из архива                 | `agent pack --env prod` → на узле `tar xzf … && cd agent && sudo ./agent install`                                              | перенос вручную; узлу не нужен доступ к бэкенду и GitHub |
 | Одной командой            | `curl -fsSL …/install.sh \| sudo sh -s -- --server https://api.example.com --token <токен>`                                    | сборка агента — из релиза на GitHub                      |
-| Архив по ссылке           | `curl -fsSL …/install.sh \| sudo sh -s -- --bundle 'https://files.example.com/agent-prod-linux-{arch}.tar.gz' --token <токен>` | архив `agent pack` с любого хостинга                     |
+| Архив по ссылке           | `curl -fsSL …/install.sh \| sudo sh -s -- --bundle 'https://files.example.com/agent-prod.tar.gz' --token <токен>` | архив `agent pack` с любого хостинга                     |
 | Только программа          | `sudo ./agent install --server https://api.example.com --token <токен> [--worker …]`                                           | без папки агента: настройки создаются по шаблону         |
 | Без root                  | `./agent install --rootless --server https://api.example.com --token <токен>`                                                  | нет прав root: агент в `~/.agent`, служба пользователя   |
-| Без установки (контейнер) | `curl -fsSL …/install.sh \| sh -s -- --run --bundle '…-linux-{arch}.tar.gz' --token <токен>`                                   | агент на переднем плане: контейнер, свой менеджер        |
+| Без установки (контейнер) | `curl -fsSL …/install.sh \| sh -s -- --run --bundle '…/agent-prod.tar.gz' --token <токен>`                                   | агент на переднем плане: контейнер, свой менеджер        |
 | Образ Docker              | `docker run -e AGENT_SERVER_URL=… -e AGENT_ENROLL_TOKEN=… -v agent-data:/var/lib/agent ghcr.io/epifanovmd/agent:<версия>`      | узел — контейнер; `:<версия>-python` — с python3         |
 
 Повторная установка обновляет программу и службу тем же способом и сохраняет ключ агента; новые

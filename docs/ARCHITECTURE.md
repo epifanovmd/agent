@@ -503,7 +503,7 @@ workers:
 | папка агента | `sudo ./agent install --env prod` в папке | `agent.yaml` + `agent.prod.yaml` одним файлом, воркеры папки |
 | архив `agent pack` | `tar xzf agent-prod-….tar.gz && cd agent && sudo ./agent install` | то же, из архива |
 | установщик `install.sh` | `curl -fsSL …/install.sh \| sudo sh -s -- --server https://api.example.com --token …` | из флагов, воркеры — `--worker` с каталога сборок |
-| архив по ссылке | `curl -fsSL …/install.sh \| sudo sh -s -- --bundle 'https://files.example.com/agent-prod-linux-{arch}.tar.gz' --token …` | архив `agent pack` с любого хостинга |
+| архив по ссылке | `curl -fsSL …/install.sh \| sudo sh -s -- --bundle 'https://files.example.com/agent-prod.tar.gz' --token …` | архив `agent pack` с любого хостинга |
 | программа агента и флаги | `sudo ./agent install --server URL --token ТОКЕН [--worker …]` | из флагов, воркеры — `--worker` с каталога сборок |
 
 `…/install.sh` — установщик из релиза агента (`deploy/install/install.sh`):
@@ -513,24 +513,26 @@ workers:
 
 ### Из папки агента и архива
 
-`agent pack --env prod` упаковывает папку агента для узлов — по архиву на платформу
-(`--platform`, по умолчанию `linux/amd64,linux/arm64`) в папку агента (`--out` — другой каталог):
-`agent-prod-<версия>-linux-amd64.tar.gz`. В архиве — папка `agent/`:
+`agent pack --env prod` упаковывает папку агента для узлов в один архив под все платформы
+`--platform` (по умолчанию `linux/amd64,linux/arm64`) в папку агента (`--out` — другой каталог):
+`agent-prod-<версия>.tar.gz`. Платформу машины архив выбирает сам при запуске — один архив годится
+и для amd64, и для arm64, в том числе для образа Docker под обе платформы. В архиве — папка `agent/`:
 
 | Что | Откуда |
 | --- | --- |
-| `agent` | программа под платформу узла: эта же или из каталога сборок агента той же версии (подпись сверяется) |
+| `agent` | скрипт: запускает программу `bin/agent-<os>-<arch>` под платформу машины (`uname`) с теми же аргументами — `./agent install`, `./agent run` |
+| `bin/agent-<os>-<arch>` | программа под каждую платформу архива: эта же или из каталога сборок агента той же версии (подпись сверяется) |
 | `agent.yaml`, `agent.prod.yaml` | файлы цепочки `extends` как есть |
-| `workers/<имя>/` | воркеры из папки (`path`) — для `agent run` прямо из архива |
+| `workers/<имя>/` | воркеры из папки (`path`) — для `agent run` прямо из архива; собираемый воркер — сборки в `workers/<имя>/<os>-<arch>/`, а его `run` (и другие исполняемые файлы сборки) — скрипты выбора платформы |
 | `release/manifest.json` и сборки | те же воркеры архивами `<имя>-<VERSION>-<os>-<arch>.tar.gz` (версия — файл `VERSION` воркера) |
-| `bundle.json` | версия агента, файл настроек, окружение, платформа, открытые ключи подписи |
+| `bundle.json` | версия агента, файл настроек, окружение, платформы (`platforms`), открытые ключи подписи |
 | `.env.prod` | только с `--with-env`: файлы переменных с секретами |
 | файлы проекта | `pack.files` настроек: файлы и папки внутри папки агента — по тому же пути; папка с `/` в конце — её содержимое в корень `agent/` (например, `Dockerfile`, `compose.yml`, `.env.example` для получателя архива) |
 
 Воркер с исполняемым `build` (программа под платформу — например, на Go) собирается под каждую
 платформу архива: `build` запускается в папке воркера с `GOOS` и `GOARCH` (и `AGENT_OS`,
-`AGENT_ARCH`) и `OUT` — каталогом итога, где должен появиться исполняемый `run`; в архив и в
-сборку воркера идёт итог сборки (и `VERSION`), а не исходники. У воркера без `build` в архив идёт
+`AGENT_ARCH`) и `OUT` — каталогом итога, где должен появиться исполняемый `run`; в архив (по
+каталогу на платформу) и в сборку воркера идёт итог сборки (и `VERSION`), а не исходники. У воркера без `build` в архив идёт
 папка как есть, кроме служебных файлов (`__pycache__`, `*.pyc`, `.git`) и строк его `.packignore`
 — шаблонов путей от папки воркера или имён (`tests/` — только каталоги, `*.tmp`, `#` — пояснение).
 
@@ -541,8 +543,9 @@ workers:
 `bundle.json`; закрытый в архив не попадает. Без ключа воркеры поставить можно, а обновить с
 бэкенда (`worker.update`) — нет.
 
-`agent install` из распакованного архива (рядом с программой — `bundle.json`) или с `--env` в
-папке агента (тогда архив собирается тут же, с файлами переменных):
+`agent install` из распакованного архива (`bundle.json` рядом со скриптом `agent`; платформа машины
+должна быть среди платформ архива, ставится программа под неё) или с `--env` в папке агента (тогда
+архив собирается тут же, с файлами переменных):
 
 1. сводит цепочку файлов в один `/etc/agent/agent.yaml`: без `extends` и `envFiles`, `dataDir` —
    каталог узла, воркеры из папки — воркеры со сборкой (`release: true`), `instance` и `install`
@@ -561,12 +564,13 @@ workers:
 `sudo ./agent uninstall [--purge]` из того же архива: экземпляр берётся из его настроек.
 
 **Архив по ссылке.** Установщик `install.sh` с `--bundle URL` скачивает архив `agent pack` и
-запускает его `agent install` — распаковывать вручную не нужно. `{arch}` в ссылке заменяется на
-`amd64` или `arm64` этой машины, так что одна команда подходит обеим платформам:
+запускает его `agent install` — распаковывать вручную не нужно. Архив один на все платформы, так
+что одна команда подходит и amd64, и arm64 (`{arch}` в ссылке, если есть, заменяется на `amd64`
+или `arm64` этой машины — для архивов по платформам на своём хостинге):
 
 ```bash
 I=https://github.com/epifanovmd/agent/releases/latest/download/install.sh
-B='https://files.example.com/agent-prod-linux-{arch}.tar.gz'
+B='https://files.example.com/agent-prod.tar.gz'
 curl -fsSL $I | sudo sh -s -- --bundle "$B" --token <токен>              # служба systemd
 curl -fsSL $I | sh -s -- --bundle "$B" --rootless --token <токен>        # агент пользователя
 curl -fsSL $I | sh -s -- --bundle "$B" --run --token <токен>             # без установки
@@ -753,7 +757,7 @@ curl -fsSL https://github.com/epifanovmd/agent/releases/latest/download/install.
 ```bash
 I=https://github.com/epifanovmd/agent/releases/latest/download/install.sh
 # архив папки агента проекта — настройки и воркеры из архива
-curl -fsSL $I | sh -s -- --run --bundle 'https://files.example.com/agent-prod-linux-{arch}.tar.gz' --token <токен>
+curl -fsSL $I | sh -s -- --run --bundle 'https://files.example.com/agent-prod.tar.gz' --token <токен>
 # только программа агента — настройки из окружения
 curl -fsSL $I | sh -s -- --run --server https://api.example.com --token <токен>
 ```
@@ -767,7 +771,7 @@ curl -fsSL $I | sh -s -- --run --server https://api.example.com --token <ток�
 
 ```bash
 docker run -d --restart unless-stopped -v agent-data:/var/lib/agent <образ> \
-  sh -c "curl -fsSL https://github.com/epifanovmd/agent/releases/latest/download/install.sh | sh -s -- --run --bundle 'https://files.example.com/agent-prod-linux-{arch}.tar.gz' --token <токен>"
+  sh -c "curl -fsSL https://github.com/epifanovmd/agent/releases/latest/download/install.sh | sh -s -- --run --bundle 'https://files.example.com/agent-prod.tar.gz' --token <токен>"
 ```
 
 Программы, нужные воркерам, должны быть в образе. Тяжёлые зависимости (например, библиотеки

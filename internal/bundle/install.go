@@ -32,9 +32,9 @@ func ReadInfo(dir string) (Info, bool, error) {
 	return info, true, nil
 }
 
-// Prepare — параметры agent install из распакованного архива dir (под
-// платформу goos/arch): настройки одним файлом (Flatten) во временном файле,
-// программа и сборки воркеров из архива, ключи подписи архива, переменные
+// Prepare — параметры agent install из распакованного архива dir (платформа goos/arch должна
+// быть среди платформ архива): настройки одним файлом (Flatten) во временном файле,
+// программа под эту платформу (bin/) и сборки воркеров из архива, ключи подписи архива, переменные
 // из его файлов переменных, раздел install и instance из настроек — там, где
 // флагов нет. Вернёт временный каталог — его удаляют после установки.
 func Prepare(dir, goos, arch string, o *install.Options) (string, error) {
@@ -45,8 +45,9 @@ func Prepare(dir, goos, arch string, o *install.Options) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("%s — не архив agent pack: нет %s", dir, InfoFile)
 	}
-	if info.OS != goos || info.Arch != arch {
-		return "", fmt.Errorf("архив собран под %s/%s, а это %s/%s: agent pack --platform %s/%s", info.OS, info.Arch, goos, arch, goos, arch)
+	here := Platform{goos, arch}
+	if !slices.Contains(info.Platforms, here.String()) {
+		return "", fmt.Errorf("архив собран под %s, а это %s: agent pack --platform %s", strings.Join(info.Platforms, ", "), here, here)
 	}
 	if o.Env != "" && info.Env != "" && o.Env != info.Env {
 		return "", fmt.Errorf("--env %s, а архив собран для %s", o.Env, info.Env)
@@ -96,7 +97,7 @@ func Prepare(dir, goos, arch string, o *install.Options) (string, error) {
 		return "", err
 	}
 
-	o.Binary = filepath.Join(dir, Binary)
+	o.Binary = BinaryFor(dir, here)
 	o.Version = info.Version
 	for _, w := range info.Workers {
 		if !slices.Contains(o.Workers, w) {
