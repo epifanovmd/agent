@@ -20,6 +20,7 @@ type envVar struct {
 var envVars = []envVar{
 	envString("AGENT_SERVER_URL", func(c *Config) *string { return &c.Server.URL }),
 	envBool("AGENT_SERVER_ALLOW_INSECURE", func(c *Config) *bool { return &c.Server.AllowInsecure }),
+	envBool("AGENT_SERVER_REQUIRED", func(c *Config) *bool { return &c.Server.Required }),
 	envString("AGENT_SERVER_CA_FILE", func(c *Config) *string { return &c.Server.CAFile }),
 	envString("AGENT_DATA_DIR", func(c *Config) *string { return &c.DataDir }),
 	envString("AGENT_NAME", func(c *Config) *string { return &c.Name }),

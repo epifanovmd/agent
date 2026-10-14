@@ -51,11 +51,17 @@ type Source struct {
 	Errors []Problem
 
 	node *yaml.Node
+	// env — окружение процесса (nil — этого процесса).
+	env func(string) (string, bool)
 }
 
 // Lookup — значение переменной: окружение процесса, иначе файлы переменных.
 func (s *Source) Lookup(name string) (string, bool) {
-	if v, ok := os.LookupEnv(name); ok {
+	env := s.env
+	if env == nil {
+		env = os.LookupEnv
+	}
+	if v, ok := env(name); ok {
 		return v, true
 	}
 	v, ok := s.Env[name]
@@ -94,7 +100,12 @@ func fromFile(file, value string) string {
 
 // ReadSource — цепочка файлов настроек, начиная с path. Ошибки — в Errors.
 func ReadSource(path string) *Source {
-	s := &Source{Env: map[string]string{}}
+	return readSource(path, nil)
+}
+
+// readSource — ReadSource с окружением процесса env (nil — этого процесса).
+func readSource(path string, env func(string) (string, bool)) *Source {
+	s := &Source{Env: map[string]string{}, env: env}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		abs = path
@@ -307,6 +318,18 @@ func resolvePaths(root *yaml.Node, file string) {
 	}
 	fix(mapValue(root, "dataDir"))
 	fix(mapValue(mapValue(root, "server"), "caFile"))
+	if files := mapValue(mapValue(root, "pack"), "files"); files != nil && files.Kind == yaml.SequenceNode {
+		for _, f := range files.Content {
+			if f.Kind == yaml.ScalarNode && f.Value != "" {
+				// «/» в конце — содержимое папки: сохраняется после разрешения пути.
+				slash := strings.HasSuffix(f.Value, "/")
+				f.Value = fromFile(file, f.Value)
+				if slash && !strings.HasSuffix(f.Value, "/") {
+					f.Value += "/"
+				}
+			}
+		}
+	}
 	if workers := mapValue(root, "workers"); workers != nil && workers.Kind == yaml.SequenceNode {
 		for _, w := range workers.Content {
 			fix(mapValue(w, "dir"))

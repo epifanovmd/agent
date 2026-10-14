@@ -93,7 +93,7 @@ func shortDir(t *testing.T) string {
 
 // config — agent.yaml узла: бэкенд url ("" — без бэкенда), воркеры echo и sysinfo.
 func config(dir, url, extra string) string {
-	server := ""
+	server := "server:\n  required: false\n"
 	if url != "" {
 		server = fmt.Sprintf("server:\n  url: %s\n  allowInsecure: true\nenroll:\n  token: e2e-token\n", url)
 	}

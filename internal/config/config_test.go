@@ -394,3 +394,31 @@ func TestUpdateKeys(t *testing.T) {
 		t.Fatalf("неверный ключ: %v", err)
 	}
 }
+
+// server.required — по умолчанию: без адреса, а до регистрации без токена — ошибка; false —
+// работа без бэкенда допустима.
+func TestRequireServer(t *testing.T) {
+	cfg := Defaults()
+	if !cfg.Server.Required {
+		t.Fatal("server.required по умолчанию — true")
+	}
+	if err := cfg.RequireServer(false); err == nil || !strings.Contains(err.Error(), "AGENT_SERVER_URL") {
+		t.Fatalf("без адреса: %v", err)
+	}
+	cfg.Server.URL = "https://api.example.com"
+	if err := cfg.RequireServer(false); err == nil || !strings.Contains(err.Error(), "AGENT_ENROLL_TOKEN") {
+		t.Fatalf("без токена до регистрации: %v", err)
+	}
+	if err := cfg.RequireServer(true); err != nil {
+		t.Fatalf("зарегистрирован — токен не нужен: %v", err)
+	}
+	cfg.Enroll.Token = "t"
+	if err := cfg.RequireServer(false); err != nil {
+		t.Fatalf("адрес и токен: %v", err)
+	}
+	t.Setenv("AGENT_SERVER_REQUIRED", "false")
+	local, err := Load("")
+	if err != nil || local.Server.Required || local.RequireServer(false) != nil {
+		t.Fatalf("server.required: false — без бэкенда можно: %+v %v", local.Server, err)
+	}
+}

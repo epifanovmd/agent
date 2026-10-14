@@ -14,7 +14,7 @@ func TestEnvVars(t *testing.T) {
 		}
 		seen[e.Name] = true
 		changed := false
-		for _, v := range []string{"7", "7s", "k=v", "true"} {
+		for _, v := range []string{"7", "7s", "k=v", "true", "false"} {
 			cfg := Defaults()
 			if e.apply(&cfg, v) == nil && !reflect.DeepEqual(cfg, Defaults()) {
 				changed = true

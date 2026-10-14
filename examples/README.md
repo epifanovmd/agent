@@ -92,8 +92,9 @@ curl -X POST 'localhost:8080/api/agents/<id>/commands?wait=10' -d '{"type":"agen
 
 ### Без бэкенда
 
-Агент работает и без `server.url`: желаемое — из файлов `desired/<воркер>/<ключ>.json` рядом с
-`agent.yaml` (перечитываются по `SIGHUP`), команды — через локальный API:
+С `server.required: false` (`AGENT_SERVER_REQUIRED=false`) агент работает и без `server.url`:
+желаемое — из файлов `desired/<воркер>/<ключ>.json` рядом с `agent.yaml` (перечитываются по
+`SIGHUP`), команды — через локальный API:
 
 ```bash
 agent command echo echo.say '{"text":"привет"}'

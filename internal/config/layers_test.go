@@ -220,6 +220,7 @@ workers:
 envFiles: [.env.prod]
 instance: example
 install: { packages: [python3] }
+pack: { files: [package/] }
 server:
   url: ${AGENT_SERVER_URL}
 log: { format: json }
@@ -230,7 +231,7 @@ log: { format: json }
 		t.Fatal(err)
 	}
 	text := string(raw)
-	for _, bad := range []string{"extends", "envFiles", "instance", "install", "path:", ".data"} {
+	for _, bad := range []string{"extends", "envFiles", "instance", "install", "pack", "path:", ".data"} {
 		if strings.Contains(text, bad) {
 			t.Errorf("лишнее %q:\n%s", bad, text)
 		}

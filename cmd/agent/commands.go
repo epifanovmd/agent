@@ -211,9 +211,13 @@ func configCheck(args []string) error {
 		fmt.Printf("%s: %v\n", envFile, envErr)
 	}
 	warnings := res.Warnings
-	if len(res.Errors) == 0 && res.Config.Enroll.Token == "" {
+	if len(res.Errors) == 0 {
 		_, err := os.Stat(filepath.Join(res.Config.DataDir, "credentials.json"))
-		if errors.Is(err, fs.ErrNotExist) {
+		enrolled := !errors.Is(err, fs.ErrNotExist)
+		switch err := res.Config.RequireServer(enrolled); {
+		case err != nil:
+			res.Errors = append(res.Errors, config.Problem{Text: err.Error()})
+		case res.Config.Server.URL != "" && !enrolled && res.Config.Enroll.Token == "":
 			warnings = append(warnings, config.Problem{Text: "агент ещё не зарегистрирован, а токена регистрации нет: задайте enroll.token или AGENT_ENROLL_TOKEN"})
 		}
 	}

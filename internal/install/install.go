@@ -290,6 +290,10 @@ func Install(ctx context.Context, s *System, o Options) error {
 	if o.Config != "" && !fsutil.IsFile(o.Config) {
 		return fmt.Errorf("--config: нет файла %s", o.Config)
 	}
+	// server.required — до любых изменений на узле: адрес и, до регистрации, токен.
+	if err := precheckServer(s, l, o, configExists); err != nil {
+		return err
+	}
 	for _, x := range o.Ignored {
 		s.warn("%s", x)
 	}
@@ -366,6 +370,9 @@ func Install(ctx context.Context, s *System, o Options) error {
 	vars["AGENT_ENROLL_TOKEN"] = o.Token
 	vars["AGENT_UPDATE_PUBLIC_KEYS"] = strings.Join(keyList(o.PublicKeys), ",")
 	if err := writeEnv(s, l, user, vars); err != nil {
+		return err
+	}
+	if err := requireServer(s, l); err != nil {
 		return err
 	}
 	unit := Unit(UnitOptions{Paths: l, User: user, Privileged: o.Privileged})
@@ -608,6 +615,85 @@ func savedServer(s *System, l Paths) string {
 		return ""
 	}
 	return strings.TrimRight(cfg.Server.URL, "/")
+}
+
+// installedVars — переменные службы из её agent.env (нет файла — пусто).
+func installedVars(s *System, l Paths) (map[string]string, error) {
+	vars := map[string]string{}
+	f, err := os.Open(s.p(l.EnvFile))
+	if err != nil {
+		return vars, nil
+	}
+	defer f.Close()
+	kv, err := config.ParseEnv(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", l.EnvFile, err)
+	}
+	for _, p := range kv {
+		vars[p[0]] = p[1]
+	}
+	return vars, nil
+}
+
+func lookupIn(vars map[string]string) func(string) (string, bool) {
+	return func(name string) (string, bool) {
+		v, ok := vars[name]
+		return v, ok
+	}
+}
+
+// precheckServer — до изменений на узле: служба получит адрес и, до регистрации, токен
+// (server.required). Значения — как у службы: прежний agent.env, переменные архива, --token,
+// --server; настройки — из --config, прежние или создаваемые по флагам.
+func precheckServer(s *System, l Paths, o Options, configExists bool) error {
+	vars, err := installedVars(s, l)
+	if err != nil {
+		return err
+	}
+	maps.Copy(vars, o.Vars)
+	if o.Token != "" {
+		vars["AGENT_ENROLL_TOKEN"] = o.Token
+	}
+	if o.Server != "" {
+		vars["AGENT_SERVER_URL"] = o.Server
+	}
+	cfg := config.Defaults()
+	switch {
+	case o.Config != "":
+		if cfg, err = config.LoadFor(o.Config, lookupIn(vars)); err != nil {
+			return err
+		}
+	case configExists:
+		if cfg, err = config.LoadFor(s.p(l.ConfigFile), lookupIn(vars)); err != nil {
+			return err
+		}
+	default:
+		cfg.Server.URL = vars["AGENT_SERVER_URL"]
+		cfg.Enroll.Token = vars["AGENT_ENROLL_TOKEN"]
+	}
+	_, enrolled, _ := identity.NewStore(s.p(l.DataDir)).Load()
+	if err := cfg.RequireServer(enrolled); err != nil {
+		return fmt.Errorf("%w — на узле ничего не изменено", err)
+	}
+	return nil
+}
+
+// requireServer — служба запустится с бэкендом (server.required): настройки так, как их прочитает
+// служба (с её файлом переменных); иначе — ошибка до запуска службы.
+func requireServer(s *System, l Paths) error {
+	vars, err := installedVars(s, l)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.LoadFor(s.p(l.ConfigFile), lookupIn(vars))
+	if err != nil {
+		return err
+	}
+	_, enrolled, _ := identity.NewStore(s.p(l.DataDir)).Load()
+	if err := cfg.RequireServer(enrolled); err != nil {
+		return fmt.Errorf("%w — служба не запущена; повторите установку с этими значениями", err)
+	}
+	return nil
 }
 
 // keyList — ключи без пустых и повторов.

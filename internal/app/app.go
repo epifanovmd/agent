@@ -114,6 +114,10 @@ func New(cfg config.Config, version string) (*App, error) {
 		log.Warn("server.allowInsecure: связь без шифрования разрешена — ключ агента и данные могут идти открытым текстом",
 			"server", cfg.Server.URL)
 	}
+	_, enrolled, _ := identity.NewStore(cfg.DataDir).Load()
+	if err := cfg.RequireServer(enrolled); err != nil {
+		return nil, err
+	}
 	lock, err := LockDataDir(cfg.DataDir)
 	if err != nil {
 		return nil, err

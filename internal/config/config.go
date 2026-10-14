@@ -64,6 +64,8 @@ type Config struct {
 	Instance string `yaml:"instance,omitempty"`
 	// Install — параметры agent install, если флагов нет (пакеты, права службы, sysctl).
 	Install *Install `yaml:"install,omitempty"`
+	// Pack — что ещё кладёт в архив agent pack. Агенту на узле не нужно — установка убирает.
+	Pack *Pack `yaml:"pack,omitempty"`
 
 	Server  Server            `yaml:"server"`
 	DataDir string            `yaml:"dataDir"`
@@ -89,6 +91,14 @@ type Install struct {
 	Sysctl            map[string]string   `yaml:"sysctl,omitempty"`
 }
 
+// Pack — файлы проекта в архиве agent pack.
+type Pack struct {
+	// Files — файлы и папки внутри папки агента (пути — от файла настроек): кладутся в архив
+	// по тому же пути; папка с «/» в конце — её содержимое в корень архива. Совпасть с тем,
+	// что кладёт сам pack (программа, настройки, воркеры, release/, bundle.json), не могут.
+	Files []string `yaml:"files,omitempty"`
+}
+
 // Outbox — очередь важных сообщений на диске.
 type Outbox struct {
 	// MaxMessages — сколько сообщений очередь держит; полна — события
@@ -97,8 +107,11 @@ type Outbox struct {
 }
 
 type Server struct {
-	// URL бэкенда: https://api.example.com; пусто — работа без бэкенда.
+	// URL бэкенда: https://api.example.com; пусто — работа без бэкенда (только с Required: false).
 	URL string `yaml:"url"`
+	// Required — агенту нужен бэкенд (по умолчанию): без адреса, а до регистрации и без токена
+	// агент не запускается и не ставится. false — допускается работа без бэкенда.
+	Required bool `yaml:"required"`
 	// AllowInsecure — разрешить http:// (стенд, локальная сеть): ключ агента и данные идут
 	// открытым текстом.
 	AllowInsecure bool `yaml:"allowInsecure"`
@@ -250,7 +263,27 @@ func Defaults() Config {
 		Log:     Log{Level: "info", Format: "text", Forward: protocol.LogWarn, Buffer: protocol.MaxLogLines},
 		Outbox:  Outbox{MaxMessages: protocol.MaxOutbox},
 		Update:  Update{Mode: UpdateSelf},
+		Server:  Server{Required: true},
 	}
+}
+
+// RequireServer — запуск или установка агента, которому нужен бэкенд (server.required): адрес
+// задан, а до регистрации (enrolled — ключа агента ещё нет) есть и токен. Без server.required
+// ошибки нет.
+func (c *Config) RequireServer(enrolled bool) error {
+	if !c.Server.Required {
+		return nil
+	}
+	if c.Server.URL == "" {
+		return errors.New("не задан адрес бэкенда server.url (AGENT_SERVER_URL): задайте его в настройках, " +
+			"окружении, файле переменных или флагом --server; работа без бэкенда — server.required: false " +
+			"(AGENT_SERVER_REQUIRED=false)")
+	}
+	if !enrolled && c.Enroll.Token == "" {
+		return errors.New("агент не зарегистрирован и нет токена регистрации enroll.token (AGENT_ENROLL_TOKEN): " +
+			"задайте его в окружении, файле переменных или флагом --token")
+	}
+	return nil
 }
 
 // Load — настройки из файла path (пустой — без файла; цепочка extends) и окружения.
@@ -268,6 +301,21 @@ func Load(path string) (Config, error) {
 	}
 	applyEnv(&cfg, src.Lookup)
 	return cfg, cfg.Validate()
+}
+
+// LoadFor — настройки из файла path так, как их увидит процесс с окружением env (служба с её
+// файлом переменных), без проверки значений.
+func LoadFor(path string, env func(string) (string, bool)) (Config, error) {
+	cfg := Defaults()
+	src := readSource(path, env)
+	if len(src.Errors) > 0 {
+		return cfg, problemsError(src.Errors)
+	}
+	if err := src.Decode(&cfg); err != nil {
+		return cfg, fmt.Errorf("config %s: %w", path, err)
+	}
+	applyEnv(&cfg, src.Lookup)
+	return cfg, nil
 }
 
 // problemsError — ошибки файлов настроек одной ошибкой, по строке на каждую.

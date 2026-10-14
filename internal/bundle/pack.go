@@ -246,8 +246,67 @@ func packOne(ctx context.Context, o Options, cfg config.Config, root string, rel
 	if err := writeJSON(filepath.Join(stage, InfoFile), info); err != nil {
 		return err
 	}
+	if cfg.Pack != nil {
+		for _, f := range cfg.Pack.Files {
+			if err := packFile(root, stage, f); err != nil {
+				return fmt.Errorf("pack.files: %w", err)
+			}
+		}
+	}
 	_, err = releases.TarDir(stage, archive, Dir)
 	return err
+}
+
+// packFile — файл или папка проекта f (pack.files) в архив stage: по пути внутри папки агента
+// root; папка с «/» в конце — её содержимое в корень архива. Совпадение с уже положенным
+// (программа, настройки, воркеры, release/, bundle.json) — ошибка.
+func packFile(root, stage, f string) error {
+	contents := strings.HasSuffix(f, "/")
+	src := filepath.Clean(f)
+	rel, err := inside(root, src)
+	if err != nil {
+		return fmt.Errorf("%s — вне папки агента %s", src, root)
+	}
+	dst := filepath.Join(stage, rel)
+	if contents {
+		dst = stage
+	}
+	st, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return copyNew(src, dst, rel)
+	}
+	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		sub, _ := filepath.Rel(src, p)
+		target := filepath.Join(dst, sub)
+		switch {
+		case info.IsDir():
+			if info.Name() == "__pycache__" || info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return os.MkdirAll(target, 0o755)
+		case info.Mode().IsRegular():
+			if info.Name() == ".DS_Store" || strings.HasSuffix(info.Name(), ".pyc") {
+				return nil
+			}
+			name, _ := filepath.Rel(stage, target)
+			return copyNew(p, target, name)
+		}
+		return nil
+	})
+}
+
+// copyNew — файл src в dst, если в архиве его ещё нет (name — путь в архиве для ошибки).
+func copyNew(src, dst, name string) error {
+	if _, err := os.Lstat(dst); err == nil {
+		return fmt.Errorf("%s уже есть в архиве — его кладёт сам pack", filepath.ToSlash(name))
+	}
+	return copyFile(src, dst)
 }
 
 // binary — программа агента под платформу p: эта же, если платформа и есть

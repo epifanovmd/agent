@@ -250,3 +250,70 @@ func TestPackBuildAndIgnore(t *testing.T) {
 		t.Fatalf("ошибка build: %v", err)
 	}
 }
+
+// pack.files: папка с «/» — содержимое в корень архива, файл — по своему пути (с правами);
+// совпасть с тем, что кладёт сам pack, нельзя; путь — от файла настроек.
+func TestPackFiles(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"agent.yaml":            "workers:\n  - path: workers/py\n",
+		"agent.prod.yaml":       "extends: agent.yaml\npack:\n  files: [package/, agent.docker.yaml, tools]\n",
+		"agent.docker.yaml":     "extends: agent.prod.yaml\n",
+		"workers/py/VERSION":    "1.0.0\n",
+		"workers/py/run":        "#!/bin/sh\n",
+		"package/Dockerfile":    "FROM scratch\n",
+		"package/compose.yml":   "services: {}\n",
+		"package/.env.example":  "AGENT_SERVER_URL=\n",
+		"tools/check.sh":        "#!/bin/sh\n",
+		"tools/__pycache__/x.c": "x",
+	}
+	for name, body := range files {
+		p := filepath.Join(dir, name)
+		_ = os.MkdirAll(filepath.Dir(p), 0o755)
+		mode := os.FileMode(0o644)
+		if strings.HasSuffix(name, ".sh") || filepath.Base(name) == "run" {
+			mode = 0o755
+		}
+		_ = os.WriteFile(p, []byte(body), mode)
+	}
+	self := filepath.Join(t.TempDir(), "agent-self")
+	_ = os.WriteFile(self, []byte("agent"), 0o755)
+	pack := func() ([]string, error) {
+		return Pack(context.Background(), Options{Config: filepath.Join(dir, "agent.prod.yaml"), Env: "prod", Out: t.TempDir(),
+			Platforms: []Platform{{runtime.GOOS, runtime.GOARCH}}, Version: "1.3.0", Self: self, Client: http.DefaultClient, Warn: func(string) {}})
+	}
+	archives, err := pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := filepath.Join(t.TempDir(), "x")
+	if err := update.Extract(archives[0], x); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(x, Dir)
+	for _, want := range []string{"Dockerfile", "compose.yml", ".env.example", "agent.docker.yaml", "tools/check.sh", "agent.prod.yaml", "bundle.json"} {
+		if _, err := os.Stat(filepath.Join(root, want)); err != nil {
+			t.Errorf("нет в архиве: %s", want)
+		}
+	}
+	for _, gone := range []string{"package", "tools/__pycache__"} {
+		if _, err := os.Stat(filepath.Join(root, gone)); err == nil {
+			t.Errorf("лишнее в архиве: %s", gone)
+		}
+	}
+	if st, err := os.Stat(filepath.Join(root, "tools/check.sh")); err != nil || st.Mode().Perm()&0o100 == 0 {
+		t.Fatalf("права файла: %v %v", st, err)
+	}
+
+	// Совпадение с тем, что кладёт сам pack, — ошибка.
+	_ = os.WriteFile(filepath.Join(dir, "package/bundle.json"), []byte("{}"), 0o644)
+	if _, err := pack(); err == nil || !strings.Contains(err.Error(), "bundle.json уже есть") {
+		t.Fatalf("совпадение: %v", err)
+	}
+	_ = os.Remove(filepath.Join(dir, "package/bundle.json"))
+	// Вне папки агента — ошибка.
+	_ = os.WriteFile(filepath.Join(dir, "agent.prod.yaml"), []byte("extends: agent.yaml\npack:\n  files: [../outside]\n"), 0o644)
+	if _, err := pack(); err == nil || !strings.Contains(err.Error(), "вне папки агента") {
+		t.Fatalf("вне папки: %v", err)
+	}
+}

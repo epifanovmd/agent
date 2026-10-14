@@ -25,6 +25,7 @@ func TestCheckLoop(t *testing.T) {
 	defer srv.Close()
 	cfg := config.Defaults()
 	cfg.Server.URL, cfg.Server.AllowInsecure = "http://127.0.0.1:1", true
+	cfg.Enroll.Token = "test-token"
 	cfg.DataDir = t.TempDir()
 	cfg.Log.Level = "error"
 	cfg.Update.Releases = srv.URL

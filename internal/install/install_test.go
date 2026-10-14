@@ -468,6 +468,26 @@ func TestInstallRefuses(t *testing.T) {
 	}
 }
 
+// server.required (по умолчанию): незарегистрированный агент без токена — ошибка до запуска
+// службы; с server.required: false в настройках — ставится.
+func TestInstallRequiresToken(t *testing.T) {
+	ctx := context.Background()
+	f, s := newFake(t, "systemctl", "useradd")
+	err := Install(ctx, s, Options{Binary: binary(t, "v1"), Server: "https://api.example.com"})
+	if err == nil || !strings.Contains(err.Error(), "AGENT_ENROLL_TOKEN") || !strings.Contains(err.Error(), "ничего не изменено") {
+		t.Fatalf("без токена: %v", err)
+	}
+	if f.exists(Binary) || f.exists(ConfigFile) || len(f.cmds) > 0 {
+		t.Fatalf("узел изменён без токена: %v", f.cmds)
+	}
+	local := filepath.Join(t.TempDir(), "agent.yaml")
+	_ = os.WriteFile(local, []byte("server:\n  url: https://api.example.com\n  required: false\n"), 0o644)
+	if err := Install(ctx, s, Options{Binary: binary(t, "v1"), Server: "https://api.example.com", Config: local}); err != nil {
+		t.Fatalf("server.required: false: %v", err)
+	}
+	f.ran(t, "systemctl restart agent.service")
+}
+
 // --worker: старшая версия под эту машину, подпись и sha256 сверяются,
 // архив распаковывается, записи — в создаваемый agent.yaml.
 func TestInstallWorkers(t *testing.T) {
@@ -557,11 +577,11 @@ func TestInstallWorkers(t *testing.T) {
 		t.Fatalf("адрес из agent.yaml: %v", err)
 	}
 	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: https://wrong.example.com\n"), 0o644)
-	_ = os.WriteFile(filepath.Join(f.root, EnvFile), []byte("AGENT_SERVER_URL="+srv.URL+"/\n"), 0o600)
+	_ = os.WriteFile(filepath.Join(f.root, EnvFile), []byte("AGENT_SERVER_URL="+srv.URL+"/\nAGENT_ENROLL_TOKEN=t\n"), 0o600)
 	if err := Install(ctx, s, Options{Binary: o.Binary, PublicKeys: []string{key}, Workers: []string{"collector"}}); err != nil {
 		t.Fatalf("адрес из agent.env: %v", err)
 	}
-	_ = os.Remove(filepath.Join(f.root, EnvFile))
+	_ = os.WriteFile(filepath.Join(f.root, EnvFile), []byte("AGENT_ENROLL_TOKEN=t\n"), 0o600)
 	_ = os.WriteFile(filepath.Join(f.root, ConfigFile), []byte("server:\n  url: "+srv.URL+"\n"), 0o644)
 	// Та же версия уже стоит — сборка не скачивается и не меняется.
 	if !strings.Contains(f.out.String(), "Воркер collector 1.2.0 уже стоит") {

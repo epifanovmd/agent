@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/epifanovmd/agent/internal/config"
@@ -19,6 +20,7 @@ import (
 func TestDataDirLock(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Server.URL, cfg.Server.AllowInsecure = "http://127.0.0.1:1", true
+	cfg.Enroll.Token = "test-token"
 	cfg.DataDir = t.TempDir()
 	cfg.Log.Level = "error"
 	first, err := New(cfg, "test")
@@ -84,4 +86,28 @@ func TestRenewKeepsCredentialsOnFailure(t *testing.T) {
 	if err != nil || !ok || creds.AgentID != "a" || creds.Secret != "s" {
 		t.Fatalf("учётные данные: %+v %v %v", creds, ok, err)
 	}
+}
+
+// server.required (по умолчанию): без адреса и без токена до регистрации агент не запускается;
+// server.required: false — запускается без бэкенда.
+func TestRequireServerOnStart(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.DataDir = t.TempDir()
+	cfg.Log.Level = "error"
+	if _, err := New(cfg, "test"); err == nil || !strings.Contains(err.Error(), "AGENT_SERVER_URL") {
+		t.Fatalf("без адреса: %v", err)
+	}
+	cfg.Server.URL, cfg.Server.AllowInsecure = "http://127.0.0.1:1", true
+	if _, err := New(cfg, "test"); err == nil || !strings.Contains(err.Error(), "AGENT_ENROLL_TOKEN") {
+		t.Fatalf("без токена: %v", err)
+	}
+	local := config.Defaults()
+	local.DataDir = t.TempDir()
+	local.Log.Level = "error"
+	local.Server.Required = false
+	a, err := New(local, "test")
+	if err != nil {
+		t.Fatalf("без бэкенда при server.required: false: %v", err)
+	}
+	a.Close()
 }
