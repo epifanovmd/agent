@@ -98,9 +98,10 @@ func (a *App) Reload(next config.Config) {
 	}
 }
 
-// Serve — работать как служба до сигнала: SIGTERM и SIGINT — остановка (воркеры работают
-// дальше), SIGUSR1 (`agent restart`) — выход для перезапуска менеджером службы (ErrRestart;
-// воркеры работают дальше), SIGHUP — перечитать настройки из path.
+// Serve — работать как служба до сигнала: SIGTERM и SIGINT — остановка (воркеры
+// останавливаются, кроме воркеров с lifecycle.keepRunning), SIGUSR1 (`agent restart`) — выход
+// для перезапуска менеджером службы (ErrRestart; воркеры работают дальше), SIGHUP — перечитать
+// настройки из path.
 func (a *App) Serve(path string) error {
 	a.configPath = path
 	if path != "" {

@@ -177,8 +177,11 @@ func (n *node) signal(sig syscall.Signal) {
 	n.cmd = nil
 }
 
-// stop — SIGTERM: агент выходит, воркеры работают дальше.
+// stop — SIGTERM: агент выходит и останавливает воркеры (кроме lifecycle.keepRunning).
 func (n *node) stop() { n.signal(syscall.SIGTERM) }
+
+// restart — SIGUSR1 (`agent restart`): агент выходит для перезапуска, воркеры работают дальше.
+func (n *node) restart() { n.signal(syscall.SIGUSR1) }
 
 // admin — клиент локального API агента.
 func (n *node) admin() *app.Admin {

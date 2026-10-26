@@ -124,20 +124,24 @@ func TestAdoptAfterAgentRestart(t *testing.T) {
 	}
 }
 
-// Перезапуск и остановка агента (ExitRestart, ExitStop) — воркер работает дальше; без SetExit —
-// останавливается вместе с агентом.
+// Перезапуск агента (ExitRestart) — воркер работает дальше; остановка (ExitStop) — только с
+// lifecycle.keepRunning; без SetExit — останавливается вместе с агентом.
 func TestExitPolicies(t *testing.T) {
 	for _, c := range []struct {
 		name  string
 		exit  Exit
+		keep  bool
 		alive bool
 	}{
-		{"restart", ExitRestart, true},
-		{"stop", ExitStop, true},
-		{"shutdown", ExitShutdown, false},
+		{"restart", ExitRestart, false, true},
+		{"stop", ExitStop, false, false},
+		{"stop keepRunning", ExitStop, true, true},
+		{"shutdown", ExitShutdown, true, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			h := start(t, spec("echo", "ok", ""))
+			w := spec("echo", "ok", "")
+			w.Lifecycle.KeepRunning = c.keep
+			h := start(t, w)
 			<-h.started
 			pid := h.pid(t, "echo")
 			defer syscall.Kill(pid, syscall.SIGKILL)
@@ -319,7 +323,9 @@ func TestRestartAfterExit(t *testing.T) {
 // останавливаются.
 func TestStopProcesses(t *testing.T) {
 	dir := tempDir(t)
-	h := startIn(t, dir, spec("echo", "ok", ""))
+	w := spec("echo", "ok", "")
+	w.Lifecycle.KeepRunning = true
+	h := startIn(t, dir, w)
 	<-h.started
 	pid := h.pid(t, "echo")
 	h.sup.SetExit(ExitStop)

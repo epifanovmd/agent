@@ -286,7 +286,7 @@ func TestAgentRestart(t *testing.T) {
 		}
 		return false
 	})
-	n.stop()
+	n.restart()
 	n.start()
 	if r := b.result(a, long); !r.OK {
 		t.Fatalf("команда через перезапуск агента: %+v", r)
@@ -300,6 +300,43 @@ func TestAgentRestart(t *testing.T) {
 	}
 	if r := b.workerCommand(a, "sysinfo", "sys.info", nil); !r.OK {
 		t.Fatalf("после перезапуска: %+v", r)
+	}
+}
+
+// Остановка агента (SIGTERM) останавливает воркеры; воркер с lifecycle.keepRunning работает
+// дальше, и следующий запуск агента его подхватывает.
+func TestAgentStopWorkers(t *testing.T) {
+	b := newBackend(t)
+	n := newNodeWith(t, func(dir string) string {
+		return strings.Replace(config(dir, b.srv.URL, ""), "lifecycle: { stopTimeout: 5s }\n  - name: sysinfo",
+			"lifecycle: { stopTimeout: 5s, keepRunning: true }\n  - name: sysinfo", 1)
+	}, nil)
+	ready(t, b)
+	pidOf := func(name string) int {
+		raw, err := os.ReadFile(filepath.Join(n.dir, "data", "processes", name+".json"))
+		if err != nil {
+			return 0
+		}
+		var st struct{ PID int }
+		_ = json.Unmarshal(raw, &st)
+		return st.PID
+	}
+	echo, sysinfo := pidOf("echo"), pidOf("sysinfo")
+	if echo == 0 || sysinfo == 0 {
+		t.Fatalf("pid воркеров: echo %d, sysinfo %d", echo, sysinfo)
+	}
+	defer syscall.Kill(echo, syscall.SIGKILL)
+	n.stop()
+	if syscall.Kill(echo, 0) != nil || pidOf("echo") != echo {
+		t.Fatal("воркер с keepRunning остановлен вместе с агентом")
+	}
+	if syscall.Kill(sysinfo, 0) == nil || pidOf("sysinfo") != 0 {
+		t.Fatal("воркер без keepRunning работает после остановки агента")
+	}
+	n.start()
+	eventually(t, "sysinfo запущен заново", func() bool { return pidOf("sysinfo") != 0 })
+	if pidOf("echo") != echo {
+		t.Fatal("воркер с keepRunning не подхвачен, а запущен заново")
 	}
 }
 

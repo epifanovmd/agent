@@ -64,7 +64,7 @@ const (
 	ExitShutdown Exit = iota
 	// ExitRestart — агент перезапускается: воркеры работают дальше.
 	ExitRestart
-	// ExitStop — агент останавливается: воркеры работают дальше.
+	// ExitStop — агент останавливается: работают дальше воркеры с lifecycle.keepRunning.
 	ExitStop
 )
 
@@ -642,8 +642,8 @@ func (w *Worker) setState(state, reason string) {
 	}
 }
 
-// keepOnExit — агент уходит, а воркер работает дальше (SetExit); удалённый из настроек —
-// никогда.
+// keepOnExit — агент уходит, а воркер работает дальше (SetExit): при перезапуске агента — всегда,
+// при остановке — с lifecycle.keepRunning; удалённый из настроек — никогда.
 func (w *Worker) keepOnExit() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -651,8 +651,10 @@ func (w *Worker) keepOnExit() bool {
 		return false
 	}
 	switch Exit(w.sup.exit.Load()) {
-	case ExitRestart, ExitStop:
+	case ExitRestart:
 		return true
+	case ExitStop:
+		return w.spec.Lifecycle.KeepRunning
 	}
 	return false
 }

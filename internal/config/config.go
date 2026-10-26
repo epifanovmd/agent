@@ -229,6 +229,10 @@ type Lifecycle struct {
 	StopTimeout Duration `yaml:"stopTimeout"`
 	// SetupTimeout — срок ./setup (установка зависимостей). 0 — DefaultSetupTimeout.
 	SetupTimeout Duration `yaml:"setupTimeout"`
+	// KeepRunning — воркер работает дальше, когда агент останавливается (SIGTERM, SIGINT), и
+	// следующий запуск агента его подхватывает; без него воркер останавливается вместе с агентом.
+	// Перезапуск и обновление агента воркер не останавливают в любом случае.
+	KeepRunning bool `yaml:"keepRunning"`
 }
 
 // Сроки lifecycle по умолчанию.

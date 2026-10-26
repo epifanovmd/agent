@@ -162,7 +162,7 @@ curl --unix-socket "$AGENT_SOCKET" -H "Authorization: Worker $AGENT_WORKER_TOKEN
 | `update.publicKey`, `update.publicKeys`     | ключи проверки подписи сборок, в дополнение к вшитому                              |
 | `outbox.maxMessages`                        | сколько итогов и событий очередь на диске держит без связи                         |
 | `workers[]`                                 | воркеры: `path` (папка с `./run`), `name` + `command`, `release: true` (сборка)    |
-| `workers[].env`, `args`, `dir`, `lifecycle` | переменные, аргументы, каталог; `lifecycle.stopTimeout` — ожидание после `SIGTERM`, `lifecycle.setupTimeout` — срок `./setup` |
+| `workers[].env`, `args`, `dir`, `lifecycle` | переменные, аргументы, каталог; `lifecycle.stopTimeout` — ожидание после `SIGTERM`, `lifecycle.setupTimeout` — срок `./setup`, `lifecycle.keepRunning` — воркер работает дальше после остановки агента |
 
 `./agent run` без флагов читает `agent.yaml` рядом с программой или в текущем каталоге; `--env prod`
 — `agent.prod.yaml`; `-config ФАЙЛ` — любой файл. `SIGHUP` перечитывает настройки и файлы
@@ -182,7 +182,7 @@ curl --unix-socket "$AGENT_SOCKET" -H "Authorization: Worker $AGENT_WORKER_TOKEN
 | `agent install [--env ИМЯ] [флаги]`        | поставить службой systemd или без root (`--rootless`)                  |
 | `agent upgrade [--check] [--version X]`    | поставить новую версию агента из каталога сборок (подпись проверяется) |
 | `agent manifest КАТАЛОГ ВЕРСИЯ [--worker]` | `manifest.json` каталога сборок агента и воркеров                      |
-| `agent stop-workers [--cleanup]`           | остановить воркеры, оставшиеся после остановки агента; `--cleanup` — и их уборка |
+| `agent stop-workers [--cleanup]`           | остановить воркеры, оставшиеся после остановки агента (`lifecycle.keepRunning`, аварийный выход); `--cleanup` — и их уборка |
 | `agent uninstall [--purge]`                | удалить службу (с `--purge` — настройки и данные)                      |
 | `agent version`, `agent help`              | версия, справка                                                        |
 
