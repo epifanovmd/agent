@@ -12,7 +12,7 @@ require github.com/shirou/gopsutil/v4 v4.25.10
 
 require (
 	go.etcd.io/bbolt v1.5.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 )
 
 require (
